@@ -1,0 +1,86 @@
+name: release-worker
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without v prefix (e.g. 2.8.8). Leave empty for current Cargo.toml."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            TAG_VERSION="${TAG#v}"
+            [[ "${TAG_VERSION}" == "${CARGO_VERSION}" ]] || (echo "Tag/Cargo version mismatch" && exit 1)
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            TAG="v${{ inputs.version }}"
+            [[ "${{ inputs.version }}" == "${CARGO_VERSION}" ]] || (echo "Input/Cargo version mismatch" && exit 1)
+          else
+            TAG="v${CARGO_VERSION}"
+          fi
+          echo "version=${CARGO_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+  publish-crate:
+    runs-on: ubuntu-latest
+    needs: verify-version
+    if: ${{ secrets.CRATES_IO_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish
+
+  publish-image:
+    runs-on: ubuntu-latest
+    needs: verify-version
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/noetl/worker:${{ needs.verify-version.outputs.version }}
+            ghcr.io/noetl/worker:latest
+
+  github-release:
+    runs-on: ubuntu-latest
+    needs: [verify-version, publish-image]
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify-version.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            - crate: `noetl-worker`
+            - image: `ghcr.io/noetl/worker:${{ needs.verify-version.outputs.version }}`

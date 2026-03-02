@@ -1,10 +1,10 @@
-# NoETL Worker (`worker-pool`)
+# NoETL Worker (`noetl-worker`)
 
 Worker executable that consumes command events and executes tools.
 
 ## Distribution Channels
 
-- **Crates.io**: `worker-pool`
+- **Crates.io**: `noetl-worker`
 - **Container image**: recommended primary runtime channel (GHCR/GCR)
 - **Cloud Build**: recommended for image builds and GKE deploy pipelines
 
@@ -12,7 +12,7 @@ Worker executable that consumes command events and executes tools.
 
 - Crates.io dependency for shared library:
   - `noetl-tools = "2.8.7"` (or matching release version)
-- Release order must publish `noetl-tools` before `worker-pool`.
+- Release order must publish `noetl-tools` before `noetl-worker`.
 
 ## Release Checklist
 

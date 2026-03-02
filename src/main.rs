@@ -5,7 +5,7 @@
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use worker_pool::{Worker, WorkerConfig};
+use noetl_worker::{Worker, WorkerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {

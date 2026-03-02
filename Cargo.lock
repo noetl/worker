@@ -2040,6 +2040,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "noetl-worker"
+version = "2.8.7"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "chrono",
+ "dotenvy",
+ "futures",
+ "hostname",
+ "noetl-tools",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4437,29 +4460,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "worker-pool"
-version = "2.8.7"
-dependencies = [
- "anyhow",
- "async-nats",
- "chrono",
- "dotenvy",
- "futures",
- "hostname",
- "noetl-tools",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "worker-pool"
+name = "noetl-worker"
 version = "2.8.7"
 edition = "2021"
 license = "MIT"
