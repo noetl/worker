@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          INPUT_VERSION="${{ github.event.inputs.version }}"
+          INPUT_VERSION="$(jq -r '.inputs.version // empty' "${GITHUB_EVENT_PATH}" 2>/dev/null || true)"
           CARGO_VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG="${GITHUB_REF_NAME}"
