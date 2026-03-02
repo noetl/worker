@@ -27,14 +27,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          INPUT_VERSION="${{ github.event.inputs.version }}"
           CARGO_VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG="${GITHUB_REF_NAME}"
             TAG_VERSION="${TAG#v}"
             [[ "${TAG_VERSION}" == "${CARGO_VERSION}" ]] || (echo "Tag/Cargo version mismatch" && exit 1)
-          elif [[ -n "${{ inputs.version }}" ]]; then
-            TAG="v${{ inputs.version }}"
-            [[ "${{ inputs.version }}" == "${CARGO_VERSION}" ]] || (echo "Input/Cargo version mismatch" && exit 1)
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            TAG="v${INPUT_VERSION}"
+            [[ "${INPUT_VERSION}" == "${CARGO_VERSION}" ]] || (echo "Input/Cargo version mismatch" && exit 1)
           else
             TAG="v${CARGO_VERSION}"
           fi
