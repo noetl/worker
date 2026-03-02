@@ -2013,6 +2013,8 @@ dependencies = [
 [[package]]
 name = "noetl-tools"
 version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1f5bfeb28c24174945d48d162fa9442e2bfb2475ed6bc376539ff45834ff29a"
 dependencies = [
  "anyhow",
  "async-trait",
