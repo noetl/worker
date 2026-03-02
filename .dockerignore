@@ -1,0 +1,7 @@
+target
+.git
+.github
+.DS_Store
+*.log
+*.tmp
+tmp
