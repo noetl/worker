@@ -10,13 +10,22 @@ Worker executable that consumes command events and executes tools.
 
 ## Dependency Policy
 
-- Crates.io dependency for shared library:
-  - `noetl-tools = "2.8.7"` (or matching release version)
-- Release order must publish `noetl-tools` before `noetl-worker`.
+- Crates.io dependencies for shared libraries:
+  - `noetl-tools = "2.8.7"` (or matching release version) — the
+    tool registry (HTTP, DuckDB, Postgres, shell, Rhai, …).
+  - `noetl-executor = "0.2"` — the shared execution core
+    (R-1.2 PR-2c onwards).  Hosts the structured-condition
+    surface (`Condition`, `Operator`,
+    `evaluate_structured_condition`) the worker's case dispatcher
+    delegates to; ships in the [`noetl/cli` workspace][cli] as a
+    workspace-member crate.
+- Release order must publish `noetl-tools` and `noetl-executor`
+  before `noetl-worker`.
 
 ## Release Checklist
 
-1. Ensure `noetl-tools` target version is available on crates.io.
+1. Ensure `noetl-tools` + `noetl-executor` target versions are
+   available on crates.io.
 2. Bump `version` in `Cargo.toml`.
 3. Build and verify:
    - `cargo build --release`
@@ -24,3 +33,5 @@ Worker executable that consumes command events and executes tools.
    - `cargo publish`
 5. Build and push container image (`worker`).
 6. Roll out worker deployment and validate command throughput.
+
+[cli]: https://github.com/noetl/cli
