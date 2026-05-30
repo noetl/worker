@@ -19,6 +19,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Release
+        id: semantic
         uses: cycjimmy/semantic-release-action@v4
         with:
           semantic_version: 24.2.3
@@ -29,3 +30,22 @@ jobs:
             conventional-changelog-conventionalcommits@8.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # GitHub Actions safeguard: tags created by GITHUB_TOKEN do not
+      # trigger workflows (prevents recursion).  The `release-worker`
+      # workflow is configured to run on `push: tags: ['v*']` but a
+      # tag pushed by the semantic-release-action via GITHUB_TOKEN
+      # won't fire it.  Explicitly dispatch it here so each new
+      # version reaches the crate / image / GitHub Release flow.
+      #
+      # Same pattern as noetl/cli's semantic-release.yml.  Without
+      # this step, `noetl-worker 1.1.0` was tagged but not published
+      # to crates.io (release-worker had to be dispatched manually).
+      - name: Trigger release-worker workflow
+        if: ${{ steps.semantic.outputs.new_release_published == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)"
+          gh workflow run release.yml --ref main -f version="${VERSION}"
