@@ -2011,6 +2011,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "noetl-executor"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "001987388f00efb70478da1c4bbad1414cad27caf2f9c68ebca8ae3a0c895919"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "noetl-tools",
+ "regex",
+ "rhai",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "noetl-tools"
 version = "2.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2049,6 +2069,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "hostname",
+ "noetl-executor",
  "noetl-tools",
  "regex",
  "reqwest",
