@@ -6,7 +6,22 @@ on:
       - main
 
 permissions:
+  # `contents: write` — semantic-release needs to push the version
+  # bump + CHANGELOG commit + tag back to main.
   contents: write
+  # `actions: write` — required for the "Trigger release-worker
+  # workflow" step (added in #4) to call
+  # `gh workflow run release.yml`.  Without this, the dispatch
+  # returns HTTP 403 "Resource not accessible by integration"
+  # and the pipeline silently leaves the newly-bumped version
+  # unpublished on crates.io.  Same permission set noetl/cli uses.
+  actions: write
+  # `issues: write` + `pull-requests: write` — semantic-release's
+  # GitHub plugin posts a successComment on the PR / closing
+  # comment on the resolved issue.  Required only when those
+  # comments are enabled in `.releaserc.json` (they are).
+  issues: write
+  pull-requests: write
 
 jobs:
   release:
