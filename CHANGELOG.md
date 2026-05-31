@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.1.3](https://github.com/noetl/worker/compare/v5.1.2...v5.1.3) (2026-05-31)
+
+### Bug Fixes
+
+* **executor:** emit reference-only payload for call.done per broker contract ([2b652ff](https://github.com/noetl/worker/commit/2b652ffcf6a63e1a14e11d8693fec54657a086a2)), closes [noetl/cli#39](https://github.com/noetl/cli/issues/39) [noetl/worker#24](https://github.com/noetl/worker/issues/24) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30) [noetl/worker#24](https://github.com/noetl/worker/issues/24)
+
 ## [5.1.2](https://github.com/noetl/worker/compare/v5.1.1...v5.1.2) (2026-05-31)
 
 ### Bug Fixes
