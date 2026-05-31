@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.2.0](https://github.com/noetl/worker/compare/v5.1.3...v5.2.0) (2026-05-31)
+
+### Features
+
+* **executor:** emit tool output in result.context for data-flow ([689e005](https://github.com/noetl/worker/commit/689e005559d713945f6a0ef2ea4cf8a7702b0246)), closes [noetl/worker#25](https://github.com/noetl/worker/issues/25) [noetl/worker#24](https://github.com/noetl/worker/issues/24) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30) [noetl/worker#24](https://github.com/noetl/worker/issues/24)
+
 ## [5.1.3](https://github.com/noetl/worker/compare/v5.1.2...v5.1.3) (2026-05-31)
 
 ### Bug Fixes
