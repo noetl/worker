@@ -71,5 +71,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 dotenvy = "0.15"
 hostname = "0.4"
 
+# URL parsing for NATS_URL credential extraction.  Honors
+# `nats://user:pass@host` inline auth (the convention the Python
+# worker + most NATS clients use); async-nats 0.38's `connect(url)`
+# only consumes the addr portion, so we extract creds ourselves
+# and feed `ConnectOptions::with_user_and_password`.
+url = "2"
+urlencoding = "2"
+
 [dev-dependencies]
 tokio-test = "0.4"

@@ -2,8 +2,10 @@
 
 use anyhow::Result;
 use async_nats::jetstream::{self, consumer::pull::Config as ConsumerConfig, Context};
+use async_nats::ConnectOptions;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Command notification received from NATS.
 ///
@@ -43,8 +45,29 @@ pub struct NatsSubscriber {
 
 impl NatsSubscriber {
     /// Connect to NATS and create a subscriber.
+    ///
+    /// Auth precedence (the Python worker convention matches the
+    /// first two):
+    /// 1. `NATS_USER` + `NATS_PASSWORD` env vars (explicit; never
+    ///    serialised to log lines).
+    /// 2. Inline credentials in the URL (`nats://user:pass@host`).
+    ///    `async_nats::connect()` only parses the addr portion and
+    ///    silently drops URL creds — so we extract them ourselves
+    ///    and feed `ConnectOptions::with_user_and_password`.
+    /// 3. Anonymous connect (the existing PR-2d-2 behaviour).
     pub async fn connect(nats_url: &str, stream: &str, consumer: &str) -> Result<Self> {
-        let client = async_nats::connect(nats_url).await?;
+        let (clean_url, user, pass) = parse_nats_credentials(nats_url)?;
+
+        let client = if let (Some(u), Some(p)) = (user, pass) {
+            tracing::info!(nats_url = %clean_url, "Connecting to NATS with user/password auth");
+            ConnectOptions::with_user_and_password(u, p)
+                .connect(&clean_url)
+                .await?
+        } else {
+            tracing::info!(nats_url = %clean_url, "Connecting to NATS anonymously");
+            async_nats::connect(&clean_url).await?
+        };
+
         let js = jetstream::new(client);
 
         // Ensure stream exists
@@ -176,6 +199,68 @@ impl NatsSubscriber {
     }
 }
 
+/// Parse user/password from the URL OR from
+/// `NATS_USER` + `NATS_PASSWORD` env vars and return the URL with
+/// inline credentials stripped (so `async_nats::connect` sees a
+/// bare addr).
+///
+/// Resolution order:
+/// 1. `NATS_USER` + `NATS_PASSWORD` env (both must be set).
+/// 2. Inline `nats://user:pass@host` URL credentials.
+/// 3. None → caller falls back to anonymous `async_nats::connect`.
+///
+/// Returns `(clean_url, user, password)`.  The clean URL drops the
+/// userinfo portion so passing it to `async_nats::connect` doesn't
+/// silently expose creds via `Debug`-printed `ServerAddr` (the
+/// inline form survives URL parsing in `ServerAddr::from_str` even
+/// though connector.rs ignores it; stripping is defence-in-depth).
+fn parse_nats_credentials(nats_url: &str) -> Result<(String, Option<String>, Option<String>)> {
+    // Env-var override first.  Matches the Python worker's behaviour
+    // where `NATS_USER` / `NATS_PASSWORD` are the deployment-manifest
+    // knobs.
+    let env_user = std::env::var("NATS_USER").ok();
+    let env_pass = std::env::var("NATS_PASSWORD").ok();
+    if let (Some(u), Some(p)) = (env_user.as_ref(), env_pass.as_ref()) {
+        if !u.is_empty() && !p.is_empty() {
+            let clean = strip_url_credentials(nats_url)?;
+            return Ok((clean, Some(u.clone()), Some(p.clone())));
+        }
+    }
+
+    // Fall back to URL-inline credentials.
+    let parsed = Url::parse(nats_url)
+        .map_err(|e| anyhow::anyhow!("Invalid NATS_URL '{}': {}", nats_url, e))?;
+    let user_in_url = parsed.username();
+    let pass_in_url = parsed.password();
+    if !user_in_url.is_empty() && pass_in_url.is_some() {
+        let user = urlencoding::decode(user_in_url)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| user_in_url.to_string());
+        let pass = urlencoding::decode(pass_in_url.unwrap_or(""))
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| pass_in_url.unwrap_or("").to_string());
+        let clean = strip_url_credentials(nats_url)?;
+        return Ok((clean, Some(user), Some(pass)));
+    }
+
+    // No credentials configured — anonymous connect.  Roundtrip
+    // through `strip_url_credentials` for shape consistency with
+    // the auth paths (canonical URL form, defence-in-depth).
+    let clean = strip_url_credentials(nats_url)?;
+    Ok((clean, None, None))
+}
+
+/// Strip the `user:password@` userinfo from a URL.  Idempotent.
+fn strip_url_credentials(nats_url: &str) -> Result<String> {
+    let mut parsed = Url::parse(nats_url)
+        .map_err(|e| anyhow::anyhow!("Invalid NATS_URL '{}': {}", nats_url, e))?;
+    // Url::set_username("") / set_password(None) drops the userinfo
+    // segment so the rendered URL is `nats://host:port/...`.
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    Ok(parsed.to_string())
+}
+
 /// Snapshot of a JetStream consumer's lag.  Returned by
 /// [`NatsSubscriber::consumer_lag`].
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +277,60 @@ pub struct ConsumerLag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// URL-inline `user:pass@host` credentials get extracted into
+    /// the returned tuple and the URL passed to `async_nats::connect`
+    /// has them stripped.  Matches what the Python worker accepts
+    /// via the `NATS_URL` env var.
+    #[test]
+    fn parse_credentials_extracts_inline_url_auth() {
+        let url = "nats://noetl:s3cret@nats.example.com:4222";
+        let (clean, user, pass) = parse_nats_credentials(url).unwrap();
+        assert_eq!(user.as_deref(), Some("noetl"));
+        assert_eq!(pass.as_deref(), Some("s3cret"));
+        assert!(!clean.contains("noetl:s3cret"));
+        assert!(clean.contains("nats.example.com:4222"));
+    }
+
+    /// Anonymous URLs surface no credentials and the URL is
+    /// preserved (modulo the `url::Url::to_string()` normalisation,
+    /// which keeps the addr portion intact — what `async_nats`
+    /// actually consumes).
+    #[test]
+    fn parse_credentials_anonymous_when_no_userinfo() {
+        let url = "nats://nats.example.com:4222";
+        let (clean, user, pass) = parse_nats_credentials(url).unwrap();
+        assert!(user.is_none());
+        assert!(pass.is_none());
+        assert!(clean.starts_with("nats://nats.example.com:4222"));
+        assert!(!clean.contains('@'));
+    }
+
+    /// Bad URLs surface a clear error instead of panicking.
+    #[test]
+    fn parse_credentials_rejects_malformed_url() {
+        let err = parse_nats_credentials("not-a-url").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid NATS_URL"), "got: {}", msg);
+    }
+
+    /// `%`-encoded URL credentials decode correctly (passwords with
+    /// `@` or `:` characters round-trip via percent-encoding).
+    #[test]
+    fn parse_credentials_decodes_percent_encoded_password() {
+        let url = "nats://noetl:s%3Acret%40@nats.example.com:4222";
+        let (_, user, pass) = parse_nats_credentials(url).unwrap();
+        assert_eq!(user.as_deref(), Some("noetl"));
+        assert_eq!(pass.as_deref(), Some("s:cret@"));
+    }
+
+    /// `strip_url_credentials` is idempotent — running it on a
+    /// URL that already has no userinfo doesn't corrupt it.
+    #[test]
+    fn strip_url_credentials_idempotent() {
+        let stripped = strip_url_credentials("nats://host:4222").unwrap();
+        assert_eq!(strip_url_credentials(&stripped).unwrap(), stripped);
+    }
 
     #[test]
     fn test_command_notification_serialization() {
