@@ -190,23 +190,33 @@ impl CommandExecutor {
             .await
         {
             Ok(result) => {
-                // Emit call.done event with a REFERENCE-ONLY result
+                // Emit call.done event with a reference-only result
                 // payload.  The Python broker's
                 // `_validate_reference_only_payload` enforces that
                 // `payload.result` only carries `{status, reference,
-                // context, command_id}` keys — the raw tool output
-                // (`stdout` / `stderr` / `exit_code` / `data` /
-                // `duration_ms`) must live in durable storage and
-                // be referenced by URI in `result.reference`.
+                // context, command_id}` at the top level — the raw
+                // tool fields (`stdout` / `stderr` / `exit_code` /
+                // `data` / `duration_ms`) live INSIDE `context` so
+                // downstream steps can reference them via Jinja
+                // (`step_name.data.rows[N].x`).
                 //
-                // Minimum-viable shape used today: just `{status}`.
-                // Tool output is NOT visible in the event log;
-                // downstream steps that reference prior outputs via
-                // Jinja `data.rows[N].x` won't have the data.
-                // Proper R-2.x work (result_store integration + the
-                // `noetl-arrow-cache` colocated acceleration crate
-                // landed in cli#39) replaces this with a real
-                // reference.  Tracked on noetl/worker#24.
+                // For results under ~100KB JSON-serialised this
+                // inline `context` is the broker's intended fast
+                // path (it's bounded by
+                // `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`, default
+                // 100KB).  Larger results need a
+                // `reference: { uri, kind }` pointer to durable
+                // storage — that path uses `noetl-arrow-cache` for
+                // colocated consumers + the durable result store
+                // for non-colocated; tracked on noetl/worker#24.
+                //
+                // Defensive: the broker forbids `_internal_data` at
+                // any depth in `result.context`.  Our `ToolResult`
+                // doesn't surface that key, so the serialised value
+                // round-trips cleanly through the validator.
+                let result_context = serde_json::to_value(&result).unwrap_or_else(|_| {
+                    serde_json::json!({ "status": result.status.to_string() })
+                });
                 self.emit_event(
                     "call.done",
                     &command.step,
@@ -218,6 +228,7 @@ impl CommandExecutor {
                         "call_index": ctx.call_index,
                         "result": {
                             "status": result.status.to_string(),
+                            "context": result_context,
                         },
                     }),
                 )
