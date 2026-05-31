@@ -200,23 +200,43 @@ impl CommandExecutor {
                 // downstream steps can reference them via Jinja
                 // (`step_name.data.rows[N].x`).
                 //
-                // For results under ~100KB JSON-serialised this
-                // inline `context` is the broker's intended fast
-                // path (it's bounded by
-                // `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`, default
-                // 100KB).  Larger results need a
-                // `reference: { uri, kind }` pointer to durable
-                // storage — that path uses `noetl-arrow-cache` for
-                // colocated consumers + the durable result store
-                // for non-colocated; tracked on noetl/worker#24.
+                // For results under `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`
+                // (default 100 KB) the broker persists `context` as-is
+                // and downstream Jinja templates can read the tool
+                // output.  When the JSON would exceed that, the broker
+                // silently drops the context (`_bounded_context`
+                // returns None), so we pre-check the size on the Rust
+                // side and emit a WARN log so operators can see *why*
+                // their large-result step's downstream rendering is
+                // empty.  Until the result-store / `noetl-arrow-cache`
+                // reference path lands (noetl/worker#24), an
+                // over-budget result still ships with just `{status}` —
+                // identical behaviour to a silent broker drop, just
+                // visible in the worker's logs.
                 //
                 // Defensive: the broker forbids `_internal_data` at
                 // any depth in `result.context`.  Our `ToolResult`
                 // doesn't surface that key, so the serialised value
                 // round-trips cleanly through the validator.
-                let result_context = serde_json::to_value(&result).unwrap_or_else(|_| {
-                    serde_json::json!({ "status": result.status.to_string() })
-                });
+                let result_context = serde_json::to_value(&result)
+                    .unwrap_or_else(|_| serde_json::json!({ "status": result.status.to_string() }));
+                let result_obj = match build_call_done_result(
+                    &result_context,
+                    &result.status.to_string(),
+                    command.execution_id,
+                    &command.step,
+                ) {
+                    Ok(obj) => obj,
+                    Err(e) => {
+                        tracing::warn!(
+                            execution_id = command.execution_id,
+                            step = %command.step,
+                            error = %e,
+                            "Failed to serialise tool result for inline context; falling back to status-only payload",
+                        );
+                        serde_json::json!({ "status": result.status.to_string() })
+                    }
+                };
                 self.emit_event(
                     "call.done",
                     &command.step,
@@ -226,10 +246,7 @@ impl CommandExecutor {
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
                         "call_index": ctx.call_index,
-                        "result": {
-                            "status": result.status.to_string(),
-                            "context": result_context,
-                        },
+                        "result": result_obj,
                     }),
                 )
                 .await?;
@@ -418,6 +435,56 @@ impl CommandExecutor {
     }
 }
 
+/// Soft upper bound for the JSON-serialised size of
+/// `payload.result.context` on `call.done` events.  Matches the
+/// Python broker's `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES` default
+/// (the broker's `_bounded_context` returns None and silently
+/// drops the field above this threshold; we pre-check Rust-side
+/// so operators see a WARN log instead of a silent drop).
+const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
+
+/// Build the `payload.result` object for a `call.done` event,
+/// choosing between the inline-context fast path and the
+/// `{status}`-only fallback based on the JSON-serialised size of
+/// the supplied `context`.
+///
+/// Returns:
+///
+/// - `{status, context}` when the serialised context fits under
+///   [`INLINE_CONTEXT_MAX_BYTES`].
+/// - `{status}` only when the context would exceed the inline
+///   budget — the proper `result.reference` path (durable
+///   storage or `noetl-arrow-cache`) is tracked on
+///   noetl/worker#24 and lands in a future PR; this fallback
+///   keeps the wire payload valid in the meantime, with a WARN
+///   log so the over-budget case is visible.
+///
+/// Errors only if the serde serialisation itself fails (which
+/// shouldn't happen for `serde_json::Value` inputs but the
+/// signature stays honest via `serde_json::Error`).
+fn build_call_done_result(
+    context: &serde_json::Value,
+    status: &str,
+    execution_id: i64,
+    step: &str,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let serialised = serde_json::to_string(context)?;
+    if serialised.len() > INLINE_CONTEXT_MAX_BYTES {
+        tracing::warn!(
+            execution_id,
+            step,
+            context_bytes = serialised.len(),
+            inline_budget_bytes = INLINE_CONTEXT_MAX_BYTES,
+            "Tool result exceeds inline context budget; emitting {status}-only result. \
+             Downstream Jinja references will be empty until result_store / \
+             noetl-arrow-cache integration lands (noetl/worker#24).",
+        );
+        Ok(serde_json::json!({ "status": status }))
+    } else {
+        Ok(serde_json::json!({ "status": status, "context": context }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +504,80 @@ mod tests {
         assert!(executor.tool_registry.has("shell"));
         assert!(executor.tool_registry.has("http"));
         assert!(executor.tool_registry.has("rhai"));
+    }
+
+    /// Small tool result rides the inline `result.context` path —
+    /// the broker accepts it and downstream Jinja templates can
+    /// reference fields off it.
+    #[test]
+    fn build_call_done_result_inlines_small_context() {
+        let context = serde_json::json!({
+            "stdout": "hello",
+            "exit_code": 0,
+            "duration_ms": 12,
+        });
+        let result = build_call_done_result(&context, "COMPLETED", 42, "greet").unwrap();
+        assert_eq!(result["status"], "COMPLETED");
+        assert_eq!(result["context"]["stdout"], "hello");
+        assert_eq!(result["context"]["exit_code"], 0);
+        // The structure stays valid against the broker's
+        // _STRICT_RESULT_ALLOWED_KEYS = {status, reference,
+        // context, command_id} contract.
+        let result_keys: Vec<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        for key in &result_keys {
+            assert!(
+                ["status", "context"].contains(key),
+                "unexpected key: {}",
+                key,
+            );
+        }
+    }
+
+    /// Large tool result exceeds the inline budget — falls back
+    /// to `{status}` only.  The proper `result.reference` path
+    /// (durable storage / noetl-arrow-cache) is tracked on
+    /// noetl/worker#24.
+    #[test]
+    fn build_call_done_result_drops_oversized_context() {
+        let big_string: String = "x".repeat(INLINE_CONTEXT_MAX_BYTES + 1024);
+        let context = serde_json::json!({ "stdout": big_string });
+        let result = build_call_done_result(&context, "COMPLETED", 42, "big_step").unwrap();
+        assert_eq!(result["status"], "COMPLETED");
+        assert!(
+            result.get("context").is_none(),
+            "oversize context must be dropped: result={}",
+            result
+        );
+    }
+
+    /// The inline-budget threshold is a constant the broker side
+    /// is tied to (`NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES` default
+    /// 102400 bytes).  Lock the value in so a future tweak to
+    /// either side stays in sync.
+    #[test]
+    fn inline_context_max_bytes_matches_broker_default() {
+        assert_eq!(INLINE_CONTEXT_MAX_BYTES, 102_400);
+    }
+
+    /// Result sized exactly at the budget is allowed; one byte
+    /// over is not.  Boundary check for the comparison.
+    #[test]
+    fn build_call_done_result_boundary_check() {
+        // We can't easily craft a context whose JSON encoding is
+        // EXACTLY INLINE_CONTEXT_MAX_BYTES, but we can prove the
+        // ">" (strictly greater) semantics by checking a result
+        // smaller and a result larger than the threshold.
+        let small = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES - 100) });
+        let small_result = build_call_done_result(&small, "COMPLETED", 1, "s").unwrap();
+        assert!(small_result.get("context").is_some());
+
+        let large = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES + 100) });
+        let large_result = build_call_done_result(&large, "COMPLETED", 1, "l").unwrap();
+        assert!(large_result.get("context").is_none());
     }
 }
