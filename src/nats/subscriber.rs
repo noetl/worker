@@ -10,6 +10,12 @@ use url::Url;
 /// Command notification received from NATS.
 ///
 /// This is a lightweight notification that triggers command fetching.
+///
+/// `command_id` is normalised to `String` in memory but the wire
+/// format accepts either a JSON string OR a JSON integer — the
+/// Python broker switched the `noetl.command.command_id` column to
+/// `bigint` snowflake and now serialises it as a JSON number on
+/// the publish path.  See `deserialize_command_id` below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandNotification {
     /// Execution ID this command belongs to.
@@ -18,7 +24,11 @@ pub struct CommandNotification {
     /// Event ID containing the full command details.
     pub event_id: i64,
 
-    /// Unique command identifier for atomic claiming.
+    /// Unique command identifier for atomic claiming.  Accepts
+    /// JSON string OR integer on the wire; stored as `String` so
+    /// downstream call sites (logging, tracing, executor `Command`)
+    /// don't need to handle both shapes.
+    #[serde(deserialize_with = "deserialize_command_id")]
     pub command_id: String,
 
     /// Step name this command is for.
@@ -26,6 +36,35 @@ pub struct CommandNotification {
 
     /// Server URL for fetching command details.
     pub server_url: String,
+}
+
+/// Accept either a JSON string OR a JSON integer for `command_id`;
+/// stringify the integer form so the in-memory representation is
+/// always `String`.  The Python broker now sends `command_id` as a
+/// `bigint` snowflake (numeric JSON literal) but the worker wasn't
+/// updated to deserialize it — the `invalid type: integer ...,
+/// expected a string` error surfaced this during the EE-3 kind
+/// validation pass.
+fn deserialize_command_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected};
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        other => Err(D::Error::invalid_type(
+            match &other {
+                serde_json::Value::Null => Unexpected::Unit,
+                serde_json::Value::Bool(b) => Unexpected::Bool(*b),
+                serde_json::Value::Array(_) => Unexpected::Seq,
+                serde_json::Value::Object(_) => Unexpected::Map,
+                _ => Unexpected::Other("non-string non-number"),
+            },
+            &"a JSON string or a JSON integer",
+        )),
+    }
 }
 
 /// NATS JetStream subscriber for command notifications.
@@ -348,5 +387,54 @@ mod tests {
 
         let parsed: CommandNotification = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.execution_id, 12345);
+    }
+
+    /// `command_id` deserializes from a JSON integer (the current
+    /// Python broker wire form — `bigint` snowflake serialised as a
+    /// numeric literal).  EE-3 kind validation surfaced this — the
+    /// worker was failing with `invalid type: integer ..., expected
+    /// a string` on every command notification.
+    #[test]
+    fn command_notification_deserialises_numeric_command_id() {
+        let wire = serde_json::json!({
+            "execution_id": 12345,
+            "event_id": 67890,
+            "command_id": 638756237806404289i64,
+            "step": "greet",
+            "server_url": "http://localhost:8082"
+        });
+        let parsed: CommandNotification = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.command_id, "638756237806404289");
+        assert_eq!(parsed.execution_id, 12345);
+    }
+
+    /// String form still works (backward compat for any older broker
+    /// builds + the worker's own serialised wire format).
+    #[test]
+    fn command_notification_deserialises_string_command_id() {
+        let wire = serde_json::json!({
+            "execution_id": 12345,
+            "event_id": 67890,
+            "command_id": "cmd-abc123",
+            "step": "greet",
+            "server_url": "http://localhost:8082"
+        });
+        let parsed: CommandNotification = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.command_id, "cmd-abc123");
+    }
+
+    /// Anything other than string/number on `command_id` produces
+    /// a clear deserialization error.
+    #[test]
+    fn command_notification_rejects_non_string_non_number_command_id() {
+        let wire = serde_json::json!({
+            "execution_id": 12345,
+            "event_id": 67890,
+            "command_id": null,
+            "step": "greet",
+            "server_url": "http://localhost:8082"
+        });
+        let err = serde_json::from_value::<CommandNotification>(wire).unwrap_err();
+        assert!(err.to_string().contains("string or"), "got: {}", err);
     }
 }
