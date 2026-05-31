@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.3.0](https://github.com/noetl/worker/compare/v5.2.1...v5.3.0) (2026-05-31)
+
+### Features
+
+* **executor:** stage over-budget call.done context in shared-memory cache ([d42be16](https://github.com/noetl/worker/commit/d42be16c1a1f411d732446a13d49aab746b1044f)), closes [noetl/worker#24](https://github.com/noetl/worker/issues/24) [noetl/worker#24](https://github.com/noetl/worker/issues/24) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [5.2.1](https://github.com/noetl/worker/compare/v5.2.0...v5.2.1) (2026-05-31)
 
 ### Bug Fixes
