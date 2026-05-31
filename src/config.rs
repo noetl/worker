@@ -67,8 +67,8 @@ impl WorkerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(4);
 
-        let metrics_bind = std::env::var("WORKER_METRICS_BIND")
-            .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+        let metrics_bind =
+            std::env::var("WORKER_METRICS_BIND").unwrap_or_else(|_| "0.0.0.0:9090".to_string());
 
         Ok(Self {
             worker_id,

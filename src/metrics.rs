@@ -34,8 +34,8 @@
 //! [rule]: https://github.com/noetl/ai-meta/blob/main/agents/rules/observability.md
 
 use prometheus::{
-    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge,
-    Registry, TextEncoder,
+    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Registry,
+    TextEncoder,
 };
 use std::sync::OnceLock;
 
@@ -271,24 +271,27 @@ mod tests {
 
     #[test]
     fn outcome_label_returns_distinct_strings() {
-        assert_eq!(outcome_label(&ClaimOutcome::Claimed(dummy_command("c"))), "claimed");
-        assert_eq!(outcome_label(&ClaimOutcome::AlreadyClaimed), "already_claimed");
-        assert_eq!(outcome_label(&ClaimOutcome::RetryLater("e".into())), "retry_later");
+        assert_eq!(
+            outcome_label(&ClaimOutcome::Claimed(dummy_command("c"))),
+            "claimed"
+        );
+        assert_eq!(
+            outcome_label(&ClaimOutcome::AlreadyClaimed),
+            "already_claimed"
+        );
+        assert_eq!(
+            outcome_label(&ClaimOutcome::RetryLater("e".into())),
+            "retry_later"
+        );
         assert_eq!(outcome_label(&ClaimOutcome::Failed("e".into())), "failed");
     }
 
     #[test]
     fn record_pull_increments_counter_and_histogram() {
         let m = WorkerMetrics::global();
-        let before = m
-            .pulls_total
-            .with_label_values(&["claimed"])
-            .get();
+        let before = m.pulls_total.with_label_values(&["claimed"]).get();
         record_pull(&ClaimOutcome::Claimed(dummy_command("c")), 0.012);
-        let after = m
-            .pulls_total
-            .with_label_values(&["claimed"])
-            .get();
+        let after = m.pulls_total.with_label_values(&["claimed"]).get();
         assert_eq!(after, before + 1);
         // Histogram sample count must increase too.
         assert!(m.pull_duration_seconds.get_sample_count() > 0);
@@ -307,7 +310,11 @@ mod tests {
             .dispatch_errors_total
             .with_label_values(&["postgres"])
             .get();
-        assert_eq!(after_errors, before_errors + 1, "only error path increments errors counter");
+        assert_eq!(
+            after_errors,
+            before_errors + 1,
+            "only error path increments errors counter"
+        );
     }
 
     #[test]

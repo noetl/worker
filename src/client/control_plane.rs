@@ -1,9 +1,22 @@
 //! Control plane HTTP client.
+//!
+//! R-1.2 PR-EE-3: the worker now emits the shared
+//! `noetl_executor::events::ExecutorEvent` wire shape on
+//! `/api/events`, replacing the worker-local `WorkerEvent` it shipped
+//! through R-1.2 PR-2e.  See the [event-envelope wiki page][ee] on
+//! the noetl/server wiki for the full envelope contract.
+//!
+//! [ee]: https://github.com/noetl/server/wiki/event-envelope
 
 use anyhow::Result;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+// Re-export the shared envelope so the rest of the worker keeps
+// importing it from `crate::client` (callers don't need to know it
+// comes from the executor crate).
+pub use noetl_executor::events::ExecutorEvent;
 
 /// Result of claiming a command.
 #[derive(Debug, Clone)]
@@ -89,19 +102,6 @@ impl Command {
     }
 }
 
-/// Event to emit to the control plane.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerEvent {
-    /// Event type (e.g., "command.claimed", "command.started", "command.completed").
-    pub event_type: String,
-
-    /// Execution ID.
-    pub execution_id: i64,
-
-    /// Event payload.
-    pub payload: serde_json::Value,
-}
-
 /// HTTP client for control plane API.
 #[derive(Clone)]
 pub struct ControlPlaneClient {
@@ -178,7 +178,15 @@ impl ControlPlaneClient {
     }
 
     /// Emit an event to the control plane.
-    pub async fn emit_event(&self, event: WorkerEvent) -> Result<()> {
+    ///
+    /// R-1.2 PR-EE-3: takes `ExecutorEvent` (the shared envelope) so
+    /// the wire shape matches what `noetl-server` (Rust + Python) and
+    /// `noetl-executor` already produce / consume.  See the
+    /// [event-envelope wiki page][ee] for the field-by-field
+    /// contract.
+    ///
+    /// [ee]: https://github.com/noetl/server/wiki/event-envelope
+    pub async fn emit_event(&self, event: ExecutorEvent) -> Result<()> {
         let response = self
             .client
             .post(format!("{}/api/events", self.server_url))
@@ -195,7 +203,11 @@ impl ControlPlaneClient {
     }
 
     /// Emit an event with retry.
-    pub async fn emit_event_with_retry(&self, event: WorkerEvent, max_retries: u32) -> Result<()> {
+    pub async fn emit_event_with_retry(
+        &self,
+        event: ExecutorEvent,
+        max_retries: u32,
+    ) -> Result<()> {
         let mut delay = Duration::from_millis(500);
 
         for attempt in 0..=max_retries {
@@ -340,18 +352,65 @@ impl ControlPlaneClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
+    /// The R-1.2 PR-EE-3 wire shape: `ExecutorEvent` with `step` +
+    /// `status` + `created_at` at the top level and `context` (was
+    /// the worker-local `payload` field).  The optional `event_id`
+    /// / `worker_id` / `meta` fields all serialize when present and
+    /// drop out via `skip_serializing_if = "Option::is_none"`.
     #[test]
-    fn test_worker_event_serialization() {
-        let event = WorkerEvent {
-            event_type: "command.started".to_string(),
+    fn test_executor_event_serialization_matches_ee_wire_format() {
+        let event = ExecutorEvent {
             execution_id: 12345,
-            payload: serde_json::json!({"command_id": "cmd-123"}),
+            event_type: "command.started".to_string(),
+            step: "fetch_calendar".to_string(),
+            status: "STARTED".to_string(),
+            created_at: Utc::now(),
+            context: serde_json::json!({ "command_id": "cmd-123" }),
+            event_id: None,
+            worker_id: Some("worker-prod-7".to_string()),
+            meta: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("command.started"));
-        assert!(json.contains("12345"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Top-level shape matches the server's `EventRequest` /
+        // Python `EventEmitRequest` after EE-2 + EE-4.
+        assert_eq!(parsed["event_type"], "command.started");
+        assert_eq!(parsed["execution_id"], 12345);
+        assert_eq!(parsed["step"], "fetch_calendar");
+        assert_eq!(parsed["status"], "STARTED");
+        assert_eq!(parsed["worker_id"], "worker-prod-7");
+        assert_eq!(parsed["context"]["command_id"], "cmd-123");
+
+        // Optional fields with `None` value must not appear in the
+        // serialised JSON (per `skip_serializing_if = "Option::is_none"`).
+        assert!(parsed.get("event_id").is_none());
+        assert!(parsed.get("meta").is_none());
+
+        // `created_at` is always populated at emit time.
+        assert!(parsed.get("created_at").is_some());
+    }
+
+    /// The `payload` alias on `ExecutorEvent.context` (added in
+    /// PR-EE-1) means pre-EE producers that still send `payload`
+    /// continue to deserialize cleanly.  Locked in here so a
+    /// future executor crate change doesn't silently drop the
+    /// alias.
+    #[test]
+    fn test_executor_event_payload_alias_back_compat() {
+        let wire = serde_json::json!({
+            "execution_id": 1,
+            "event_type": "call.done",
+            "step": "fetch",
+            "status": "COMPLETED",
+            "created_at": "2026-05-31T03:14:15Z",
+            "payload": { "result": "ok" },
+        });
+        let event: ExecutorEvent = serde_json::from_value(wire).unwrap();
+        assert_eq!(event.context, serde_json::json!({ "result": "ok" }));
     }
 
     #[test]
