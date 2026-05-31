@@ -115,17 +115,13 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_returns_prometheus_text_format() {
         // Bump a counter so the encoded output isn't empty.
-        crate::metrics::record_pull(
-            &ClaimOutcome::Claimed(dummy_command("test")),
-            0.05,
-        );
+        crate::metrics::record_pull(&ClaimOutcome::Claimed(dummy_command("test")), 0.05);
 
         // Bind to ephemeral port + grab actual addr via a TcpListener.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let actual_addr = listener.local_addr().unwrap();
 
-        let app = Router::new()
-            .route("/metrics", get(metrics_handler));
+        let app = Router::new().route("/metrics", get(metrics_handler));
         let server_handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -150,8 +146,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let actual_addr = listener.local_addr().unwrap();
 
-        let app = Router::new()
-            .route("/healthz", get(healthz_handler));
+        let app = Router::new().route("/healthz", get(healthz_handler));
         let server_handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });

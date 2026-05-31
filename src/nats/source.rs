@@ -192,7 +192,10 @@ impl CommandSource for NatsCommandSource {
 
         Ok(Some(Pulled {
             outcome,
-            ack: NatsAckHandle { message: msg, notification },
+            ack: NatsAckHandle {
+                message: msg,
+                notification,
+            },
         }))
     }
 
@@ -211,7 +214,11 @@ mod tests {
     use serde_json::json;
 
     /// Build a minimal worker `Command` JSON for translation tests.
-    fn worker_command(action: &str, context: serde_json::Value, attempts: Option<u64>) -> WorkerCommand {
+    fn worker_command(
+        action: &str,
+        context: serde_json::Value,
+        attempts: Option<u64>,
+    ) -> WorkerCommand {
         let meta = match attempts {
             Some(n) => json!({"command_id": "cmd-test", "attempts": n}),
             None => json!({"command_id": "cmd-test"}),
@@ -306,10 +313,16 @@ mod tests {
             None,
         );
         let ec = translate(wc);
-        assert!(ec.input.get("tool_config").is_some(), "tool_config must be in input");
+        assert!(
+            ec.input.get("tool_config").is_some(),
+            "tool_config must be in input"
+        );
         assert!(ec.input.get("cases").is_some(), "cases must be in input");
         assert!(ec.input.get("args").is_some(), "args must be in input");
-        assert!(ec.input.get("render_context").is_some(), "render_context must be in input (also surfaced via the dedicated field)");
+        assert!(
+            ec.input.get("render_context").is_some(),
+            "render_context must be in input (also surfaced via the dedicated field)"
+        );
     }
 
     #[test]

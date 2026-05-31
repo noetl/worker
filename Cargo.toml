@@ -20,10 +20,11 @@ noetl-tools = "2.8.7"
 # - `condition::{Operator, Condition, evaluate_structured_condition}`
 #   in place of the case_evaluator's inline duplicates (R-1.2 PR-2c).
 # - `worker::source::{CommandSource, ClaimOutcome, Pulled, Command}`
-#   in `nats::source::NatsCommandSource` (R-1.2 PR-2d-2, this PR).
-# - `events::ExecutorEvent` adoption pending event-envelope
-#   reconciliation across worker / server / executor — tracked
-#   on noetl/ai-meta#30.
+#   in `nats::source::NatsCommandSource` (R-1.2 PR-2d-2).
+# - `events::ExecutorEvent` as the wire-format event envelope sent
+#   to `/api/events`, replacing the worker-local `WorkerEvent`
+#   (R-1.2 PR-EE-3, this PR).  Both servers (Rust noetl-server +
+#   Python broker) accept this shape after EE-2 + EE-4.
 # See Appendix H of the global hybrid cloud blueprint at
 # https://noetl.dev/docs/architecture/noetl_global_hybrid_cloud_grid_distributed_architecture_blueprint
 # and especially § H.10 (the tree-walker vs pull-model finding).

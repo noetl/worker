@@ -26,7 +26,7 @@ use noetl_tools::context::ExecutionContext;
 use noetl_tools::registry::{ToolConfig, ToolRegistry};
 use noetl_tools::tools::create_default_registry;
 
-use crate::client::{ControlPlaneClient, WorkerEvent};
+use crate::client::{ControlPlaneClient, ExecutorEvent};
 use crate::executor::case_evaluator::{CaseAction, CaseEvaluator};
 
 /// Command executor that runs tools and evaluates cases.
@@ -114,14 +114,19 @@ impl CommandExecutor {
             .entry("node_name".to_string())
             .or_insert_with(|| serde_json::json!(command.step.clone()));
 
-        // Emit command.started event
+        // Emit command.started event.  R-1.2 PR-EE-3: `step` +
+        // `worker_id` are top-level fields on the `ExecutorEvent`
+        // shape, so the context payload only carries the
+        // command-specific keys.  The server's `EventRequest` /
+        // Python's `EventEmitRequest` both read `step` /
+        // `worker_id` from the top level after EE-2 + EE-4.
         self.emit_event(
             "command.started",
+            &command.step,
+            "STARTED",
             command.execution_id,
             serde_json::json!({
                 "command_id": command.command_id.clone(),
-                "worker_id": self.worker_id,
-                "step": command.step.clone(),
             }),
         )
         .await?;
@@ -172,6 +177,8 @@ impl CommandExecutor {
                 // Emit call.done event
                 self.emit_event(
                     "call.done",
+                    &command.step,
+                    "COMPLETED",
                     command.execution_id,
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
@@ -187,6 +194,8 @@ impl CommandExecutor {
                 // Emit call.error event
                 self.emit_event(
                     "call.error",
+                    &command.step,
+                    "FAILED",
                     command.execution_id,
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
@@ -199,6 +208,8 @@ impl CommandExecutor {
                 // Emit command.failed event
                 self.emit_event(
                     "command.failed",
+                    &command.step,
+                    "FAILED",
                     command.execution_id,
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
@@ -235,12 +246,17 @@ impl CommandExecutor {
             {
                 match case_result.action {
                     CaseAction::Exit { status, data } => {
-                        // Emit step.exit event
+                        // Emit step.exit event.  `step` is top-level
+                        // on the EE shape; the case's status string
+                        // becomes the envelope status so the projector
+                        // sees the actual case outcome.
+                        let exit_status = status.clone();
                         self.emit_event(
                             "step.exit",
+                            &command.step,
+                            &exit_status,
                             command.execution_id,
                             serde_json::json!({
-                                "step": command.step.clone(),
                                 "status": status,
                                 "data": data,
                             }),
@@ -257,6 +273,8 @@ impl CommandExecutor {
                         // Emit command.failed event
                         self.emit_event(
                             "command.failed",
+                            &command.step,
+                            "FAILED",
                             command.execution_id,
                             serde_json::json!({
                                 "command_id": command.command_id.clone(),
@@ -275,9 +293,15 @@ impl CommandExecutor {
             }
         }
 
-        // Emit command.completed event
+        // Emit command.completed event.  The tool's terminal status
+        // (e.g. `"success"` / `"failure"` from the tool registry)
+        // becomes the envelope status — projectors group by status
+        // to compute success/failure rates per step.
+        let completion_status = tool_result.status.to_string();
         self.emit_event(
             "command.completed",
+            &command.step,
+            &completion_status,
             command.execution_id,
             serde_json::json!({
                 "command_id": command.command_id.clone(),
@@ -292,6 +316,14 @@ impl CommandExecutor {
 
     /// Emit an event to the control plane.
     ///
+    /// R-1.2 PR-EE-3: constructs the shared `ExecutorEvent` shape
+    /// (`step` + `status` + `created_at` + `context` at the top
+    /// level, plus `worker_id` from the executor's own id).
+    /// `event_id` is `None` so the server's `gen_snowflake()` DB
+    /// default fires today — a follow-up will move snowflake
+    /// generation to the application side per
+    /// `observability.md` Principle 3.
+    ///
     /// Per `observability.md` Principle 2: records the emit latency
     /// to `noetl_worker_event_emit_duration_seconds{event_type=...}`.
     /// The retries counter is incremented only when the underlying
@@ -302,22 +334,26 @@ impl CommandExecutor {
     async fn emit_event(
         &self,
         event_type: &str,
+        step: &str,
+        status: &str,
         execution_id: i64,
-        payload: serde_json::Value,
+        context: serde_json::Value,
     ) -> Result<()> {
-        let event = WorkerEvent {
-            event_type: event_type.to_string(),
+        let event = ExecutorEvent {
             execution_id,
-            payload,
+            event_type: event_type.to_string(),
+            step: step.to_string(),
+            status: status.to_string(),
+            created_at: chrono::Utc::now(),
+            context,
+            event_id: None,
+            worker_id: Some(self.worker_id.clone()),
+            meta: None,
         };
 
         let emit_start = std::time::Instant::now();
         let result = self.client.emit_event_with_retry(event, 3).await;
-        crate::metrics::record_event_emit(
-            event_type,
-            emit_start.elapsed().as_secs_f64(),
-            0,
-        );
+        crate::metrics::record_event_emit(event_type, emit_start.elapsed().as_secs_f64(), 0);
         result
     }
 }
