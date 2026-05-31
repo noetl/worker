@@ -306,9 +306,7 @@ mod tests {
         //   ((ts & ((1<<41)-1)) << 22)
         //     | ((node & 0x3FF) << 12)
         //     | (seq & 0xFFF)
-        let recomposed = ((ts & ((1u64 << 41) - 1)) << 22)
-            | ((node & 0x3FF) << 12)
-            | (seq & 0xFFF);
+        let recomposed = ((ts & ((1u64 << 41) - 1)) << 22) | ((node & 0x3FF) << 12) | (seq & 0xFFF);
         assert_eq!(recomposed, id);
         assert_eq!(node, NODE_ID);
         // Top bit must be zero — fits a signed bigint.

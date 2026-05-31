@@ -81,16 +81,20 @@ impl EventEmitter {
     }
 
     /// Build a fresh `ExecutorEvent` stamped with `created_at = now`,
-    /// the emitter's `worker_id`, and an application-side snowflake
-    /// `event_id`.  Per `observability.md` Principle 3 the id exists
-    /// at span-creation time + survives retries — both invariants
-    /// the previous `event_id: None` shape couldn't deliver.
+    /// the emitter's `worker_id`, an application-side snowflake
+    /// `event_id`, and the per-command `attempts` counter in
+    /// `meta`.  Per `observability.md` Principle 3 the id exists
+    /// at span-creation time + survives retries; per the EE-3
+    /// follow-up [noetl/worker#13] retry behaviour rides the
+    /// event log via `meta.attempts` so projectors don't need
+    /// to reach back into the worker's logs.
     fn build_event(
         &self,
         event_type: &str,
         execution_id: i64,
         step: &str,
         status: &str,
+        attempts: u32,
         context: serde_json::Value,
     ) -> ExecutorEvent {
         ExecutorEvent {
@@ -102,7 +106,7 @@ impl EventEmitter {
             context,
             event_id: Some(self.snowflake.next_id()),
             worker_id: Some(self.worker_id.clone()),
-            meta: None,
+            meta: Some(serde_json::json!({ "attempts": attempts })),
         }
     }
 
@@ -176,12 +180,14 @@ impl EventEmitter {
         execution_id: i64,
         step: &str,
         command_id: &str,
+        attempts: u32,
     ) -> Result<()> {
         self.emit(self.build_event(
             "command.claimed",
             execution_id,
             step,
             "STARTED",
+            attempts,
             serde_json::json!({ "command_id": command_id }),
         ))
         .await
@@ -193,12 +199,14 @@ impl EventEmitter {
         execution_id: i64,
         step: &str,
         command_id: &str,
+        attempts: u32,
     ) -> Result<()> {
         self.emit(self.build_event(
             "command.started",
             execution_id,
             step,
             "STARTED",
+            attempts,
             serde_json::json!({ "command_id": command_id }),
         ))
         .await
@@ -211,6 +219,7 @@ impl EventEmitter {
         step: &str,
         command_id: &str,
         call_index: usize,
+        attempts: u32,
         result: &serde_json::Value,
     ) -> Result<()> {
         self.emit(self.build_event(
@@ -218,6 +227,7 @@ impl EventEmitter {
             execution_id,
             step,
             "COMPLETED",
+            attempts,
             serde_json::json!({
                 "command_id": command_id,
                 "call_index": call_index,
@@ -234,6 +244,7 @@ impl EventEmitter {
         step: &str,
         command_id: &str,
         call_index: usize,
+        attempts: u32,
         error: &str,
     ) -> Result<()> {
         self.emit(self.build_event(
@@ -241,6 +252,7 @@ impl EventEmitter {
             execution_id,
             step,
             "FAILED",
+            attempts,
             serde_json::json!({
                 "command_id": command_id,
                 "call_index": call_index,
@@ -256,6 +268,7 @@ impl EventEmitter {
         execution_id: i64,
         step: &str,
         status: &str,
+        attempts: u32,
         data: Option<&serde_json::Value>,
     ) -> Result<()> {
         self.emit(self.build_event(
@@ -263,6 +276,7 @@ impl EventEmitter {
             execution_id,
             step,
             status,
+            attempts,
             serde_json::json!({ "data": data }),
         ))
         .await
@@ -275,12 +289,14 @@ impl EventEmitter {
         step: &str,
         command_id: &str,
         status: &str,
+        attempts: u32,
     ) -> Result<()> {
         self.emit(self.build_event(
             "command.completed",
             execution_id,
             step,
             status,
+            attempts,
             serde_json::json!({ "command_id": command_id }),
         ))
         .await
@@ -292,6 +308,7 @@ impl EventEmitter {
         execution_id: i64,
         step: &str,
         command_id: &str,
+        attempts: u32,
         error: &str,
     ) -> Result<()> {
         self.emit(self.build_event(
@@ -299,6 +316,7 @@ impl EventEmitter {
             execution_id,
             step,
             "FAILED",
+            attempts,
             serde_json::json!({
                 "command_id": command_id,
                 "error": error,
@@ -349,11 +367,13 @@ mod tests {
     /// `build_event` stamps `worker_id` from the emitter, sets
     /// `created_at` to a wall-clock timestamp (so the event log
     /// preserves per-component ordering across server-clock skew),
-    /// and populates `event_id` from the snowflake generator (per
+    /// populates `event_id` from the snowflake generator (per
     /// `observability.md` Principle 3 — the id exists at emit time,
-    /// not after the DB round-trip).
+    /// not after the DB round-trip), and carries `meta.attempts`
+    /// so retry behaviour rides the event log without forcing
+    /// projectors to reach back into the worker's logs.
     #[test]
-    fn test_build_event_stamps_worker_id_created_at_and_event_id() {
+    fn test_build_event_stamps_worker_id_created_at_event_id_and_attempts() {
         let client = ControlPlaneClient::new("http://localhost:8082");
         let emitter = EventEmitter::new(client, "worker-prod-7", snowflake_for_tests());
 
@@ -363,6 +383,7 @@ mod tests {
             42,
             "fetch_calendar",
             "COMPLETED",
+            2,
             serde_json::json!({ "result": "ok" }),
         );
         let after = Utc::now();
@@ -375,8 +396,30 @@ mod tests {
         assert!(event.event_id.is_some());
         let id = event.event_id.unwrap();
         assert!(id > 0, "event_id must be positive: {}", id);
-        assert!(event.meta.is_none());
+        assert_eq!(
+            event.meta,
+            Some(serde_json::json!({ "attempts": 2 })),
+            "meta.attempts must carry the supplied counter"
+        );
         assert!(event.created_at >= before && event.created_at <= after);
+    }
+
+    /// First-attempt events carry `meta.attempts = 0`, not `meta: None`
+    /// — the projector reads attempts uniformly without a
+    /// presence check.
+    #[test]
+    fn test_build_event_carries_attempts_zero_for_first_try() {
+        let client = ControlPlaneClient::new("http://localhost:8082");
+        let emitter = EventEmitter::new(client, "worker-prod-7", snowflake_for_tests());
+        let event = emitter.build_event(
+            "command.started",
+            1,
+            "step",
+            "STARTED",
+            0,
+            serde_json::json!({}),
+        );
+        assert_eq!(event.meta, Some(serde_json::json!({ "attempts": 0 })));
     }
 
     /// Consecutive `build_event` calls from the same emitter
@@ -390,18 +433,24 @@ mod tests {
 
         let mut prev: i64 = 0;
         for _ in 0..16 {
-            let event =
-                emitter.build_event("call.done", 1, "step", "COMPLETED", serde_json::json!({}));
+            let event = emitter.build_event(
+                "call.done",
+                1,
+                "step",
+                "COMPLETED",
+                0,
+                serde_json::json!({}),
+            );
             let id = event.event_id.unwrap();
             assert!(id > prev, "id {} not > prev {}", id, prev);
             prev = id;
         }
     }
 
-    /// Locks in the wire shape the worker sends after PR-EE-3 so a
-    /// future refactor can't accidentally drop a field both
-    /// servers (Rust + Python) expect.  Mirrors the
-    /// `tests/api/test_event_emit_request_aliases.py::
+    /// Locks in the wire shape the worker sends after PR-EE-3 +
+    /// the snowflake + attempts follow-ups so a future refactor
+    /// can't accidentally drop a field both servers (Rust + Python)
+    /// expect.  Mirrors the `tests/api/test_event_emit_request_aliases.py::
     /// TestFullExecutorEnvelopeRoundTrips` test on the Python
     /// side.
     #[test]
@@ -413,6 +462,7 @@ mod tests {
             478775660589088776,
             "fetch_calendar",
             "COMPLETED",
+            3,
             serde_json::json!({ "command_id": "cmd-42" }),
         );
 
@@ -426,11 +476,11 @@ mod tests {
             "context",
             "worker_id",
             "event_id",
+            "meta",
         ] {
             assert!(json.get(key).is_some(), "missing top-level field: {}", key);
         }
-        // `meta` stays `None` → omitted from the JSON.  Tracked
-        // separately in [noetl/worker#13].
-        assert!(json.get("meta").is_none());
+        // `meta.attempts` carries the supplied counter.
+        assert_eq!(json["meta"]["attempts"], 3);
     }
 }
