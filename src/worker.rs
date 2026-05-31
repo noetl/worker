@@ -1,23 +1,38 @@
 //! Worker lifecycle management.
+//!
+//! R-1.2 PR-2d-2: command pulling is now driven through the
+//! `noetl_executor::worker::source::CommandSource` trait via
+//! [`crate::nats::NatsCommandSource`].  `Worker::process_commands`
+//! is generic over the trait's `next()` + `ack()` / `nack()`
+//! lifecycle, so unit tests can swap in
+//! `noetl_executor::worker::source::tests::MockSource` to drive
+//! the dispatcher with synthetic outcomes.
 
 use anyhow::Result;
+use noetl_executor::worker::source::{ClaimOutcome, CommandSource, Pulled};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
-use crate::client::{ClaimResult, ControlPlaneClient};
+use crate::client::ControlPlaneClient;
 use crate::config::WorkerConfig;
 use crate::executor::CommandExecutor;
-use crate::nats::NatsSubscriber;
+use crate::nats::{NatsCommandSource, NatsSubscriber};
 
 /// Worker pool that processes commands.
 pub struct Worker {
     /// Worker configuration.
     config: WorkerConfig,
 
-    /// NATS subscriber for command notifications.
-    subscriber: NatsSubscriber,
+    /// Pull-model command source backed by NATS JetStream + the
+    /// control-plane HTTP API.  Behind a `Mutex` so
+    /// `process_commands` (which takes `&self`) can call `next()`
+    /// (which takes `&mut self`).
+    source: Arc<Mutex<NatsCommandSource>>,
 
-    /// Control plane HTTP client.
+    /// Control plane HTTP client — used by Worker for register /
+    /// deregister / heartbeat / set_variable paths that aren't part
+    /// of the pull-loop.  `NatsCommandSource` owns its own clone for
+    /// the `claim_command` calls inside `next()`.
     client: ControlPlaneClient,
 
     /// Command executor.
@@ -38,6 +53,16 @@ impl Worker {
         // Create HTTP client
         let client = ControlPlaneClient::new(&config.server_url);
 
+        // Wrap subscriber + client into the trait-conformant
+        // command source.  The source owns its own clone of the
+        // client for `claim_command` calls; Worker keeps a
+        // separate clone for register / deregister / heartbeat.
+        let source = Arc::new(Mutex::new(NatsCommandSource::new(
+            subscriber,
+            client.clone(),
+            config.worker_id.clone(),
+        )));
+
         // Create executor
         let executor = Arc::new(CommandExecutor::new(
             client.clone(),
@@ -50,7 +75,7 @@ impl Worker {
 
         Ok(Self {
             config,
-            subscriber,
+            source,
             client,
             executor,
             semaphore,
@@ -134,96 +159,108 @@ impl Worker {
         })
     }
 
-    /// Process commands from NATS.
+    /// Process commands from the configured `CommandSource`.
+    ///
+    /// R-1.2 PR-2d-2: rewritten to drive through the
+    /// `noetl_executor::worker::source::CommandSource` trait
+    /// (`source.next()` + `source.ack()` / `source.nack()`) instead of
+    /// inline `subscriber.receive()` + `client.claim_command()` +
+    /// `subscriber.ack()` calls.  The four `ClaimOutcome` variants
+    /// map 1:1 onto the worker's pre-PR-2d-2 control flow.
     async fn process_commands(&self) -> Result<()> {
         loop {
             // Wait for available slot
             let permit = self.semaphore.clone().acquire_owned().await?;
 
-            // Receive notification
-            match self.subscriber.receive().await? {
-                Some((notification, msg)) => {
+            // Pull one item from the source.  The Mutex is held only
+            // for the duration of `next()` + the corresponding ack /
+            // nack; dispatch happens after the lock is released.
+            let pulled = {
+                let mut source = self.source.lock().await;
+                source.next().await?
+            };
+
+            let Some(Pulled { outcome, ack }) = pulled else {
+                // Source exhausted (local-mode playbook complete);
+                // long-running NATS source never returns None in
+                // normal operation but we tolerate it for testability
+                // and the brief gap when no messages are queued.
+                drop(permit);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            };
+
+            match outcome {
+                ClaimOutcome::Claimed(command) => {
                     tracing::debug!(
-                        execution_id = notification.execution_id,
-                        command_id = %notification.command_id,
-                        step = %notification.step,
-                        "Received command notification"
+                        command_id = %command.command_id,
+                        execution_id = command.execution_id,
+                        step = %command.step,
+                        "Command claimed"
                     );
 
-                    // Try to claim the command
-                    match self
-                        .client
-                        .claim_command(notification.event_id, &self.config.worker_id)
-                        .await?
+                    // Ack the source handle now that we own the
+                    // command; dispatch happens off the pull loop.
                     {
-                        ClaimResult::Claimed(command) => {
-                            tracing::debug!(
-                                command_id = %notification.command_id,
-                                "Command claimed"
-                            );
-
-                            // Acknowledge NATS message
-                            self.subscriber.ack(&msg).await?;
-
-                            // Spawn task to process command
-                            let executor = self.executor.clone();
-                            let command_id = notification.command_id.clone();
-
-                            tokio::spawn(async move {
-                                // Keep permit until done
-                                let _permit = permit;
-
-                                if let Err(e) = executor.execute(&command).await {
-                                    tracing::error!(
-                                        command_id = %command_id,
-                                        error = %e,
-                                        "Command execution failed"
-                                    );
-                                }
-                            });
-                        }
-                        ClaimResult::AlreadyClaimed => {
-                            tracing::debug!(
-                                command_id = %notification.command_id,
-                                "Command already claimed by another worker"
-                            );
-
-                            // Acknowledge message (another worker has it)
-                            self.subscriber.ack(&msg).await?;
-
-                            // Release permit immediately
-                            drop(permit);
-                        }
-                        ClaimResult::RetryLater(error) => {
-                            tracing::warn!(
-                                command_id = %notification.command_id,
-                                error = %error,
-                                "Transient claim failure, requesting redelivery"
-                            );
-
-                            // Nack message for redelivery on transient overload/contention
-                            self.subscriber.nack(&msg).await?;
-                            drop(permit);
-                        }
-                        ClaimResult::Failed(error) => {
-                            tracing::error!(
-                                command_id = %notification.command_id,
-                                error = %error,
-                                "Failed to claim command"
-                            );
-
-                            // Nack message for redelivery
-                            self.subscriber.nack(&msg).await?;
-
-                            // Release permit
-                            drop(permit);
-                        }
+                        let source = self.source.lock().await;
+                        source.ack(ack).await?;
                     }
+
+                    // Spawn task to process command
+                    let executor = self.executor.clone();
+                    let command_id = command.command_id.clone();
+
+                    tokio::spawn(async move {
+                        // Keep permit until done
+                        let _permit = permit;
+
+                        if let Err(e) = executor.execute(&command).await {
+                            tracing::error!(
+                                command_id = %command_id,
+                                error = %e,
+                                "Command execution failed"
+                            );
+                        }
+                    });
                 }
-                None => {
-                    // No message, release permit and continue
+                ClaimOutcome::AlreadyClaimed => {
+                    tracing::debug!("Command already claimed by another worker");
+
+                    // Ack — another worker has it, no redelivery.
+                    {
+                        let source = self.source.lock().await;
+                        source.ack(ack).await?;
+                    }
+
+                    // Release permit immediately
                     drop(permit);
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                ClaimOutcome::RetryLater(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Transient claim failure, requesting redelivery"
+                    );
+
+                    // Nack for redelivery on transient overload /
+                    // contention.
+                    {
+                        let source = self.source.lock().await;
+                        source.nack(ack).await?;
+                    }
+                    drop(permit);
+                }
+                ClaimOutcome::Failed(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "Failed to claim command"
+                    );
+
+                    // Nack for redelivery.
+                    {
+                        let source = self.source.lock().await;
+                        source.nack(ack).await?;
+                    }
+                    drop(permit);
                 }
             }
         }

@@ -1,11 +1,32 @@
 //! Command executor.
+//!
+//! R-1.2 PR-2d-2: `CommandExecutor::execute` now takes
+//! `&noetl_executor::worker::source::Command` (the executor crate's
+//! enriched Command, 0.3.0+) instead of the worker's local
+//! `crate::client::Command`.  Field accesses:
+//!
+//! - `command.execution_id` (i64) — same as before.
+//! - `command.step` (String) — was `command.step()` accessor returning `&node_name`.
+//! - `command.command_id` (String) — was `command.command_id()`.
+//! - `command.tool_kind` (String) — was `command.action`.
+//! - `command.render_context` (HashMap) — was `command.render_context()`.
+//! - `command.attempts` (u32) — new in 0.3.0; useful for retry decisions.
+//! - `command.input` (Value) — carries the worker's full `context` JSON
+//!   including `tool_config`, `cases`, `args`, and `render_context`
+//!   (the dedicated field is also populated for direct access).
+//!   `tool_config` is extracted via `command.input.get("tool_config")`;
+//!   `cases` via `command.input.get("cases")`.
+//!
+//! Per `nats::source::NatsCommandSource::translate`, the executor's
+//! Command is a lossless mapping of the worker's Command.
 
 use anyhow::Result;
+use noetl_executor::worker::source::Command;
 use noetl_tools::context::ExecutionContext;
 use noetl_tools::registry::{ToolConfig, ToolRegistry};
 use noetl_tools::tools::create_default_registry;
 
-use crate::client::{Command, ControlPlaneClient, WorkerEvent};
+use crate::client::{ControlPlaneClient, WorkerEvent};
 use crate::executor::case_evaluator::{CaseAction, CaseEvaluator};
 
 /// Command executor that runs tools and evaluates cases.
@@ -41,38 +62,64 @@ impl CommandExecutor {
     /// Execute a command.
     pub async fn execute(&self, command: &Command) -> Result<()> {
         // Build execution context
-        let mut ctx = ExecutionContext::new(command.execution_id, command.step(), &self.server_url)
+        let mut ctx = ExecutionContext::new(command.execution_id, &command.step, &self.server_url)
             .with_worker_id(&self.worker_id)
-            .with_command_id(command.command_id());
+            .with_command_id(&command.command_id);
 
         // Add render context variables from command payload.
-        ctx.variables = command.render_context();
+        ctx.variables = command.render_context.clone();
         ctx.variables
             .entry("action".to_string())
-            .or_insert_with(|| serde_json::json!(command.action));
+            .or_insert_with(|| serde_json::json!(command.tool_kind));
         ctx.variables
             .entry("node_name".to_string())
-            .or_insert_with(|| serde_json::json!(command.node_name.clone()));
+            .or_insert_with(|| serde_json::json!(command.step.clone()));
 
         // Emit command.started event
         self.emit_event(
             "command.started",
             command.execution_id,
             serde_json::json!({
-                "command_id": command.command_id(),
+                "command_id": command.command_id.clone(),
                 "worker_id": self.worker_id,
-                "step": command.step(),
+                "step": command.step.clone(),
             }),
         )
         .await?;
 
-        // Parse tool configuration
-        let tool_config: ToolConfig = serde_json::from_value(command.tool_config_value())?;
+        // Reconstruct the ToolConfig the noetl-tools registry expects.
+        // `command.input` is the worker's full `context` JSON; the
+        // tool-side config lives under `input.tool_config`.  Inject
+        // `kind` from the executor `Command.tool_kind` field if the
+        // nested config doesn't already carry it (mirrors the worker's
+        // pre-PR-2d-2 `Command.tool_config_value()` behaviour).
+        let tool_config_value = {
+            let mut cfg = command
+                .input
+                .get("tool_config")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !cfg.is_object() {
+                cfg = serde_json::json!({});
+            }
+            if let Some(map) = cfg.as_object_mut() {
+                map.entry("kind".to_string())
+                    .or_insert_with(|| serde_json::json!(command.tool_kind));
+                if !map.contains_key("args") {
+                    if let Some(args) = command.input.get("args") {
+                        map.insert("args".to_string(), args.clone());
+                    }
+                }
+            }
+            cfg
+        };
+        let tool_config: ToolConfig = serde_json::from_value(tool_config_value)?;
 
         tracing::debug!(
             execution_id = command.execution_id,
-            step = %command.step(),
+            step = %command.step,
             tool = %tool_config.kind,
+            attempts = command.attempts,
             "Executing tool"
         );
 
@@ -88,7 +135,7 @@ impl CommandExecutor {
                     "call.done",
                     command.execution_id,
                     serde_json::json!({
-                        "command_id": command.command_id(),
+                        "command_id": command.command_id.clone(),
                         "call_index": ctx.call_index,
                         "result": result,
                     }),
@@ -103,7 +150,7 @@ impl CommandExecutor {
                     "call.error",
                     command.execution_id,
                     serde_json::json!({
-                        "command_id": command.command_id(),
+                        "command_id": command.command_id.clone(),
                         "call_index": ctx.call_index,
                         "error": e.to_string(),
                     }),
@@ -115,7 +162,7 @@ impl CommandExecutor {
                     "command.failed",
                     command.execution_id,
                     serde_json::json!({
-                        "command_id": command.command_id(),
+                        "command_id": command.command_id.clone(),
                         "error": e.to_string(),
                     }),
                 )
@@ -125,9 +172,12 @@ impl CommandExecutor {
             }
         };
 
-        // Parse cases from command
+        // Parse cases from command.  The executor's `Command.input`
+        // carries the worker's full `context` JSON, so `cases`
+        // lives at `command.input.cases` (was `command.context.cases`
+        // pre-PR-2d-2).
         let cases: Vec<crate::executor::case_evaluator::Case> = command
-            .context
+            .input
             .get("cases")
             .and_then(|v| v.as_array())
             .map(|list| {
@@ -150,7 +200,7 @@ impl CommandExecutor {
                             "step.exit",
                             command.execution_id,
                             serde_json::json!({
-                                "step": command.step(),
+                                "step": command.step.clone(),
                                 "status": status,
                                 "data": data,
                             }),
@@ -169,7 +219,7 @@ impl CommandExecutor {
                             "command.failed",
                             command.execution_id,
                             serde_json::json!({
-                                "command_id": command.command_id(),
+                                "command_id": command.command_id.clone(),
                                 "error": message,
                             }),
                         )
@@ -189,7 +239,7 @@ impl CommandExecutor {
             "command.completed",
             command.execution_id,
             serde_json::json!({
-                "command_id": command.command_id(),
+                "command_id": command.command_id.clone(),
                 "status": tool_result.status.to_string(),
             }),
         )
