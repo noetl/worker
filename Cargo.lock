@@ -2113,9 +2113,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-executor"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "001987388f00efb70478da1c4bbad1414cad27caf2f9c68ebca8ae3a0c895919"
+checksum = "29aad749b348b73200e99e8f3cc039d8eb33d5453f664545f9aa979a3412e2f9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2166,6 +2166,7 @@ version = "1.1.2"
 dependencies = [
  "anyhow",
  "async-nats",
+ "async-trait",
  "chrono",
  "dotenvy",
  "futures",
