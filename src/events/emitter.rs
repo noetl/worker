@@ -16,9 +16,11 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::client::{ControlPlaneClient, ExecutorEvent};
+use crate::snowflake::SnowflakeGen;
 
 /// Event emitter with automatic retry.
 ///
@@ -26,9 +28,17 @@ use crate::client::{ControlPlaneClient, ExecutorEvent};
 /// can stamp `worker_id` on the outgoing envelope without forcing
 /// every call site to thread it through (per `observability.md`
 /// Principle 4 — every wire format carries the correlation key).
+///
+/// Post-EE-3 follow-up (this change): holds an `Arc<SnowflakeGen>`
+/// so every emitted envelope carries an application-side `event_id`
+/// per `observability.md` Principle 3 — the id exists at span-
+/// creation time + retries are idempotent across the same logical
+/// event without depending on the server's `gen_snowflake()` DB
+/// default firing.  Closes [noetl/worker#12].
 pub struct EventEmitter {
     client: ControlPlaneClient,
     worker_id: String,
+    snowflake: Arc<SnowflakeGen>,
     max_retries: u32,
     initial_delay: Duration,
     max_delay: Duration,
@@ -36,10 +46,15 @@ pub struct EventEmitter {
 
 impl EventEmitter {
     /// Create a new event emitter.
-    pub fn new(client: ControlPlaneClient, worker_id: impl Into<String>) -> Self {
+    pub fn new(
+        client: ControlPlaneClient,
+        worker_id: impl Into<String>,
+        snowflake: Arc<SnowflakeGen>,
+    ) -> Self {
         Self {
             client,
             worker_id: worker_id.into(),
+            snowflake,
             max_retries: 3,
             initial_delay: Duration::from_millis(500),
             max_delay: Duration::from_secs(10),
@@ -50,6 +65,7 @@ impl EventEmitter {
     pub fn with_retry(
         client: ControlPlaneClient,
         worker_id: impl Into<String>,
+        snowflake: Arc<SnowflakeGen>,
         max_retries: u32,
         initial_delay: Duration,
         max_delay: Duration,
@@ -57,17 +73,18 @@ impl EventEmitter {
         Self {
             client,
             worker_id: worker_id.into(),
+            snowflake,
             max_retries,
             initial_delay,
             max_delay,
         }
     }
 
-    /// Build a fresh `ExecutorEvent` stamped with `created_at = now`
-    /// and the emitter's `worker_id`.  `event_id` is left as `None`
-    /// — the server's `gen_snowflake()` DB default fires today.  A
-    /// follow-up will move snowflake generation to the application
-    /// side per `observability.md` Principle 3.
+    /// Build a fresh `ExecutorEvent` stamped with `created_at = now`,
+    /// the emitter's `worker_id`, and an application-side snowflake
+    /// `event_id`.  Per `observability.md` Principle 3 the id exists
+    /// at span-creation time + survives retries — both invariants
+    /// the previous `event_id: None` shape couldn't deliver.
     fn build_event(
         &self,
         event_type: &str,
@@ -83,7 +100,7 @@ impl EventEmitter {
             status: status.to_string(),
             created_at: Utc::now(),
             context,
-            event_id: None,
+            event_id: Some(self.snowflake.next_id()),
             worker_id: Some(self.worker_id.clone()),
             meta: None,
         }
@@ -294,11 +311,17 @@ impl EventEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snowflake::SnowflakeGen;
+
+    fn snowflake_for_tests() -> Arc<SnowflakeGen> {
+        // Pin the node id so tests don't depend on env / hostname.
+        Arc::new(SnowflakeGen::with_node_and_epoch(42, 0))
+    }
 
     #[test]
     fn test_event_emitter_creation() {
         let client = ControlPlaneClient::new("http://localhost:8082");
-        let emitter = EventEmitter::new(client, "worker-test-1");
+        let emitter = EventEmitter::new(client, "worker-test-1", snowflake_for_tests());
 
         assert_eq!(emitter.max_retries, 3);
         assert_eq!(emitter.initial_delay, Duration::from_millis(500));
@@ -311,6 +334,7 @@ mod tests {
         let emitter = EventEmitter::with_retry(
             client,
             "worker-test-2",
+            snowflake_for_tests(),
             5,
             Duration::from_millis(100),
             Duration::from_secs(5),
@@ -325,14 +349,13 @@ mod tests {
     /// `build_event` stamps `worker_id` from the emitter, sets
     /// `created_at` to a wall-clock timestamp (so the event log
     /// preserves per-component ordering across server-clock skew),
-    /// and leaves `event_id` + `meta` as `None` (the server's
-    /// `gen_snowflake()` default fires today; PR-EE-3 follow-up
-    /// moves snowflake generation to the application side per
-    /// `observability.md` Principle 3).
+    /// and populates `event_id` from the snowflake generator (per
+    /// `observability.md` Principle 3 — the id exists at emit time,
+    /// not after the DB round-trip).
     #[test]
-    fn test_build_event_stamps_worker_id_and_created_at() {
+    fn test_build_event_stamps_worker_id_created_at_and_event_id() {
         let client = ControlPlaneClient::new("http://localhost:8082");
-        let emitter = EventEmitter::new(client, "worker-prod-7");
+        let emitter = EventEmitter::new(client, "worker-prod-7", snowflake_for_tests());
 
         let before = Utc::now();
         let event = emitter.build_event(
@@ -349,9 +372,30 @@ mod tests {
         assert_eq!(event.step, "fetch_calendar");
         assert_eq!(event.status, "COMPLETED");
         assert_eq!(event.worker_id, Some("worker-prod-7".to_string()));
-        assert!(event.event_id.is_none());
+        assert!(event.event_id.is_some());
+        let id = event.event_id.unwrap();
+        assert!(id > 0, "event_id must be positive: {}", id);
         assert!(event.meta.is_none());
         assert!(event.created_at >= before && event.created_at <= after);
+    }
+
+    /// Consecutive `build_event` calls from the same emitter
+    /// produce monotonically increasing `event_id`s — the contract
+    /// downstream tooling relies on for ordering events without
+    /// hitting the DB.
+    #[test]
+    fn test_event_ids_increase_monotonically_within_emitter() {
+        let client = ControlPlaneClient::new("http://localhost:8082");
+        let emitter = EventEmitter::new(client, "worker-prod-7", snowflake_for_tests());
+
+        let mut prev: i64 = 0;
+        for _ in 0..16 {
+            let event =
+                emitter.build_event("call.done", 1, "step", "COMPLETED", serde_json::json!({}));
+            let id = event.event_id.unwrap();
+            assert!(id > prev, "id {} not > prev {}", id, prev);
+            prev = id;
+        }
     }
 
     /// Locks in the wire shape the worker sends after PR-EE-3 so a
@@ -363,7 +407,7 @@ mod tests {
     #[test]
     fn test_emitted_event_has_full_ee_wire_shape() {
         let client = ControlPlaneClient::new("http://localhost:8082");
-        let emitter = EventEmitter::new(client, "worker-prod-7");
+        let emitter = EventEmitter::new(client, "worker-prod-7", snowflake_for_tests());
         let event = emitter.build_event(
             "command.completed",
             478775660589088776,
@@ -381,11 +425,12 @@ mod tests {
             "created_at",
             "context",
             "worker_id",
+            "event_id",
         ] {
             assert!(json.get(key).is_some(), "missing top-level field: {}", key);
         }
-        // `event_id` + `meta` are `None` → omitted from the JSON.
-        assert!(json.get("event_id").is_none());
+        // `meta` stays `None` → omitted from the JSON.  Tracked
+        // separately in [noetl/worker#13].
         assert!(json.get("meta").is_none());
     }
 }
