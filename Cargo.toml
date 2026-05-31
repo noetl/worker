@@ -30,6 +30,15 @@ noetl-tools = "2.8.7"
 # and especially § H.10 (the tree-walker vs pull-model finding).
 noetl-executor = "0.3"
 
+# Same-node zero-copy IPC cache for over-budget tool results
+# (R-2.1 / noetl/cli#39).  When `call.done`'s serialised
+# `result.context` exceeds the broker's 100KB inline budget,
+# the worker stages the bytes in shared memory + emits an
+# `IpcHint` reference instead of dropping the context entirely.
+# See `executor::command::build_call_done_result` for the
+# fallback chain.
+noetl-arrow-cache = "0.1"
+
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 

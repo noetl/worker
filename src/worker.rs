@@ -9,6 +9,7 @@
 //! the dispatcher with synthetic outcomes.
 
 use anyhow::Result;
+use noetl_arrow_cache::ArrowIpcSharedMemoryCache;
 use noetl_executor::worker::source::{ClaimOutcome, CommandSource, Pulled};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
@@ -77,12 +78,29 @@ impl Worker {
             "Snowflake generator initialised"
         );
 
+        // One Arrow IPC shared-memory cache per worker process — same-
+        // node zero-copy reference path for `call.done` results that
+        // exceed the broker's 100KB inline budget.  Reads
+        // `NOETL_IPC_CACHE_BUDGET_BYTES` (default 256 MB) and the
+        // node-id env chain (`NOETL_NODE_ID` / `NODE_NAME` /
+        // `K8S_NODE_NAME` / `HOSTNAME`) from the same conventions
+        // Python's `ArrowIpcSharedMemoryCache` reads — so a hint
+        // produced by either stack round-trips against the other.
+        // Per Appendix H R-2.1; partial progress on noetl/worker#24.
+        let arrow_cache = Arc::new(ArrowIpcSharedMemoryCache::new());
+        tracing::info!(
+            node_id = %arrow_cache.config().node_id,
+            budget_bytes = arrow_cache.config().budget_bytes,
+            "Arrow IPC shared-memory cache initialised"
+        );
+
         // Create executor
         let executor = Arc::new(CommandExecutor::new(
             client.clone(),
             config.worker_id.clone(),
             config.server_url.clone(),
             snowflake.clone(),
+            arrow_cache.clone(),
         ));
 
         // Create semaphore for concurrency control
