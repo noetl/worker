@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.2.1](https://github.com/noetl/worker/compare/v5.2.0...v5.2.1) (2026-05-31)
+
+### Bug Fixes
+
+* **executor:** pre-check call.done context size against broker budget ([cb35b48](https://github.com/noetl/worker/commit/cb35b480d9edd27459e57a59b0c254a7843ef7cf)), closes [noetl/worker#24](https://github.com/noetl/worker/issues/24) [#26](https://github.com/noetl/worker/issues/26) [noetl/worker#24](https://github.com/noetl/worker/issues/24) [noetl/worker#24](https://github.com/noetl/worker/issues/24) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30) [noetl/worker#24](https://github.com/noetl/worker/issues/24)
+
 ## [5.2.0](https://github.com/noetl/worker/compare/v5.1.3...v5.2.0) (2026-05-31)
 
 ### Features
