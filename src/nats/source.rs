@@ -157,6 +157,10 @@ impl CommandSource for NatsCommandSource {
         let span = tracing::debug_span!("nats.pull");
         let _enter = span.enter();
 
+        // Timer captures pull latency (receive + claim) for the
+        // `noetl_worker_pull_duration_seconds` histogram.
+        let pull_start = std::time::Instant::now();
+
         let Some((notification, msg)) = self.subscriber.receive().await? else {
             return Ok(None);
         };
@@ -180,6 +184,11 @@ impl CommandSource for NatsCommandSource {
             ClaimResult::RetryLater(err) => ClaimOutcome::RetryLater(err),
             ClaimResult::Failed(err) => ClaimOutcome::Failed(err),
         };
+
+        // Record the pull's outcome + duration before returning.
+        // The metrics helpers are non-blocking + cheap so doing
+        // them inside `next()` is fine.
+        crate::metrics::record_pull(&outcome, pull_start.elapsed().as_secs_f64());
 
         Ok(Some(Pulled {
             outcome,

@@ -29,6 +29,12 @@ pub struct WorkerConfig {
 
     /// Maximum concurrent tasks.
     pub max_concurrent_tasks: usize,
+
+    /// Bind address for the Prometheus `/metrics` endpoint.
+    /// Defaults to `0.0.0.0:9090` so it's reachable from sidecar
+    /// scrapers in Kubernetes without extra config.  See
+    /// `agents/rules/observability.md` Principle 2.
+    pub metrics_bind: String,
 }
 
 impl WorkerConfig {
@@ -61,6 +67,9 @@ impl WorkerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(4);
 
+        let metrics_bind = std::env::var("WORKER_METRICS_BIND")
+            .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+
         Ok(Self {
             worker_id,
             pool_name,
@@ -70,6 +79,7 @@ impl WorkerConfig {
             nats_consumer,
             heartbeat_interval: Duration::from_secs(heartbeat_secs),
             max_concurrent_tasks: max_concurrent,
+            metrics_bind,
         })
     }
 }
@@ -85,6 +95,7 @@ impl Default for WorkerConfig {
             nats_consumer: "worker-pool".to_string(),
             heartbeat_interval: Duration::from_secs(15),
             max_concurrent_tasks: 4,
+            metrics_bind: "0.0.0.0:9090".to_string(),
         }
     }
 }
