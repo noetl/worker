@@ -21,6 +21,7 @@
 //! Command is a lossless mapping of the worker's Command.
 
 use anyhow::Result;
+use noetl_arrow_cache::ArrowIpcSharedMemoryCache;
 use noetl_executor::worker::source::Command;
 use noetl_tools::context::ExecutionContext;
 use noetl_tools::registry::{ToolConfig, ToolRegistry};
@@ -54,6 +55,15 @@ pub struct CommandExecutor {
     /// metrics carry it at span-creation time and retries stay
     /// idempotent.
     snowflake: Arc<SnowflakeGen>,
+
+    /// Same-node Arrow IPC cache for `call.done` results that
+    /// exceed the broker's 100KB inline budget.  When a tool
+    /// returns a large output (Postgres rowset, HTTP API
+    /// response, etc.), the bytes go into shared memory + the
+    /// event payload carries an `IpcHint` reference instead.
+    /// Per R-2.1 (the `noetl-arrow-cache` crate); partial progress
+    /// on noetl/worker#24.
+    arrow_cache: Arc<ArrowIpcSharedMemoryCache>,
 }
 
 impl CommandExecutor {
@@ -63,6 +73,7 @@ impl CommandExecutor {
         worker_id: String,
         server_url: String,
         snowflake: Arc<SnowflakeGen>,
+        arrow_cache: Arc<ArrowIpcSharedMemoryCache>,
     ) -> Self {
         Self {
             tool_registry: create_default_registry(),
@@ -71,6 +82,7 @@ impl CommandExecutor {
             worker_id,
             server_url,
             snowflake,
+            arrow_cache,
         }
     }
 
@@ -225,6 +237,7 @@ impl CommandExecutor {
                     &result.status.to_string(),
                     command.execution_id,
                     &command.step,
+                    self.arrow_cache.as_ref(),
                 ) {
                     Ok(obj) => obj,
                     Err(e) => {
@@ -452,12 +465,17 @@ const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
 ///
 /// - `{status, context}` when the serialised context fits under
 ///   [`INLINE_CONTEXT_MAX_BYTES`].
-/// - `{status}` only when the context would exceed the inline
-///   budget — the proper `result.reference` path (durable
-///   storage or `noetl-arrow-cache`) is tracked on
-///   noetl/worker#24 and lands in a future PR; this fallback
-///   keeps the wire payload valid in the meantime, with a WARN
-///   log so the over-budget case is visible.
+/// - `{status, reference}` when the context exceeds the inline
+///   budget — the bytes go into the `noetl-arrow-cache` shared-
+///   memory region + the returned `IpcHint` rides the event as
+///   `result.reference`.  Same-node consumers attach via
+///   `cache.get(&hint)` and decode based on `hint.media_type`
+///   (`application/json` here; future tabular tools will emit
+///   `application/vnd.apache.arrow.stream`).
+/// - `{status}` only when the context exceeds the budget AND
+///   the cache `put` fails (out of space, name collision, etc.).
+///   Predictable + visible fallback rather than a silent broker
+///   drop.
 ///
 /// Errors only if the serde serialisation itself fails (which
 /// shouldn't happen for `serde_json::Value` inputs but the
@@ -467,37 +485,97 @@ fn build_call_done_result(
     status: &str,
     execution_id: i64,
     step: &str,
+    arrow_cache: &ArrowIpcSharedMemoryCache,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let serialised = serde_json::to_string(context)?;
-    if serialised.len() > INLINE_CONTEXT_MAX_BYTES {
-        tracing::warn!(
-            execution_id,
-            step,
-            context_bytes = serialised.len(),
-            inline_budget_bytes = INLINE_CONTEXT_MAX_BYTES,
-            "Tool result exceeds inline context budget; emitting {status}-only result. \
-             Downstream Jinja references will be empty until result_store / \
-             noetl-arrow-cache integration lands (noetl/worker#24).",
-        );
-        Ok(serde_json::json!({ "status": status }))
-    } else {
-        Ok(serde_json::json!({ "status": status, "context": context }))
+    if serialised.len() <= INLINE_CONTEXT_MAX_BYTES {
+        return Ok(serde_json::json!({ "status": status, "context": context }));
+    }
+
+    // Over-budget: stage the bytes in shared memory + emit a
+    // reference.  Use a fixed `schema_digest` of `"json"` since
+    // these are opaque JSON bytes, not Arrow IPC streams (the
+    // cache's `put_arrow_ipc` API accepts arbitrary bytes; the
+    // `schema_digest` field is for consumer-side schema-drift
+    // detection and is meaningless for JSON content).  The
+    // returned `IpcHint` carries the matching `media_type =
+    // application/json` so the consumer knows how to decode.
+    let put_result = arrow_cache.put_arrow_ipc(serialised.as_bytes(), "json", None, None);
+
+    match put_result {
+        Ok(mut hint) => {
+            // Override the default Arrow media type with the JSON
+            // marker so consumers know to JSON-decode the bytes.
+            // Tabular tool outputs (DuckDB, Postgres) will keep
+            // the default Arrow media type once they encode via
+            // `noetl_tools::arrow_codec::encode_record_batch`.
+            hint.media_type = "application/json".to_string();
+            tracing::info!(
+                execution_id,
+                step,
+                context_bytes = serialised.len(),
+                shm_name = %hint.shm_name,
+                "Tool result exceeds inline context budget; staged in shared-memory cache.",
+            );
+            // Serialise the hint to a JSON object so it slots
+            // into `result.reference` per the broker contract
+            // (`reference` MUST be a dict).
+            let reference = serde_json::to_value(&hint).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "kind": "arrow_ipc",
+                    "shm_name": hint.shm_name.clone(),
+                    "byte_length": hint.byte_length,
+                    "media_type": "application/json",
+                })
+            });
+            Ok(serde_json::json!({ "status": status, "reference": reference }))
+        }
+        Err(e) => {
+            tracing::warn!(
+                execution_id,
+                step,
+                context_bytes = serialised.len(),
+                inline_budget_bytes = INLINE_CONTEXT_MAX_BYTES,
+                error = %e,
+                "Tool result exceeds inline context budget and shared-memory cache put failed; emitting status-only result. \
+                 Downstream Jinja references will be empty.  Track at noetl/worker#24.",
+            );
+            Ok(serde_json::json!({ "status": status }))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noetl_arrow_cache::CacheConfig;
+
+    /// Build a test-isolated cache with a unique namespace so
+    /// concurrent test runs don't collide on shm names.  POSIX shm
+    /// names are filesystem-global; the namespace is the prefix
+    /// stamped onto every entry the cache produces.
+    fn test_cache(namespace: &str) -> Arc<ArrowIpcSharedMemoryCache> {
+        let config = CacheConfig {
+            namespace: namespace.to_string(),
+            budget_bytes: 8 * 1024 * 1024,
+            default_lease_seconds: 60.0,
+            producer: "test".to_string(),
+            node_id: "test-node".to_string(),
+        };
+        Arc::new(ArrowIpcSharedMemoryCache::with_config(config))
+    }
 
     #[test]
     fn test_command_executor_creation() {
         let client = ControlPlaneClient::new("http://localhost:8082");
         let snowflake = Arc::new(SnowflakeGen::with_node_and_epoch(1, 0));
+        let cache = test_cache("wkr-test-ctor");
         let executor = CommandExecutor::new(
             client,
             "worker-1".to_string(),
             "http://localhost:8082".to_string(),
             snowflake,
+            cache,
         );
 
         // Verify tools are registered
@@ -511,12 +589,14 @@ mod tests {
     /// reference fields off it.
     #[test]
     fn build_call_done_result_inlines_small_context() {
+        let cache = test_cache("wkr-test-small");
         let context = serde_json::json!({
             "stdout": "hello",
             "exit_code": 0,
             "duration_ms": 12,
         });
-        let result = build_call_done_result(&context, "COMPLETED", 42, "greet").unwrap();
+        let result =
+            build_call_done_result(&context, "COMPLETED", 42, "greet", cache.as_ref()).unwrap();
         assert_eq!(result["status"], "COMPLETED");
         assert_eq!(result["context"]["stdout"], "hello");
         assert_eq!(result["context"]["exit_code"], 0);
@@ -538,20 +618,46 @@ mod tests {
         }
     }
 
-    /// Large tool result exceeds the inline budget — falls back
-    /// to `{status}` only.  The proper `result.reference` path
-    /// (durable storage / noetl-arrow-cache) is tracked on
-    /// noetl/worker#24.
+    /// Large tool result exceeds the inline budget — gets staged in
+    /// the same-node shared-memory cache and emitted as
+    /// `result.reference` (an `IpcHint` dict).  The bytes are
+    /// recoverable by colocated consumers via `cache.get(&hint)`.
+    /// This replaces the pre-R-2.1 silent-drop behaviour.
     #[test]
-    fn build_call_done_result_drops_oversized_context() {
+    fn build_call_done_result_stages_oversized_context_via_cache() {
+        let cache = test_cache("wkr-test-big");
         let big_string: String = "x".repeat(INLINE_CONTEXT_MAX_BYTES + 1024);
         let context = serde_json::json!({ "stdout": big_string });
-        let result = build_call_done_result(&context, "COMPLETED", 42, "big_step").unwrap();
+        let result =
+            build_call_done_result(&context, "COMPLETED", 42, "big_step", cache.as_ref()).unwrap();
         assert_eq!(result["status"], "COMPLETED");
+        // Over-budget context must NOT ride inline as `context`...
         assert!(
             result.get("context").is_none(),
-            "oversize context must be dropped: result={}",
+            "oversize context must not ride inline: result={}",
             result
+        );
+        // ...instead it must surface as `result.reference` carrying
+        // the `IpcHint` fields the broker contract expects.
+        let reference = result
+            .get("reference")
+            .expect("oversize context must surface as result.reference");
+        assert!(reference.is_object(), "reference must be a dict");
+        assert_eq!(reference["media_type"], "application/json");
+        assert!(
+            reference["shm_name"].is_string(),
+            "reference.shm_name must be a string"
+        );
+        assert!(
+            reference["byte_length"].as_u64().is_some(),
+            "reference.byte_length must be a u64"
+        );
+        // The cache must now hold exactly one entry — the staged
+        // bytes — and `used_bytes` should be > the inline budget.
+        assert!(
+            cache.used_bytes() > INLINE_CONTEXT_MAX_BYTES as u64,
+            "cache must hold the staged bytes: used_bytes={}",
+            cache.used_bytes()
         );
     }
 
@@ -565,19 +671,26 @@ mod tests {
     }
 
     /// Result sized exactly at the budget is allowed; one byte
-    /// over is not.  Boundary check for the comparison.
+    /// over is not.  Boundary check for the comparison — and a
+    /// regression guard that the over-budget path takes the
+    /// reference branch rather than dropping the context entirely.
     #[test]
     fn build_call_done_result_boundary_check() {
+        let cache = test_cache("wkr-test-bound");
         // We can't easily craft a context whose JSON encoding is
         // EXACTLY INLINE_CONTEXT_MAX_BYTES, but we can prove the
         // ">" (strictly greater) semantics by checking a result
         // smaller and a result larger than the threshold.
         let small = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES - 100) });
-        let small_result = build_call_done_result(&small, "COMPLETED", 1, "s").unwrap();
+        let small_result =
+            build_call_done_result(&small, "COMPLETED", 1, "s", cache.as_ref()).unwrap();
         assert!(small_result.get("context").is_some());
+        assert!(small_result.get("reference").is_none());
 
         let large = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES + 100) });
-        let large_result = build_call_done_result(&large, "COMPLETED", 1, "l").unwrap();
+        let large_result =
+            build_call_done_result(&large, "COMPLETED", 1, "l", cache.as_ref()).unwrap();
         assert!(large_result.get("context").is_none());
+        assert!(large_result.get("reference").is_some());
     }
 }
