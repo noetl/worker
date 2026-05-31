@@ -131,6 +131,62 @@ impl NatsSubscriber {
             .map_err(|e| anyhow::anyhow!("Failed to nack message: {}", e))?;
         Ok(())
     }
+
+    /// Stream name this subscriber is bound to.  Exposed so the lag
+    /// poller can label its gauges with the same names the consumer
+    /// + KEDA see.
+    pub fn stream_name(&self) -> &str {
+        &self.stream
+    }
+
+    /// Consumer name this subscriber is bound to.
+    pub fn consumer_name(&self) -> &str {
+        &self.consumer
+    }
+
+    /// Fetch a snapshot of the consumer's lag state from JetStream.
+    ///
+    /// Returns `(pending, ack_pending)` — `pending` is the count of
+    /// messages still in the stream not yet delivered to any
+    /// consumer; `ack_pending` is the count of messages delivered
+    /// but awaiting ack.  Together they're the queue-depth signal
+    /// KEDA + the dashboard read to decide whether to scale.
+    ///
+    /// `info()` requires `&mut Consumer`; this method takes the
+    /// short path of building a fresh consumer handle each call —
+    /// the lag-poll cadence (seconds, not millis) makes the
+    /// allocation noise irrelevant.
+    pub async fn consumer_lag(&self) -> Result<ConsumerLag> {
+        let stream = self.js.get_stream(&self.stream).await?;
+        // The pull-consumer type is what the subscriber created in
+        // `ensure_consumer`; reusing it here keeps the consumer
+        // handle compatible with the same generic instantiation.
+        let mut consumer: jetstream::consumer::Consumer<jetstream::consumer::pull::Config> = stream
+            .get_consumer(&self.consumer)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch consumer: {}", e))?;
+        let info = consumer
+            .info()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch consumer info: {}", e))?;
+        Ok(ConsumerLag {
+            pending: info.num_pending,
+            ack_pending: info.num_ack_pending,
+        })
+    }
+}
+
+/// Snapshot of a JetStream consumer's lag.  Returned by
+/// [`NatsSubscriber::consumer_lag`].
+#[derive(Debug, Clone, Copy)]
+pub struct ConsumerLag {
+    /// Messages still in the stream not yet delivered to any
+    /// consumer.  The backlog the worker hasn't seen yet.
+    pub pending: u64,
+
+    /// Messages delivered to a consumer but not yet ack'd.
+    /// Live in-flight work the worker is processing.
+    pub ack_pending: usize,
 }
 
 #[cfg(test)]

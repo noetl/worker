@@ -111,12 +111,27 @@ impl Worker {
         // `agents/rules/observability.md` Principle 2.
         let metrics_handle = crate::metrics_server::spawn(&self.config.metrics_bind).await?;
 
+        // Start NATS consumer-lag poller.  Periodically queries
+        // JetStream consumer info and updates the
+        // `noetl_worker_nats_consumer_pending` +
+        // `noetl_worker_nats_consumer_ack_pending` gauges so KEDA
+        // and the dashboard can read queue depth without scraping
+        // logs.  Cadence is `WORKER_NATS_LAG_POLL_INTERVAL` env (s),
+        // default 5s.  Per `observability.md` Principle 2.
+        let lag_poll_interval = crate::nats::lag_poller::poll_interval_from_env();
+        let lag_handle = crate::nats::lag_poller::spawn(self.source.clone(), lag_poll_interval);
+        tracing::info!(
+            interval_secs = lag_poll_interval.as_secs(),
+            "NATS consumer-lag poller started"
+        );
+
         // Process commands
         let result = self.process_commands().await;
 
-        // Stop heartbeat + metrics server
+        // Stop heartbeat + metrics server + lag poller
         heartbeat_handle.abort();
         metrics_handle.abort();
+        lag_handle.abort();
 
         // Deregister worker
         self.deregister().await?;
