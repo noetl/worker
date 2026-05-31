@@ -57,11 +57,22 @@ pub struct Command {
 
 impl Command {
     /// Extract command_id from metadata (or fallback).
+    ///
+    /// Accepts the JSON value as either a string OR a number — the
+    /// Python broker now emits `command_id` as a `bigint` snowflake
+    /// (numeric JSON literal) in its outgoing payloads.  When the
+    /// value is missing entirely, falls back to a synthetic id
+    /// constructed from `execution_id` + `node_name` for diagnostic
+    /// purposes.
     pub fn command_id(&self) -> String {
         self.meta
             .get("command_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
             .unwrap_or_else(|| format!("{}:{}:unknown", self.execution_id, self.node_name))
     }
 
