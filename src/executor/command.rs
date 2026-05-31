@@ -190,7 +190,23 @@ impl CommandExecutor {
             .await
         {
             Ok(result) => {
-                // Emit call.done event
+                // Emit call.done event with a REFERENCE-ONLY result
+                // payload.  The Python broker's
+                // `_validate_reference_only_payload` enforces that
+                // `payload.result` only carries `{status, reference,
+                // context, command_id}` keys — the raw tool output
+                // (`stdout` / `stderr` / `exit_code` / `data` /
+                // `duration_ms`) must live in durable storage and
+                // be referenced by URI in `result.reference`.
+                //
+                // Minimum-viable shape used today: just `{status}`.
+                // Tool output is NOT visible in the event log;
+                // downstream steps that reference prior outputs via
+                // Jinja `data.rows[N].x` won't have the data.
+                // Proper R-2.x work (result_store integration + the
+                // `noetl-arrow-cache` colocated acceleration crate
+                // landed in cli#39) replaces this with a real
+                // reference.  Tracked on noetl/worker#24.
                 self.emit_event(
                     "call.done",
                     &command.step,
@@ -200,7 +216,9 @@ impl CommandExecutor {
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
                         "call_index": ctx.call_index,
-                        "result": result,
+                        "result": {
+                            "status": result.status.to_string(),
+                        },
                     }),
                 )
                 .await?;
