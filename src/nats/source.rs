@@ -52,7 +52,25 @@ use noetl_executor::worker::source::{
 };
 
 use crate::client::{ClaimResult, Command as WorkerCommand, ControlPlaneClient};
-use crate::nats::subscriber::NatsSubscriber;
+use crate::nats::subscriber::{CommandNotification, NatsSubscriber};
+
+/// Per-pull notification metadata.  Carried alongside the NATS
+/// message handle in the source's [`AckHandle`] so the Worker can
+/// log `execution_id` + `command_id` + `step` correlations on the
+/// non-Claimed ClaimOutcome variants (AlreadyClaimed / RetryLater /
+/// Failed) — where the executor's `ClaimOutcome` doesn't carry
+/// command identifiers.
+///
+/// Per `observability.md` Principle 4: `execution_id` rides every
+/// wire format and every structured log/span field on WARN+ERROR.
+/// This struct is the worker-side bridge between the NATS
+/// notification (which has the ids) and the WARN/ERROR call sites
+/// in `Worker::process_commands` (which need them for correlation).
+#[derive(Debug)]
+pub struct NatsAckHandle {
+    pub message: Message,
+    pub notification: CommandNotification,
+}
 
 /// `CommandSource` implementation backed by NATS JetStream + the
 /// control-plane HTTP API.
@@ -126,9 +144,19 @@ fn translate(worker: WorkerCommand) -> ExecutorCommand {
 
 #[async_trait]
 impl CommandSource for NatsCommandSource {
-    type AckHandle = Message;
+    /// Carries both the NATS message handle (for ack/nack) AND the
+    /// original notification metadata so the Worker has
+    /// `execution_id` / `command_id` / `step` available for WARN /
+    /// ERROR correlation on every ClaimOutcome variant.
+    type AckHandle = NatsAckHandle;
 
     async fn next(&mut self) -> Result<Option<Pulled<Self::AckHandle>>> {
+        // Span covers the entire pull (receive + claim).  Per
+        // `observability.md` Principle 1, every boundary call ships
+        // a span that the metrics + logs hang off of.
+        let span = tracing::debug_span!("nats.pull");
+        let _enter = span.enter();
+
         let Some((notification, msg)) = self.subscriber.receive().await? else {
             return Ok(None);
         };
@@ -137,6 +165,7 @@ impl CommandSource for NatsCommandSource {
             execution_id = notification.execution_id,
             command_id = %notification.command_id,
             step = %notification.step,
+            event_id = notification.event_id,
             "Pulled command notification from NATS"
         );
 
@@ -152,15 +181,18 @@ impl CommandSource for NatsCommandSource {
             ClaimResult::Failed(err) => ClaimOutcome::Failed(err),
         };
 
-        Ok(Some(Pulled { outcome, ack: msg }))
+        Ok(Some(Pulled {
+            outcome,
+            ack: NatsAckHandle { message: msg, notification },
+        }))
     }
 
     async fn ack(&self, handle: Self::AckHandle) -> Result<()> {
-        self.subscriber.ack(&handle).await
+        self.subscriber.ack(&handle.message).await
     }
 
     async fn nack(&self, handle: Self::AckHandle) -> Result<()> {
-        self.subscriber.nack(&handle).await
+        self.subscriber.nack(&handle.message).await
     }
 }
 

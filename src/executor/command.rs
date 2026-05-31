@@ -60,7 +60,24 @@ impl CommandExecutor {
     }
 
     /// Execute a command.
+    ///
+    /// Per `observability.md` Principle 1: every boundary call
+    /// ships a span.  The `command.execute` span covers the full
+    /// dispatch path (tool registry lookup, tool execution, case
+    /// evaluation, lifecycle event emission) so downstream
+    /// observability tooling (traces, metrics exemplars) can group
+    /// every sub-operation under one execution.
     pub async fn execute(&self, command: &Command) -> Result<()> {
+        let span = tracing::info_span!(
+            "command.execute",
+            execution_id = command.execution_id,
+            command_id = %command.command_id,
+            step = %command.step,
+            tool_kind = %command.tool_kind,
+            attempts = command.attempts,
+        );
+        let _enter = span.enter();
+
         // Build execution context
         let mut ctx = ExecutionContext::new(command.execution_id, &command.step, &self.server_url)
             .with_worker_id(&self.worker_id)

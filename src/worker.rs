@@ -209,14 +209,24 @@ impl Worker {
                     // Spawn task to process command
                     let executor = self.executor.clone();
                     let command_id = command.command_id.clone();
+                    let execution_id = command.execution_id;
+                    let step = command.step.clone();
 
                     tokio::spawn(async move {
                         // Keep permit until done
                         let _permit = permit;
 
                         if let Err(e) = executor.execute(&command).await {
+                            // Per `observability.md` Principle 4:
+                            // structured execution_id on every
+                            // ERROR.  Includes `step` for the
+                            // playbook-level correlation when
+                            // looking at a single execution's
+                            // trace.
                             tracing::error!(
+                                execution_id,
                                 command_id = %command_id,
+                                step = %step,
                                 error = %e,
                                 "Command execution failed"
                             );
@@ -224,7 +234,17 @@ impl Worker {
                     });
                 }
                 ClaimOutcome::AlreadyClaimed => {
-                    tracing::debug!("Command already claimed by another worker");
+                    // Per `observability.md` Principle 4: every
+                    // WARN/ERROR carries `execution_id` as a
+                    // structured field.  `ack.notification` gives
+                    // us the ids without requiring the ClaimOutcome
+                    // variant to carry them.
+                    tracing::debug!(
+                        execution_id = ack.notification.execution_id,
+                        command_id = %ack.notification.command_id,
+                        step = %ack.notification.step,
+                        "Command already claimed by another worker"
+                    );
 
                     // Ack — another worker has it, no redelivery.
                     {
@@ -237,6 +257,9 @@ impl Worker {
                 }
                 ClaimOutcome::RetryLater(error) => {
                     tracing::warn!(
+                        execution_id = ack.notification.execution_id,
+                        command_id = %ack.notification.command_id,
+                        step = %ack.notification.step,
                         error = %error,
                         "Transient claim failure, requesting redelivery"
                     );
@@ -251,6 +274,9 @@ impl Worker {
                 }
                 ClaimOutcome::Failed(error) => {
                     tracing::error!(
+                        execution_id = ack.notification.execution_id,
+                        command_id = %ack.notification.command_id,
+                        step = %ack.notification.step,
                         error = %error,
                         "Failed to claim command"
                     );
