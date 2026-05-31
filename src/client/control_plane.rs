@@ -18,6 +18,33 @@ use std::time::Duration;
 // comes from the executor crate).
 pub use noetl_executor::events::ExecutorEvent;
 
+/// Response shape from `PUT /api/result/{execution_id}`.
+///
+/// Mirrors the Python server's `ResultPutResponse` (see
+/// `noetl/server/api/result/endpoint.py`).  The `ref` field is the
+/// `noetl://execution/<eid>/result/<name>/<id>` URI that downstream
+/// consumers resolve via `GET /api/result/resolve?ref=<uri>`.  The
+/// other fields are metadata the producer stamps onto the
+/// `result.reference` dict it emits with `call.done`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultPutResponse {
+    /// `noetl://execution/<eid>/result/<name>/<id>` URI.
+    pub r#ref: String,
+    /// Storage tier the server chose (e.g. `"disk"`, `"s3"`, `"gcs"`).
+    pub store: String,
+    /// Lifecycle scope (`"execution"` by default for the worker's path).
+    pub scope: String,
+    /// Optional ISO-8601 expiry; `None` for permanent scope.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Size in bytes the server stored.
+    #[serde(default)]
+    pub bytes: u64,
+    /// Optional SHA-256 of the stored bytes.
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
 /// Result of claiming a command.
 #[derive(Debug, Clone)]
 pub enum ClaimResult {
@@ -293,6 +320,82 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// Store a result payload in the durable result store.
+    ///
+    /// Calls `PUT /api/result/{execution_id}` on the Python server
+    /// with a `ResultPutRequest`-shaped body and returns the
+    /// `ResultRef` the server allocated.  Used by
+    /// `CommandExecutor::build_call_done_result` for the cross-node
+    /// reference path of `noetl/worker#24` — when a tool's
+    /// serialised `result.context` exceeds the broker's inline
+    /// budget, the worker stages the bytes here and emits a
+    /// `result.reference` carrying the returned URI.
+    ///
+    /// Per `agents/rules/execution-model.md`: this is platform-
+    /// runtime traffic (worker → server, internal control plane),
+    /// not a business-logic call into a third-party API — the
+    /// server's `default_store` handles tier selection (`disk` /
+    /// `s3` / `gcs`) and durable lifecycle.
+    ///
+    /// Per `observability.md` Principle 4: the caller is expected
+    /// to wrap the call in a `result_store.put` span carrying
+    /// `execution_id` + `step` so the durable-write latency is
+    /// attributable to the playbook run.
+    ///
+    /// Arguments:
+    /// - `execution_id`: the execution this result belongs to;
+    ///   propagated to `default_tracker.register_ref` for scope
+    ///   cleanup at execution completion.
+    /// - `name`: logical name for the result, usually the step name.
+    ///   Forms part of the returned `noetl://` URI.
+    /// - `data`: arbitrary JSON value to stage.  The server
+    ///   measures, hashes, and routes to the right tier.
+    /// - `scope`: `"execution"` (default) for normal results;
+    ///   `"workflow"` for results that outlive the current
+    ///   playbook (nested playbook calls); `"permanent"` for
+    ///   results that should never auto-cleanup.
+    /// - `source_step`: step that produced the result; informs the
+    ///   scope tracker so step-scoped results clean up when that
+    ///   step's last consumer reports done.
+    pub async fn put_result(
+        &self,
+        execution_id: i64,
+        name: &str,
+        data: &serde_json::Value,
+        scope: &str,
+        source_step: Option<&str>,
+    ) -> Result<ResultPutResponse> {
+        let mut body = serde_json::json!({
+            "name": name,
+            "data": data,
+            "scope": scope,
+        });
+        if let Some(step) = source_step {
+            if let Some(map) = body.as_object_mut() {
+                map.insert(
+                    "source_step".to_string(),
+                    serde_json::Value::String(step.to_string()),
+                );
+            }
+        }
+
+        let response = self
+            .client
+            .put(format!("{}/api/result/{}", self.server_url, execution_id))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("put_result failed: HTTP {} {}", status.as_u16(), body);
+        }
+
+        let parsed: ResultPutResponse = response.json().await?;
+        Ok(parsed)
+    }
+
     /// Register the worker pool with the control plane.
     ///
     /// Wire shape matches the Python broker's `RuntimeRegistrationRequest`:
@@ -462,6 +565,42 @@ mod tests {
         assert_eq!(command.execution_id, 12345);
         assert_eq!(command.step(), "process");
         assert_eq!(command.command_id(), "cmd-abc");
+    }
+
+    /// `ResultPutResponse` matches the Python server's
+    /// `ResultPutResponse` wire shape (noetl/server/api/result/endpoint.py).
+    /// Lock the field names in so a future server-side rename
+    /// surfaces here at build time.
+    #[test]
+    fn test_result_put_response_deserialization() {
+        let wire = serde_json::json!({
+            "ref": "noetl://execution/12345/result/big_step/abcd1234",
+            "store": "disk",
+            "scope": "execution",
+            "expires_at": "2026-06-01T00:00:00Z",
+            "bytes": 204_800,
+            "sha256": "deadbeef",
+        });
+        let parsed: ResultPutResponse = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            parsed.r#ref,
+            "noetl://execution/12345/result/big_step/abcd1234"
+        );
+        assert_eq!(parsed.store, "disk");
+        assert_eq!(parsed.scope, "execution");
+        assert_eq!(parsed.bytes, 204_800);
+        assert_eq!(parsed.sha256.as_deref(), Some("deadbeef"));
+
+        // `expires_at` is allowed to be missing for permanent scope.
+        let wire_no_expiry = serde_json::json!({
+            "ref": "noetl://execution/1/result/n/x",
+            "store": "memory",
+            "scope": "permanent",
+            "bytes": 12,
+        });
+        let parsed: ResultPutResponse = serde_json::from_value(wire_no_expiry).unwrap();
+        assert!(parsed.expires_at.is_none());
+        assert!(parsed.sha256.is_none());
     }
 
     #[test]

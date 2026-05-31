@@ -20,6 +20,9 @@
 //! | `noetl_worker_concurrent_dispatches` | gauge | — | Live count of in-flight dispatches (semaphore depth) |
 //! | `noetl_worker_nats_consumer_pending` | gauge | `stream`, `consumer` | JetStream messages not yet delivered to a consumer (backlog the worker hasn't seen yet) |
 //! | `noetl_worker_nats_consumer_ack_pending` | gauge | `stream`, `consumer` | Messages delivered but not yet ack'd (live in-flight work) |
+//! | `noetl_worker_result_store_put_duration_seconds` | histogram | — | Durable result-store PUT latency (the cross-node reference path on `call.done` events) |
+//! | `noetl_worker_result_store_put_bytes_total` | counter | — | Total bytes staged in the durable result store |
+//! | `noetl_worker_result_store_put_errors_total` | counter | — | Durable result-store PUT failures (fall back to shm-cache-only or status-only) |
 //!
 //! `pending` + `ack_pending` together is the queue-depth signal KEDA
 //! and the dashboard read to decide whether to scale the worker pool.
@@ -39,8 +42,8 @@
 //! [rule]: https://github.com/noetl/ai-meta/blob/main/agents/rules/observability.md
 
 use prometheus::{
-    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge,
-    IntGaugeVec, Registry, TextEncoder,
+    CounterVec, Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec, Registry, TextEncoder,
 };
 use std::sync::OnceLock;
 
@@ -74,6 +77,9 @@ pub struct WorkerMetrics {
     pub concurrent_dispatches: IntGauge,
     pub nats_consumer_pending: IntGaugeVec,
     pub nats_consumer_ack_pending: IntGaugeVec,
+    pub result_store_put_duration_seconds: Histogram,
+    pub result_store_put_bytes_total: IntCounter,
+    pub result_store_put_errors_total: IntCounter,
 }
 
 impl WorkerMetrics {
@@ -198,6 +204,45 @@ impl WorkerMetrics {
             .register(Box::new(nats_consumer_ack_pending.clone()))
             .expect("register nats_consumer_ack_pending");
 
+        // Durable result-store metrics — populated on the over-budget
+        // `call.done` path inside `executor::command::build_call_done_result`.
+        // Histogram covers PUT round-trip; counters track total bytes
+        // staged + total errors so operators can spot a network outage
+        // or sudden bandwidth spike.  No labels — the worker only has
+        // one durable store endpoint (the control plane) so the labels
+        // would all collapse to a single series.
+        let result_store_put_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_worker_result_store_put_duration_seconds",
+                "Latency of one durable result-store PUT (control-plane round-trip).",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+        )
+        .expect("result_store_put_duration_seconds metric");
+        registry
+            .register(Box::new(result_store_put_duration_seconds.clone()))
+            .expect("register result_store_put_duration_seconds");
+
+        let result_store_put_bytes_total = IntCounter::new(
+            "noetl_worker_result_store_put_bytes_total",
+            "Total bytes staged in the durable result store across all successful PUTs.",
+        )
+        .expect("result_store_put_bytes_total metric");
+        registry
+            .register(Box::new(result_store_put_bytes_total.clone()))
+            .expect("register result_store_put_bytes_total");
+
+        let result_store_put_errors_total = IntCounter::new(
+            "noetl_worker_result_store_put_errors_total",
+            "Total durable result-store PUT failures (fall back to shm-cache-only or status-only).",
+        )
+        .expect("result_store_put_errors_total metric");
+        registry
+            .register(Box::new(result_store_put_errors_total.clone()))
+            .expect("register result_store_put_errors_total");
+
         Self {
             registry,
             pulls_total,
@@ -209,6 +254,9 @@ impl WorkerMetrics {
             concurrent_dispatches,
             nats_consumer_pending,
             nats_consumer_ack_pending,
+            result_store_put_duration_seconds,
+            result_store_put_bytes_total,
+            result_store_put_errors_total,
         }
     }
 
@@ -295,6 +343,27 @@ pub fn record_nats_consumer_lag(stream: &str, consumer: &str, pending: i64, ack_
     m.nats_consumer_ack_pending
         .with_label_values(&[stream, consumer])
         .set(ack_pending);
+}
+
+/// Record one successful durable result-store PUT.  `bytes` is the
+/// serialised size of the payload that was staged; the helper bumps
+/// the bytes counter + observes the duration histogram.  Failures
+/// use [`record_result_store_put_error`] which doesn't touch the
+/// duration histogram (so percentiles only reflect successful PUTs;
+/// the error counter is the separate signal for failure rate).
+pub fn record_result_store_put(duration_seconds: f64, bytes: usize, _is_error: bool) {
+    let m = WorkerMetrics::global();
+    m.result_store_put_duration_seconds
+        .observe(duration_seconds);
+    m.result_store_put_bytes_total.inc_by(bytes as u64);
+}
+
+/// Record one failed durable result-store PUT.  Bumps the error
+/// counter; the duration histogram is intentionally not touched so
+/// percentiles stay clean (an error path tied up in a 30s reqwest
+/// timeout would otherwise skew p99 on an otherwise-healthy worker).
+pub fn record_result_store_put_error() {
+    WorkerMetrics::global().result_store_put_errors_total.inc();
 }
 
 // Unused-warning suppression for fields that aren't read directly
@@ -459,5 +528,34 @@ mod tests {
         ));
         assert!(text.contains("# HELP noetl_worker_nats_consumer_ack_pending"));
         assert!(text.contains("# TYPE noetl_worker_nats_consumer_ack_pending gauge"));
+    }
+
+    /// `record_result_store_put` observes the duration histogram +
+    /// bumps the bytes counter on success; `record_result_store_put_error`
+    /// bumps the error counter independently.  Both metrics must
+    /// surface in the encoded Prometheus text so dashboards can scrape
+    /// them.
+    #[test]
+    fn result_store_metrics_round_trip_through_encode() {
+        let m = WorkerMetrics::global();
+        let before_bytes = m.result_store_put_bytes_total.get();
+        let before_errors = m.result_store_put_errors_total.get();
+
+        record_result_store_put(0.025, 200 * 1024, false);
+        record_result_store_put_error();
+
+        assert_eq!(
+            m.result_store_put_bytes_total.get(),
+            before_bytes + 200 * 1024
+        );
+        assert_eq!(m.result_store_put_errors_total.get(), before_errors + 1);
+
+        let text = String::from_utf8(m.encode()).unwrap();
+        assert!(text.contains("# HELP noetl_worker_result_store_put_duration_seconds"));
+        assert!(text.contains("# TYPE noetl_worker_result_store_put_duration_seconds histogram"));
+        assert!(text.contains("# HELP noetl_worker_result_store_put_bytes_total"));
+        assert!(text.contains("# TYPE noetl_worker_result_store_put_bytes_total counter"));
+        assert!(text.contains("# HELP noetl_worker_result_store_put_errors_total"));
+        assert!(text.contains("# TYPE noetl_worker_result_store_put_errors_total counter"));
     }
 }

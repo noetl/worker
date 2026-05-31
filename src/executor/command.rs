@@ -238,7 +238,10 @@ impl CommandExecutor {
                     command.execution_id,
                     &command.step,
                     self.arrow_cache.as_ref(),
-                ) {
+                    &self.client,
+                )
+                .await
+                {
                     Ok(obj) => obj,
                     Err(e) => {
                         tracing::warn!(
@@ -457,69 +460,123 @@ impl CommandExecutor {
 const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
 
 /// Build the `payload.result` object for a `call.done` event,
-/// choosing between the inline-context fast path and the
-/// `{status}`-only fallback based on the JSON-serialised size of
-/// the supplied `context`.
+/// choosing between four exit shapes based on the JSON-serialised
+/// size of the supplied `context` and the success of the durable
+/// result-store write + same-node shm staging.
 ///
-/// Returns:
+/// Fallback chain (highest fidelity first):
 ///
-/// - `{status, context}` when the serialised context fits under
-///   [`INLINE_CONTEXT_MAX_BYTES`].
-/// - `{status, reference}` when the context exceeds the inline
-///   budget — the bytes go into the `noetl-arrow-cache` shared-
-///   memory region + the returned `IpcHint` rides the event as
-///   `result.reference`.  Same-node consumers attach via
-///   `cache.get(&hint)` and decode based on `hint.media_type`
-///   (`application/json` here; future tabular tools will emit
-///   `application/vnd.apache.arrow.stream`).
-/// - `{status}` only when the context exceeds the budget AND
-///   the cache `put` fails (out of space, name collision, etc.).
-///   Predictable + visible fallback rather than a silent broker
-///   drop.
+/// 1. **Inline.**  Serialised context ≤ [`INLINE_CONTEXT_MAX_BYTES`]
+///    → `{status, context}`.  No HTTP, no shm.  Both cross-node
+///    and colocated consumers read the rendered fields directly
+///    off `result.context`.
+/// 2. **Durable + colocated acceleration.**  Over-budget AND the
+///    durable PUT to `/api/result/{execution_id}` AND the shm
+///    cache `put` BOTH succeed → `{status, reference}` where
+///    `reference` is a `ResultRef`-shaped dict carrying the
+///    `noetl://` URI for cross-node fetch + a nested `ipc` field
+///    with the [`IpcHint`] for same-node attach.  Mirrors the
+///    Python worker's `TempStore.put_ipc_bytes` shape.
+/// 3. **Durable only.**  Over-budget, durable PUT succeeds, shm
+///    cache `put` fails → same `reference = ResultRef` dict but
+///    without the `ipc` field.  Cross-node consumers work; same-
+///    node consumers pay the durable round-trip instead of taking
+///    the shm shortcut.
+/// 4. **Colocated only.**  Over-budget, durable PUT fails, shm
+///    cache `put` succeeds → `{status, reference}` carrying the
+///    bare [`IpcHint`] (matches noetl/worker#28 behaviour).
+///    Same-node consumers still read; cross-node consumers get
+///    nothing.  WARN-logged so operators see the degradation.
+/// 5. **Status only.**  Over-budget, both durable AND shm fail →
+///    `{status}`.  Predictable + visible fallback rather than a
+///    silent broker drop.  ERROR-logged.
 ///
 /// Errors only if the serde serialisation itself fails (which
 /// shouldn't happen for `serde_json::Value` inputs but the
 /// signature stays honest via `serde_json::Error`).
-fn build_call_done_result(
+async fn build_call_done_result(
     context: &serde_json::Value,
     status: &str,
     execution_id: i64,
     step: &str,
     arrow_cache: &ArrowIpcSharedMemoryCache,
+    client: &ControlPlaneClient,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let serialised = serde_json::to_string(context)?;
     if serialised.len() <= INLINE_CONTEXT_MAX_BYTES {
         return Ok(serde_json::json!({ "status": status, "context": context }));
     }
 
-    // Over-budget: stage the bytes in shared memory + emit a
-    // reference.  Use a fixed `schema_digest` of `"json"` since
-    // these are opaque JSON bytes, not Arrow IPC streams (the
-    // cache's `put_arrow_ipc` API accepts arbitrary bytes; the
-    // `schema_digest` field is for consumer-side schema-drift
-    // detection and is meaningless for JSON content).  The
-    // returned `IpcHint` carries the matching `media_type =
-    // application/json` so the consumer knows how to decode.
-    let put_result = arrow_cache.put_arrow_ipc(serialised.as_bytes(), "json", None, None);
+    // Over-budget.  Try the durable result-store first — that's
+    // the only path that helps cross-node consumers.  Then layer
+    // the shm cache on top as a colocated acceleration so same-
+    // node consumers can skip the durable round-trip.
+    let put_start = std::time::Instant::now();
+    let durable_outcome = client
+        .put_result(execution_id, step, context, "execution", Some(step))
+        .await;
+    let put_elapsed = put_start.elapsed().as_secs_f64();
 
-    match put_result {
-        Ok(mut hint) => {
-            // Override the default Arrow media type with the JSON
-            // marker so consumers know to JSON-decode the bytes.
-            // Tabular tool outputs (DuckDB, Postgres) will keep
-            // the default Arrow media type once they encode via
-            // `noetl_tools::arrow_codec::encode_record_batch`.
+    let shm_outcome = arrow_cache.put_arrow_ipc(serialised.as_bytes(), "json", None, None);
+
+    match (durable_outcome, shm_outcome) {
+        (Ok(durable), shm_result) => {
+            // Build the ResultRef-shaped reference.  Mirrors
+            // Python's `ResultRef` model (noetl/core/storage/models.py)
+            // — kind discriminator + URI + tier + scope + meta.
+            // The `ipc` field nests an `IpcHint` for the colocated
+            // fast path (Python expects `ipc: Optional[IpcHint]`).
+            crate::metrics::record_result_store_put(put_elapsed, serialised.len(), false);
+            let mut reference = serde_json::json!({
+                "kind": "result_ref",
+                "ref": durable.r#ref,
+                "store": durable.store,
+                "scope": durable.scope,
+                "meta": {
+                    "bytes": durable.bytes,
+                    "sha256": durable.sha256,
+                    "media_type": "application/json",
+                    "content_type": "application/json",
+                },
+            });
+            if let Some(expiry) = durable.expires_at.as_ref() {
+                reference["expires_at"] = serde_json::Value::String(expiry.clone());
+            }
+            if let Ok(mut hint) = shm_result {
+                hint.media_type = "application/json".to_string();
+                // Stamp the hint as the `ipc` field on the
+                // ResultRef so same-node consumers can attach
+                // without the durable round-trip.
+                if let Ok(ipc_value) = serde_json::to_value(&hint) {
+                    reference["ipc"] = ipc_value;
+                }
+                tracing::info!(
+                    execution_id,
+                    step,
+                    context_bytes = serialised.len(),
+                    result_ref = %reference["ref"].as_str().unwrap_or(""),
+                    shm_name = %hint.shm_name,
+                    put_duration_seconds = put_elapsed,
+                    "Tool result exceeds inline budget; staged in durable result store + shared-memory cache.",
+                );
+            } else {
+                tracing::info!(
+                    execution_id,
+                    step,
+                    context_bytes = serialised.len(),
+                    result_ref = %reference["ref"].as_str().unwrap_or(""),
+                    put_duration_seconds = put_elapsed,
+                    "Tool result exceeds inline budget; staged in durable result store (shm cache unavailable).",
+                );
+            }
+            Ok(serde_json::json!({ "status": status, "reference": reference }))
+        }
+        (Err(durable_err), Ok(mut hint)) => {
+            // Durable PUT failed but shm worked.  Emit the bare
+            // IpcHint as before (#28 behaviour) — degraded mode,
+            // cross-node consumers can't read this.
+            crate::metrics::record_result_store_put_error();
             hint.media_type = "application/json".to_string();
-            tracing::info!(
-                execution_id,
-                step,
-                context_bytes = serialised.len(),
-                shm_name = %hint.shm_name,
-                "Tool result exceeds inline context budget; staged in shared-memory cache.",
-            );
-            // Serialise the hint to a JSON object so it slots
-            // into `result.reference` per the broker contract
-            // (`reference` MUST be a dict).
             let reference = serde_json::to_value(&hint).unwrap_or_else(|_| {
                 serde_json::json!({
                     "kind": "arrow_ipc",
@@ -528,17 +585,31 @@ fn build_call_done_result(
                     "media_type": "application/json",
                 })
             });
-            Ok(serde_json::json!({ "status": status, "reference": reference }))
-        }
-        Err(e) => {
             tracing::warn!(
                 execution_id,
                 step,
                 context_bytes = serialised.len(),
+                shm_name = %hint.shm_name,
+                error = %durable_err,
+                "Durable result-store PUT failed; falling back to shared-memory cache only. \
+                 Cross-node consumers will see an empty result.",
+            );
+            Ok(serde_json::json!({ "status": status, "reference": reference }))
+        }
+        (Err(durable_err), Err(shm_err)) => {
+            // Both failed.  Status-only fallback — broker accepts
+            // the event but downstream Jinja references will be
+            // empty.  ERROR-logged so operators see the drop.
+            crate::metrics::record_result_store_put_error();
+            tracing::error!(
+                execution_id,
+                step,
+                context_bytes = serialised.len(),
                 inline_budget_bytes = INLINE_CONTEXT_MAX_BYTES,
-                error = %e,
-                "Tool result exceeds inline context budget and shared-memory cache put failed; emitting status-only result. \
-                 Downstream Jinja references will be empty.  Track at noetl/worker#24.",
+                durable_error = %durable_err,
+                shm_error = %shm_err,
+                "Tool result exceeds inline budget and BOTH durable + shm staging failed; \
+                 emitting status-only result.  Downstream Jinja references will be empty.",
             );
             Ok(serde_json::json!({ "status": status }))
         }
@@ -548,7 +619,9 @@ fn build_call_done_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
     use noetl_arrow_cache::CacheConfig;
+    use tokio::net::TcpListener;
 
     /// Build a test-isolated cache with a unique namespace so
     /// concurrent test runs don't collide on shm names.  POSIX shm
@@ -563,6 +636,82 @@ mod tests {
             node_id: "test-node".to_string(),
         };
         Arc::new(ArrowIpcSharedMemoryCache::with_config(config))
+    }
+
+    /// Build a cache too small to admit even a modest payload so the
+    /// over-budget `put_arrow_ipc` call deterministically fails.
+    /// Used to exercise the "durable failure + shm failure → status-
+    /// only" branch.
+    fn tiny_test_cache(namespace: &str) -> Arc<ArrowIpcSharedMemoryCache> {
+        let config = CacheConfig {
+            namespace: namespace.to_string(),
+            // 1 KB budget; oversized contexts in these tests are
+            // > 100 KB so the shm cache rejects them.
+            budget_bytes: 1024,
+            default_lease_seconds: 60.0,
+            producer: "test".to_string(),
+            node_id: "test-node".to_string(),
+        };
+        Arc::new(ArrowIpcSharedMemoryCache::with_config(config))
+    }
+
+    /// Spin up an in-test axum mock of the Python server's
+    /// `PUT /api/result/{execution_id}` endpoint.  Returns the
+    /// bound `(base_url, server_handle)`; drop the handle to stop
+    /// the server.  Each test gets its own mock so they don't share
+    /// state.
+    async fn start_mock_result_store(
+        response_body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        async fn handler(
+            Path(execution_id): Path<i64>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Result<Json<serde_json::Value>, AxumStatus> {
+            // Returning the body's `name` interpolated into the
+            // canned response is overkill for the assertions here;
+            // hand back a fixed ResultRef shape with the
+            // execution_id wired in.
+            Ok(Json(serde_json::json!({
+                "ref": format!("noetl://execution/{}/result/{}/abcd1234",
+                    execution_id,
+                    body.get("name").and_then(|v| v.as_str()).unwrap_or("step")),
+                "store": "disk",
+                "scope": "execution",
+                "expires_at": "2026-06-01T00:00:00Z",
+                "bytes": body
+                    .get("data")
+                    .map(|d| d.to_string().len() as u64)
+                    .unwrap_or(0),
+                "sha256": "deadbeefcafe",
+            })))
+        }
+
+        // Pick which handler to install: if the caller passed a
+        // `null` body, use the dynamic one (echoes execution_id +
+        // step into the canned ResultRef shape); otherwise serve
+        // the caller-supplied response body verbatim.
+        let app = if response_body.is_null() {
+            Router::new().route("/api/result/{execution_id}", put(handler))
+        } else {
+            // Per-test ResultPutResponse override path — captures
+            // the canned `response_body` so tests can override
+            // individual fields (e.g. drive a particular `store`
+            // tier or omit `expires_at`).
+            let canned = response_body;
+            let canned_handler = move |Path(_): Path<i64>, Json(_): Json<serde_json::Value>| {
+                let body = canned.clone();
+                async move { Ok::<_, AxumStatus>(Json(body)) }
+            };
+            Router::new().route("/api/result/{execution_id}", put(canned_handler))
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("axum serve");
+        });
+        (base, handle)
     }
 
     #[test]
@@ -584,19 +733,24 @@ mod tests {
         assert!(executor.tool_registry.has("rhai"));
     }
 
-    /// Small tool result rides the inline `result.context` path —
-    /// the broker accepts it and downstream Jinja templates can
-    /// reference fields off it.
-    #[test]
-    fn build_call_done_result_inlines_small_context() {
+    /// Branch 1 — small tool result rides the inline
+    /// `result.context` path.  No HTTP, no shm.  Downstream Jinja
+    /// templates can reference fields off `result.context` directly.
+    #[tokio::test]
+    async fn build_call_done_result_inlines_small_context() {
         let cache = test_cache("wkr-test-small");
+        // Client points at an unreachable URL; the inline path
+        // must NOT make any HTTP call.
+        let client = ControlPlaneClient::new("http://127.0.0.1:1");
         let context = serde_json::json!({
             "stdout": "hello",
             "exit_code": 0,
             "duration_ms": 12,
         });
         let result =
-            build_call_done_result(&context, "COMPLETED", 42, "greet", cache.as_ref()).unwrap();
+            build_call_done_result(&context, "COMPLETED", 42, "greet", cache.as_ref(), &client)
+                .await
+                .unwrap();
         assert_eq!(result["status"], "COMPLETED");
         assert_eq!(result["context"]["stdout"], "hello");
         assert_eq!(result["context"]["exit_code"], 0);
@@ -616,49 +770,172 @@ mod tests {
                 key,
             );
         }
+        // No bytes should have landed in the shm cache for the
+        // inline path.
+        assert_eq!(cache.used_bytes(), 0);
     }
 
-    /// Large tool result exceeds the inline budget — gets staged in
-    /// the same-node shared-memory cache and emitted as
-    /// `result.reference` (an `IpcHint` dict).  The bytes are
-    /// recoverable by colocated consumers via `cache.get(&hint)`.
-    /// This replaces the pre-R-2.1 silent-drop behaviour.
-    #[test]
-    fn build_call_done_result_stages_oversized_context_via_cache() {
-        let cache = test_cache("wkr-test-big");
-        let big_string: String = "x".repeat(INLINE_CONTEXT_MAX_BYTES + 1024);
+    /// Branch 2 — over-budget AND both durable PUT + shm staging
+    /// succeed → `{status, reference}` carrying a `ResultRef`-shaped
+    /// dict with a nested `ipc` field for the colocated fast path.
+    #[tokio::test]
+    async fn build_call_done_result_uses_durable_plus_ipc_when_both_succeed() {
+        let cache = test_cache("wkr-test-durable-plus-ipc");
+        let (base, handle) = start_mock_result_store(serde_json::Value::Null).await;
+        let client = ControlPlaneClient::new(&base);
+
+        let big_string: String = "x".repeat(INLINE_CONTEXT_MAX_BYTES + 4096);
         let context = serde_json::json!({ "stdout": big_string });
-        let result =
-            build_call_done_result(&context, "COMPLETED", 42, "big_step", cache.as_ref()).unwrap();
+        let result = build_call_done_result(
+            &context,
+            "COMPLETED",
+            12345,
+            "big_step",
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
+
         assert_eq!(result["status"], "COMPLETED");
-        // Over-budget context must NOT ride inline as `context`...
         assert!(
             result.get("context").is_none(),
-            "oversize context must not ride inline: result={}",
+            "oversize must not ride inline"
+        );
+        let reference = result.get("reference").expect("must have reference");
+        assert_eq!(reference["kind"], "result_ref");
+        assert!(reference["ref"]
+            .as_str()
+            .map(|s| s.starts_with("noetl://execution/12345/result/big_step/"))
+            .unwrap_or(false));
+        assert_eq!(reference["store"], "disk");
+        assert_eq!(reference["scope"], "execution");
+        // `meta` is populated from the server response.
+        assert!(reference["meta"]["bytes"].as_u64().is_some());
+        assert_eq!(reference["meta"]["media_type"], "application/json");
+        // `ipc` carries the IpcHint for the colocated acceleration.
+        let ipc = reference.get("ipc").expect("must include ipc hint");
+        assert_eq!(ipc["kind"], "arrow_ipc");
+        assert!(ipc["shm_name"].is_string());
+        assert!(ipc["byte_length"].as_u64().is_some());
+        assert_eq!(ipc["media_type"], "application/json");
+        // The shm cache must hold the staged bytes.
+        assert!(cache.used_bytes() > INLINE_CONTEXT_MAX_BYTES as u64);
+
+        handle.abort();
+    }
+
+    /// Branch 3 — over-budget AND durable PUT succeeds BUT shm
+    /// staging fails (e.g. cache budget exhausted) → `{status,
+    /// reference}` is the `ResultRef` dict WITHOUT an `ipc` field.
+    /// Cross-node consumers still work; same-node consumers pay
+    /// the durable round-trip.
+    #[tokio::test]
+    async fn build_call_done_result_durable_only_when_shm_fails() {
+        let cache = tiny_test_cache("wkr-test-durable-only");
+        let (base, handle) = start_mock_result_store(serde_json::Value::Null).await;
+        let client = ControlPlaneClient::new(&base);
+
+        let big_string: String = "x".repeat(INLINE_CONTEXT_MAX_BYTES + 4096);
+        let context = serde_json::json!({ "stdout": big_string });
+        let result = build_call_done_result(
+            &context,
+            "COMPLETED",
+            42,
+            "no_ipc_step",
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], "COMPLETED");
+        let reference = result.get("reference").expect("must have reference");
+        assert_eq!(reference["kind"], "result_ref");
+        assert!(reference["ref"].as_str().unwrap().starts_with("noetl://"));
+        // No ipc field — the shm cache rejected the bytes.
+        assert!(
+            reference.get("ipc").is_none(),
+            "no ipc field when shm fails: {}",
+            reference
+        );
+
+        handle.abort();
+    }
+
+    /// Branch 4 — over-budget AND durable PUT fails (no server)
+    /// BUT shm cache works → emit the bare `IpcHint` as
+    /// `result.reference` (matches noetl/worker#28 degraded mode).
+    /// Cross-node consumers will see nothing; same-node consumers
+    /// still attach.
+    #[tokio::test]
+    async fn build_call_done_result_falls_back_to_ipc_only_when_durable_fails() {
+        let cache = test_cache("wkr-test-ipc-only");
+        // Unreachable URL — `put_result` will fail with a connect
+        // error.  127.0.0.1:1 is reliably refused on every common
+        // OS (privileged port + no listener).
+        let client = ControlPlaneClient::new("http://127.0.0.1:1");
+
+        let big_string: String = "x".repeat(INLINE_CONTEXT_MAX_BYTES + 4096);
+        let context = serde_json::json!({ "stdout": big_string });
+        let result = build_call_done_result(
+            &context,
+            "COMPLETED",
+            42,
+            "shm_only_step",
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], "COMPLETED");
+        let reference = result.get("reference").expect("must have reference");
+        // Bare IpcHint shape — no `kind: result_ref`, no `ref` URI.
+        assert_eq!(reference["kind"], "arrow_ipc");
+        assert!(reference["shm_name"].is_string());
+        assert!(reference.get("ref").is_none());
+        // `media_type` is JSON because that's the encoder we used.
+        assert_eq!(reference["media_type"], "application/json");
+    }
+
+    /// Branch 5 — over-budget AND BOTH durable PUT + shm staging
+    /// fail → `{status}` only.  Predictable + visible fallback;
+    /// downstream Jinja references will be empty but the broker
+    /// still accepts the event.
+    #[tokio::test]
+    async fn build_call_done_result_falls_back_to_status_only_when_everything_fails() {
+        let cache = tiny_test_cache("wkr-test-status-only");
+        let client = ControlPlaneClient::new("http://127.0.0.1:1");
+
+        let big_string: String = "x".repeat(INLINE_CONTEXT_MAX_BYTES + 4096);
+        let context = serde_json::json!({ "stdout": big_string });
+        let result = build_call_done_result(
+            &context,
+            "COMPLETED",
+            42,
+            "drop_step",
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], "COMPLETED");
+        assert!(
+            result.get("reference").is_none(),
+            "no reference when everything fails: {}",
             result
         );
-        // ...instead it must surface as `result.reference` carrying
-        // the `IpcHint` fields the broker contract expects.
-        let reference = result
-            .get("reference")
-            .expect("oversize context must surface as result.reference");
-        assert!(reference.is_object(), "reference must be a dict");
-        assert_eq!(reference["media_type"], "application/json");
-        assert!(
-            reference["shm_name"].is_string(),
-            "reference.shm_name must be a string"
-        );
-        assert!(
-            reference["byte_length"].as_u64().is_some(),
-            "reference.byte_length must be a u64"
-        );
-        // The cache must now hold exactly one entry — the staged
-        // bytes — and `used_bytes` should be > the inline budget.
-        assert!(
-            cache.used_bytes() > INLINE_CONTEXT_MAX_BYTES as u64,
-            "cache must hold the staged bytes: used_bytes={}",
-            cache.used_bytes()
-        );
+        assert!(result.get("context").is_none());
+        // Only `status` should be in the result object.
+        let keys: Vec<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(keys, vec!["status"]);
     }
 
     /// The inline-budget threshold is a constant the broker side
@@ -670,26 +947,32 @@ mod tests {
         assert_eq!(INLINE_CONTEXT_MAX_BYTES, 102_400);
     }
 
-    /// Result sized exactly at the budget is allowed; one byte
-    /// over is not.  Boundary check for the comparison — and a
-    /// regression guard that the over-budget path takes the
-    /// reference branch rather than dropping the context entirely.
-    #[test]
-    fn build_call_done_result_boundary_check() {
+    /// Boundary check: under-budget → no reference; over-budget →
+    /// no inline context (regardless of which over-budget branch
+    /// fires).  Uses an unreachable client so the over-budget path
+    /// takes the shm-only branch, which is sufficient for proving
+    /// the inline-vs-reference decision.
+    #[tokio::test]
+    async fn build_call_done_result_boundary_check() {
         let cache = test_cache("wkr-test-bound");
+        let client = ControlPlaneClient::new("http://127.0.0.1:1");
         // We can't easily craft a context whose JSON encoding is
         // EXACTLY INLINE_CONTEXT_MAX_BYTES, but we can prove the
         // ">" (strictly greater) semantics by checking a result
         // smaller and a result larger than the threshold.
         let small = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES - 100) });
         let small_result =
-            build_call_done_result(&small, "COMPLETED", 1, "s", cache.as_ref()).unwrap();
+            build_call_done_result(&small, "COMPLETED", 1, "s", cache.as_ref(), &client)
+                .await
+                .unwrap();
         assert!(small_result.get("context").is_some());
         assert!(small_result.get("reference").is_none());
 
         let large = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES + 100) });
         let large_result =
-            build_call_done_result(&large, "COMPLETED", 1, "l", cache.as_ref()).unwrap();
+            build_call_done_result(&large, "COMPLETED", 1, "l", cache.as_ref(), &client)
+                .await
+                .unwrap();
         assert!(large_result.get("context").is_none());
         assert!(large_result.get("reference").is_some());
     }
