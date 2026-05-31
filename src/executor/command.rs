@@ -25,9 +25,11 @@ use noetl_executor::worker::source::Command;
 use noetl_tools::context::ExecutionContext;
 use noetl_tools::registry::{ToolConfig, ToolRegistry};
 use noetl_tools::tools::create_default_registry;
+use std::sync::Arc;
 
 use crate::client::{ControlPlaneClient, ExecutorEvent};
 use crate::executor::case_evaluator::{CaseAction, CaseEvaluator};
+use crate::snowflake::SnowflakeGen;
 
 /// Command executor that runs tools and evaluates cases.
 pub struct CommandExecutor {
@@ -45,17 +47,30 @@ pub struct CommandExecutor {
 
     /// Control-plane base URL.
     server_url: String,
+
+    /// Application-side snowflake generator for `event_id` on every
+    /// emitted envelope.  Per `observability.md` Principle 3 — the
+    /// id is generated BEFORE the row hits the database so spans /
+    /// metrics carry it at span-creation time and retries stay
+    /// idempotent.
+    snowflake: Arc<SnowflakeGen>,
 }
 
 impl CommandExecutor {
     /// Create a new command executor.
-    pub fn new(client: ControlPlaneClient, worker_id: String, server_url: String) -> Self {
+    pub fn new(
+        client: ControlPlaneClient,
+        worker_id: String,
+        server_url: String,
+        snowflake: Arc<SnowflakeGen>,
+    ) -> Self {
         Self {
             tool_registry: create_default_registry(),
             case_evaluator: CaseEvaluator::new(),
             client,
             worker_id,
             server_url,
+            snowflake,
         }
     }
 
@@ -319,10 +334,12 @@ impl CommandExecutor {
     /// R-1.2 PR-EE-3: constructs the shared `ExecutorEvent` shape
     /// (`step` + `status` + `created_at` + `context` at the top
     /// level, plus `worker_id` from the executor's own id).
-    /// `event_id` is `None` so the server's `gen_snowflake()` DB
-    /// default fires today — a follow-up will move snowflake
-    /// generation to the application side per
-    /// `observability.md` Principle 3.
+    ///
+    /// Post-EE-3 follow-up: `event_id` is now stamped from the
+    /// application-side snowflake generator per
+    /// `observability.md` Principle 3 — the id exists at span-
+    /// creation time + survives retries (which used to either
+    /// create duplicate rows or leave a NULL id window).
     ///
     /// Per `observability.md` Principle 2: records the emit latency
     /// to `noetl_worker_event_emit_duration_seconds{event_type=...}`.
@@ -346,7 +363,7 @@ impl CommandExecutor {
             status: status.to_string(),
             created_at: chrono::Utc::now(),
             context,
-            event_id: None,
+            event_id: Some(self.snowflake.next_id()),
             worker_id: Some(self.worker_id.clone()),
             meta: None,
         };
@@ -365,10 +382,12 @@ mod tests {
     #[test]
     fn test_command_executor_creation() {
         let client = ControlPlaneClient::new("http://localhost:8082");
+        let snowflake = Arc::new(SnowflakeGen::with_node_and_epoch(1, 0));
         let executor = CommandExecutor::new(
             client,
             "worker-1".to_string(),
             "http://localhost:8082".to_string(),
+            snowflake,
         );
 
         // Verify tools are registered

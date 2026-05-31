@@ -17,6 +17,7 @@ use crate::client::ControlPlaneClient;
 use crate::config::WorkerConfig;
 use crate::executor::CommandExecutor;
 use crate::nats::{NatsCommandSource, NatsSubscriber};
+use crate::snowflake::SnowflakeGen;
 
 /// Worker pool that processes commands.
 pub struct Worker {
@@ -63,11 +64,25 @@ impl Worker {
             config.worker_id.clone(),
         )));
 
+        // One snowflake generator per worker process — populates the
+        // application-side `event_id` on every emitted envelope per
+        // `observability.md` Principle 3.  Node id derives from the
+        // `NOETL_SNOWFLAKE_NODE_ID` / `NOETL_SHARD_ID` env vars when
+        // set (matches the Python broker convention), else from a
+        // stable hash of the worker id.
+        let snowflake = Arc::new(SnowflakeGen::from_env_or_hint(&config.worker_id));
+        tracing::info!(
+            worker_id = %config.worker_id,
+            snowflake_node_id = snowflake.node_id(),
+            "Snowflake generator initialised"
+        );
+
         // Create executor
         let executor = Arc::new(CommandExecutor::new(
             client.clone(),
             config.worker_id.clone(),
             config.server_url.clone(),
+            snowflake.clone(),
         ));
 
         // Create semaphore for concurrency control
