@@ -140,6 +140,7 @@ impl CommandExecutor {
             &command.step,
             "STARTED",
             command.execution_id,
+            command.attempts,
             serde_json::json!({
                 "command_id": command.command_id.clone(),
             }),
@@ -195,6 +196,7 @@ impl CommandExecutor {
                     &command.step,
                     "COMPLETED",
                     command.execution_id,
+                    command.attempts,
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
                         "call_index": ctx.call_index,
@@ -212,6 +214,7 @@ impl CommandExecutor {
                     &command.step,
                     "FAILED",
                     command.execution_id,
+                    command.attempts,
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
                         "call_index": ctx.call_index,
@@ -226,6 +229,7 @@ impl CommandExecutor {
                     &command.step,
                     "FAILED",
                     command.execution_id,
+                    command.attempts,
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
                         "error": e.to_string(),
@@ -271,6 +275,7 @@ impl CommandExecutor {
                             &command.step,
                             &exit_status,
                             command.execution_id,
+                            command.attempts,
                             serde_json::json!({
                                 "status": status,
                                 "data": data,
@@ -291,6 +296,7 @@ impl CommandExecutor {
                             &command.step,
                             "FAILED",
                             command.execution_id,
+                            command.attempts,
                             serde_json::json!({
                                 "command_id": command.command_id.clone(),
                                 "error": message,
@@ -318,6 +324,7 @@ impl CommandExecutor {
             &command.step,
             &completion_status,
             command.execution_id,
+            command.attempts,
             serde_json::json!({
                 "command_id": command.command_id.clone(),
                 "status": tool_result.status.to_string(),
@@ -335,11 +342,17 @@ impl CommandExecutor {
     /// (`step` + `status` + `created_at` + `context` at the top
     /// level, plus `worker_id` from the executor's own id).
     ///
-    /// Post-EE-3 follow-up: `event_id` is now stamped from the
-    /// application-side snowflake generator per
-    /// `observability.md` Principle 3 — the id exists at span-
-    /// creation time + survives retries (which used to either
-    /// create duplicate rows or leave a NULL id window).
+    /// Post-EE-3 follow-ups now folded in:
+    ///
+    /// - `event_id` is stamped from the application-side snowflake
+    ///   generator per `observability.md` Principle 3 — the id
+    ///   exists at span-creation time + survives retries (which
+    ///   used to either create duplicate rows or leave a NULL id
+    ///   window).  Closes noetl/worker#12.
+    /// - `meta.attempts` carries the executor `Command.attempts`
+    ///   counter so retry behaviour rides the event log without
+    ///   needing to reach back into the worker's logs.  Closes
+    ///   noetl/worker#13.
     ///
     /// Per `observability.md` Principle 2: records the emit latency
     /// to `noetl_worker_event_emit_duration_seconds{event_type=...}`.
@@ -354,6 +367,7 @@ impl CommandExecutor {
         step: &str,
         status: &str,
         execution_id: i64,
+        attempts: u32,
         context: serde_json::Value,
     ) -> Result<()> {
         let event = ExecutorEvent {
@@ -365,7 +379,7 @@ impl CommandExecutor {
             context,
             event_id: Some(self.snowflake.next_id()),
             worker_id: Some(self.worker_id.clone()),
-            meta: None,
+            meta: Some(serde_json::json!({ "attempts": attempts })),
         };
 
         let emit_start = std::time::Instant::now();
