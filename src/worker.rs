@@ -90,11 +90,18 @@ impl Worker {
         // Start heartbeat task
         let heartbeat_handle = self.start_heartbeat();
 
+        // Start metrics HTTP server.  Bind failures are
+        // immediately surfaced; the server runs in the background
+        // for the worker's lifetime.  Per
+        // `agents/rules/observability.md` Principle 2.
+        let metrics_handle = crate::metrics_server::spawn(&self.config.metrics_bind).await?;
+
         // Process commands
         let result = self.process_commands().await;
 
-        // Stop heartbeat
+        // Stop heartbeat + metrics server
         heartbeat_handle.abort();
+        metrics_handle.abort();
 
         // Deregister worker
         self.deregister().await?;
@@ -212,6 +219,13 @@ impl Worker {
                     let execution_id = command.execution_id;
                     let step = command.step.clone();
 
+                    // Bump the in-flight dispatches gauge for the
+                    // duration of the spawn.  The matching dec is
+                    // in the spawned task's exit path so the
+                    // counter is balanced even on error returns.
+                    // Per `observability.md` Principle 2.
+                    crate::metrics::inc_concurrent_dispatches();
+
                     tokio::spawn(async move {
                         // Keep permit until done
                         let _permit = permit;
@@ -231,6 +245,7 @@ impl Worker {
                                 "Command execution failed"
                             );
                         }
+                        crate::metrics::dec_concurrent_dispatches();
                     });
                 }
                 ClaimOutcome::AlreadyClaimed => {

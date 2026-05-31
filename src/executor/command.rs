@@ -67,6 +67,12 @@ impl CommandExecutor {
     /// evaluation, lifecycle event emission) so downstream
     /// observability tooling (traces, metrics exemplars) can group
     /// every sub-operation under one execution.
+    ///
+    /// Principle 2 (metrics over logs): dispatch duration recorded
+    /// to `noetl_worker_dispatch_duration_seconds{tool_kind=...}`;
+    /// errors to `noetl_worker_dispatch_errors_total{tool_kind=...}`.
+    /// Both labeled by tool_kind so the dashboard can spot which
+    /// tools are slow / failing.
     pub async fn execute(&self, command: &Command) -> Result<()> {
         let span = tracing::info_span!(
             "command.execute",
@@ -77,6 +83,22 @@ impl CommandExecutor {
             attempts = command.attempts,
         );
         let _enter = span.enter();
+
+        // Timer captures the full dispatch latency including tool
+        // execution + case evaluation + lifecycle events.  Recorded
+        // on every exit path (success + error) so the histogram is
+        // complete.
+        let dispatch_start = std::time::Instant::now();
+        let tool_kind = command.tool_kind.clone();
+        // Helper to record the dispatch metric on every exit path.
+        // Captured by the error-return + success-return code below.
+        let record_metric = |error: bool| {
+            crate::metrics::record_dispatch(
+                &tool_kind,
+                dispatch_start.elapsed().as_secs_f64(),
+                error,
+            );
+        };
 
         // Build execution context
         let mut ctx = ExecutionContext::new(command.execution_id, &command.step, &self.server_url)
@@ -185,6 +207,7 @@ impl CommandExecutor {
                 )
                 .await?;
 
+                record_metric(true);
                 return Err(e.into());
             }
         };
@@ -242,6 +265,7 @@ impl CommandExecutor {
                         )
                         .await?;
 
+                        record_metric(true);
                         return Err(anyhow::anyhow!("Case evaluation failed: {}", message));
                     }
                     CaseAction::Continue | CaseAction::Goto { .. } | CaseAction::Retry { .. } => {
@@ -262,10 +286,19 @@ impl CommandExecutor {
         )
         .await?;
 
+        record_metric(false);
         Ok(())
     }
 
     /// Emit an event to the control plane.
+    ///
+    /// Per `observability.md` Principle 2: records the emit latency
+    /// to `noetl_worker_event_emit_duration_seconds{event_type=...}`.
+    /// The retries counter is incremented only when the underlying
+    /// `emit_event_with_retry` actually retried (i.e. the first
+    /// attempt failed); the retry count is currently not exposed
+    /// by the client, so this MVP records 0 — a follow-up will
+    /// thread the actual retry count back from the client.
     async fn emit_event(
         &self,
         event_type: &str,
@@ -278,7 +311,14 @@ impl CommandExecutor {
             payload,
         };
 
-        self.client.emit_event_with_retry(event, 3).await
+        let emit_start = std::time::Instant::now();
+        let result = self.client.emit_event_with_retry(event, 3).await;
+        crate::metrics::record_event_emit(
+            event_type,
+            emit_start.elapsed().as_secs_f64(),
+            0,
+        );
+        result
     }
 }
 

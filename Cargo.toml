@@ -57,6 +57,14 @@ regex = "1.10"
 # Utilities
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Observability — per agents/rules/observability.md (codified
+# 2026-05-30).  `prometheus` provides the metrics registry + the
+# Prometheus text format encoder; `axum` exposes the `/metrics`
+# endpoint on a dedicated port (default 9090) so sidecar scrapers
+# can pull without going through the main control-plane traffic.
+prometheus = "0.14"
+axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dotenvy = "0.15"
