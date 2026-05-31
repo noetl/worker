@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.4.0](https://github.com/noetl/worker/compare/v5.3.0...v5.4.0) (2026-05-31)
+
+### Features
+
+* **executor:** durable result-store reference path for cross-node consumers ([73d1dd7](https://github.com/noetl/worker/commit/73d1dd7dd41ef15acae87bd32fe8963ab3673d5f)), closes [noetl/worker#24](https://github.com/noetl/worker/issues/24) [#26](https://github.com/noetl/worker/issues/26) [#28](https://github.com/noetl/worker/issues/28) [noetl/worker#24](https://github.com/noetl/worker/issues/24) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [5.3.0](https://github.com/noetl/worker/compare/v5.2.1...v5.3.0) (2026-05-31)
 
 ### Features
