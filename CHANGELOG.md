@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.0](https://github.com/noetl/worker/compare/v4.0.0...v5.0.0) (2026-05-31)
+
+### ⚠ BREAKING CHANGES
+
+* `EventEmitter`'s emit_* helpers and
+`CommandExecutor::emit_event` now take an `attempts: u32`
+parameter so the per-command retry counter rides every emitted
+envelope via `meta.attempts`.  Callers pass the executor
+`Command.attempts` value (or `0` when not in a command
+lifecycle context).
+
+### Features
+
+* propagate Command.attempts through ExecutorEvent.meta on emit ([579a974](https://github.com/noetl/worker/commit/579a97439d393dd9c88134324d5f704ab4491523)), closes [noetl/worker#13](https://github.com/noetl/worker/issues/13) [#14](https://github.com/noetl/worker/issues/14) [noetl/worker#13](https://github.com/noetl/worker/issues/13) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [4.0.0](https://github.com/noetl/worker/compare/v3.0.0...v4.0.0) (2026-05-31)
 
 ### ⚠ BREAKING CHANGES
