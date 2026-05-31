@@ -283,6 +283,17 @@ impl ControlPlaneClient {
     }
 
     /// Register the worker pool with the control plane.
+    ///
+    /// Wire shape matches the Python broker's `RuntimeRegistrationRequest`:
+    /// `name` (the unique component name; we pass `worker_id`),
+    /// `component_type` (`worker_pool`), `runtime` (`rust`),
+    /// `status` (`ready`), `capacity` (max-concurrent dispatches),
+    /// `hostname`, plus a `labels` map carrying the pool name so
+    /// multi-pool deployments can filter on it.
+    ///
+    /// Pre-fix sent `{worker_id, pool_name, hostname}` which the
+    /// broker rejected with `Field required: body.name` — kind
+    /// validation surfaced this 2026-05-31.
     pub async fn register_worker(
         &self,
         worker_id: &str,
@@ -293,9 +304,14 @@ impl ControlPlaneClient {
             .client
             .post(format!("{}/api/worker/pool/register", self.server_url))
             .json(&serde_json::json!({
-                "worker_id": worker_id,
-                "pool_name": pool_name,
+                "name": worker_id,
+                "component_type": "worker_pool",
+                "runtime": "rust",
+                "status": "ready",
                 "hostname": hostname,
+                "labels": {
+                    "pool_name": pool_name,
+                },
             }))
             .send()
             .await?;
@@ -309,13 +325,16 @@ impl ControlPlaneClient {
     }
 
     /// Send a heartbeat to the control plane.
-    pub async fn heartbeat(&self, worker_id: &str, pool_name: &str) -> Result<()> {
+    ///
+    /// Wire shape matches the Python broker's
+    /// `RuntimeHeartbeatRequest`: `name` only.  The broker upserts
+    /// the heartbeat timestamp keyed by `name`.
+    pub async fn heartbeat(&self, worker_id: &str, _pool_name: &str) -> Result<()> {
         let response = self
             .client
             .post(format!("{}/api/worker/pool/heartbeat", self.server_url))
             .json(&serde_json::json!({
-                "worker_id": worker_id,
-                "pool_name": pool_name,
+                "name": worker_id,
             }))
             .send()
             .await?;
@@ -329,13 +348,17 @@ impl ControlPlaneClient {
     }
 
     /// Deregister the worker pool.
-    pub async fn deregister_worker(&self, worker_id: &str, pool_name: &str) -> Result<()> {
+    ///
+    /// Wire shape matches the Python broker's deregister endpoint:
+    /// `name` + `component_type`.  POST (not DELETE) — the broker
+    /// expects a JSON body with the component name and type.
+    pub async fn deregister_worker(&self, worker_id: &str, _pool_name: &str) -> Result<()> {
         let response = self
             .client
-            .delete(format!("{}/api/worker/pool/deregister", self.server_url))
+            .post(format!("{}/api/worker/pool/deregister", self.server_url))
             .json(&serde_json::json!({
-                "worker_id": worker_id,
-                "pool_name": pool_name,
+                "name": worker_id,
+                "component_type": "worker_pool",
             }))
             .send()
             .await?;
