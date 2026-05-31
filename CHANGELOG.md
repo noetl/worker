@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.0.0](https://github.com/noetl/worker/compare/v3.0.0...v4.0.0) (2026-05-31)
+
+### ⚠ BREAKING CHANGES
+
+* CommandExecutor::new and EventEmitter::new /
+EventEmitter::with_retry now take an Arc<SnowflakeGen>
+parameter so the application-side event_id can be stamped at
+emit time per observability.md Principle 3.  Callers that
+constructed these types directly need to pass
+SnowflakeGen::from_env_or_hint(worker_id_string).into() (or
+the explicit with_node_and_epoch constructor for tests).
+
+### Features
+
+* app-side snowflake event_id (observability.md Principle 3) ([8f92167](https://github.com/noetl/worker/commit/8f9216742fcf4ae5a6ed66ac735b5181cad6d3f2)), closes [noetl/worker#12](https://github.com/noetl/worker/issues/12) [noetl/worker#12](https://github.com/noetl/worker/issues/12) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [3.0.0](https://github.com/noetl/worker/compare/v2.1.0...v3.0.0) (2026-05-31)
 
 ### ⚠ BREAKING CHANGES
