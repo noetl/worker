@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.6.0](https://github.com/noetl/worker/compare/v5.5.0...v5.6.0) (2026-06-01)
+
+### Features
+
+* **scrub:** producer-side credential scrubbing in build_call_done_result ([a82f294](https://github.com/noetl/worker/commit/a82f294ee14de49932b30b8d9f4b8dcee7125049)), closes [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [5.5.0](https://github.com/noetl/worker/compare/v5.4.0...v5.5.0) (2026-06-01)
 
 ### Features
