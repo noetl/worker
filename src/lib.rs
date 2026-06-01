@@ -15,6 +15,7 @@ pub mod executor;
 pub mod metrics;
 pub mod metrics_server;
 pub mod nats;
+pub mod scrub;
 pub mod snowflake;
 pub mod worker;
 
