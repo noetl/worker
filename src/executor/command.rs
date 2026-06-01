@@ -26,11 +26,63 @@ use noetl_executor::worker::source::Command;
 use noetl_tools::context::ExecutionContext;
 use noetl_tools::registry::{ToolConfig, ToolRegistry};
 use noetl_tools::tools::create_default_registry;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::client::{ControlPlaneClient, ExecutorEvent};
 use crate::executor::case_evaluator::{CaseAction, CaseEvaluator};
 use crate::snowflake::SnowflakeGen;
+
+/// Env var carrying the comma-separated list of worker-pod env var
+/// names to lift into `ExecutionContext.secrets` at startup
+/// (noetl/ai-meta#34).  Operators populate the underlying env vars
+/// via k8s Secret `envFrom`; playbook config (e.g.
+/// `result_fetch.bearer_token: NOETL_FLIGHT_BEARER_TOKEN`)
+/// references each by its env-var name as a keychain alias.
+///
+/// Per `agents/rules/execution-model.md`, business-logic credentials
+/// (bearer tokens, API keys, etc.) belong in the NoETL keychain and
+/// are referenced by alias from the playbook.  This allow-list is
+/// the worker-side bridge between platform-mounted Secret envs and
+/// the in-process keychain map the tools' `ctx.get_secret(...)`
+/// calls read.
+///
+/// Empty / unset → no env vars get lifted (existing behaviour;
+/// playbooks that pass literal credentials still work).
+pub(crate) const KEYCHAIN_ENV_ALLOWLIST_VAR: &str = "NOETL_KEYCHAIN_ENV_VARS";
+
+/// Parse the comma-separated allow-list + look up each env var.
+/// Names that are missing / empty in the environment are silently
+/// skipped — that way an operator can stage rollouts (define the
+/// allow-list ahead of mounting the Secret) without spamming
+/// startup logs.
+///
+/// Returns a `(alias → value)` map ready to merge into
+/// `ExecutionContext.secrets`.  Keys are the env-var names verbatim,
+/// matching the convention playbook authors reference (so a
+/// `bearer_token: NOETL_FLIGHT_BEARER_TOKEN` field resolves directly
+/// without any prefix-strip transformation).
+pub(crate) fn load_keychain_env_allowlist() -> HashMap<String, String> {
+    let raw = match std::env::var(KEYCHAIN_ENV_ALLOWLIST_VAR) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match std::env::var(name) {
+            Ok(value) if !value.is_empty() => {
+                out.insert(name.to_string(), value);
+            }
+            _ => {
+                // Allow-listed but not yet set on the pod — silent
+                // skip.  An operator who's mid-rollout (allow-list
+                // ahead of Secret mount) shouldn't see a noisy log
+                // line per startup.
+            }
+        }
+    }
+    out
+}
 
 /// Command executor that runs tools and evaluates cases.
 pub struct CommandExecutor {
@@ -64,10 +116,31 @@ pub struct CommandExecutor {
     /// Per R-2.1 (the `noetl-arrow-cache` crate); partial progress
     /// on noetl/worker#24.
     arrow_cache: Arc<ArrowIpcSharedMemoryCache>,
+
+    /// Operator-provided keychain credentials lifted from worker
+    /// pod env vars at startup (noetl/ai-meta#34).  The allow-list
+    /// (`NOETL_KEYCHAIN_ENV_VARS`) names which env vars are credentials
+    /// rather than runtime config; values get copied into each
+    /// command's `ExecutionContext.secrets` so tools'
+    /// `ctx.get_secret(alias)` calls resolve playbook keychain
+    /// aliases (e.g. `result_fetch.bearer_token: NOETL_FLIGHT_BEARER_TOKEN`).
+    ///
+    /// Populated once at executor construction; immutable across
+    /// the worker's lifetime.  Empty when the allow-list env var
+    /// is unset (pre-#34 behaviour, no breakage).
+    keychain_env: HashMap<String, String>,
 }
 
 impl CommandExecutor {
     /// Create a new command executor.
+    ///
+    /// At construction time, scans the `NOETL_KEYCHAIN_ENV_VARS`
+    /// allow-list + lifts the named env vars into a per-executor
+    /// keychain map.  Each command's `ExecutionContext.secrets`
+    /// then carries these values so playbook keychain aliases like
+    /// `result_fetch.bearer_token: NOETL_FLIGHT_BEARER_TOKEN`
+    /// resolve via `ctx.get_secret(alias)`.  See
+    /// [`load_keychain_env_allowlist`] for the env-var contract.
     pub fn new(
         client: ControlPlaneClient,
         worker_id: String,
@@ -75,6 +148,20 @@ impl CommandExecutor {
         snowflake: Arc<SnowflakeGen>,
         arrow_cache: Arc<ArrowIpcSharedMemoryCache>,
     ) -> Self {
+        let keychain_env = load_keychain_env_allowlist();
+        if !keychain_env.is_empty() {
+            // Observability per `agents/rules/observability.md` —
+            // log the KEY NAMES at startup (not values; values are
+            // credentials).  Operators verify the allow-list took
+            // effect via `kubectl logs`.
+            let mut names: Vec<&str> = keychain_env.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            tracing::info!(
+                count = names.len(),
+                aliases = ?names,
+                "Loaded keychain credentials from NOETL_KEYCHAIN_ENV_VARS"
+            );
+        }
         Self {
             tool_registry: create_default_registry(),
             case_evaluator: CaseEvaluator::new(),
@@ -83,6 +170,7 @@ impl CommandExecutor {
             server_url,
             snowflake,
             arrow_cache,
+            keychain_env,
         }
     }
 
@@ -131,6 +219,18 @@ impl CommandExecutor {
         let mut ctx = ExecutionContext::new(command.execution_id, &command.step, &self.server_url)
             .with_worker_id(&self.worker_id)
             .with_command_id(&command.command_id);
+
+        // Seed keychain credentials lifted from worker pod env at
+        // startup (noetl/ai-meta#34).  Tools that read credentials
+        // via `ctx.get_secret(alias)` (postgres, result_fetch, ...)
+        // now resolve playbook-side keychain aliases against the
+        // operator-provided `NOETL_KEYCHAIN_ENV_VARS` allow-list.
+        // Per-command secrets from the playbook step (auth: block)
+        // can still set / override entries — they layer on top of
+        // these env-mounted defaults.
+        for (alias, value) in &self.keychain_env {
+            ctx.set_secret(alias, value);
+        }
 
         // Add render context variables from command payload.
         ctx.variables = command.render_context.clone();
@@ -715,6 +815,150 @@ mod tests {
     use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
     use noetl_arrow_cache::CacheConfig;
     use tokio::net::TcpListener;
+
+    // ------------------------------------------------------------
+    // Keychain env-var allow-list (noetl/ai-meta#34)
+    //
+    // The env-var loader is independent of the rest of the executor
+    // surface — these tests use serial mutation of `std::env::*`,
+    // which means they MUST run on the same OS thread.  `cargo test`
+    // already serialises tests inside a module by default but we
+    // also clean every var we set (drop guard) so cross-test bleed
+    // is bounded.
+    // ------------------------------------------------------------
+
+    /// RAII guard that sets a process env var on construction and
+    /// restores its prior state on drop.  Without this, a panic
+    /// inside a test leaks the test's env var into sibling tests
+    /// (especially when running with `--test-threads=1` for
+    /// repeatability), turning what should be a single failure into
+    /// a cascade.
+    struct EnvGuard {
+        key: String,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: process is single-threaded for these tests via
+            // the module-level serialisation cargo test enforces.
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(&self.key, v),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keychain_env_unset_returns_empty() {
+        // Default no-auth shape — the allow-list env var isn't set,
+        // existing deployments (pre-#34) keep working unchanged.
+        let _g = EnvGuard::unset(KEYCHAIN_ENV_ALLOWLIST_VAR);
+        let loaded = load_keychain_env_allowlist();
+        assert!(loaded.is_empty(), "expected empty map, got {loaded:?}");
+    }
+
+    #[test]
+    fn keychain_env_loads_listed_vars() {
+        let _g = EnvGuard::set(
+            KEYCHAIN_ENV_ALLOWLIST_VAR,
+            "TEST_NOETL_KC_VAR_A,TEST_NOETL_KC_VAR_B",
+        );
+        let _a = EnvGuard::set("TEST_NOETL_KC_VAR_A", "alpha-secret");
+        let _b = EnvGuard::set("TEST_NOETL_KC_VAR_B", "beta-secret");
+        let loaded = load_keychain_env_allowlist();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.get("TEST_NOETL_KC_VAR_A").map(String::as_str),
+            Some("alpha-secret")
+        );
+        assert_eq!(
+            loaded.get("TEST_NOETL_KC_VAR_B").map(String::as_str),
+            Some("beta-secret")
+        );
+    }
+
+    #[test]
+    fn keychain_env_tolerates_whitespace_and_empty_entries() {
+        let _g = EnvGuard::set(
+            KEYCHAIN_ENV_ALLOWLIST_VAR,
+            " TEST_NOETL_KC_WS_A , , TEST_NOETL_KC_WS_B,",
+        );
+        let _a = EnvGuard::set("TEST_NOETL_KC_WS_A", "first");
+        let _b = EnvGuard::set("TEST_NOETL_KC_WS_B", "second");
+        let loaded = load_keychain_env_allowlist();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.get("TEST_NOETL_KC_WS_A").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(
+            loaded.get("TEST_NOETL_KC_WS_B").map(String::as_str),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn keychain_env_silently_skips_missing_vars() {
+        // Operator allow-listed a var ahead of mounting the Secret
+        // — startup proceeds without it (mid-rollout shape) rather
+        // than spamming a warn / refusing to start.
+        let _g = EnvGuard::set(
+            KEYCHAIN_ENV_ALLOWLIST_VAR,
+            "TEST_NOETL_KC_PRESENT,TEST_NOETL_KC_ABSENT",
+        );
+        let _p = EnvGuard::set("TEST_NOETL_KC_PRESENT", "here");
+        let _a = EnvGuard::unset("TEST_NOETL_KC_ABSENT");
+        let loaded = load_keychain_env_allowlist();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded.get("TEST_NOETL_KC_PRESENT").map(String::as_str),
+            Some("here")
+        );
+        assert!(!loaded.contains_key("TEST_NOETL_KC_ABSENT"));
+    }
+
+    #[test]
+    fn keychain_env_skips_empty_string_values() {
+        // Distinguishing "unset" vs "set to empty string" is a
+        // common deployment-time surprise — both shapes should be
+        // skipped.  Otherwise a Secret with a blank field would
+        // silently authenticate as an empty token, which is worse
+        // than failing closed.
+        let _g = EnvGuard::set(KEYCHAIN_ENV_ALLOWLIST_VAR, "TEST_NOETL_KC_BLANK");
+        let _b = EnvGuard::set("TEST_NOETL_KC_BLANK", "");
+        let loaded = load_keychain_env_allowlist();
+        assert!(loaded.is_empty(), "blank values must be skipped");
+    }
+
+    #[test]
+    fn keychain_env_empty_allowlist_returns_empty() {
+        let _g = EnvGuard::set(KEYCHAIN_ENV_ALLOWLIST_VAR, "");
+        let loaded = load_keychain_env_allowlist();
+        assert!(loaded.is_empty());
+    }
 
     /// Build a test-isolated cache with a unique namespace so
     /// concurrent test runs don't collide on shm names.  POSIX shm
