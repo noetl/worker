@@ -2528,9 +2528,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-arrow-flight-client"
-version = "0.1.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e35abeed8ecb6358a62ce83526cda802f1080ef046b807072136343e189ce2e"
+checksum = "c908b727308473022b69fe5bc6c060fe8ef400253f24f63710d2b696ea108f17"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -2565,9 +2565,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "2.12.0"
+version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b658c7a4bb97b01365171f9b6d07c758941caaf6c1727737fec3825f3dcccdb"
+checksum = "e03c82ab9d8d721b9b8616ea70ef8ac03afbf75b23e8c5d2d9d3a47aab7b0673"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -4382,8 +4382,10 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
+ "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
