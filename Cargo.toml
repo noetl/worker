@@ -12,8 +12,17 @@ name = "noetl-worker"
 path = "src/main.rs"
 
 [dependencies]
-# Tool library
-noetl-tools = "2.8.7"
+# Tool library.
+#
+# `noetl-tools = "2.10"` picks up the `arrow_codec::try_encode_tabular_json`
+# helper added in R-2.2 PR-A — the worker's `build_call_done_result`
+# now calls it on the over-budget branch to encode DuckDB / Postgres
+# rowsets as Arrow IPC stream bytes (media_type
+# `application/vnd.apache.arrow.stream`) instead of JSON, so cross-
+# stack consumers can read the bytes with
+# `pyarrow.ipc.RecordBatchStreamReader` directly + colocated consumers
+# benefit from the columnar layout in the shm cache.
+noetl-tools = "2.10"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
