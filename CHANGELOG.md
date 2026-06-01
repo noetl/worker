@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.7.0](https://github.com/noetl/worker/compare/v5.6.0...v5.7.0) (2026-06-01)
+
+### Features
+
+* **executor:** keychain env-var allow-list (noetl/ai-meta[#34](https://github.com/noetl/worker/issues/34)) ([19a76b7](https://github.com/noetl/worker/commit/19a76b758df8366f9291ed21b9aec6dce863077a)), closes [noetl/ops#133](https://github.com/noetl/ops/issues/133)
+
 ## [5.6.0](https://github.com/noetl/worker/compare/v5.5.0...v5.6.0) (2026-06-01)
 
 ### Features
