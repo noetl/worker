@@ -14,15 +14,22 @@ path = "src/main.rs"
 [dependencies]
 # Tool library.
 #
-# `noetl-tools = "2.10"` picks up the `arrow_codec::try_encode_tabular_json`
-# helper added in R-2.2 PR-A — the worker's `build_call_done_result`
-# now calls it on the over-budget branch to encode DuckDB / Postgres
-# rowsets as Arrow IPC stream bytes (media_type
-# `application/vnd.apache.arrow.stream`) instead of JSON, so cross-
-# stack consumers can read the bytes with
-# `pyarrow.ipc.RecordBatchStreamReader` directly + colocated consumers
-# benefit from the columnar layout in the shm cache.
-noetl-tools = "2.10"
+# `noetl-tools = "2.11"` picks up:
+# - `arrow_codec::try_encode_tabular_json` (2.10.0): the worker's
+#   `build_call_done_result` calls it on the over-budget branch to
+#   encode DuckDB / Postgres rowsets as Arrow IPC stream bytes
+#   (media_type `application/vnd.apache.arrow.stream`) instead of
+#   JSON, so cross-stack consumers can read the bytes with
+#   `pyarrow.ipc.RecordBatchStreamReader` directly + colocated
+#   consumers benefit from the columnar layout in the shm cache.
+# - `ResultFetchTool` (2.11.0, noetl/tools#8): the playbook-facing
+#   surface for explicit cross-step / cross-node fetches of a
+#   `noetl://execution/<eid>/result/<step>/<id>` URI.  Tool kind
+#   `result_fetch` is dispatched through the noetl-tools registry
+#   when a playbook step declares it.  Per
+#   `agents/rules/execution-model.md` fetch policy belongs in the
+#   playbook layer; this tool is the surface authors invoke.
+noetl-tools = "2.11"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
