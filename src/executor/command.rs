@@ -459,6 +459,27 @@ impl CommandExecutor {
 /// so operators see a WARN log instead of a silent drop).
 const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
 
+/// Encoding choice for the over-budget shm cache write.  R-2.2:
+/// tabular tool outputs (DuckDB / Postgres / Snowflake rowsets)
+/// encode as Arrow IPC stream bytes so colocated consumers benefit
+/// from the columnar layout; non-tabular outputs (shell stdout, HTTP
+/// JSON, etc.) fall back to JSON bytes.
+struct ShmPayload {
+    /// Bytes to write into the shm region.
+    bytes: Vec<u8>,
+    /// `media_type` to stamp on the `IpcHint` so consumers know how
+    /// to decode (`application/vnd.apache.arrow.stream` for tabular;
+    /// `application/json` for the fallback path).
+    media_type: String,
+    /// `schema_digest` argument to `cache.put_arrow_ipc` — `"arrow"`
+    /// when the bytes are Arrow IPC (the schema is recoverable from
+    /// the stream's first message); `"json"` for the fallback.
+    schema_digest: &'static str,
+    /// Row count for the `IpcHint.row_count` field.  Only populated
+    /// for the tabular path.
+    row_count: Option<u64>,
+}
+
 /// Build the `payload.result` object for a `call.done` event,
 /// choosing between four exit shapes based on the JSON-serialised
 /// size of the supplied `context` and the success of the durable
@@ -507,17 +528,62 @@ async fn build_call_done_result(
         return Ok(serde_json::json!({ "status": status, "context": context }));
     }
 
-    // Over-budget.  Try the durable result-store first — that's
-    // the only path that helps cross-node consumers.  Then layer
-    // the shm cache on top as a colocated acceleration so same-
-    // node consumers can skip the durable round-trip.
+    // Over-budget.  R-2.2: pick the right shm encoding based on
+    // whether the context is tabular (DuckDB / Postgres / Snowflake
+    // rowset shape).  Tabular outputs go in as Arrow IPC stream
+    // bytes — `noetl_tools::arrow_codec::try_encode_tabular_json`
+    // returns `Some` for the canonical `{columns, rows}` (or
+    // `{data: {columns, rows}}`) shape and the encoded bytes
+    // round-trip through `pyarrow.ipc.RecordBatchStreamReader` for
+    // cross-stack consumers.  Non-tabular outputs (shell stdout,
+    // HTTP JSON, etc.) stage as JSON bytes — matches the
+    // noetl/worker#28 behaviour.
+    let shm_payload = match noetl_tools::arrow_codec::try_encode_tabular_json(context) {
+        Some(enc) => {
+            tracing::debug!(
+                execution_id,
+                step,
+                row_count = enc.row_count,
+                arrow_bytes = enc.bytes.len(),
+                json_bytes = serialised.len(),
+                "Tabular tool result detected; staging as Arrow IPC stream for shm cache.",
+            );
+            ShmPayload {
+                bytes: enc.bytes,
+                media_type: enc.media_type.to_string(),
+                schema_digest: "arrow",
+                row_count: Some(enc.row_count as u64),
+            }
+        }
+        None => ShmPayload {
+            bytes: serialised.as_bytes().to_vec(),
+            media_type: "application/json".to_string(),
+            schema_digest: "json",
+            row_count: None,
+        },
+    };
+
+    // Try the durable result-store first — that's the only path
+    // that helps cross-node consumers.  Then layer the shm cache
+    // on top as a colocated acceleration so same-node consumers
+    // can skip the durable round-trip.
+    //
+    // The durable PUT always sends JSON (the server accepts `data:
+    // Any` and stores in its tiered backends).  Cross-node consumers
+    // fetch the JSON back; only the shm fast path benefits from the
+    // Arrow IPC re-encoding above.
     let put_start = std::time::Instant::now();
     let durable_outcome = client
         .put_result(execution_id, step, context, "execution", Some(step))
         .await;
     let put_elapsed = put_start.elapsed().as_secs_f64();
 
-    let shm_outcome = arrow_cache.put_arrow_ipc(serialised.as_bytes(), "json", None, None);
+    let shm_outcome = arrow_cache.put_arrow_ipc(
+        &shm_payload.bytes,
+        shm_payload.schema_digest,
+        shm_payload.row_count,
+        None,
+    );
 
     match (durable_outcome, shm_outcome) {
         (Ok(durable), shm_result) => {
@@ -543,10 +609,13 @@ async fn build_call_done_result(
                 reference["expires_at"] = serde_json::Value::String(expiry.clone());
             }
             if let Ok(mut hint) = shm_result {
-                hint.media_type = "application/json".to_string();
+                hint.media_type = shm_payload.media_type.clone();
                 // Stamp the hint as the `ipc` field on the
                 // ResultRef so same-node consumers can attach
-                // without the durable round-trip.
+                // without the durable round-trip.  The
+                // `media_type` field tells the consumer how to
+                // decode the shm bytes: Arrow IPC stream for
+                // tabular outputs, JSON for everything else.
                 if let Ok(ipc_value) = serde_json::to_value(&hint) {
                     reference["ipc"] = ipc_value;
                 }
@@ -554,6 +623,8 @@ async fn build_call_done_result(
                     execution_id,
                     step,
                     context_bytes = serialised.len(),
+                    shm_bytes = shm_payload.bytes.len(),
+                    shm_media_type = %hint.media_type,
                     result_ref = %reference["ref"].as_str().unwrap_or(""),
                     shm_name = %hint.shm_name,
                     put_duration_seconds = put_elapsed,
@@ -574,21 +645,26 @@ async fn build_call_done_result(
         (Err(durable_err), Ok(mut hint)) => {
             // Durable PUT failed but shm worked.  Emit the bare
             // IpcHint as before (#28 behaviour) — degraded mode,
-            // cross-node consumers can't read this.
+            // cross-node consumers can't read this.  R-2.2: the
+            // `media_type` reflects the actual encoding (Arrow IPC
+            // for tabular, JSON for fallback) so a same-node
+            // consumer reads the right bytes.
             crate::metrics::record_result_store_put_error();
-            hint.media_type = "application/json".to_string();
+            hint.media_type = shm_payload.media_type.clone();
             let reference = serde_json::to_value(&hint).unwrap_or_else(|_| {
                 serde_json::json!({
                     "kind": "arrow_ipc",
                     "shm_name": hint.shm_name.clone(),
                     "byte_length": hint.byte_length,
-                    "media_type": "application/json",
+                    "media_type": shm_payload.media_type,
                 })
             });
             tracing::warn!(
                 execution_id,
                 step,
                 context_bytes = serialised.len(),
+                shm_bytes = shm_payload.bytes.len(),
+                shm_media_type = %hint.media_type,
                 shm_name = %hint.shm_name,
                 error = %durable_err,
                 "Durable result-store PUT failed; falling back to shared-memory cache only. \
@@ -821,6 +897,98 @@ mod tests {
         assert_eq!(ipc["media_type"], "application/json");
         // The shm cache must hold the staged bytes.
         assert!(cache.used_bytes() > INLINE_CONTEXT_MAX_BYTES as u64);
+
+        handle.abort();
+    }
+
+    /// R-2.2: over-budget tabular tool output (DuckDB / Postgres
+    /// rowset shape) stages in shm as **Arrow IPC stream bytes**
+    /// rather than JSON, with `media_type =
+    /// application/vnd.apache.arrow.stream` on the `IpcHint`.
+    /// Colocated consumers read the bytes via
+    /// `arrow_ipc::reader::StreamReader` and get columnar layout for
+    /// free; the durable PUT still rides JSON via `/api/result/`.
+    #[tokio::test]
+    async fn build_call_done_result_uses_arrow_ipc_for_tabular_tool_output() {
+        let cache = test_cache("wkr-test-tabular-arrow");
+        let (base, handle) = start_mock_result_store(serde_json::Value::Null).await;
+        let client = ControlPlaneClient::new(&base);
+
+        // Build an over-budget DuckDB-shape rowset: 6000 rows × 4
+        // columns of typed values.  At ~26 bytes/row JSON-serialised
+        // that's ~150 KB, comfortably over the 100 KB inline budget,
+        // and the typed columns exercise the Int64 / Utf8 / Float64
+        // / Boolean inference paths in
+        // `arrow_codec::try_encode_tabular_json`.
+        let rows: Vec<serde_json::Value> = (0..6_000)
+            .map(|i| {
+                serde_json::json!([i, format!("row_{:06}", i), (i as f64) * 1.5_f64, i % 2 == 0,])
+            })
+            .collect();
+        let context = serde_json::json!({
+            "status": "Success",
+            "data": {
+                "columns": ["id", "label", "score", "active"],
+                "rows": rows,
+                "row_count": 6_000,
+            },
+            "duration_ms": 42,
+        });
+
+        let result = build_call_done_result(
+            &context,
+            "COMPLETED",
+            999,
+            "tabular_step",
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
+
+        // Same five-row fallback chain (#29).  Tabular output
+        // takes the "durable + ipc" branch because both the
+        // durable mock + the shm cache accept it.
+        assert_eq!(result["status"], "COMPLETED");
+        assert!(
+            result.get("context").is_none(),
+            "oversize must not ride inline"
+        );
+        let reference = result.get("reference").expect("must have reference");
+        assert_eq!(reference["kind"], "result_ref");
+
+        // The `ipc` field's `media_type` is the Arrow IPC stream
+        // marker — same value Python's
+        // `arrow_ipc.ARROW_STREAM_MEDIA_TYPE` carries.  This is the
+        // key R-2.2 behaviour: consumers switch on `media_type` to
+        // pick the right decoder.
+        let ipc = reference.get("ipc").expect("must include ipc hint");
+        assert_eq!(
+            ipc["media_type"], "application/vnd.apache.arrow.stream",
+            "tabular shm bytes must advertise Arrow IPC media type"
+        );
+        // `row_count` propagates from `TabularEncoding.row_count`
+        // through `cache.put_arrow_ipc` onto the IpcHint.
+        assert_eq!(
+            ipc["row_count"].as_u64(),
+            Some(6_000),
+            "IpcHint must carry the tabular row_count"
+        );
+        // `schema_digest` is `"arrow"` (the helper's literal) so
+        // consumers can branch on it if they ever need to.
+        assert_eq!(ipc["schema_digest"], "arrow");
+        // The shm region holds the Arrow IPC bytes — those should
+        // be smaller than the original JSON serialisation because
+        // columnar encoding compresses repetitive structure.
+        let arrow_bytes = ipc["byte_length"].as_u64().unwrap_or(0);
+        let json_bytes = serde_json::to_string(&context).unwrap().len() as u64;
+        assert!(arrow_bytes > 0);
+        assert!(
+            arrow_bytes < json_bytes,
+            "Arrow IPC bytes ({}) should be smaller than JSON ({}) for typed rowsets",
+            arrow_bytes,
+            json_bytes
+        );
 
         handle.abort();
     }
