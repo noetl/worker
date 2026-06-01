@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.5.0](https://github.com/noetl/worker/compare/v5.4.0...v5.5.0) (2026-06-01)
+
+### Features
+
+* **executor:** stage tabular tool outputs as Arrow IPC bytes in shm cache (R-2.2) ([69dff28](https://github.com/noetl/worker/commit/69dff28961f55d6d94358eebd3df952913f62476)), closes [noetl/tools#7](https://github.com/noetl/tools/issues/7) [#29](https://github.com/noetl/worker/issues/29) [noetl/ai-meta#30](https://github.com/noetl/ai-meta/issues/30)
+
 ## [5.4.0](https://github.com/noetl/worker/compare/v5.3.0...v5.4.0) (2026-05-31)
 
 ### Features
