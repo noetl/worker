@@ -2527,6 +2527,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "noetl-arrow-flight-client"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e35abeed8ecb6358a62ce83526cda802f1080ef046b807072136343e189ce2e"
+dependencies = [
+ "anyhow",
+ "arrow 53.4.1",
+ "arrow-flight",
+ "futures",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "noetl-executor"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2548,9 +2565,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "2.10.0"
+version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a220edbc86d32a564dfe7dfbf9f53645dfe090ea36cab462c0bbcc0088d6f2eb"
+checksum = "c50aefc53a043e9ccf1bea5d839e0fb7800d944e94cb4c661e54010528143fa1"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -2565,6 +2582,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "minijinja",
+ "noetl-arrow-flight-client",
  "regex",
  "reqwest",
  "rhai",
@@ -2580,7 +2598,7 @@ dependencies = [
 
 [[package]]
 name = "noetl-worker"
-version = "5.6.0"
+version = "5.7.0"
 dependencies = [
  "anyhow",
  "async-nats",
