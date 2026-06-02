@@ -65,46 +65,90 @@ jobs:
         if: ${{ env.CRATES_IO_TOKEN == '' }}
         run: echo "CRATES_IO_TOKEN is not set; skipping crate publish."
 
+  # Split per-arch build matrix: each arch builds on its NATIVE
+  # runner (ubuntu-latest = amd64; ubuntu-24.04-arm = arm64).  Per
+  # noetl/ai-meta#44 follow-up: the prior QEMU-emulated approach
+  # made arm64 Rust builds ~6-10x slower than native amd64 and
+  # routinely ran 60-90 min for cargo-chef cold cache.  Native
+  # runners drop each arch to 10-15 min, and the two jobs run
+  # in parallel.  The merge into a manifest list happens in the
+  # ``publish-manifest`` job below.
   publish-image:
-    runs-on: ubuntu-latest
     needs: verify-version
     if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch_tag: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch_tag: arm64
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      image_amd64: ${{ steps.export.outputs.image_amd64 }}
+      image_arm64: ${{ steps.export.outputs.image_arm64 }}
     steps:
       - uses: actions/checkout@v4
-      # QEMU emulation enables cross-arch builds on the amd64
-      # ubuntu-latest runner.  Required for the linux/arm64
-      # variant per noetl/ai-meta#44 — pre-#44 published images
-      # were amd64-only, which blocked the kind validation rig
-      # on Apple Silicon hosts (the worker image couldn't pull
-      # on arm64 macOS).
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
+      # Build + push the per-arch image with a digest-only tag.
+      # The version-tagged manifest list is assembled below in the
+      # publish-manifest job from the two digests.
+      - id: build
+        uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
-          # Multi-arch manifest list — Apple Silicon kind clusters
-          # and arm64 production nodes (Graviton, Ampere) pull
-          # arm64; x86_64 hosts pull amd64.  Per noetl/ai-meta#44.
-          # Rust cross-compile via QEMU is roughly 3-4x slower
-          # than native amd64 for the cargo-chef cooked layer;
-          # the planner/cook split keeps incremental rebuilds
-          # cheap once the base layer is warm.
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/noetl/worker:${{ needs.verify-version.outputs.version }}
-            ghcr.io/noetl/worker:latest
+          platforms: ${{ matrix.platform }}
+          tags: ghcr.io/noetl/worker:${{ needs.verify-version.outputs.version }}-${{ matrix.arch_tag }}
+      - id: export
+        run: |
+          echo "image_${{ matrix.arch_tag }}=ghcr.io/noetl/worker:${{ needs.verify-version.outputs.version }}-${{ matrix.arch_tag }}" >> "$GITHUB_OUTPUT"
+
+  # Combine the two per-arch images into a manifest list under the
+  # version + ``latest`` tags.  No build work here — just metadata.
+  # Per noetl/ai-meta#44.
+  publish-manifest:
+    runs-on: ubuntu-latest
+    needs: [verify-version, publish-image]
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create + push multi-arch manifest list
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t ghcr.io/noetl/worker:${VERSION} \
+            -t ghcr.io/noetl/worker:latest \
+            ghcr.io/noetl/worker:${VERSION}-amd64 \
+            ghcr.io/noetl/worker:${VERSION}-arm64
+          echo "=== manifest list ==="
+          docker buildx imagetools inspect ghcr.io/noetl/worker:${VERSION}
 
   github-release:
     runs-on: ubuntu-latest
-    needs: [verify-version, publish-image]
-    if: ${{ always() && needs.verify-version.result == 'success' && (needs.publish-image.result == 'success' || needs.publish-image.result == 'skipped') }}
+    needs: [verify-version, publish-image, publish-manifest]
+    # ``publish-image`` is a matrix; ``publish-manifest`` is the
+    # terminal step that merges the per-arch tags into the multi-arch
+    # manifest list.  Gate the release on the manifest job so we
+    # don't publish notes for an incomplete multi-arch push.  Allow
+    # ``skipped`` for the no-Dockerfile case (publish-image's
+    # condition cascades).
+    if: ${{ always() && needs.verify-version.result == 'success' && (needs.publish-manifest.result == 'success' || (needs.publish-image.result == 'skipped' && needs.publish-manifest.result == 'skipped')) }}
     steps:
       - uses: softprops/action-gh-release@v2
         with:
