@@ -24,6 +24,23 @@ pub struct WorkerConfig {
     /// NATS consumer name.
     pub nats_consumer: String,
 
+    /// Base NATS subject the publisher writes command notifications to.
+    ///
+    /// Defaults to `noetl.commands`.  Per noetl/ai-meta#42 PR-3 this
+    /// is now env-driven (`NATS_SUBJECT`) so the deployment yaml can
+    /// override it independently of the stream + consumer names.  The
+    /// stream is widened to accept both this bare subject AND the
+    /// hierarchical wildcard `<subject>.>` (matches the Python PR-2a).
+    pub nats_subject: String,
+
+    /// JetStream consumer-side filter subject.  Per noetl/ai-meta#42
+    /// PR-3, the worker subscribes to commands matching this filter.
+    /// Default = `nats_subject` (the bare subject — today's
+    /// behaviour, no change).  PR-4 sets this to
+    /// `noetl.commands.shared.>` via the Rust worker's deployment
+    /// env so the Rust pool only sees shared-segment commands.
+    pub nats_filter_subject: String,
+
     /// Heartbeat interval.
     pub heartbeat_interval: Duration,
 
@@ -57,6 +74,19 @@ impl WorkerConfig {
         let nats_consumer =
             std::env::var("NATS_CONSUMER").unwrap_or_else(|_| "worker-pool".to_string());
 
+        // PR-3 of noetl/ai-meta#42: subject + filter_subject become
+        // env-driven so the deployment yaml can point the Rust pool
+        // at `noetl.commands.shared.>` without code change.  Default
+        // for the filter is the bare subject — preserves today's
+        // single-consumer behaviour.
+        let nats_subject =
+            std::env::var("NATS_SUBJECT").unwrap_or_else(|_| "noetl.commands".to_string());
+
+        let nats_filter_subject = std::env::var("NATS_FILTER_SUBJECT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| nats_subject.clone());
+
         let heartbeat_secs: u64 = std::env::var("WORKER_HEARTBEAT_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -77,6 +107,8 @@ impl WorkerConfig {
             nats_url,
             nats_stream,
             nats_consumer,
+            nats_subject,
+            nats_filter_subject,
             heartbeat_interval: Duration::from_secs(heartbeat_secs),
             max_concurrent_tasks: max_concurrent,
             metrics_bind,
@@ -86,6 +118,7 @@ impl WorkerConfig {
 
 impl Default for WorkerConfig {
     fn default() -> Self {
+        let nats_subject = "noetl.commands".to_string();
         Self {
             worker_id: uuid::Uuid::new_v4().to_string(),
             pool_name: "default".to_string(),
@@ -93,6 +126,8 @@ impl Default for WorkerConfig {
             nats_url: "nats://localhost:4222".to_string(),
             nats_stream: "noetl_commands".to_string(),
             nats_consumer: "worker-pool".to_string(),
+            nats_filter_subject: nats_subject.clone(),
+            nats_subject,
             heartbeat_interval: Duration::from_secs(15),
             max_concurrent_tasks: 4,
             metrics_bind: "0.0.0.0:9090".to_string(),
@@ -109,5 +144,15 @@ mod tests {
         let config = WorkerConfig::default();
         assert_eq!(config.pool_name, "default");
         assert_eq!(config.max_concurrent_tasks, 4);
+    }
+
+    #[test]
+    fn test_default_subject_and_filter_match() {
+        // Backward compat: with no env override, `nats_filter_subject`
+        // equals `nats_subject` so the worker keeps subscribing to
+        // the bare subject (today's behaviour).  Noetl/ai-meta#42 PR-3.
+        let config = WorkerConfig::default();
+        assert_eq!(config.nats_subject, "noetl.commands");
+        assert_eq!(config.nats_filter_subject, config.nats_subject);
     }
 }
