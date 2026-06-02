@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # Tool library.
 #
-# `noetl-tools = "2.11"` picks up:
+# `noetl-tools = "2.16"` picks up:
 # - `arrow_codec::try_encode_tabular_json` (2.10.0): the worker's
 #   `build_call_done_result` calls it on the over-budget branch to
 #   encode DuckDB / Postgres rowsets as Arrow IPC stream bytes
@@ -29,7 +29,12 @@ path = "src/main.rs"
 #   when a playbook step declares it.  Per
 #   `agents/rules/execution-model.md` fetch policy belongs in the
 #   playbook layer; this tool is the surface authors invoke.
-noetl-tools = "2.11"
+# - `NatsTool` (2.15.0, noetl/tools#12): JetStream / K/V / Object
+#   Store operations dispatched via `tool_kind = "nats"`.  No
+#   per-variant match arm needed — the dynamic registry handles it.
+# - `McpTool` (2.16.0, noetl/tools#13): MCP JSON-RPC over HTTP bridge
+#   dispatched via `tool_kind = "mcp"`.  Same dynamic-registry pattern.
+noetl-tools = "2.16"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
@@ -106,3 +111,6 @@ urlencoding = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# uuid used in integration tests (dispatch_nats_mcp.rs) to generate unique
+# NATS KV bucket names so concurrent test runs don't collide.
+uuid = { version = "1", features = ["v4"] }

@@ -11,8 +11,8 @@ Worker executable that consumes command events and executes tools.
 ## Dependency Policy
 
 - Crates.io dependencies for shared libraries:
-  - `noetl-tools = "2.8.7"` (or matching release version) — the
-    tool registry (HTTP, DuckDB, Postgres, shell, Rhai, …).
+  - `noetl-tools = "2.16"` (or matching release version) — the
+    tool registry (HTTP, DuckDB, Postgres, shell, Rhai, nats, mcp, …).
   - `noetl-executor = "0.3"` — the shared execution core
     (R-1.2 PR-2c onwards).  Hosts the structured-condition
     surface (`Condition`, `Operator`,
