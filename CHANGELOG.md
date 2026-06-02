@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.9.0](https://github.com/noetl/worker/compare/v5.8.0...v5.9.0) (2026-06-02)
+
+### Features
+
+* **routing:** env-driven NATS subject + filter_subject for per-pool routing (PR-3 of 6) ([e5068f4](https://github.com/noetl/worker/commit/e5068f43119f189e37f2f77d520e9a0df919f660)), closes [noetl/ai-meta#42](https://github.com/noetl/ai-meta/issues/42) [noetl/noetl#655](https://github.com/noetl/noetl/issues/655)
+
 ## [5.8.0](https://github.com/noetl/worker/compare/v5.7.0...v5.8.0) (2026-06-02)
 
 ### Features
