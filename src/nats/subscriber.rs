@@ -94,7 +94,23 @@ impl NatsSubscriber {
     ///    silently drops URL creds — so we extract them ourselves
     ///    and feed `ConnectOptions::with_user_and_password`.
     /// 3. Anonymous connect (the existing PR-2d-2 behaviour).
-    pub async fn connect(nats_url: &str, stream: &str, consumer: &str) -> Result<Self> {
+    ///
+    /// `subject` is the base NATS subject the stream is configured
+    /// for; the stream is widened to accept both the bare subject
+    /// AND `<subject>.>` to match the Python PR-2a widening
+    /// (noetl/ai-meta#42 PR-2a).
+    ///
+    /// `filter_subject` is the consumer-side filter — if the
+    /// deployment env sets `NATS_FILTER_SUBJECT=noetl.commands.shared.>`
+    /// the Rust worker only sees shared-segment commands; if unset
+    /// it defaults to `subject` (single-consumer behaviour).
+    pub async fn connect(
+        nats_url: &str,
+        stream: &str,
+        consumer: &str,
+        subject: &str,
+        filter_subject: &str,
+    ) -> Result<Self> {
         let (clean_url, user, pass) = parse_nats_credentials(nats_url)?;
 
         let client = if let (Some(u), Some(p)) = (user, pass) {
@@ -109,10 +125,14 @@ impl NatsSubscriber {
 
         let js = jetstream::new(client);
 
-        // Ensure stream exists
+        // Ensure stream exists.  Widen subjects per noetl/ai-meta#42
+        // PR-2a parity with the Python side: stream accepts both the
+        // bare subject and the hierarchical wildcard so PR-5's
+        // cutover (publisher emits `noetl.commands.shared.X`) lands
+        // on a configured subject.
         let stream_config = jetstream::stream::Config {
             name: stream.to_string(),
-            subjects: vec!["noetl.commands".to_string()],
+            subjects: vec![subject.to_string(), format!("{}.>", subject)],
             ..Default::default()
         };
 
@@ -131,7 +151,7 @@ impl NatsSubscriber {
             js,
             stream: stream.to_string(),
             consumer: consumer.to_string(),
-            subject: "noetl.commands".to_string(),
+            subject: filter_subject.to_string(),
         })
     }
 

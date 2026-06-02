@@ -47,10 +47,19 @@ pub struct Worker {
 impl Worker {
     /// Create a new worker.
     pub async fn new(config: WorkerConfig) -> Result<Self> {
-        // Connect to NATS
-        let subscriber =
-            NatsSubscriber::connect(&config.nats_url, &config.nats_stream, &config.nats_consumer)
-                .await?;
+        // Connect to NATS.  `nats_subject` is the base for the
+        // stream config; `nats_filter_subject` is the consumer-side
+        // filter — defaults to the bare subject in `WorkerConfig`
+        // unless `NATS_FILTER_SUBJECT` is set by the deployment env
+        // (PR-4 of noetl/ai-meta#42 ships the manifest change).
+        let subscriber = NatsSubscriber::connect(
+            &config.nats_url,
+            &config.nats_stream,
+            &config.nats_consumer,
+            &config.nats_subject,
+            &config.nats_filter_subject,
+        )
+        .await?;
 
         // Create HTTP client
         let client = ControlPlaneClient::new(&config.server_url);
