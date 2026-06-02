@@ -71,6 +71,13 @@ jobs:
     if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' }}
     steps:
       - uses: actions/checkout@v4
+      # QEMU emulation enables cross-arch builds on the amd64
+      # ubuntu-latest runner.  Required for the linux/arm64
+      # variant per noetl/ai-meta#44 — pre-#44 published images
+      # were amd64-only, which blocked the kind validation rig
+      # on Apple Silicon hosts (the worker image couldn't pull
+      # on arm64 macOS).
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -82,6 +89,14 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          # Multi-arch manifest list — Apple Silicon kind clusters
+          # and arm64 production nodes (Graviton, Ampere) pull
+          # arm64; x86_64 hosts pull amd64.  Per noetl/ai-meta#44.
+          # Rust cross-compile via QEMU is roughly 3-4x slower
+          # than native amd64 for the cargo-chef cooked layer;
+          # the planner/cook split keeps incremental rebuilds
+          # cheap once the base layer is warm.
+          platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/noetl/worker:${{ needs.verify-version.outputs.version }}
             ghcr.io/noetl/worker:latest
