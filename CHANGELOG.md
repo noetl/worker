@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.8.0](https://github.com/noetl/worker/compare/v5.7.0...v5.8.0) (2026-06-02)
+
+### Features
+
+* **deps:** bump noetl-tools 2.11 → 2.16 + add nats/mcp dispatch tests ([4c93f49](https://github.com/noetl/worker/commit/4c93f4959e9a09fa1b36ce62d3a94be833c98702)), closes [noetl/tools#12](https://github.com/noetl/tools/issues/12) [noetl/tools#13](https://github.com/noetl/tools/issues/13) [noetl/ai-meta#40](https://github.com/noetl/ai-meta/issues/40)
+
 ## [5.7.0](https://github.com/noetl/worker/compare/v5.6.0...v5.7.0) (2026-06-01)
 
 ### Features
