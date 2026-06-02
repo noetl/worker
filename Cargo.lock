@@ -2565,19 +2565,20 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "2.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e03c82ab9d8d721b9b8616ea70ef8ac03afbf75b23e8c5d2d9d3a47aab7b0673"
+version = "2.16.0"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
  "arrow-flight",
  "arrow-ipc",
+ "async-nats",
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
  "deadpool-postgres",
  "duckdb",
+ "futures",
  "gcp_auth",
  "k8s-openapi",
  "kube",
