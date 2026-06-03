@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.10.0](https://github.com/noetl/worker/compare/v5.9.0...v5.10.0) (2026-06-03)
+
+### Features
+
+* **executor:** resolve credential aliases in tool config dispatch ([2867bdc](https://github.com/noetl/worker/commit/2867bdce8dcb0914334e59fe6d442fcb49f6f0d8)), closes [noetl/ai-meta#48](https://github.com/noetl/ai-meta/issues/48) [noetl/ai-meta#42](https://github.com/noetl/ai-meta/issues/42) [noetl/ai-meta#48](https://github.com/noetl/ai-meta/issues/48)
+
 ## [5.9.0](https://github.com/noetl/worker/compare/v5.8.0...v5.9.0) (2026-06-02)
 
 ### Features
