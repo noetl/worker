@@ -1,5 +1,6 @@
 //! Command execution module.
 
+mod auth_alias;
 mod case_evaluator;
 mod command;
 
