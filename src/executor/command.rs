@@ -298,6 +298,18 @@ impl CommandExecutor {
             command.execution_id,
         )
         .await?;
+        if !alias_secrets.is_empty() {
+            // Per `observability.md` Principle 1: log keychain
+            // alias resolution so operators can trace credential
+            // lookups in the worker log alongside the dispatch
+            // span.  Value never logged (just the alias name).
+            tracing::info!(
+                execution_id = command.execution_id,
+                step = %command.step,
+                aliases = ?alias_secrets.keys().collect::<Vec<_>>(),
+                "Resolved keychain alias(es) for tool dispatch"
+            );
+        }
         for (alias, value) in alias_secrets {
             ctx.set_secret(&alias, &value);
         }
