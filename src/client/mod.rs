@@ -5,4 +5,4 @@
 
 mod control_plane;
 
-pub use control_plane::{ClaimResult, Command, ControlPlaneClient, ExecutorEvent};
+pub use control_plane::{ClaimResult, Command, ControlPlaneClient, Credential, ExecutorEvent};

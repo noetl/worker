@@ -265,7 +265,7 @@ impl CommandExecutor {
         // `kind` from the executor `Command.tool_kind` field if the
         // nested config doesn't already carry it (mirrors the worker's
         // pre-PR-2d-2 `Command.tool_config_value()` behaviour).
-        let tool_config_value = {
+        let mut tool_config_value = {
             let mut cfg = command
                 .input
                 .get("tool_config")
@@ -285,6 +285,35 @@ impl CommandExecutor {
             }
             cfg
         };
+
+        // Resolve string `auth:` values (keychain aliases) into either
+        // the noetl-tools `AuthConfig` shape or the tool's flat
+        // connection fields BEFORE serde deserialization.  See
+        // `auth_alias` module + noetl/ai-meta#48 for the regression
+        // brief.  Idempotent: if `auth` is already a struct (or
+        // absent), this is a no-op + no HTTP call.
+        let alias_secrets = super::auth_alias::resolve_auth_alias(
+            &mut tool_config_value,
+            &self.client,
+            command.execution_id,
+        )
+        .await?;
+        if !alias_secrets.is_empty() {
+            // Per `observability.md` Principle 1: log keychain
+            // alias resolution so operators can trace credential
+            // lookups in the worker log alongside the dispatch
+            // span.  Value never logged (just the alias name).
+            tracing::info!(
+                execution_id = command.execution_id,
+                step = %command.step,
+                aliases = ?alias_secrets.keys().collect::<Vec<_>>(),
+                "Resolved keychain alias(es) for tool dispatch"
+            );
+        }
+        for (alias, value) in alias_secrets {
+            ctx.set_secret(&alias, &value);
+        }
+
         let tool_config: ToolConfig = serde_json::from_value(tool_config_value)?;
 
         tracing::debug!(

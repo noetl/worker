@@ -45,6 +45,42 @@ pub struct ResultPutResponse {
     pub sha256: Option<String>,
 }
 
+/// Credential record returned by `GET /api/credentials/{alias}`.
+///
+/// Wire shape mirrors the server's `CredentialResponse` model: a
+/// `type` field carrying the credential family (`postgres`, `bearer`,
+/// `api_key`, `basic`, `gcp_adc`, ...) and a free-form `data` dict
+/// whose keys depend on the type.  The worker's
+/// `resolve_auth_alias` helper maps the type-specific fields into
+/// either the tool's flat connection fields (postgres) or a
+/// noetl-tools `AuthConfig` JSON (bearer / api_key / basic).
+///
+/// See noetl/ai-meta#48 for the regression brief.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Credential {
+    /// Server-assigned numeric id (snowflake), serialized as string.
+    pub id: String,
+    /// Alias as referenced by playbook `auth: "<alias>"`.
+    pub name: String,
+    /// Credential family.  Values seen today: `postgres`, `bearer`,
+    /// `api_key`, `basic`, `gcp_adc`, `gcp_oauth`, `hmac`.
+    #[serde(rename = "type")]
+    pub cred_type: String,
+    /// Decrypted credential payload.  Keys depend on `cred_type`.
+    /// Always present because `get_credential` always requests
+    /// `include_data=true`.
+    #[serde(default)]
+    pub data: std::collections::HashMap<String, serde_json::Value>,
+    /// Optional metadata (environment tags, etc.).  Not consumed by
+    /// the resolver today but preserved on the type for forward
+    /// compatibility.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Free-form description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// Result of claiming a command.
 #[derive(Debug, Clone)]
 pub enum ClaimResult {
@@ -294,6 +330,62 @@ impl ControlPlaneClient {
 
         let value: serde_json::Value = response.json().await?;
         Ok(Some(value))
+    }
+
+    /// Resolve a keychain credential alias to its full record.
+    ///
+    /// Calls `GET /api/credentials/{alias}?include_data=true` on the
+    /// server and returns the decrypted payload.  Used by the worker
+    /// dispatch path (`executor::command::resolve_auth_alias`) when a
+    /// playbook step's `auth:` field is a bare string — see
+    /// noetl/ai-meta#48 for the regression brief.
+    ///
+    /// Per `agents/rules/execution-model.md`'s "Secrets and credentials"
+    /// rule the credential body never lives in worker pod env; the
+    /// keychain is the source of truth and the worker resolves at
+    /// dispatch time.  `execution_id` is forwarded so the server's
+    /// keychain cache scopes lookups correctly (and so audit logging
+    /// attributes the read to the playbook run).
+    ///
+    /// Returns `Ok(None)` when the server responds 404 — the caller
+    /// converts that into a clear `Credential alias '<name>' not
+    /// found in keychain` error so operators see the alias name in
+    /// the failure message rather than a serde mismatch.
+    pub async fn get_credential(
+        &self,
+        alias: &str,
+        execution_id: i64,
+    ) -> Result<Option<Credential>> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/api/credentials/{}",
+                self.server_url, alias
+            ))
+            .query(&[
+                ("include_data", "true"),
+                ("execution_id", &execution_id.to_string()),
+            ])
+            .send()
+            .await?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "get_credential('{}') failed: HTTP {} {}",
+                alias,
+                status.as_u16(),
+                body
+            );
+        }
+
+        let parsed: Credential = response.json().await?;
+        Ok(Some(parsed))
     }
 
     /// Set a variable value for an execution.
@@ -610,5 +702,140 @@ mod tests {
 
         let client = ControlPlaneClient::new("http://localhost:8082/");
         assert_eq!(client.server_url, "http://localhost:8082");
+    }
+
+    // -----------------------------------------------------------------
+    // `get_credential` integration tests (noetl/ai-meta#48)
+    //
+    // Use the same axum-based mock-server pattern as the put_result
+    // tests above.  Each test spawns a tiny HTTP server on
+    // 127.0.0.1:0, exercises the client against it, then asserts.
+    // -----------------------------------------------------------------
+
+    use axum::{
+        extract::{Path, Query},
+        routing::get,
+        Json, Router,
+    };
+    use std::collections::HashMap;
+    use tokio::net::TcpListener;
+
+    async fn spawn_credential_server(
+        response: Option<serde_json::Value>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let canned = response.clone();
+        let app = Router::new().route(
+            "/api/credentials/{alias}",
+            get(
+                move |Path(alias): Path<String>,
+                      Query(qs): Query<HashMap<String, String>>| {
+                    let canned = canned.clone();
+                    async move {
+                        // include_data + execution_id are the contract
+                        // — assert them so the test fails fast if the
+                        // client forgets a query param.
+                        assert_eq!(
+                            qs.get("include_data").map(String::as_str),
+                            Some("true"),
+                            "get_credential must request include_data=true"
+                        );
+                        assert!(
+                            qs.contains_key("execution_id"),
+                            "get_credential must forward execution_id"
+                        );
+                        match canned {
+                            Some(body) => Ok(Json(body)),
+                            None => Err(axum::http::StatusCode::NOT_FOUND),
+                        }
+                        .map(|json| (axum::http::StatusCode::OK, json))
+                        .or_else(|status| {
+                            Err::<(axum::http::StatusCode, Json<serde_json::Value>), _>(status)
+                        })
+                        .map(|(_status, body)| {
+                            // Echo the alias so the test can assert
+                            // the URL was routed correctly.
+                            let mut body = body;
+                            if let Some(map) = body.0.as_object_mut() {
+                                map.insert(
+                                    "_test_routed_alias".to_string(),
+                                    serde_json::Value::String(alias.clone()),
+                                );
+                            }
+                            body
+                        })
+                    }
+                },
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("axum serve");
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn get_credential_decodes_postgres_credential_response() {
+        let (base, _handle) = spawn_credential_server(Some(serde_json::json!({
+            "id": "611677533586588198",
+            "name": "pg_local",
+            "type": "postgres",
+            "data": {
+                "db_host": "postgres.local",
+                "db_port": "5432",
+                "db_user": "demo",
+                "db_password": "demo_pw",
+                "db_name": "demo_noetl"
+            },
+            "tags": ["dev", "postgres"],
+            "description": "Local Postgres for tests"
+        })))
+        .await;
+        let client = ControlPlaneClient::new(&base);
+
+        let cred = client
+            .get_credential("pg_local", 42)
+            .await
+            .expect("get_credential ok")
+            .expect("credential present");
+
+        assert_eq!(cred.name, "pg_local");
+        assert_eq!(cred.cred_type, "postgres");
+        assert_eq!(
+            cred.data.get("db_host").and_then(|v| v.as_str()),
+            Some("postgres.local")
+        );
+        assert_eq!(cred.tags, vec!["dev", "postgres"]);
+    }
+
+    #[tokio::test]
+    async fn get_credential_returns_none_on_404() {
+        let (base, _handle) = spawn_credential_server(None).await;
+        let client = ControlPlaneClient::new(&base);
+
+        let result = client
+            .get_credential("does_not_exist", 1)
+            .await
+            .expect("get_credential ok");
+        assert!(result.is_none(), "404 must map to Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn get_credential_propagates_unexpected_http_error() {
+        // The default route on this router returns 404 for any URL
+        // not matching `/api/credentials/{alias}`.  Point the client
+        // at an unbound port to force a connection error.
+        let client = ControlPlaneClient::new("http://127.0.0.1:1");
+        let err = client.get_credential("anything", 1).await.unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("error sending request")
+                || msg.contains("Connection refused")
+                || msg.contains("os error"),
+            "expected a transport-level error, got: {msg}"
+        );
     }
 }
