@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.11.0](https://github.com/noetl/worker/compare/v5.10.0...v5.11.0) (2026-06-03)
+
+### Features
+
+* **dispatch:** honor server_url from NATS command notification ([e972d1b](https://github.com/noetl/worker/commit/e972d1bab9028d159a2700aa63c4daed3e45ddf8)), closes [noetl/ai-meta#53](https://github.com/noetl/ai-meta/issues/53) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [#35](https://github.com/noetl/worker/issues/35) [noetl/server#33](https://github.com/noetl/server/issues/33) [noetl/server#34](https://github.com/noetl/server/issues/34) [noetl/ai-meta#53](https://github.com/noetl/ai-meta/issues/53) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [5.10.0](https://github.com/noetl/worker/compare/v5.9.0...v5.10.0) (2026-06-03)
 
 ### Features
