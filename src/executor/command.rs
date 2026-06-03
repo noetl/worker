@@ -189,6 +189,41 @@ impl CommandExecutor {
     /// Both labeled by tool_kind so the dashboard can spot which
     /// tools are slow / failing.
     pub async fn execute(&self, command: &Command) -> Result<()> {
+        self.execute_with_server_url(command, None).await
+    }
+
+    /// Execute a command with an optional per-dispatch server-URL
+    /// override.
+    ///
+    /// noetl/ai-meta#53 Gap 1: the NATS notification carries a
+    /// `server_url` field identifying the server that PUBLISHED
+    /// the command.  Multi-server deployments (e.g. a kind cluster
+    /// running both `noetl-server` (Python) and `noetl-server-rust`
+    /// side by side) need each command's lifecycle events
+    /// (claim → started → call.done → completed) to flow back to
+    /// the originating server so its orchestrator can advance the
+    /// playbook.  Without an override, the executor's captured
+    /// client + server_url (initialised from `NOETL_SERVER_URL` at
+    /// worker startup) wins, and events for a Rust-server-dispatched
+    /// command end up at the Python server — silently recorded to
+    /// the shared DB but not driving any orchestrator.
+    ///
+    /// When `server_url_override` is `Some`, this method:
+    ///   * Builds a per-dispatch `ControlPlaneClient` via
+    ///     `client.with_server_url(override)` — cheap; the inner
+    ///     `reqwest::Client` is Arc-shared.
+    ///   * Threads the override URL through to `ExecutionContext`
+    ///     (where `auth` tools resolve credentials against the
+    ///     callback URL) and through every call site that would
+    ///     otherwise have used `self.client` / `self.server_url`.
+    ///
+    /// `None` keeps the old behaviour: every dispatch uses the
+    /// startup-configured client + server URL.
+    pub async fn execute_with_server_url(
+        &self,
+        command: &Command,
+        server_url_override: Option<&str>,
+    ) -> Result<()> {
         let span = tracing::info_span!(
             "command.execute",
             execution_id = command.execution_id,
@@ -198,6 +233,18 @@ impl CommandExecutor {
             attempts = command.attempts,
         );
         let _enter = span.enter();
+
+        // Per-dispatch client + URL.  When the notification carries
+        // a server_url, build a fresh `ControlPlaneClient` pointed
+        // at the publishing server; otherwise reuse the captured
+        // client (and server_url) from worker startup.
+        let dispatch_server_url: String = server_url_override
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.server_url.clone());
+        let dispatch_client: ControlPlaneClient = match server_url_override {
+            Some(url) if url != self.server_url => self.client.with_server_url(url),
+            _ => self.client.clone(),
+        };
 
         // Timer captures the full dispatch latency including tool
         // execution + case evaluation + lifecycle events.  Recorded
@@ -216,7 +263,7 @@ impl CommandExecutor {
         };
 
         // Build execution context
-        let mut ctx = ExecutionContext::new(command.execution_id, &command.step, &self.server_url)
+        let mut ctx = ExecutionContext::new(command.execution_id, &command.step, &dispatch_server_url)
             .with_worker_id(&self.worker_id)
             .with_command_id(&command.command_id);
 
@@ -247,7 +294,7 @@ impl CommandExecutor {
         // command-specific keys.  The server's `EventRequest` /
         // Python's `EventEmitRequest` both read `step` /
         // `worker_id` from the top level after EE-2 + EE-4.
-        self.emit_event(
+        self.emit_event_via(&dispatch_client, 
             "command.started",
             &command.step,
             "STARTED",
@@ -294,7 +341,7 @@ impl CommandExecutor {
         // absent), this is a no-op + no HTTP call.
         let alias_secrets = super::auth_alias::resolve_auth_alias(
             &mut tool_config_value,
-            &self.client,
+            &dispatch_client,
             command.execution_id,
         )
         .await?;
@@ -367,7 +414,7 @@ impl CommandExecutor {
                     command.execution_id,
                     &command.step,
                     self.arrow_cache.as_ref(),
-                    &self.client,
+                    &dispatch_client,
                 )
                 .await
                 {
@@ -382,7 +429,7 @@ impl CommandExecutor {
                         serde_json::json!({ "status": result.status.to_string() })
                     }
                 };
-                self.emit_event(
+                self.emit_event_via(&dispatch_client, 
                     "call.done",
                     &command.step,
                     "COMPLETED",
@@ -400,7 +447,7 @@ impl CommandExecutor {
             }
             Err(e) => {
                 // Emit call.error event
-                self.emit_event(
+                self.emit_event_via(&dispatch_client, 
                     "call.error",
                     &command.step,
                     "FAILED",
@@ -415,7 +462,7 @@ impl CommandExecutor {
                 .await?;
 
                 // Emit command.failed event
-                self.emit_event(
+                self.emit_event_via(&dispatch_client, 
                     "command.failed",
                     &command.step,
                     "FAILED",
@@ -461,7 +508,7 @@ impl CommandExecutor {
                         // becomes the envelope status so the projector
                         // sees the actual case outcome.
                         let exit_status = status.clone();
-                        self.emit_event(
+                        self.emit_event_via(&dispatch_client, 
                             "step.exit",
                             &command.step,
                             &exit_status,
@@ -476,13 +523,13 @@ impl CommandExecutor {
                     }
                     CaseAction::SetVar { name, value } => {
                         // Set variable via API
-                        self.client
+                        dispatch_client
                             .set_variable(command.execution_id, &name, value)
                             .await?;
                     }
                     CaseAction::Fail { message } => {
                         // Emit command.failed event
-                        self.emit_event(
+                        self.emit_event_via(&dispatch_client, 
                             "command.failed",
                             &command.step,
                             "FAILED",
@@ -510,7 +557,7 @@ impl CommandExecutor {
         // becomes the envelope status — projectors group by status
         // to compute success/failure rates per step.
         let completion_status = tool_result.status.to_string();
-        self.emit_event(
+        self.emit_event_via(&dispatch_client, 
             "command.completed",
             &command.step,
             &completion_status,
@@ -552,8 +599,18 @@ impl CommandExecutor {
     /// attempt failed); the retry count is currently not exposed
     /// by the client, so this MVP records 0 — a follow-up will
     /// thread the actual retry count back from the client.
-    async fn emit_event(
+    /// Emit a lifecycle event via the given control-plane client.
+    ///
+    /// Takes an explicit client argument so per-dispatch routing
+    /// (noetl/ai-meta#53 Gap 1) can override the captured
+    /// `self.client` for events that should land on the server
+    /// that published the command rather than the startup-
+    /// configured `NOETL_SERVER_URL` server.  Every callsite inside
+    /// `execute_with_server_url` passes a per-dispatch
+    /// `ControlPlaneClient`.
+    async fn emit_event_via(
         &self,
+        client: &ControlPlaneClient,
         event_type: &str,
         step: &str,
         status: &str,
@@ -574,7 +631,7 @@ impl CommandExecutor {
         };
 
         let emit_start = std::time::Instant::now();
-        let result = self.client.emit_event_with_retry(event, 3).await;
+        let result = client.emit_event_with_retry(event, 3).await;
         crate::metrics::record_event_emit(event_type, emit_start.elapsed().as_secs_f64(), 0);
         result
     }

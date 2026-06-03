@@ -170,11 +170,24 @@ impl CommandSource for NatsCommandSource {
             command_id = %notification.command_id,
             step = %notification.step,
             event_id = notification.event_id,
+            server_url = %notification.server_url,
             "Pulled command notification from NATS"
         );
 
-        let claim = self
-            .client
+        // noetl/ai-meta#53 Gap 1: route `claim_command` (and every
+        // downstream HTTP call this dispatch makes) to the server
+        // that PUBLISHED this notification — carried as
+        // `notification.server_url`.  Without this override the
+        // claim went to the global env-var server URL, which is
+        // the wrong server when a different server (e.g. the Rust
+        // `noetl-server-rust` deployment) published the command;
+        // the trigger_orchestrator call back into the publishing
+        // server never fired, stalling multi-step playbooks at
+        // the first `command.completed`.  The reqwest client is
+        // internally Arc'd so this clone is cheap.
+        let dispatch_client = self.client.with_server_url(&notification.server_url);
+
+        let claim = dispatch_client
             .claim_command(notification.event_id, &self.worker_id)
             .await?;
 
