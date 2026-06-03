@@ -184,6 +184,28 @@ pub struct ControlPlaneClient {
 }
 
 impl ControlPlaneClient {
+    /// Return a clone of this client with a different server URL.
+    ///
+    /// Used by the dispatch path (noetl/ai-meta#53 Gap 1) so each
+    /// command's HTTP callbacks go to the server that published
+    /// the command (carried as `server_url` on the NATS
+    /// notification) rather than the global env-var server URL.
+    /// Cheap: `reqwest::Client` is internally reference-counted, so
+    /// the inner HTTP client + connection pool are shared.
+    pub fn with_server_url(&self, server_url: &str) -> Self {
+        Self {
+            client: self.client.clone(),
+            server_url: server_url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// Borrow the server URL this client is currently configured
+    /// with.  Useful for log lines that want to surface which
+    /// server a particular dispatch is targeting.
+    pub fn server_url(&self) -> &str {
+        &self.server_url
+    }
+
     /// Create a new control plane client.
     pub fn new(server_url: &str) -> Self {
         let client = reqwest::Client::builder()
@@ -837,5 +859,34 @@ mod tests {
                 || msg.contains("os error"),
             "expected a transport-level error, got: {msg}"
         );
+    }
+
+    /// noetl/ai-meta#53 Gap 1: `with_server_url` returns a fresh
+    /// client pointed at a different server.  The original client's
+    /// URL stays untouched (clients are immutable from the outside)
+    /// so the global startup client isn't accidentally mutated by
+    /// a per-dispatch override.
+    #[test]
+    fn test_with_server_url_returns_independent_client() {
+        let original = ControlPlaneClient::new("http://noetl.noetl.svc:8082");
+        assert_eq!(original.server_url(), "http://noetl.noetl.svc:8082");
+
+        let overridden = original.with_server_url("http://noetl-server-rust.noetl.svc:8082");
+        assert_eq!(
+            overridden.server_url(),
+            "http://noetl-server-rust.noetl.svc:8082"
+        );
+
+        // Original keeps its URL.
+        assert_eq!(original.server_url(), "http://noetl.noetl.svc:8082");
+    }
+
+    /// `with_server_url` strips a trailing slash so callers can
+    /// pass either form without `format!` doubling up the path
+    /// separator at downstream call sites.
+    #[test]
+    fn test_with_server_url_trims_trailing_slash() {
+        let c = ControlPlaneClient::new("http://x/").with_server_url("http://y:8082/");
+        assert_eq!(c.server_url(), "http://y:8082");
     }
 }

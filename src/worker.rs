@@ -263,6 +263,17 @@ impl Worker {
                         "Command claimed"
                     );
 
+                    // noetl/ai-meta#53 Gap 1: extract the publishing
+                    // server's URL from the NATS notification BEFORE
+                    // we hand the ack back to the source (which owns
+                    // the handle).  The dispatch task uses this to
+                    // route lifecycle events back to the server that
+                    // published the command, not the global env-var
+                    // server URL.  Empty string (which the
+                    // notification never carries in practice) falls
+                    // back to the captured client.
+                    let dispatch_server_url = ack.notification.server_url.clone();
+
                     // Ack the source handle now that we own the
                     // command; dispatch happens off the pull loop.
                     {
@@ -287,7 +298,15 @@ impl Worker {
                         // Keep permit until done
                         let _permit = permit;
 
-                        if let Err(e) = executor.execute(&command).await {
+                        let override_url = if dispatch_server_url.is_empty() {
+                            None
+                        } else {
+                            Some(dispatch_server_url.as_str())
+                        };
+                        if let Err(e) = executor
+                            .execute_with_server_url(&command, override_url)
+                            .await
+                        {
                             // Per `observability.md` Principle 4:
                             // structured execution_id on every
                             // ERROR.  Includes `step` for the
