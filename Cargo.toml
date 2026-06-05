@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # Tool library.
 #
-# `noetl-tools = "2.16"` picks up:
+# `noetl-tools = "2.18"` picks up:
 # - `arrow_codec::try_encode_tabular_json` (2.10.0): the worker's
 #   `build_call_done_result` calls it on the over-budget branch to
 #   encode DuckDB / Postgres rowsets as Arrow IPC stream bytes
@@ -34,7 +34,24 @@ path = "src/main.rs"
 #   per-variant match arm needed — the dynamic registry handles it.
 # - `McpTool` (2.16.0, noetl/tools#13): MCP JSON-RPC over HTTP bridge
 #   dispatched via `tool_kind = "mcp"`.  Same dynamic-registry pattern.
-noetl-tools = "2.16"
+# - `PythonTool` result-global capture (2.17.1, noetl/tools#17):
+#   user code's `result = {...}` global is captured via a sentinel-
+#   marker line on stdout and exposed as the tool's `data` field.
+#   Without this, every playbook whose next.arcs / step.when guards
+#   read step results would stall — the orchestrator couldn't
+#   resolve `{{ step_name.field }}` references to a real value.
+#   Surfaced via the Rust-only e2e probe on the Rust server (see
+#   noetl/ai-meta#59 follow-up).
+# - `TaskSequenceTool` (2.18.0, noetl/tools#18): the runtime for
+#   the v10 list-shaped `tool: [...]` pipeline.  Server emits
+#   `tool.kind = task_sequence` for any pipeline-shape step (per
+#   noetl/server#61's accepted-both-shapes parser); without this
+#   tool the worker errored with "Tool not found: task_sequence"
+#   and every pipeline-shape fixture stalled.  Threads results
+#   across tasks via `_prev` / `_results` injected into the
+#   Jinja context; renders each task's config against the
+#   augmented context before dispatch.
+noetl-tools = "2.18"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
