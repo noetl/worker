@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.11.3](https://github.com/noetl/worker/compare/v5.11.2...v5.11.3) (2026-06-05)
+
+### Bug Fixes
+
+* **auth_alias:** resolve keychain aliases on task_sequence sub-tasks ([ec17624](https://github.com/noetl/worker/commit/ec176243eab28c17b9e6d7eb1585204ae03161d2)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/worker#47](https://github.com/noetl/worker/issues/47) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [5.11.2](https://github.com/noetl/worker/compare/v5.11.1...v5.11.2) (2026-06-05)
 
 ### Bug Fixes
