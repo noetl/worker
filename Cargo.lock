@@ -2565,9 +2565,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "2.18.2"
+version = "2.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "450683f0eaf1d09c85a0fc39d669a7dd4793fff3f81da90d2f949a2554cc2f72"
+checksum = "e7dde1fffcae014cebab1cf763798d7f121be1e5669664574e7be9368b6f3ea3"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
