@@ -58,6 +58,18 @@ path = "src/main.rs"
 #   failing-SQL playbook steps diagnosable from the event log.
 #   (Cargo.lock now resolves noetl-tools 2.18.2; `^2.18` already
 #   covered it.)
+# - PostgresTool + DuckdbTool canonical v10 SQL shapes (2.18.3,
+#   noetl/tools#23): the postgres tool accepts `command:` as an alias
+#   for `query:` (canonical v10 postgres steps use `command:`, e.g.
+#   v10_canonical_example.yaml), and both the postgres and duckdb tools
+#   now run multi-statement SQL (`CREATE …; INSERT …; SELECT …`) by
+#   batching the leading statements and keeping the final statement on
+#   the typed single-statement path (so a trailing SELECT still returns
+#   typed rows).  Without this, canonical postgres steps failed to parse
+#   (`missing field query`) and multi-statement duckdb/postgres fixtures
+#   errored on the single-statement prepared protocol.  Surfaced by the
+#   Rust-only kind regression sweep for noetl/ai-meta#54.  (Cargo.lock
+#   now resolves noetl-tools 2.18.3; `^2.18` already covered it.)
 noetl-tools = "2.18"
 
 # Shared execution core -- types and utilities shared with the noetl
