@@ -70,6 +70,15 @@ path = "src/main.rs"
 #   errored on the single-statement prepared protocol.  Surfaced by the
 #   Rust-only kind regression sweep for noetl/ai-meta#54.  (Cargo.lock
 #   now resolves noetl-tools 2.18.3; `^2.18` already covered it.)
+# - More canonical v10 config shapes (2.18.4, noetl/tools#26): the
+#   duckdb tool accepts `command:` as an alias for `query:` (parity
+#   with postgres), and the http tool coerces non-string `params` /
+#   `headers` / `form` values — template rendering yields integers
+#   (`offset: "{{ ctx.offset }}"`) or null (undefined ref), which the
+#   `HashMap<String,String>` fields rejected with `invalid type:
+#   integer/null, expected a string`.  Numbers/bools are stringified,
+#   null entries dropped.  Unblocks the pagination + http fixtures.
+#   (Cargo.lock now resolves noetl-tools 2.18.4; `^2.18` covers it.)
 noetl-tools = "2.18"
 
 # Shared execution core -- types and utilities shared with the noetl
