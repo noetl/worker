@@ -51,6 +51,13 @@ path = "src/main.rs"
 #   across tasks via `_prev` / `_results` injected into the
 #   Jinja context; renders each task's config against the
 #   augmented context before dispatch.
+# - PostgresTool error detail (2.18.2, noetl/tools#21): the postgres
+#   tool now surfaces the real SQLSTATE + message (e.g. `ERROR:
+#   relation "..." does not exist (SQLSTATE 42P01)`) instead of the
+#   opaque `db error` that tokio_postgres' Display renders.  Makes
+#   failing-SQL playbook steps diagnosable from the event log.
+#   (Cargo.lock now resolves noetl-tools 2.18.2; `^2.18` already
+#   covered it.)
 noetl-tools = "2.18"
 
 # Shared execution core -- types and utilities shared with the noetl
