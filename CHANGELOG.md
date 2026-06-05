@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.11.2](https://github.com/noetl/worker/compare/v5.11.1...v5.11.2) (2026-06-05)
+
+### Bug Fixes
+
+* **auth_alias:** resolve keychain alias under the v10 credential: key ([7f2d118](https://github.com/noetl/worker/commit/7f2d118885cdf09eb6369e436e955acaf90671ee)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/worker#45](https://github.com/noetl/worker/issues/45) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [5.11.1](https://github.com/noetl/worker/compare/v5.11.0...v5.11.1) (2026-06-05)
 
 ### Bug Fixes
