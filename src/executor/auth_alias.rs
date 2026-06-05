@@ -84,10 +84,21 @@ pub async fn resolve_auth_alias(
         None => return Ok(HashMap::new()),
     };
 
-    // Pop the `auth` slot only if it's a string — leave struct /
+    // Pop the alias slot only if it's a string — leave struct /
     // mapping values untouched so existing playbooks (and the
     // noetl-tools `AuthConfig` deserializer) keep working unchanged.
-    let alias = match map.get("auth") {
+    //
+    // The canonical v10 playbook YAML writes the keychain alias under
+    // `credential:` (e.g. `credential: "{{ pg_auth }}"`); older
+    // fixtures + the noetl/ai-meta#48 path use `auth:`.  Accept both
+    // — check `auth` first, then `credential`.  Without the
+    // `credential` fallback every v10 postgres/http step that
+    // references a keychain alias got no connection fields injected
+    // and the tool fell back to a default (unreachable) connection.
+    let alias = match map
+        .get("auth")
+        .or_else(|| map.get("credential"))
+    {
         Some(Value::String(s)) => s.clone(),
         _ => return Ok(HashMap::new()),
     };
@@ -117,6 +128,13 @@ fn apply_credential(
     alias: &str,
     credential: &Credential,
 ) -> Result<HashMap<String, String>> {
+    // Strip BOTH alias keys so neither leaks into the tool config as
+    // a stray string (the alias was carried under `auth` or
+    // `credential`; the type-specific appliers below inject the real
+    // connection fields / auth struct).
+    map.remove("auth");
+    map.remove("credential");
+
     let cred_type = credential.cred_type.to_lowercase();
     match cred_type.as_str() {
         "postgres" => apply_postgres(map, &credential.data),
@@ -135,8 +153,7 @@ fn apply_postgres(
     map: &mut serde_json::Map<String, Value>,
     data: &HashMap<String, Value>,
 ) -> Result<HashMap<String, String>> {
-    map.remove("auth");
-
+    // `auth` / `credential` already stripped by `apply_credential`.
     for (src, dst) in POSTGRES_FIELD_MAP {
         let Some(value) = data.get(*src) else { continue };
         // Don't clobber explicit playbook overrides — operator wrote
@@ -312,6 +329,48 @@ mod tests {
         // Tool-specific fields preserved.
         assert_eq!(map.get("kind").unwrap(), "postgres");
         assert_eq!(map.get("command").unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn postgres_alias_under_credential_key_resolves_and_strips() {
+        // Canonical v10 playbook YAML carries the keychain alias under
+        // `credential:` (not `auth:`).  apply_credential must strip
+        // BOTH alias keys and inject the flat connection fields.
+        // Regression for noetl/ai-meta#54 Phase F R5 — postgres
+        // fixtures stalled with "error connecting to server" because
+        // the alias under `credential:` was never resolved.
+        let mut cfg = serde_json::json!({
+            "kind": "postgres",
+            "credential": "pg_k8s",
+            "command": "CREATE TABLE t (id int)",
+        });
+        let c = cred(
+            "pg_k8s",
+            "postgres",
+            serde_json::json!({
+                "db_host": "postgres.postgres.svc.cluster.local",
+                "db_port": "5432",
+                "db_user": "demo",
+                "db_password": "demo_pw",
+                "db_name": "demo_noetl",
+            }),
+        );
+
+        let map = cfg.as_object_mut().unwrap();
+        let secrets = apply_credential(map, "pg_k8s", &c).unwrap();
+
+        assert!(secrets.is_empty());
+        assert!(!map.contains_key("auth"), "auth stripped");
+        assert!(
+            !map.contains_key("credential"),
+            "credential key stripped so it doesn't leak into PostgresConfig"
+        );
+        assert_eq!(map.get("host").unwrap(), "postgres.postgres.svc.cluster.local");
+        assert_eq!(map.get("port").unwrap(), 5432);
+        assert_eq!(map.get("user").unwrap(), "demo");
+        assert_eq!(map.get("password").unwrap(), "demo_pw");
+        assert_eq!(map.get("database").unwrap(), "demo_noetl");
+        assert_eq!(map.get("command").unwrap(), "CREATE TABLE t (id int)");
     }
 
     #[test]
