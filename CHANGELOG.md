@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.11.1](https://github.com/noetl/worker/compare/v5.11.0...v5.11.1) (2026-06-05)
+
+### Bug Fixes
+
+* **command:** preserve array tool_config for task_sequence ([91434ab](https://github.com/noetl/worker/commit/91434ab5fe0b93a2153cb8800f77493d265f9988)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/worker#43](https://github.com/noetl/worker/issues/43) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [5.11.0](https://github.com/noetl/worker/compare/v5.10.0...v5.11.0) (2026-06-03)
 
 ### Features
