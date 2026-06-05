@@ -313,14 +313,29 @@ impl CommandExecutor {
         // nested config doesn't already carry it (mirrors the worker's
         // pre-PR-2d-2 `Command.tool_config_value()` behaviour).
         let mut tool_config_value = {
-            let mut cfg = command
+            let raw = command
                 .input
                 .get("tool_config")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            if !cfg.is_object() {
-                cfg = serde_json::json!({});
-            }
+            // Tools whose server-side `tool_config` is an array
+            // (currently only `task_sequence`, which sends a
+            // pipeline `[{label: spec}, ...]`) used to be silently
+            // discarded here — the old `if !cfg.is_object()` arm
+            // replaced the array with `{}`, leaving the worker to
+            // dispatch an empty config to the registry.  Preserve
+            // the array by wrapping it under a `tool_config` key
+            // so the flattened `ToolConfig.config` carries it
+            // forward; the `task_sequence` parser accepts that
+            // exact "worker envelope" shape per its `parse_tasks`
+            // contract in noetl-tools v2.18.1.
+            let mut cfg = if raw.is_object() {
+                raw
+            } else if raw.is_array() {
+                serde_json::json!({ "tool_config": raw })
+            } else {
+                serde_json::json!({})
+            };
             if let Some(map) = cfg.as_object_mut() {
                 map.entry("kind".to_string())
                     .or_insert_with(|| serde_json::json!(command.tool_kind));
