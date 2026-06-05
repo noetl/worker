@@ -79,6 +79,60 @@ pub async fn resolve_auth_alias(
     client: &ControlPlaneClient,
     execution_id: i64,
 ) -> Result<HashMap<String, String>> {
+    // task_sequence pipelines carry the keychain alias on each
+    // SUB-TASK (`credential:` / `auth:` inside a pipeline entry), not
+    // on the outer envelope.  The task_sequence tool dispatches its
+    // sub-tasks through noetl-tools' registry, which has no
+    // ControlPlaneClient and so can't resolve aliases — every nested
+    // postgres/http step therefore got no connection fields and fell
+    // back to a default (unreachable) connection.  Pre-resolve each
+    // pipeline task's inner spec here, in the worker, before the
+    // task_sequence runs.  See noetl/worker#47.
+    //
+    // Detect the task_sequence shape without holding a borrow across
+    // the await points below.
+    let is_task_sequence = tool_config_value
+        .as_object()
+        .and_then(|m| m.get("kind"))
+        .and_then(|v| v.as_str())
+        == Some("task_sequence");
+
+    if is_task_sequence {
+        let mut all_secrets = HashMap::new();
+        if let Some(Value::Array(tasks)) = tool_config_value
+            .as_object_mut()
+            .and_then(|m| m.get_mut("tool_config"))
+        {
+            // Each pipeline entry is a single-key `{label: spec}` map;
+            // resolve the alias (if any) on each task's inner spec.
+            for task in tasks.iter_mut() {
+                if let Some(task_obj) = task.as_object_mut() {
+                    for (_label, spec) in task_obj.iter_mut() {
+                        let secrets =
+                            resolve_single_tool_alias(spec, client, execution_id).await?;
+                        all_secrets.extend(secrets);
+                    }
+                }
+            }
+        }
+        return Ok(all_secrets);
+    }
+
+    resolve_single_tool_alias(tool_config_value, client, execution_id).await
+}
+
+/// Resolve a keychain alias on a single (non-pipeline) tool config.
+///
+/// Looks for the alias under `auth` or `credential`, fetches the
+/// credential from the keychain via the control-plane API, and
+/// applies it (injecting flat connection fields for postgres, an
+/// `AuthConfig` struct for bearer/api_key/basic).  Returns the
+/// secrets to seed into the execution context (empty for postgres).
+async fn resolve_single_tool_alias(
+    tool_config_value: &mut Value,
+    client: &ControlPlaneClient,
+    execution_id: i64,
+) -> Result<HashMap<String, String>> {
     let map = match tool_config_value.as_object_mut() {
         Some(m) => m,
         None => return Ok(HashMap::new()),
