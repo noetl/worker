@@ -79,6 +79,14 @@ path = "src/main.rs"
 #   integer/null, expected a string`.  Numbers/bools are stringified,
 #   null entries dropped.  Unblocks the pagination + http fixtures.
 #   (Cargo.lock now resolves noetl-tools 2.18.4; `^2.18` covers it.)
+# - Dollar-quote-aware statement splitter (2.18.5, noetl/tools#27): the
+#   multi-statement splitter added in 2.18.3 split on `;` inside
+#   PostgreSQL `$$ … $$` dollar-quoted blocks, shredding plpgsql function
+#   bodies / `DO` blocks (`unterminated dollar-quoted string`).  The
+#   splitter now tracks dollar-quote state (`$$`/`$tag$`; `$1` params
+#   excluded).  Surfaced by data_transfer/postgres_jsonb_test on the
+#   Rust-only kind regression sweep (noetl/ai-meta#54).  (Cargo.lock now
+#   resolves noetl-tools 2.18.5; `^2.18` covers it.)
 noetl-tools = "2.18"
 
 # Shared execution core -- types and utilities shared with the noetl
