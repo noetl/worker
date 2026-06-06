@@ -207,11 +207,16 @@ impl ControlPlaneClient {
     }
 
     /// Create a new control plane client.
+    ///
+    /// Plain HTTP by default.  When `NOETL_TLS_CLIENT_CERT` +
+    /// `NOETL_TLS_CLIENT_KEY` (and optionally `NOETL_TLS_CA`) are set the
+    /// client presents a certificate for **mTLS** to the server's TLS
+    /// listener (Secrets Wallet Phase 4b, noetl/ai-meta#61).  A TLS
+    /// misconfiguration is fatal — a worker that must reach an mTLS server
+    /// fails fast rather than silently downgrading to a plain client.
     pub fn new(server_url: &str) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        let client = crate::client::tls::build_http_client(Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("control-plane HTTP client init failed: {e:#}"));
 
         Self {
             client,
@@ -380,10 +385,7 @@ impl ControlPlaneClient {
     ) -> Result<Option<Credential>> {
         let response = self
             .client
-            .get(format!(
-                "{}/api/credentials/{}",
-                self.server_url, alias
-            ))
+            .get(format!("{}/api/credentials/{}", self.server_url, alias))
             .query(&[
                 ("include_data", "true"),
                 ("execution_id", &execution_id.to_string()),
@@ -749,8 +751,7 @@ mod tests {
         let app = Router::new().route(
             "/api/credentials/{alias}",
             get(
-                move |Path(alias): Path<String>,
-                      Query(qs): Query<HashMap<String, String>>| {
+                move |Path(alias): Path<String>, Query(qs): Query<HashMap<String, String>>| {
                     let canned = canned.clone();
                     async move {
                         // include_data + execution_id are the contract
