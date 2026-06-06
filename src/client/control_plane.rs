@@ -9,9 +9,13 @@
 //! [ee]: https://github.com/noetl/server/wiki/event-envelope
 
 use anyhow::Result;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 // Re-export the shared envelope so the rest of the worker keeps
 // importing it from `crate::client` (callers don't need to know it
@@ -181,6 +185,13 @@ impl Command {
 pub struct ControlPlaneClient {
     client: reqwest::Client,
     server_url: String,
+    /// Long-lived X25519 [`StaticSecret`] generated once at startup
+    /// (Secrets Wallet Phase 5c, noetl/ai-meta#61).  Wrapped in `Arc` so the
+    /// inner key bytes are shared across [`with_server_url`] dispatch clones
+    /// — the recipient identity stays constant for the worker's lifetime, so
+    /// every sealed credential the server addresses to this pool unseals
+    /// with the same secret.
+    sealing_sk: Arc<StaticSecret>,
 }
 
 impl ControlPlaneClient {
@@ -196,6 +207,7 @@ impl ControlPlaneClient {
         Self {
             client: self.client.clone(),
             server_url: server_url.trim_end_matches('/').to_string(),
+            sealing_sk: Arc::clone(&self.sealing_sk),
         }
     }
 
@@ -217,11 +229,80 @@ impl ControlPlaneClient {
     pub fn new(server_url: &str) -> Self {
         let client = crate::client::tls::build_http_client(Duration::from_secs(30))
             .unwrap_or_else(|e| panic!("control-plane HTTP client init failed: {e:#}"));
+        let sealing_sk = StaticSecret::random_from_rng(rand_core::OsRng);
 
         Self {
             client,
             server_url: server_url.trim_end_matches('/').to_string(),
+            sealing_sk: Arc::new(sealing_sk),
         }
+    }
+
+    /// Base64-encoded X25519 public key the worker registers as the recipient
+    /// for sealed credential responses (Secrets Wallet Phase 5c).  The matching
+    /// [`StaticSecret`] stays in-process — only the public half ever leaves.
+    pub fn worker_public_key_b64(&self) -> String {
+        let pk = PublicKey::from(self.sealing_sk.as_ref());
+        B64.encode(pk.as_bytes())
+    }
+
+    /// Fetch a credential addressed to this worker as a sealed payload
+    /// (Secrets Wallet Phase 5c, server endpoint Phase 5b).
+    ///
+    /// Calls `GET /api/credentials/{alias}/sealed?worker_id=<worker_id>`,
+    /// receives a [`SealedEnvelope`] addressed to this worker's
+    /// [`worker_public_key_b64`], unseals it with the long-lived
+    /// [`StaticSecret`], and returns the same [`Credential`] shape
+    /// [`get_credential`] returns — so the auth-alias resolver can stay
+    /// shape-stable across the plaintext / sealed paths.
+    ///
+    /// **Zeroization.** The intermediate plaintext `Vec<u8>` is wiped with
+    /// [`zeroize::Zeroize`] after `serde_json::from_slice` consumes it.  The
+    /// returned [`Credential`]'s `data` map still carries the raw secret
+    /// (the caller — `auth_alias.rs` — owns that and should zeroize on its
+    /// side after the tool dispatch returns).
+    pub async fn get_sealed_credential(
+        &self,
+        alias: &str,
+        worker_id: &str,
+        execution_id: i64,
+    ) -> Result<Option<Credential>> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/api/credentials/{}/sealed",
+                self.server_url, alias
+            ))
+            .query(&[
+                ("worker_id", worker_id),
+                ("execution_id", &execution_id.to_string()),
+            ])
+            .send()
+            .await?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "get_sealed_credential('{alias}', worker_id='{worker_id}') failed: HTTP {} {body}",
+                status.as_u16(),
+            );
+        }
+        let envelope: crate::client::SealedEnvelope = response.json().await?;
+        let mut plaintext = crate::client::sealed_open(&self.sealing_sk, &envelope)?;
+        let credential: Credential =
+            serde_json::from_slice(&plaintext).map_err(|e| {
+                plaintext.zeroize();
+                anyhow::anyhow!("get_sealed_credential('{alias}'): decode plaintext: {e}")
+            })?;
+        // Plaintext bytes wiped — the value is now in `credential.data`,
+        // which the caller is responsible for clearing after the tool
+        // dispatch consumes it.
+        plaintext.zeroize();
+        Ok(Some(credential))
     }
 
     /// Atomically claim a command and fetch its details.
@@ -530,13 +611,21 @@ impl ControlPlaneClient {
         pool_name: &str,
         hostname: &str,
     ) -> Result<()> {
+        // Phase 5c (noetl/ai-meta#61): include the worker's X25519 sealing
+        // public key in the `runtime` JSON blob.  Server's
+        // `RuntimeService::get_worker_public_key` reads it from this exact
+        // path on a sealed-credential fetch; the field is harmless metadata
+        // when the server isn't on the Phase-5b code path.
         let response = self
             .client
             .post(format!("{}/api/worker/pool/register", self.server_url))
             .json(&serde_json::json!({
                 "name": worker_id,
                 "component_type": "worker_pool",
-                "runtime": "rust",
+                "runtime": {
+                    "kind": "rust",
+                    "worker_public_key": self.worker_public_key_b64(),
+                },
                 "status": "ready",
                 "hostname": hostname,
                 "labels": {

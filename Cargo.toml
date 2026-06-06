@@ -144,6 +144,20 @@ anyhow = "1.0"
 # Regex
 regex = "1.10"
 
+# Secrets Wallet Phase 5c (noetl/ai-meta#61) — worker-side sealed credential
+# delivery.  Long-lived X25519 StaticSecret registered as the recipient
+# pubkey; ChaCha20-Poly1305 + HKDF-SHA256 unseal the server's SealedEnvelope
+# (mirror of noetl/server's src/crypto/sealed.rs primitives).  base64 for
+# the wire-shape decode; zeroize for explicit cleartext wipe after the
+# caller's tool dispatch returns.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+zeroize = "1.7"
+rand_core = "0.6"
+
 # Utilities
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

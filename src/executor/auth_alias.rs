@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
-use crate::client::{Credential, ControlPlaneClient};
+use crate::client::{ControlPlaneClient, Credential};
 
 /// Mapping from credential `data` keys to the postgres tool's flat
 /// connection-config keys.  Mirrors the Python normalization in
@@ -108,8 +108,7 @@ pub async fn resolve_auth_alias(
             for task in tasks.iter_mut() {
                 if let Some(task_obj) = task.as_object_mut() {
                     for (_label, spec) in task_obj.iter_mut() {
-                        let secrets =
-                            resolve_single_tool_alias(spec, client, execution_id).await?;
+                        let secrets = resolve_single_tool_alias(spec, client, execution_id).await?;
                         all_secrets.extend(secrets);
                     }
                 }
@@ -149,16 +148,12 @@ async fn resolve_single_tool_alias(
     // `credential` fallback every v10 postgres/http step that
     // references a keychain alias got no connection fields injected
     // and the tool fell back to a default (unreachable) connection.
-    let alias = match map
-        .get("auth")
-        .or_else(|| map.get("credential"))
-    {
+    let alias = match map.get("auth").or_else(|| map.get("credential")) {
         Some(Value::String(s)) => s.clone(),
         _ => return Ok(HashMap::new()),
     };
 
-    let credential = client
-        .get_credential(&alias, execution_id)
+    let credential = fetch_credential_maybe_sealed(client, &alias, execution_id)
         .await
         .with_context(|| format!("looking up credential alias '{alias}' in keychain"))?
         .ok_or_else(|| {
@@ -169,7 +164,58 @@ async fn resolve_single_tool_alias(
             )
         })?;
 
-    apply_credential(map, &alias, &credential)
+    let mut credential = credential;
+    let injected_secrets = apply_credential(map, &alias, &credential)?;
+    // Phase 5c (noetl/ai-meta#61): zeroize the credential payload after the
+    // dispatcher has copied what it needs into the tool config / context.
+    // `apply_credential` reads `credential.data` by reference; once it
+    // returns we're done with the resolved-secret bytes here.  The fields
+    // landed in `tool_config_value` + `injected_secrets` are the caller's
+    // to manage.
+    use zeroize::Zeroize;
+    for v in credential.data.values_mut() {
+        if let Value::String(s) = v {
+            s.zeroize();
+        }
+    }
+    Ok(injected_secrets)
+}
+
+/// Route the credential fetch through the sealed endpoint when
+/// `NOETL_SEALED_CREDENTIALS=true` (or `1`) is set and the pod identifies
+/// itself via `WORKER_ID` (matching what the worker passes to
+/// `register_worker`).
+///
+/// Defense-in-depth on top of Phase-4 mTLS: with sealing on, the resolved
+/// secret travels as a [`ControlPlaneClient::get_sealed_credential`]
+/// SealedEnvelope; the cleartext exists only briefly inside the worker
+/// process after unseal, never inside the server's HTTP response body.
+///
+/// Defaults off — workers that don't opt in keep using the plaintext path
+/// they always used, so this round can land before the deployment manifests
+/// flip the flag.
+async fn fetch_credential_maybe_sealed(
+    client: &ControlPlaneClient,
+    alias: &str,
+    execution_id: i64,
+) -> Result<Option<Credential>> {
+    let sealed_enabled = std::env::var("NOETL_SEALED_CREDENTIALS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
+    if sealed_enabled {
+        if let Ok(worker_id) = std::env::var("WORKER_ID") {
+            if !worker_id.is_empty() {
+                return client
+                    .get_sealed_credential(alias, &worker_id, execution_id)
+                    .await;
+            }
+        }
+        tracing::warn!(
+            alias = %alias,
+            "NOETL_SEALED_CREDENTIALS=true but WORKER_ID is unset; falling back to plaintext credential fetch",
+        );
+    }
+    client.get_credential(alias, execution_id).await
 }
 
 /// Apply a resolved credential to a tool-config JSON object.
@@ -209,7 +255,9 @@ fn apply_postgres(
 ) -> Result<HashMap<String, String>> {
     // `auth` / `credential` already stripped by `apply_credential`.
     for (src, dst) in POSTGRES_FIELD_MAP {
-        let Some(value) = data.get(*src) else { continue };
+        let Some(value) = data.get(*src) else {
+            continue;
+        };
         // Don't clobber explicit playbook overrides — operator wrote
         // `port: 6543` to override the keychain default, keep that.
         if map.contains_key(*dst) {
@@ -419,7 +467,10 @@ mod tests {
             !map.contains_key("credential"),
             "credential key stripped so it doesn't leak into PostgresConfig"
         );
-        assert_eq!(map.get("host").unwrap(), "postgres.postgres.svc.cluster.local");
+        assert_eq!(
+            map.get("host").unwrap(),
+            "postgres.postgres.svc.cluster.local"
+        );
         assert_eq!(map.get("port").unwrap(), 5432);
         assert_eq!(map.get("user").unwrap(), "demo");
         assert_eq!(map.get("password").unwrap(), "demo_pw");
