@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.13.0](https://github.com/noetl/worker/compare/v5.12.0...v5.13.0) (2026-06-06)
+
+### Features
+
+* **client:** sealed credential delivery + worker keypair + zeroize (Phase 5c) ([218a5a5](https://github.com/noetl/worker/commit/218a5a522db618b273a36dcab43f6d344f9234bb)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [server#107](https://github.com/noetl/server/issues/107) [server#109](https://github.com/noetl/server/issues/109) [#57](https://github.com/noetl/worker/issues/57) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [5.12.0](https://github.com/noetl/worker/compare/v5.11.3...v5.12.0) (2026-06-06)
 
 ### Features
