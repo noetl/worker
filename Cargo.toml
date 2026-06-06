@@ -87,6 +87,12 @@ path = "src/main.rs"
 #   excluded).  Surfaced by data_transfer/postgres_jsonb_test on the
 #   Rust-only kind regression sweep (noetl/ai-meta#54).  (Cargo.lock now
 #   resolves noetl-tools 2.18.5; `^2.18` covers it.)
+# - GCP Secret Manager provider (2.19.0, noetl/tools#29): the
+#   `secrets` / `secret_manager` tools now dispatch on a `provider` field
+#   to a backend behind a `SecretProvider` trait — `env` (unchanged) or
+#   `gcp` (Google Secret Manager via ambient GKE Workload-Identity token).
+#   Secrets Wallet Phase 3a (noetl/ai-meta#61).  (Cargo.lock now resolves
+#   noetl-tools 2.19.0; `^2.18` covers it.)
 noetl-tools = "2.18"
 
 # Shared execution core -- types and utilities shared with the noetl
