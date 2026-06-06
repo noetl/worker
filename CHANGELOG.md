@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.12.0](https://github.com/noetl/worker/compare/v5.11.3...v5.12.0) (2026-06-06)
+
+### Features
+
+* **tls:** worker control-plane mTLS client (Secrets Wallet Phase 4b) ([3b70c17](https://github.com/noetl/worker/commit/3b70c17c908391198d96eae0d85f2dc66e9dd202)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [server#103](https://github.com/noetl/server/issues/103) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [5.11.3](https://github.com/noetl/worker/compare/v5.11.2...v5.11.3) (2026-06-05)
 
 ### Bug Fixes
