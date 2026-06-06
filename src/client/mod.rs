@@ -4,5 +4,6 @@
 //! from `noetl_executor::events`) is the shared event-envelope shape.
 
 mod control_plane;
+pub mod tls;
 
 pub use control_plane::{ClaimResult, Command, ControlPlaneClient, Credential, ExecutorEvent};
