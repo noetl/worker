@@ -93,7 +93,7 @@ path = "src/main.rs"
 #   `gcp` (Google Secret Manager via ambient GKE Workload-Identity token).
 #   Secrets Wallet Phase 3a (noetl/ai-meta#61).  (Cargo.lock now resolves
 #   noetl-tools 2.19.0; `^2.18` covers it.)
-noetl-tools = "2.18"
+noetl-tools = "2.21"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
@@ -108,7 +108,7 @@ noetl-tools = "2.18"
 # See Appendix H of the global hybrid cloud blueprint at
 # https://noetl.dev/docs/architecture/noetl_global_hybrid_cloud_grid_distributed_architecture_blueprint
 # and especially § H.10 (the tree-walker vs pull-model finding).
-noetl-executor = "0.3"
+noetl-executor = "0.4"
 
 # Same-node zero-copy IPC cache for over-budget tool results
 # (R-2.1 / noetl/cli#39).  When `call.done`'s serialised

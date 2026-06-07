@@ -444,19 +444,48 @@ impl CommandExecutor {
                         serde_json::json!({ "status": result.status.to_string() })
                     }
                 };
-                self.emit_event_via(&dispatch_client, 
-                    "call.done",
-                    &command.step,
-                    "COMPLETED",
-                    command.execution_id,
-                    command.attempts,
-                    serde_json::json!({
-                        "command_id": command.command_id.clone(),
-                        "call_index": ctx.call_index,
-                        "result": result_obj,
-                    }),
-                )
-                .await?;
+                // noetl/ai-meta#43 Round 4 — `pending_callback` adoption.
+                //
+                // `Tool::Container` (and any future tool that dispatches a
+                // long-running external work item) sets
+                // `ToolResult.pending_callback = Some(true)` to signal that
+                // the step's terminal `call.done` will be emitted
+                // asynchronously by a separate callback path
+                // (`POST /api/internal/container-callback/{eid}/{step}`
+                // on noetl-server, driven by `noetl-k8s-watcher`).  When
+                // that marker is set the worker MUST NOT emit its own
+                // `call.done` — doing so races the watcher's later emit
+                // (the server's stale-counter
+                // `noetl_container_callback_stale_total` records the
+                // collision) and the orchestrator sees an early-completion
+                // value with only the Job handle in `data`.
+                //
+                // All other tools omit the field (`None`) which keeps the
+                // pre-existing behaviour fully intact — the worker emits
+                // `call.done` immediately as the tool's terminal event.
+                if matches!(result.pending_callback, Some(true)) {
+                    tracing::info!(
+                        execution_id = command.execution_id,
+                        step = %command.step,
+                        tool = %tool_config.kind,
+                        "skipping call.done emit per pending_callback marker (await async callback)"
+                    );
+                    crate::metrics::record_call_done_skipped_pending_callback(&tool_config.kind);
+                } else {
+                    self.emit_event_via(&dispatch_client,
+                        "call.done",
+                        &command.step,
+                        "COMPLETED",
+                        command.execution_id,
+                        command.attempts,
+                        serde_json::json!({
+                            "command_id": command.command_id.clone(),
+                            "call_index": ctx.call_index,
+                            "result": result_obj,
+                        }),
+                    )
+                    .await?;
+                }
 
                 result
             }
