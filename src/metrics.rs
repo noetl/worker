@@ -23,6 +23,7 @@
 //! | `noetl_worker_result_store_put_duration_seconds` | histogram | — | Durable result-store PUT latency (the cross-node reference path on `call.done` events) |
 //! | `noetl_worker_result_store_put_bytes_total` | counter | — | Total bytes staged in the durable result store |
 //! | `noetl_worker_result_store_put_errors_total` | counter | — | Durable result-store PUT failures (fall back to shm-cache-only or status-only) |
+//! | `noetl_worker_call_done_skipped_pending_callback_total` | counter | `tool_kind` | Times the worker skipped its own `call.done` emit because the tool set `ToolResult.pending_callback = Some(true)` (the terminal event arrives via an async callback path; today only `Tool::Container` sets this — see noetl/ai-meta#43 Round 4) |
 //!
 //! `pending` + `ack_pending` together is the queue-depth signal KEDA
 //! and the dashboard read to decide whether to scale the worker pool.
@@ -80,6 +81,7 @@ pub struct WorkerMetrics {
     pub result_store_put_duration_seconds: Histogram,
     pub result_store_put_bytes_total: IntCounter,
     pub result_store_put_errors_total: IntCounter,
+    pub call_done_skipped_pending_callback_total: IntCounterVec,
 }
 
 impl WorkerMetrics {
@@ -243,6 +245,29 @@ impl WorkerMetrics {
             .register(Box::new(result_store_put_errors_total.clone()))
             .expect("register result_store_put_errors_total");
 
+        // noetl/ai-meta#43 Round 4 — pending_callback adoption.  When a
+        // tool sets `ToolResult.pending_callback = Some(true)` the
+        // worker skips its own `call.done` emit because the terminal
+        // event arrives asynchronously via a callback (e.g. the K8s
+        // watcher → `POST /api/internal/container-callback/...` path
+        // for `Tool::Container`).  Counted per `tool_kind` so the
+        // dashboard can pair this with the server-side
+        // `noetl_container_callback_total{state}` and
+        // `noetl_container_callback_stale_total{state}` counters —
+        // healthy steady state is `skipped_total ≈ container_callback_total`
+        // with `container_callback_stale_total` near zero.
+        let call_done_skipped_pending_callback_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_call_done_skipped_pending_callback_total",
+                "Times the worker skipped its own call.done emit because the tool set ToolResult.pending_callback (the terminal event arrives via an async callback path).",
+            ),
+            &["tool_kind"],
+        )
+        .expect("call_done_skipped_pending_callback_total metric");
+        registry
+            .register(Box::new(call_done_skipped_pending_callback_total.clone()))
+            .expect("register call_done_skipped_pending_callback_total");
+
         Self {
             registry,
             pulls_total,
@@ -257,6 +282,7 @@ impl WorkerMetrics {
             result_store_put_duration_seconds,
             result_store_put_bytes_total,
             result_store_put_errors_total,
+            call_done_skipped_pending_callback_total,
         }
     }
 
@@ -364,6 +390,21 @@ pub fn record_result_store_put(duration_seconds: f64, bytes: usize, _is_error: b
 /// timeout would otherwise skew p99 on an otherwise-healthy worker).
 pub fn record_result_store_put_error() {
     WorkerMetrics::global().result_store_put_errors_total.inc();
+}
+
+/// Record one skipped `call.done` emit driven by
+/// `ToolResult.pending_callback = Some(true)`.  Called from
+/// [`crate::executor::command`] on the success path after the tool
+/// returns.  The `tool_kind` label is the executor's tool kind
+/// string (today only `"container"` sets `pending_callback`, but
+/// future tools that dispatch long-running external work — e.g. a
+/// future GCP Batch / AWS Batch / Argo Workflow tool — would land
+/// on the same counter under their own kind label).
+pub fn record_call_done_skipped_pending_callback(tool_kind: &str) {
+    WorkerMetrics::global()
+        .call_done_skipped_pending_callback_total
+        .with_label_values(&[tool_kind])
+        .inc();
 }
 
 // Unused-warning suppression for fields that aren't read directly
@@ -528,6 +569,56 @@ mod tests {
         ));
         assert!(text.contains("# HELP noetl_worker_nats_consumer_ack_pending"));
         assert!(text.contains("# TYPE noetl_worker_nats_consumer_ack_pending gauge"));
+    }
+
+    /// noetl/ai-meta#43 Round 4 — `pending_callback` skip counter.
+    /// Verifies the label is `tool_kind`, the counter increments per
+    /// call, and the metric surfaces in the encoded Prometheus text.
+    #[test]
+    fn call_done_skipped_pending_callback_counter_increments_per_tool_kind() {
+        let m = WorkerMetrics::global();
+        let before_container = m
+            .call_done_skipped_pending_callback_total
+            .with_label_values(&["container"])
+            .get();
+        record_call_done_skipped_pending_callback("container");
+        record_call_done_skipped_pending_callback("container");
+        let after_container = m
+            .call_done_skipped_pending_callback_total
+            .with_label_values(&["container"])
+            .get();
+        assert_eq!(
+            after_container,
+            before_container + 2,
+            "two container skips -> counter += 2"
+        );
+
+        // Distinct tool_kind labels keep their own series — the
+        // dashboard can split by future tools that adopt the marker.
+        let before_future = m
+            .call_done_skipped_pending_callback_total
+            .with_label_values(&["future_async_tool"])
+            .get();
+        record_call_done_skipped_pending_callback("future_async_tool");
+        let after_future = m
+            .call_done_skipped_pending_callback_total
+            .with_label_values(&["future_async_tool"])
+            .get();
+        assert_eq!(after_future, before_future + 1);
+        // Container series is unchanged by the unrelated label.
+        assert_eq!(
+            m.call_done_skipped_pending_callback_total
+                .with_label_values(&["container"])
+                .get(),
+            after_container
+        );
+
+        let text = String::from_utf8(m.encode()).unwrap();
+        assert!(text.contains("# HELP noetl_worker_call_done_skipped_pending_callback_total"));
+        assert!(text.contains("# TYPE noetl_worker_call_done_skipped_pending_callback_total counter"));
+        assert!(text.contains(
+            "noetl_worker_call_done_skipped_pending_callback_total{tool_kind=\"container\"}"
+        ));
     }
 
     /// `record_result_store_put` observes the duration histogram +
