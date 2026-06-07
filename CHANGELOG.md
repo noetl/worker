@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.14.0](https://github.com/noetl/worker/compare/v5.13.0...v5.14.0) (2026-06-07)
+
+### Features
+
+* **executor:** skip call.done emit when ToolResult.pending_callback is Some(true) ([41a98f4](https://github.com/noetl/worker/commit/41a98f441c5e9325bee86c30932f2eee0792f601)), closes [noetl/ai-meta#43](https://github.com/noetl/ai-meta/issues/43) [noetl/tools#37](https://github.com/noetl/tools/issues/37) [noetl/cli#56](https://github.com/noetl/cli/issues/56) [noetl/worker#59](https://github.com/noetl/worker/issues/59) [noetl/ai-meta#43](https://github.com/noetl/ai-meta/issues/43)
+
 ## [5.13.0](https://github.com/noetl/worker/compare/v5.12.0...v5.13.0) (2026-06-06)
 
 ### Features
