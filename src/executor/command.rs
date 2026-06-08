@@ -887,7 +887,40 @@ async fn build_call_done_result(
                     "Tool result exceeds inline budget; staged in durable result store (shm cache unavailable).",
                 );
             }
-            Ok(serde_json::json!({ "status": status, "reference": reference }))
+            // noetl/ai-meta#69 — embed an inline `context.data`
+            // block carrying the synthetic `_ref` URI alongside the
+            // `reference` block.  Without this, the orchestrator's
+            // `extract_user_data` walks `outer.context.result.context.data`
+            // and finds nothing for over-budget results, so a
+            // downstream consumer like the `artifact` tool's
+            // `result_ref: '{{ step._ref }}'` template renders to
+            // null — the artifact tool then errors on
+            // `Invalid artifact config: invalid type: null, expected
+            // a string`.  Embedding `_ref` here makes the URI
+            // template resolution work without bloating the inline
+            // payload (single string, well under the inline budget).
+            //
+            // The `context.data` shape mirrors the under-budget path's
+            // user_data layer so the orchestrator's extraction logic
+            // (`extract_user_data` + the noetl/ai-meta#66 `step.data`
+            // accessor) finds the same shape regardless of which
+            // branch produced the call.done.
+            //
+            // Future expansion (when `output.output_select` plumbing
+            // lands at the server-side ToolSpec layer): also project
+            // the selected fields here alongside `_ref` so
+            // `{{ step.<selected_field> }}` resolves directly without
+            // a result_fetch round-trip.  Today only `_ref` lives
+            // here; consumers that need full data dispatch the
+            // `artifact` tool (`kind: artifact, action: get, input:
+            // {result_ref: '{{ step._ref }}'}`) which uses the URI
+            // to read the durable result.
+            let inline_data = serde_json::json!({ "_ref": durable.r#ref });
+            Ok(serde_json::json!({
+                "status": status,
+                "context": { "data": inline_data },
+                "reference": reference,
+            }))
         }
         (Err(durable_err), Ok(mut hint)) => {
             // Durable PUT failed but shm worked.  Emit the bare
@@ -1265,16 +1298,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["status"], "COMPLETED");
-        assert!(
-            result.get("context").is_none(),
-            "oversize must not ride inline"
-        );
         let reference = result.get("reference").expect("must have reference");
         assert_eq!(reference["kind"], "result_ref");
-        assert!(reference["ref"]
+        let durable_ref = reference["ref"]
             .as_str()
-            .map(|s| s.starts_with("noetl://execution/12345/result/big_step/"))
-            .unwrap_or(false));
+            .expect("ref must be a string");
+        assert!(durable_ref.starts_with("noetl://execution/12345/result/big_step/"));
         assert_eq!(reference["store"], "disk");
         assert_eq!(reference["scope"], "execution");
         // `meta` is populated from the server response.
@@ -1288,6 +1317,22 @@ mod tests {
         assert_eq!(ipc["media_type"], "application/json");
         // The shm cache must hold the staged bytes.
         assert!(cache.used_bytes() > INLINE_CONTEXT_MAX_BYTES as u64);
+
+        // noetl/ai-meta#69 — over-budget result MUST also embed an
+        // inline `context.data._ref` URI so downstream
+        // `{{ step._ref }}` templates resolve.  Without this, the
+        // orchestrator's extract_user_data finds nothing on the
+        // over-budget path and consumers like the `artifact` tool
+        // error on `Invalid artifact config: invalid type: null,
+        // expected a string`.
+        let context = result.get("context").expect(
+            "noetl/ai-meta#69: over-budget result must embed inline context.data with _ref so {{ step._ref }} resolves",
+        );
+        assert_eq!(
+            context["data"]["_ref"].as_str(),
+            Some(durable_ref),
+            "context.data._ref must match the durable PUT's ref so consumers can fetch the full result"
+        );
 
         handle.abort();
     }
@@ -1407,7 +1452,12 @@ mod tests {
 
         // The over-budget path fires; we should NOT see the raw
         // tabular shape in result.context.
-        assert!(result.get("context").is_none());
+        // noetl/ai-meta#69: over-budget result NOW embeds an inline
+        // `context.data._ref` block so downstream `{{ step._ref }}`
+        // resolves.  The full tabular shape still lives in the
+        // durable PUT + shm cache — only `_ref` rides inline.
+        let inline_ctx = result.get("context").expect("context.data._ref must be embedded inline");
+        assert!(inline_ctx["data"]["_ref"].is_string());
         let reference = result.get("reference").expect("must have reference");
         // The `ipc` field carries the Arrow IPC bytes — but the
         // ROWS that landed in shm must have had their sensitive
@@ -1475,10 +1525,12 @@ mod tests {
         // takes the "durable + ipc" branch because both the
         // durable mock + the shm cache accept it.
         assert_eq!(result["status"], "COMPLETED");
-        assert!(
-            result.get("context").is_none(),
-            "oversize must not ride inline"
-        );
+        // noetl/ai-meta#69: over-budget result now embeds an inline
+        // `context.data._ref` block (the URI string is well under
+        // the inline budget) so downstream `{{ step._ref }}`
+        // resolves.  The full tabular payload stays out-of-band.
+        let inline_ctx = result.get("context").expect("context.data._ref must be embedded inline");
+        assert!(inline_ctx["data"]["_ref"].is_string());
         let reference = result.get("reference").expect("must have reference");
         assert_eq!(reference["kind"], "result_ref");
 
@@ -1620,7 +1672,14 @@ mod tests {
             "no reference when everything fails: {}",
             result
         );
-        assert!(result.get("context").is_none());
+        // When BOTH durable PUT and shm cache failed, there's no
+        // `_ref` URI to embed — emit `{status}` only (status-only
+        // fallback, matches the legacy behaviour pre-#69).
+        assert!(
+            result.get("context").is_none(),
+            "no inline context.data when there's no durable URI to embed: {}",
+            result
+        );
         // Only `status` should be in the result object.
         let keys: Vec<&str> = result
             .as_object()
