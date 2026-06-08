@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.15.0](https://github.com/noetl/worker/compare/v5.14.0...v5.15.0) (2026-06-08)
+
+### Features
+
+* **executor:** embed inline `context.data._ref` on over-budget call.done ([55e5ef6](https://github.com/noetl/worker/commit/55e5ef63f2d30c91f7c4f4195649c28a6719b3e7)), closes [noetl/ai-meta#69](https://github.com/noetl/ai-meta/issues/69) [#68](https://github.com/noetl/worker/issues/68) [noetl/ai-meta#69](https://github.com/noetl/ai-meta/issues/69)
+
 ## [5.14.0](https://github.com/noetl/worker/compare/v5.13.0...v5.14.0) (2026-06-07)
 
 ### Features
