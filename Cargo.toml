@@ -93,7 +93,7 @@ path = "src/main.rs"
 #   `gcp` (Google Secret Manager via ambient GKE Workload-Identity token).
 #   Secrets Wallet Phase 3a (noetl/ai-meta#61).  (Cargo.lock now resolves
 #   noetl-tools 2.19.0; `^2.18` covers it.)
-noetl-tools = "2.23"
+noetl-tools = "2.24"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
