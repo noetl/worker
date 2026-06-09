@@ -42,15 +42,18 @@ path = "src/main.rs"
 #   resolve `{{ step_name.field }}` references to a real value.
 #   Surfaced via the Rust-only e2e probe on the Rust server (see
 #   noetl/ai-meta#59 follow-up).
-# - `TaskSequenceTool` (2.18.0, noetl/tools#18): the runtime for
-#   the v10 list-shaped `tool: [...]` pipeline.  Server emits
-#   `tool.kind = task_sequence` for any pipeline-shape step (per
+# - `TaskSequenceTool` (2.18.0, noetl/tools#18; breaking v3.0.0
+#   noetl/tools#45): the runtime for the v10 list-shaped
+#   `tool: [...]` pipeline.  Server emits `tool.kind =
+#   task_sequence` for any pipeline-shape step (per
 #   noetl/server#61's accepted-both-shapes parser); without this
 #   tool the worker errored with "Tool not found: task_sequence"
-#   and every pipeline-shape fixture stalled.  Threads results
-#   across tasks via `_prev` / `_results` injected into the
-#   Jinja context; renders each task's config against the
-#   augmented context before dispatch.
+#   and every pipeline-shape fixture stalled.  v3.0.0 replaces
+#   `_prev`/`_results` injection with explicit `set:`/`input:`
+#   forward-only data binding — each task declares `set:` to
+#   capture `output` into named context variables, and later
+#   tasks use `input:` to pull those variables.  No backward
+#   compat fallback; all fixtures must use the new shape.
 # - PostgresTool error detail (2.18.2, noetl/tools#21): the postgres
 #   tool now surfaces the real SQLSTATE + message (e.g. `ERROR:
 #   relation "..." does not exist (SQLSTATE 42P01)`) instead of the
@@ -93,7 +96,7 @@ path = "src/main.rs"
 #   `gcp` (Google Secret Manager via ambient GKE Workload-Identity token).
 #   Secrets Wallet Phase 3a (noetl/ai-meta#61).  (Cargo.lock now resolves
 #   noetl-tools 2.19.0; `^2.18` covers it.)
-noetl-tools = "2.24"
+noetl-tools = "3"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
@@ -108,7 +111,7 @@ noetl-tools = "2.24"
 # See Appendix H of the global hybrid cloud blueprint at
 # https://noetl.dev/docs/architecture/noetl_global_hybrid_cloud_grid_distributed_architecture_blueprint
 # and especially § H.10 (the tree-walker vs pull-model finding).
-noetl-executor = "0.4"
+noetl-executor = "0.5"
 
 # Same-node zero-copy IPC cache for over-budget tool results
 # (R-2.1 / noetl/cli#39).  When `call.done`'s serialised
