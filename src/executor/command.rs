@@ -51,6 +51,20 @@ use crate::snowflake::SnowflakeGen;
 /// playbooks that pass literal credentials still work).
 pub(crate) const KEYCHAIN_ENV_ALLOWLIST_VAR: &str = "NOETL_KEYCHAIN_ENV_VARS";
 
+/// Maximum command attempts before a transient (retryable) pre-dispatch
+/// failure is escalated to a terminal `call.error`.
+///
+/// A transient keychain transport error on a fresh command
+/// (`command.attempts < MAX_PREDISPATCH_ATTEMPTS`) is left to the
+/// command path's retry/redelivery — the worker does NOT emit a terminal
+/// event, so a later attempt can still complete the step.  Once the
+/// attempt counter reaches this ceiling the worker emits the terminal
+/// `call.error` so the execution can't hang at `command.started`
+/// indefinitely.  Terminal failures (clean 404, unsupported credential
+/// type, malformed tool config) bypass this counter — they emit on the
+/// first failure.  See noetl/ai-meta#78.
+pub(crate) const MAX_PREDISPATCH_ATTEMPTS: u32 = 3;
+
 /// Parse the comma-separated allow-list + look up each env var.
 /// Names that are missing / empty in the environment are silently
 /// skipped — that way an operator can stage rollouts (define the
@@ -263,9 +277,10 @@ impl CommandExecutor {
         };
 
         // Build execution context
-        let mut ctx = ExecutionContext::new(command.execution_id, &command.step, &dispatch_server_url)
-            .with_worker_id(&self.worker_id)
-            .with_command_id(&command.command_id);
+        let mut ctx =
+            ExecutionContext::new(command.execution_id, &command.step, &dispatch_server_url)
+                .with_worker_id(&self.worker_id)
+                .with_command_id(&command.command_id);
 
         // Seed keychain credentials lifted from worker pod env at
         // startup (noetl/ai-meta#34).  Tools that read credentials
@@ -294,7 +309,8 @@ impl CommandExecutor {
         // command-specific keys.  The server's `EventRequest` /
         // Python's `EventEmitRequest` both read `step` /
         // `worker_id` from the top level after EE-2 + EE-4.
-        self.emit_event_via(&dispatch_client, 
+        self.emit_event_via(
+            &dispatch_client,
             "command.started",
             &command.step,
             "STARTED",
@@ -354,12 +370,38 @@ impl CommandExecutor {
         // `auth_alias` module + noetl/ai-meta#48 for the regression
         // brief.  Idempotent: if `auth` is already a struct (or
         // absent), this is a no-op + no HTTP call.
-        let alias_secrets = super::auth_alias::resolve_auth_alias(
+        let alias_secrets = match super::auth_alias::resolve_auth_alias(
             &mut tool_config_value,
             &dispatch_client,
             command.execution_id,
         )
-        .await?;
+        .await
+        {
+            Ok(secrets) => secrets,
+            Err(e) => {
+                // Pre-dispatch credential-alias failure.  Before this
+                // fix the `?` early-returned here and the worker just
+                // logged "Command execution failed" — no `call.error`
+                // ever reached the server, so the execution hung at
+                // `command.started` forever (noetl/ai-meta#78).  Now we
+                // classify: a terminal failure (clean 404 / unsupported
+                // type / malformed shape) — or a transient one whose
+                // attempt counter is exhausted — emits a terminal
+                // `call.error` so the execution fails cleanly.  A
+                // transient failure on a fresh command stays retryable.
+                record_metric(true);
+                let terminal = e.is_terminal() || command.attempts >= MAX_PREDISPATCH_ATTEMPTS;
+                return self
+                    .handle_predispatch_failure(
+                        &dispatch_client,
+                        command,
+                        ctx.call_index,
+                        terminal,
+                        anyhow::Error::new(e),
+                    )
+                    .await;
+            }
+        };
         if !alias_secrets.is_empty() {
             // Per `observability.md` Principle 1: log keychain
             // alias resolution so operators can trace credential
@@ -376,7 +418,29 @@ impl CommandExecutor {
             ctx.set_secret(&alias, &value);
         }
 
-        let tool_config: ToolConfig = serde_json::from_value(tool_config_value)?;
+        let tool_config: ToolConfig = match serde_json::from_value(tool_config_value) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // Malformed tool config is the other pre-dispatch
+                // failure that used to silently `?`-return and hang the
+                // execution at `command.started` (noetl/ai-meta#78).
+                // It is always terminal — the same bytes deserialize to
+                // the same error on a retry — so emit a terminal
+                // `call.error`.
+                record_metric(true);
+                let err = anyhow::Error::new(e)
+                    .context("malformed tool config (pre-dispatch deserialization)");
+                return self
+                    .handle_predispatch_failure(
+                        &dispatch_client,
+                        command,
+                        ctx.call_index,
+                        true,
+                        err,
+                    )
+                    .await;
+            }
+        };
 
         tracing::debug!(
             execution_id = command.execution_id,
@@ -472,7 +536,8 @@ impl CommandExecutor {
                     );
                     crate::metrics::record_call_done_skipped_pending_callback(&tool_config.kind);
                 } else {
-                    self.emit_event_via(&dispatch_client,
+                    self.emit_event_via(
+                        &dispatch_client,
                         "call.done",
                         &command.step,
                         "COMPLETED",
@@ -491,7 +556,8 @@ impl CommandExecutor {
             }
             Err(e) => {
                 // Emit call.error event
-                self.emit_event_via(&dispatch_client, 
+                self.emit_event_via(
+                    &dispatch_client,
                     "call.error",
                     &command.step,
                     "FAILED",
@@ -506,7 +572,8 @@ impl CommandExecutor {
                 .await?;
 
                 // Emit command.failed event
-                self.emit_event_via(&dispatch_client, 
+                self.emit_event_via(
+                    &dispatch_client,
                     "command.failed",
                     &command.step,
                     "FAILED",
@@ -552,7 +619,8 @@ impl CommandExecutor {
                         // becomes the envelope status so the projector
                         // sees the actual case outcome.
                         let exit_status = status.clone();
-                        self.emit_event_via(&dispatch_client, 
+                        self.emit_event_via(
+                            &dispatch_client,
                             "step.exit",
                             &command.step,
                             &exit_status,
@@ -573,7 +641,8 @@ impl CommandExecutor {
                     }
                     CaseAction::Fail { message } => {
                         // Emit command.failed event
-                        self.emit_event_via(&dispatch_client, 
+                        self.emit_event_via(
+                            &dispatch_client,
                             "command.failed",
                             &command.step,
                             "FAILED",
@@ -601,7 +670,8 @@ impl CommandExecutor {
         // becomes the envelope status — projectors group by status
         // to compute success/failure rates per step.
         let completion_status = tool_result.status.to_string();
-        self.emit_event_via(&dispatch_client, 
+        self.emit_event_via(
+            &dispatch_client,
             "command.completed",
             &command.step,
             &completion_status,
@@ -678,6 +748,98 @@ impl CommandExecutor {
         let result = client.emit_event_with_retry(event, 3).await;
         crate::metrics::record_event_emit(event_type, emit_start.elapsed().as_secs_f64(), 0);
         result
+    }
+
+    /// Handle a failure that happens BEFORE the tool-dispatch match
+    /// (credential-alias resolution, tool-config deserialization).
+    ///
+    /// noetl/ai-meta#78: these failures used to early-`?`-return from
+    /// `execute_with_server_url` straight to the worker dispatch loop,
+    /// which only logged `Command execution failed` — no `call.error`
+    /// reached the server, so the execution sat at `command.started`
+    /// forever.
+    ///
+    /// When `terminal` is true this emits the same `call.error` +
+    /// `command.failed` pair the post-dispatch error arm emits (matching
+    /// payload fields so the server/UI treat both identically), so the
+    /// execution reaches a terminal FAILED state instead of hanging.
+    /// When `terminal` is false (a transient transport error on a
+    /// command whose attempt counter isn't yet exhausted) it logs a WARN
+    /// and emits nothing, leaving the command path's retry/redelivery to
+    /// run.
+    ///
+    /// Always returns `Err(error)` so the caller's early return
+    /// propagates the failure to the dispatch loop (which records it and
+    /// balances the in-flight gauge).  The invariant the dispatch loop
+    /// relies on: by the time this returns `Err`, a terminal failure has
+    /// already emitted its terminal event here — the loop must NOT emit
+    /// its own (doing so would double-emit terminals and clobber the
+    /// retryable path).  Per `observability.md` Principle 4 every line
+    /// carries `execution_id` + `command_id` + `step`.
+    async fn handle_predispatch_failure(
+        &self,
+        client: &ControlPlaneClient,
+        command: &Command,
+        call_index: usize,
+        terminal: bool,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        if terminal {
+            // Emit call.error — mirrors the post-dispatch error arm's
+            // payload (command_id + call_index + error string) so the
+            // projector/UI render a pre-dispatch failure identically to
+            // a tool-execution failure.
+            self.emit_event_via(
+                client,
+                "call.error",
+                &command.step,
+                "FAILED",
+                command.execution_id,
+                command.attempts,
+                serde_json::json!({
+                    "command_id": command.command_id.clone(),
+                    "call_index": call_index,
+                    "error": error.to_string(),
+                }),
+            )
+            .await?;
+
+            // Emit command.failed so the orchestrator advances the
+            // execution to a terminal FAILED state.
+            self.emit_event_via(
+                client,
+                "command.failed",
+                &command.step,
+                "FAILED",
+                command.execution_id,
+                command.attempts,
+                serde_json::json!({
+                    "command_id": command.command_id.clone(),
+                    "error": error.to_string(),
+                }),
+            )
+            .await?;
+
+            tracing::error!(
+                execution_id = command.execution_id,
+                command_id = %command.command_id,
+                step = %command.step,
+                attempts = command.attempts,
+                error = %error,
+                "Pre-dispatch failure is terminal; emitted call.error + command.failed so the execution fails cleanly instead of hanging at command.started",
+            );
+        } else {
+            tracing::warn!(
+                execution_id = command.execution_id,
+                command_id = %command.command_id,
+                step = %command.step,
+                attempts = command.attempts,
+                error = %error,
+                "Pre-dispatch failure is transient (retryable); no terminal call.error emitted, leaving retry to the command path",
+            );
+        }
+
+        Err(error)
     }
 }
 
@@ -1300,9 +1462,7 @@ mod tests {
         assert_eq!(result["status"], "COMPLETED");
         let reference = result.get("reference").expect("must have reference");
         assert_eq!(reference["kind"], "result_ref");
-        let durable_ref = reference["ref"]
-            .as_str()
-            .expect("ref must be a string");
+        let durable_ref = reference["ref"].as_str().expect("ref must be a string");
         assert!(durable_ref.starts_with("noetl://execution/12345/result/big_step/"));
         assert_eq!(reference["store"], "disk");
         assert_eq!(reference["scope"], "execution");
@@ -1456,7 +1616,9 @@ mod tests {
         // `context.data._ref` block so downstream `{{ step._ref }}`
         // resolves.  The full tabular shape still lives in the
         // durable PUT + shm cache — only `_ref` rides inline.
-        let inline_ctx = result.get("context").expect("context.data._ref must be embedded inline");
+        let inline_ctx = result
+            .get("context")
+            .expect("context.data._ref must be embedded inline");
         assert!(inline_ctx["data"]["_ref"].is_string());
         let reference = result.get("reference").expect("must have reference");
         // The `ipc` field carries the Arrow IPC bytes — but the
@@ -1529,7 +1691,9 @@ mod tests {
         // `context.data._ref` block (the URI string is well under
         // the inline budget) so downstream `{{ step._ref }}`
         // resolves.  The full tabular payload stays out-of-band.
-        let inline_ctx = result.get("context").expect("context.data._ref must be embedded inline");
+        let inline_ctx = result
+            .get("context")
+            .expect("context.data._ref must be embedded inline");
         assert!(inline_ctx["data"]["_ref"].is_string());
         let reference = result.get("reference").expect("must have reference");
         assert_eq!(reference["kind"], "result_ref");
@@ -1727,5 +1891,157 @@ mod tests {
                 .unwrap();
         assert!(large_result.get("context").is_none());
         assert!(large_result.get("reference").is_some());
+    }
+
+    // ----------------------------------------------------------------
+    // Pre-dispatch failure emission (noetl/ai-meta#78)
+    //
+    // A pre-dispatch failure (credential-alias 404, malformed tool
+    // config) used to early-`?`-return from `execute_with_server_url`
+    // and the worker only logged it — no `call.error` reached the
+    // server, so the execution hung at `command.started` forever.
+    // `handle_predispatch_failure` now emits the terminal events for
+    // terminal failures and emits nothing for still-retryable transient
+    // ones.  These tests drive that method against a mock `/api/events`
+    // sink and assert the emitted (or absent) events.
+    // ----------------------------------------------------------------
+
+    use std::sync::Mutex;
+
+    fn predispatch_command() -> Command {
+        Command {
+            command_id: "cmd-78".to_string(),
+            execution_id: 323127686446714880,
+            step: "start".to_string(),
+            tool_kind: "postgres".to_string(),
+            input: serde_json::Value::Null,
+            render_context: Default::default(),
+            attempts: 0,
+        }
+    }
+
+    /// Spawn a mock control-plane that records every event POSTed to
+    /// `/api/events`.  Returns `(base_url, recorded_events, handle)`.
+    async fn start_mock_event_sink() -> (
+        String,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let recorded: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let app = Router::new().route(
+            "/api/events",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(body);
+                    Json(serde_json::json!({ "status": "ok" }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("axum serve");
+        });
+        (base, recorded, handle)
+    }
+
+    fn test_executor(base: &str) -> CommandExecutor {
+        CommandExecutor::new(
+            ControlPlaneClient::new(base),
+            "worker-test".to_string(),
+            base.to_string(),
+            Arc::new(SnowflakeGen::with_node_and_epoch(1, 0)),
+            test_cache("wkr-test-predispatch"),
+        )
+    }
+
+    /// Terminal pre-dispatch failure → emits `call.error` (FAILED) and
+    /// `command.failed` so the execution fails cleanly instead of
+    /// hanging at `command.started`.  This is the core noetl/ai-meta#78
+    /// assertion.
+    #[tokio::test]
+    async fn predispatch_terminal_failure_emits_call_error() {
+        let (base, recorded, handle) = start_mock_event_sink().await;
+        let executor = test_executor(&base);
+        let command = predispatch_command();
+        let client = ControlPlaneClient::new(&base);
+
+        let err = executor
+            .handle_predispatch_failure(
+                &client,
+                &command,
+                0,
+                true,
+                anyhow::anyhow!(
+                    "Credential alias 'pg_noetl_k8s' not found in keychain (server returned 404 for /api/credentials/pg_noetl_k8s)"
+                ),
+            )
+            .await
+            .expect_err("handle_predispatch_failure always returns Err");
+        assert!(err.to_string().contains("pg_noetl_k8s"));
+
+        let events = recorded.lock().unwrap();
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.get("event_type").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            types.contains(&"call.error"),
+            "terminal pre-dispatch failure must emit call.error, got: {types:?}"
+        );
+        assert!(
+            types.contains(&"command.failed"),
+            "terminal pre-dispatch failure must emit command.failed, got: {types:?}"
+        );
+
+        // The call.error carries FAILED status + the error string +
+        // command_id, matching the post-dispatch error arm's shape.
+        let call_error = events
+            .iter()
+            .find(|e| e.get("event_type").and_then(|v| v.as_str()) == Some("call.error"))
+            .expect("call.error present");
+        assert_eq!(call_error["status"], "FAILED");
+        assert_eq!(call_error["step"], "start");
+        assert_eq!(call_error["context"]["command_id"], "cmd-78");
+        assert!(call_error["context"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not found in keychain"));
+
+        handle.abort();
+    }
+
+    /// Retryable pre-dispatch failure (transient transport error,
+    /// attempts not exhausted) → emits NOTHING, so the command path's
+    /// retry/redelivery can still complete the step.
+    #[tokio::test]
+    async fn predispatch_retryable_failure_emits_nothing() {
+        let (base, recorded, handle) = start_mock_event_sink().await;
+        let executor = test_executor(&base);
+        let command = predispatch_command();
+        let client = ControlPlaneClient::new(&base);
+
+        let _err = executor
+            .handle_predispatch_failure(
+                &client,
+                &command,
+                0,
+                false,
+                anyhow::anyhow!(
+                    "transient error looking up credential alias 'pg_noetl_k8s' in keychain"
+                ),
+            )
+            .await
+            .expect_err("handle_predispatch_failure always returns Err");
+
+        let events = recorded.lock().unwrap();
+        assert!(
+            events.is_empty(),
+            "retryable pre-dispatch failure must emit no events, got: {events:?}"
+        );
+        handle.abort();
     }
 }

@@ -7,5 +7,7 @@ mod control_plane;
 pub mod sealed;
 pub mod tls;
 
-pub use control_plane::{ClaimResult, Command, ControlPlaneClient, Credential, ExecutorEvent};
+pub use control_plane::{
+    ClaimResult, Command, ControlPlaneClient, Credential, CredentialHttpError, ExecutorEvent,
+};
 pub use sealed::{open as sealed_open, SealedEnvelope, SEAL_ALG, SEAL_V};

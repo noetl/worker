@@ -85,6 +85,24 @@ pub struct Credential {
     pub description: Option<String>,
 }
 
+/// A non-success, non-404 HTTP response from a credential fetch.
+///
+/// Carries the numeric status so callers can classify retryability by
+/// code (a 503 is transient; a 500 "Decryption failed" or a 400 is
+/// terminal) WITHOUT string-matching the formatted error message.
+/// `get_credential` / `get_sealed_credential` return this (wrapped in
+/// `anyhow::Error`) instead of an opaque `bail!`, and
+/// `auth_alias::classify_fetch_error` downcasts to it.  A 404 never
+/// reaches here — it maps to `Ok(None)` upstream.  See
+/// [noetl/ai-meta#78](https://github.com/noetl/ai-meta/issues/78).
+#[derive(Debug, thiserror::Error)]
+#[error("credential fetch for '{alias}' failed: HTTP {status} {body}")]
+pub struct CredentialHttpError {
+    pub alias: String,
+    pub status: u16,
+    pub body: String,
+}
+
 /// Result of claiming a command.
 #[derive(Debug, Clone)]
 pub enum ClaimResult {
@@ -286,10 +304,13 @@ impl ControlPlaneClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "get_sealed_credential('{alias}', worker_id='{worker_id}') failed: HTTP {} {body}",
-                status.as_u16(),
-            );
+            // Typed error so the alias-resolution path can classify
+            // retryability by status code (noetl/ai-meta#78).
+            return Err(anyhow::Error::new(CredentialHttpError {
+                alias: alias.to_string(),
+                status: status.as_u16(),
+                body: format!("(worker_id='{worker_id}') {body}"),
+            }));
         }
         let envelope: crate::client::SealedEnvelope = response.json().await?;
         let mut plaintext = crate::client::sealed_open(&self.sealing_sk, &envelope)?;
@@ -481,12 +502,13 @@ impl ControlPlaneClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "get_credential('{}') failed: HTTP {} {}",
-                alias,
-                status.as_u16(),
-                body
-            );
+            // Typed error so the alias-resolution path can classify
+            // retryability by status code (noetl/ai-meta#78).
+            return Err(anyhow::Error::new(CredentialHttpError {
+                alias: alias.to_string(),
+                status: status.as_u16(),
+                body,
+            }));
         }
 
         let parsed: Credential = response.json().await?;

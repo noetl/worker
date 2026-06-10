@@ -45,6 +45,118 @@ use serde_json::Value;
 
 use crate::client::{ControlPlaneClient, Credential};
 
+/// Classified failure from credential-alias resolution.
+///
+/// Distinguishes a **terminal** failure — a clean 404 from the keychain
+/// (the alias isn't bound), an unsupported credential type, or a
+/// malformed credential shape — from a **retryable** transport error
+/// where the keychain HTTP call itself failed and a later attempt might
+/// succeed.  None of the terminal cases get fixed by retrying; the
+/// transport case might.
+///
+/// The command executor branches on
+/// [`CredentialResolutionError::is_terminal`] to decide whether to emit
+/// a terminal `call.error` (so the execution fails cleanly instead of
+/// hanging at `command.started`) or to leave the command path's
+/// retry/redelivery semantics in place.  Classifying with a typed error
+/// keeps that decision off fragile `anyhow`-message string matching.
+/// See [noetl/ai-meta#78](https://github.com/noetl/ai-meta/issues/78).
+#[derive(Debug, thiserror::Error)]
+pub enum CredentialResolutionError {
+    /// The keychain returned a clean 404 for `/api/keychain/<alias>` —
+    /// the alias is not bound.  **Terminal**: the binding won't appear
+    /// on a retry, so the execution should fail cleanly rather than
+    /// hang.  (The credential *record* may still exist in the separate
+    /// `/api/credentials/<alias>` store; this error is specifically the
+    /// keychain-binding lookup the worker performs at dispatch time.)
+    #[error("Credential alias '{alias}' not found in keychain (server returned 404 for /api/credentials/{alias})")]
+    AliasNotFound { alias: String },
+
+    /// The keychain HTTP call failed at the transport layer (connection
+    /// refused, timeout, 5xx, TLS error, ...).  **Retryable**: a later
+    /// attempt may reach a healthy keychain.  The command executor does
+    /// NOT emit a terminal `call.error` for this on a fresh command —
+    /// only once the command's attempt counter is exhausted.
+    #[error("transient error looking up credential alias '{alias}' in keychain")]
+    Transient {
+        alias: String,
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// The credential resolved but its type/shape can't be applied
+    /// (unsupported credential type, malformed `db_port`, ...).
+    /// **Terminal**: the same bytes deserialize to the same error on a
+    /// retry.
+    #[error(transparent)]
+    Invalid(#[from] anyhow::Error),
+}
+
+impl CredentialResolutionError {
+    /// True when the failure will never succeed on retry.  The command
+    /// executor emits a terminal `call.error` for these immediately;
+    /// retryable (transient) failures are escalated to terminal only
+    /// after the command's attempt counter is exhausted.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Transient { .. })
+    }
+}
+
+/// HTTP statuses worth retrying — transient server / infrastructure
+/// conditions where a later attempt may succeed.  Everything else
+/// (400 / 401 / 403, a deterministic 500 like the keychain's
+/// "Decryption failed: aead::Error", etc.) is treated as terminal so
+/// the execution fails cleanly instead of hanging.  See
+/// noetl/ai-meta#78.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(
+        status,
+        408 /* Request Timeout */
+        | 429 /* Too Many Requests */
+        | 502 /* Bad Gateway */
+        | 503 /* Service Unavailable */
+        | 504 /* Gateway Timeout */
+    )
+}
+
+/// Classify an error from the credential-fetch HTTP call into terminal
+/// (`AliasNotFound` is handled by the caller; this returns `Invalid`)
+/// vs retryable (`Transient`).
+///
+/// Inspects typed errors rather than string-matching messages
+/// (noetl/ai-meta#78):
+///
+/// - A [`crate::client::CredentialHttpError`] carries the HTTP status —
+///   retryable only for [`is_retryable_status`] codes; every other
+///   status (incl. the keychain's 500 "Decryption failed") is terminal.
+/// - A transport-layer [`reqwest::Error`] is retryable when it's a
+///   connect/timeout/request failure, but terminal when it's a
+///   decode/body failure (the response shape is wrong and won't change
+///   on retry).
+/// - Anything else (e.g. a sealed-envelope open/decrypt failure) is a
+///   deterministic local error → terminal.
+fn classify_fetch_error(alias: &str, err: anyhow::Error) -> CredentialResolutionError {
+    if let Some(http) = err.downcast_ref::<crate::client::CredentialHttpError>() {
+        if is_retryable_status(http.status) {
+            return CredentialResolutionError::Transient {
+                alias: alias.to_string(),
+                source: err,
+            };
+        }
+        return CredentialResolutionError::Invalid(err);
+    }
+    if let Some(re) = err.downcast_ref::<reqwest::Error>() {
+        if re.is_decode() || re.is_body() {
+            return CredentialResolutionError::Invalid(err);
+        }
+        return CredentialResolutionError::Transient {
+            alias: alias.to_string(),
+            source: err,
+        };
+    }
+    CredentialResolutionError::Invalid(err)
+}
+
 /// Mapping from credential `data` keys to the postgres tool's flat
 /// connection-config keys.  Mirrors the Python normalization in
 /// `noetl/core/auth/postgres.py` so the Rust path produces an
@@ -78,7 +190,7 @@ pub async fn resolve_auth_alias(
     tool_config_value: &mut Value,
     client: &ControlPlaneClient,
     execution_id: i64,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<String, String>, CredentialResolutionError> {
     // task_sequence pipelines carry the keychain alias on each
     // SUB-TASK (`credential:` / `auth:` inside a pipeline entry), not
     // on the outer envelope.  The task_sequence tool dispatches its
@@ -131,7 +243,7 @@ async fn resolve_single_tool_alias(
     tool_config_value: &mut Value,
     client: &ControlPlaneClient,
     execution_id: i64,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<String, String>, CredentialResolutionError> {
     let map = match tool_config_value.as_object_mut() {
         Some(m) => m,
         None => return Ok(HashMap::new()),
@@ -153,18 +265,25 @@ async fn resolve_single_tool_alias(
         _ => return Ok(HashMap::new()),
     };
 
+    // Classify the fetch outcome for the executor's terminal-vs-retryable
+    // decision (noetl/ai-meta#78):
+    //   * `Ok(None)` — the keychain returned a clean 404, the alias isn't
+    //     bound → `AliasNotFound` (terminal).
+    //   * `Err(_)` — a transport error or a non-success HTTP status;
+    //     `classify_fetch_error` decides terminal vs retryable by
+    //     inspecting the typed error (HTTP status code / reqwest
+    //     predicates), NOT by string-matching the message.
     let credential = fetch_credential_maybe_sealed(client, &alias, execution_id)
         .await
-        .with_context(|| format!("looking up credential alias '{alias}' in keychain"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Credential alias '{}' not found in keychain (server returned 404 for /api/credentials/{})",
-                alias,
-                alias
-            )
+        .map_err(|source| classify_fetch_error(&alias, source))?
+        .ok_or_else(|| CredentialResolutionError::AliasNotFound {
+            alias: alias.clone(),
         })?;
 
     let mut credential = credential;
+    // `apply_credential` returns `anyhow::Error` for unsupported types /
+    // malformed shapes; the `#[from]` arm classifies those as terminal
+    // `Invalid`.
     let injected_secrets = apply_credential(map, &alias, &credential)?;
     // Phase 5c (noetl/ai-meta#61): zeroize the credential payload after the
     // dispatcher has copied what it needs into the tool config / context.
@@ -666,5 +785,219 @@ mod tests {
 
         let secrets = resolve_auth_alias(&mut cfg, &client, 1).await.unwrap();
         assert!(secrets.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // Terminal-vs-retryable classification (noetl/ai-meta#78)
+    //
+    // The command executor branches on `is_terminal()` to decide
+    // whether a pre-dispatch credential-alias failure emits a terminal
+    // `call.error` (so the execution fails cleanly instead of hanging
+    // at `command.started`) or stays retryable.  These tests pin the
+    // classification at the boundary the executor reads.
+    // ----------------------------------------------------------------
+
+    use axum::{extract::Path, http::StatusCode, routing::get, Json, Router};
+    use tokio::net::TcpListener;
+
+    /// Spawn a mock keychain that returns `response` (200) for every
+    /// `/api/credentials/{alias}` GET, or 404 when `response` is `None`.
+    /// Returns `(base_url, server_handle)`; drop the handle to stop it.
+    async fn spawn_keychain(
+        response: Option<serde_json::Value>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let canned = response;
+        let app = Router::new().route(
+            "/api/credentials/{alias}",
+            get(move |Path(_alias): Path<String>| {
+                let canned = canned.clone();
+                async move {
+                    match canned {
+                        Some(body) => Ok(Json(body)),
+                        None => Err(StatusCode::NOT_FOUND),
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("axum serve");
+        });
+        (base, handle)
+    }
+
+    /// A clean 404 from the keychain (the alias isn't bound) is the
+    /// live-repro fixture from noetl/ai-meta#78 (`pg_noetl_k8s`).  It
+    /// must classify as terminal `AliasNotFound` so the executor emits
+    /// `call.error` rather than hanging.
+    #[tokio::test]
+    async fn alias_404_classifies_as_terminal_alias_not_found() {
+        let (base, handle) = spawn_keychain(None).await;
+        let client = ControlPlaneClient::new(&base);
+        let mut cfg = serde_json::json!({
+            "kind": "postgres",
+            "auth": "pg_noetl_k8s",
+            "command": "SELECT 1",
+        });
+
+        let err = resolve_auth_alias(&mut cfg, &client, 1)
+            .await
+            .expect_err("missing alias must error");
+
+        assert!(
+            matches!(err, CredentialResolutionError::AliasNotFound { ref alias } if alias == "pg_noetl_k8s"),
+            "clean 404 must classify as AliasNotFound, got: {err:?}"
+        );
+        assert!(err.is_terminal(), "alias-404 must be terminal");
+        handle.abort();
+    }
+
+    /// A transport error talking to the keychain (connection refused)
+    /// must classify as retryable `Transient` — the executor leaves the
+    /// command path's retry/redelivery in place rather than emitting a
+    /// terminal `call.error` on the first failure.
+    #[tokio::test]
+    async fn transport_error_classifies_as_retryable_transient() {
+        // Port 1 is unbound — the keychain HTTP call fails at the
+        // transport layer.
+        let client = ControlPlaneClient::new("http://127.0.0.1:1");
+        let mut cfg = serde_json::json!({
+            "kind": "postgres",
+            "auth": "pg_noetl_k8s",
+            "command": "SELECT 1",
+        });
+
+        let err = resolve_auth_alias(&mut cfg, &client, 1)
+            .await
+            .expect_err("transport failure must error");
+
+        assert!(
+            matches!(err, CredentialResolutionError::Transient { ref alias, .. } if alias == "pg_noetl_k8s"),
+            "transport error must classify as Transient, got: {err:?}"
+        );
+        assert!(
+            !err.is_terminal(),
+            "transient transport error must stay retryable"
+        );
+    }
+
+    /// HTTP 500 "Decryption failed: aead::Error" is the ACTUAL live
+    /// repro from noetl/ai-meta#78 (the credential record exists but its
+    /// stored ciphertext can't be decrypted server-side — sealing is
+    /// off, so the worker hits `/api/credentials/pg_noetl_k8s` and gets
+    /// a deterministic 500, NOT a 404).  It must classify as terminal
+    /// `Invalid` so the executor emits `call.error` rather than treating
+    /// a permanent decryption failure as retryable and hanging.
+    #[tokio::test]
+    async fn http_500_decryption_classifies_as_terminal_invalid() {
+        let app = Router::new().route(
+            "/api/credentials/{alias}",
+            get(|Path(_): Path<String>| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Decryption failed: aead::Error",
+                        "status": 500,
+                    })),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("axum serve");
+        });
+        let client = ControlPlaneClient::new(&base);
+        let mut cfg = serde_json::json!({
+            "kind": "postgres",
+            "auth": "pg_noetl_k8s",
+        });
+
+        let err = resolve_auth_alias(&mut cfg, &client, 1)
+            .await
+            .expect_err("500 must error");
+        assert!(
+            matches!(err, CredentialResolutionError::Invalid(_)),
+            "deterministic 500 must classify as terminal Invalid, got: {err:?}"
+        );
+        assert!(
+            err.is_terminal(),
+            "a 500 decryption failure must be terminal so the execution fails cleanly"
+        );
+        handle.abort();
+    }
+
+    /// A genuinely transient HTTP status (503 Service Unavailable)
+    /// surfaces from `get_credential` as an `Err` and must classify as
+    /// retryable `Transient` — a later attempt may reach a healthy
+    /// keychain.  This is the half of the split that must NOT emit a
+    /// terminal `call.error` on the first failure.
+    #[tokio::test]
+    async fn http_503_classifies_as_retryable_transient() {
+        let app = Router::new().route(
+            "/api/credentials/{alias}",
+            get(|Path(_): Path<String>| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("axum serve");
+        });
+        let client = ControlPlaneClient::new(&base);
+        let mut cfg = serde_json::json!({
+            "kind": "postgres",
+            "auth": "pg_noetl_k8s",
+        });
+
+        let err = resolve_auth_alias(&mut cfg, &client, 1)
+            .await
+            .expect_err("5xx must error");
+        assert!(
+            matches!(err, CredentialResolutionError::Transient { .. }),
+            "5xx must classify as Transient, got: {err:?}"
+        );
+        assert!(!err.is_terminal());
+        handle.abort();
+    }
+
+    /// A credential that resolves but carries an unsupported type can
+    /// never be applied — it must classify as terminal `Invalid`.
+    #[tokio::test]
+    async fn unsupported_credential_type_classifies_as_terminal_invalid() {
+        let (base, handle) = spawn_keychain(Some(serde_json::json!({
+            "id": "1",
+            "name": "weird",
+            "type": "exotic",
+            "data": {},
+            "tags": [],
+            "description": null,
+        })))
+        .await;
+        let client = ControlPlaneClient::new(&base);
+        let mut cfg = serde_json::json!({
+            "kind": "http",
+            "auth": "weird",
+        });
+
+        let err = resolve_auth_alias(&mut cfg, &client, 1)
+            .await
+            .expect_err("unsupported type must error");
+        assert!(
+            matches!(err, CredentialResolutionError::Invalid(_)),
+            "unsupported type must classify as Invalid, got: {err:?}"
+        );
+        assert!(
+            err.is_terminal(),
+            "unsupported credential type must be terminal"
+        );
+        assert!(
+            err.to_string().contains("unsupported type 'exotic'"),
+            "Invalid error must name the offending type, got: {err}"
+        );
+        handle.abort();
     }
 }

@@ -313,6 +313,27 @@ impl Worker {
                             // playbook-level correlation when
                             // looking at a single execution's
                             // trace.
+                            //
+                            // Invariant (noetl/ai-meta#78): by the time
+                            // `execute_with_server_url` returns `Err`,
+                            // it has ALREADY emitted the step's terminal
+                            // events for every terminal failure —
+                            // tool-execution errors (the post-dispatch
+                            // error arm) and pre-dispatch errors
+                            // (credential-alias 404, malformed tool
+                            // config, etc.) both emit `call.error` +
+                            // `command.failed` before returning.  The
+                            // only `Err` that reaches here WITHOUT a
+                            // terminal event is a transient (retryable)
+                            // pre-dispatch failure that hasn't exhausted
+                            // its attempt counter — that is deliberate,
+                            // so the command path's retry/redelivery can
+                            // still complete the step.  Therefore this
+                            // arm must NOT emit a blanket terminal event
+                            // as a "safety net": doing so would
+                            // double-emit terminals for the terminal
+                            // case and defeat the retry for the
+                            // transient case.  It logs only.
                             tracing::error!(
                                 execution_id,
                                 command_id = %command_id,
