@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.15.1](https://github.com/noetl/worker/compare/v5.15.0...v5.15.1) (2026-06-10)
+
+### Bug Fixes
+
+* emit terminal call.error on pre-dispatch failures instead of hanging ([#68](https://github.com/noetl/worker/issues/68)) ([99e2c66](https://github.com/noetl/worker/commit/99e2c668bbf0c9d9979bfa92b64db6ca32606b28)), closes [noetl/worker#67](https://github.com/noetl/worker/issues/67) [noetl/ai-meta#78](https://github.com/noetl/ai-meta/issues/78)
+
 ## [5.15.0](https://github.com/noetl/worker/compare/v5.14.0...v5.15.0) (2026-06-08)
 
 ### Features
