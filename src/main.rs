@@ -5,7 +5,7 @@
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use noetl_worker::{Worker, WorkerConfig};
+use noetl_worker::{SubscriptionRuntime, Worker, WorkerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,19 +21,8 @@ async fn main() -> Result<()> {
     // Load environment variables
     dotenvy::dotenv().ok();
 
-    tracing::info!("Starting NoETL Worker Pool");
-
     // Load configuration
     let config = WorkerConfig::from_env()?;
-    tracing::info!(
-        worker_id = %config.worker_id,
-        pool_name = %config.pool_name,
-        server_url = %config.server_url,
-        "Worker configuration loaded"
-    );
-
-    // Create and run worker
-    let worker = Worker::new(config).await?;
 
     // Handle shutdown signals
     let shutdown = async {
@@ -42,6 +31,38 @@ async fn main() -> Result<()> {
             .expect("Failed to install CTRL+C handler");
         tracing::info!("Shutdown signal received");
     };
+
+    // Run-mode selection (noetl/ai-meta#90 Phase 2).  `WORKER_MODE=subscription`
+    // turns the binary into the continuous subscription runtime (Mode B);
+    // anything else (default) is the ordinary command-pull worker pool.  Both
+    // are the same binary with distinct configuration — the system-pool
+    // philosophy, no new compiled artifact.
+    let mode = std::env::var("WORKER_MODE").unwrap_or_else(|_| "command".to_string());
+    if mode == "subscription" {
+        tracing::info!(
+            worker_id = %config.worker_id,
+            server_url = %config.server_url,
+            subscription_path = %std::env::var("NOETL_SUBSCRIPTION_PATH").unwrap_or_default(),
+            "Starting NoETL Subscription Runtime (Mode B)"
+        );
+        let runtime = SubscriptionRuntime::new(&config)?;
+        if let Err(e) = runtime.run(shutdown).await {
+            tracing::error!(error = %e, "Subscription runtime error");
+            return Err(e);
+        }
+        tracing::info!("Subscription runtime stopped");
+        return Ok(());
+    }
+
+    tracing::info!(
+        worker_id = %config.worker_id,
+        pool_name = %config.pool_name,
+        server_url = %config.server_url,
+        "Starting NoETL Worker Pool"
+    );
+
+    // Create and run worker
+    let worker = Worker::new(config).await?;
 
     tokio::select! {
         result = worker.run() => {

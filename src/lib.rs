@@ -17,7 +17,9 @@ pub mod metrics_server;
 pub mod nats;
 pub mod scrub;
 pub mod snowflake;
+pub mod subscription;
 pub mod worker;
 
 pub use config::WorkerConfig;
+pub use subscription::SubscriptionRuntime;
 pub use worker::Worker;

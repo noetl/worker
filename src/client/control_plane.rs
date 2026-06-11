@@ -711,6 +711,146 @@ impl ControlPlaneClient {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Subscription continuous runtime (noetl/ai-meta#90 Phase 2)
+    // -----------------------------------------------------------------------
+
+    /// Fetch a catalog entry's raw YAML content by path
+    /// (`POST /api/catalog/resource`).  The continuous runtime uses this to
+    /// load the `kind: Subscription` spec it activates.
+    pub async fn get_catalog_content(&self, path: &str) -> Result<String> {
+        let response = self
+            .client
+            .post(format!("{}/api/catalog/resource", self.server_url))
+            .json(&serde_json::json!({ "path": path, "version": "latest" }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("catalog resource '{path}' fetch failed ({status}): {body}");
+        }
+        let v: serde_json::Value = response.json().await?;
+        v.get("content")
+            .and_then(|c| c.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("catalog resource '{path}' has no 'content'"))
+    }
+
+    /// Start a per-message execution (`POST /api/execute`), routing the whole
+    /// run to `execution_pool` and stamping the W3C `trace` context.  Returns
+    /// the new `execution_id`.  This is the continuous runtime's "one
+    /// execution per message" call.
+    pub async fn execute(
+        &self,
+        path: &str,
+        payload: serde_json::Value,
+        execution_pool: Option<&str>,
+        trace: Option<&serde_json::Value>,
+        parent_execution_id: Option<i64>,
+    ) -> Result<i64> {
+        let mut body = serde_json::json!({ "path": path, "payload": payload });
+        if let serde_json::Value::Object(ref mut m) = body {
+            if let Some(pool) = execution_pool {
+                m.insert("execution_pool".to_string(), serde_json::json!(pool));
+            }
+            if let Some(t) = trace {
+                m.insert("trace".to_string(), t.clone());
+            }
+            if let Some(parent) = parent_execution_id {
+                m.insert("parent_execution_id".to_string(), serde_json::json!(parent));
+            }
+        }
+        let response = self
+            .client
+            .post(format!("{}/api/execute", self.server_url))
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("execute '{path}' failed ({status}): {text}");
+        }
+        let v: serde_json::Value = response.json().await?;
+        let eid = v
+            .get("execution_id")
+            .and_then(|e| e.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| e.as_i64()))
+            .ok_or_else(|| anyhow::anyhow!("execute response missing execution_id: {v}"))?;
+        Ok(eid)
+    }
+
+    /// Register a `kind: Subscription` and return its lifecycle id + state
+    /// (`POST /api/subscriptions/register`).
+    pub async fn subscription_register(&self, path: &str) -> Result<SubscriptionStatus> {
+        let response = self
+            .client
+            .post(format!("{}/api/subscriptions/register", self.server_url))
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("subscription register '{path}' failed ({status}): {body}");
+        }
+        Ok(response.json().await?)
+    }
+
+    /// Apply a lifecycle transition (`activate` / `pause` / `resume` /
+    /// `drain` / `deactivate`) — `POST /api/subscriptions/{id}/{action}`.
+    pub async fn subscription_lifecycle(
+        &self,
+        subscription_id: i64,
+        action: &str,
+    ) -> Result<SubscriptionStatus> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/subscriptions/{}/{}",
+                self.server_url, subscription_id, action
+            ))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("subscription {subscription_id} {action} failed ({status}): {body}");
+        }
+        Ok(response.json().await?)
+    }
+
+    /// Read a subscription's current lifecycle state
+    /// (`GET /api/subscriptions/{id}`).
+    pub async fn subscription_get(&self, subscription_id: i64) -> Result<SubscriptionStatus> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/api/subscriptions/{}",
+                self.server_url, subscription_id
+            ))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("subscription {subscription_id} get failed ({status}): {body}");
+        }
+        Ok(response.json().await?)
+    }
+}
+
+/// Subscription lifecycle status returned by the `/api/subscriptions` routes.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SubscriptionStatus {
+    pub subscription_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub catalog_id: String,
+    pub state: String,
+    #[serde(default)]
+    pub last_event_type: String,
 }
 
 #[cfg(test)]
