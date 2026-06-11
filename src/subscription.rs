@@ -246,6 +246,7 @@ pub struct SubscriptionRuntime {
     client: ControlPlaneClient,
     worker_id: String,
     subscription_path: String,
+    metrics_bind: String,
 }
 
 impl SubscriptionRuntime {
@@ -259,6 +260,7 @@ impl SubscriptionRuntime {
             client: ControlPlaneClient::new(&worker_cfg.server_url),
             worker_id: worker_cfg.worker_id.clone(),
             subscription_path,
+            metrics_bind: worker_cfg.metrics_bind.clone(),
         })
     }
 
@@ -268,6 +270,11 @@ impl SubscriptionRuntime {
     where
         F: std::future::Future<Output = ()>,
     {
+        // Expose the subscription counters at /metrics (observability.md P2).
+        if let Err(e) = crate::metrics_server::spawn(&self.metrics_bind).await {
+            tracing::warn!(bind = %self.metrics_bind, error = %e, "metrics server bind failed (continuing)");
+        }
+
         // 1. Load + parse the subscription spec.
         let yaml_str = self
             .client

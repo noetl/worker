@@ -24,11 +24,30 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = WorkerConfig::from_env()?;
 
-    // Handle shutdown signals
+    // Handle shutdown signals.  Kubernetes terminates pods with SIGTERM, so
+    // the continuous subscription runtime must drain + deactivate on SIGTERM
+    // (not only SIGINT/ctrl_c) — otherwise a rollout / scale-down SIGKILLs it
+    // mid-flight and the drain/deactivate lifecycle events never land
+    // (noetl/ai-meta#90 Phase 2).
     let shutdown = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C handler");
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+                _ = sigint.recv()  => tracing::info!("SIGINT received"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C handler");
+        }
         tracing::info!("Shutdown signal received");
     };
 
