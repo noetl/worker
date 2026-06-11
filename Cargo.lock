@@ -1004,6 +1004,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2139,15 +2154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2220,6 +2226,22 @@ dependencies = [
  "serde",
  "serde-value",
  "serde_json",
+]
+
+[[package]]
+name = "kafka"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2054ba4edcb4dcda4209e138c7e88caf26d4a325b3db76fbdb6ca5eecc23e426"
+dependencies = [
+ "byteorder",
+ "crc",
+ "flate2",
+ "fnv",
+ "ref_slice",
+ "thiserror 1.0.69",
+ "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -2670,9 +2692,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "3.1.1"
+version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1165b1584fc14e39b6bd9d5b1f6008a57f061618f73abcbf19ab3f5e91fe839e"
+checksum = "bd29619fdbdd16a805ab4f8e40be3f67fef741af7bfd0bd1654d0d374345204a"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -2688,6 +2710,7 @@ dependencies = [
  "futures",
  "gcp_auth",
  "k8s-openapi",
+ "kafka",
  "kube",
  "minijinja",
  "noetl-arrow-flight-client",
@@ -2880,7 +2903,7 @@ dependencies = [
  "futures",
  "humantime",
  "hyper",
- "itertools 0.13.0",
+ "itertools",
  "parking_lot",
  "percent-encoding",
  "quick-xml",
@@ -3230,7 +3253,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3461,6 +3484,12 @@ checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.13.0",
 ]
+
+[[package]]
+name = "ref_slice"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4ed1d73fb92eba9b841ba2aef69533a060ccc0d3ec71c90aeda5996d4afb7a9"
 
 [[package]]
 name = "regex"
@@ -4769,6 +4798,17 @@ checksum = "9fe58ebd5edd976e0fe0f8a14d2a04b7c81ef153ea9a54eebc42e67c2c23b4e5"
 dependencies = [
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "twox-hash"
+version = "1.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
+dependencies = [
+ "cfg-if",
+ "rand 0.8.6",
+ "static_assertions",
 ]
 
 [[package]]
