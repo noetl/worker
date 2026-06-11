@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.15.2](https://github.com/noetl/worker/compare/v5.15.1...v5.15.2) (2026-06-11)
+
+### Bug Fixes
+
+* **auth:** resolve nats/pubsub/kafka credential aliases into tool config ([#71](https://github.com/noetl/worker/issues/71)) ([ca606b2](https://github.com/noetl/worker/commit/ca606b224c3aaadb78e6c6b3511789b91a52e8da)), closes [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90) [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90)
+
 ## [5.15.1](https://github.com/noetl/worker/compare/v5.15.0...v5.15.1) (2026-06-10)
 
 ### Bug Fixes
