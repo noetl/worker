@@ -360,6 +360,17 @@ fn apply_credential(
         "bearer" | "bearer_token" => Ok(apply_bearer(map, alias, &credential.data)),
         "api_key" => Ok(apply_api_key(map, alias, &credential.data)),
         "basic" => Ok(apply_basic(map, alias, &credential.data)),
+        // Message-source credentials (the `nats` tool + the `subscription`
+        // tool's nats/pubsub/kafka backends) carry their connection in the
+        // credential data (`url` / `user` / `password` / `token` / etc.).
+        // Inject those fields directly into the tool config — the same shape
+        // `apply_postgres` uses — so the tool reads them as explicit config.
+        // The `auth` alias was already stripped by `apply_credential`, which
+        // also avoids colliding with the outer `ToolConfig.auth`
+        // (`Option<AuthConfig>`, which can't hold a bare alias string).
+        // noetl/ai-meta#90 Phase 1 surfaced this during the in-cluster
+        // subscription-tool E2E.
+        "nats" | "pubsub" | "kafka" => Ok(apply_source_credential(map, &credential.data)),
         other => Err(anyhow::anyhow!(
             "Credential alias '{}' has unsupported type '{}'.  Supported types: postgres, bearer, api_key, basic.  File an issue if your tool needs another type.",
             alias,
@@ -503,6 +514,27 @@ fn apply_basic(
     secrets
 }
 
+/// Inject a message-source credential's data fields directly into the tool
+/// config map, for the `nats` tool and the `subscription` tool's
+/// nats/pubsub/kafka backends.
+///
+/// These tools resolve their connection from explicit config fields
+/// (`url` / `user` / `password` / `token` / …) rather than a typed `auth:`
+/// struct.  Like [`apply_postgres`], this merges the credential data into the
+/// config (without clobbering explicit playbook overrides) and seeds no
+/// secrets — and it deliberately does NOT re-attach `auth`, which the outer
+/// `ToolConfig.auth` (`Option<AuthConfig>`) would reject as a bare string.
+fn apply_source_credential(
+    map: &mut serde_json::Map<String, Value>,
+    data: &HashMap<String, Value>,
+) -> HashMap<String, String> {
+    for (key, value) in data {
+        // Don't clobber an explicit playbook override.
+        map.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    HashMap::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +582,67 @@ mod tests {
         // Tool-specific fields preserved.
         assert_eq!(map.get("kind").unwrap(), "postgres");
         assert_eq!(map.get("command").unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn nats_alias_injects_connection_fields_and_strips_auth() {
+        // noetl/ai-meta#90 Phase 1: a type-`nats` credential must merge its
+        // connection fields into the tool config (so the `subscription` /
+        // `nats` tool reads explicit `url`/`user`/`password`) and strip the
+        // `auth` alias (the outer ToolConfig.auth can't hold a bare string),
+        // rather than erroring as an unsupported type.
+        let mut cfg = serde_json::json!({
+            "kind": "subscription",
+            "auth": "nats_e2e",
+            "source": "nats",
+            "operation": "poll",
+            "stream": "ORDERS",
+            "consumer": "orders-drain",
+        });
+        let c = cred(
+            "nats_e2e",
+            "nats",
+            serde_json::json!({
+                "url": "nats://nats.nats.svc.cluster.local:4222",
+                "user": "noetl",
+                "password": "noetl",
+            }),
+        );
+
+        let map = cfg.as_object_mut().unwrap();
+        let secrets = apply_credential(map, "nats_e2e", &c).unwrap();
+
+        assert!(secrets.is_empty(), "source path seeds no secrets");
+        assert!(!map.contains_key("auth"), "auth alias stripped");
+        // Connection fields injected directly.
+        assert_eq!(
+            map.get("url").unwrap(),
+            "nats://nats.nats.svc.cluster.local:4222"
+        );
+        assert_eq!(map.get("user").unwrap(), "noetl");
+        assert_eq!(map.get("password").unwrap(), "noetl");
+        // Tool-specific fields untouched.
+        assert_eq!(map.get("source").unwrap(), "nats");
+        assert_eq!(map.get("consumer").unwrap(), "orders-drain");
+    }
+
+    #[test]
+    fn source_credential_does_not_clobber_explicit_override() {
+        // An explicit playbook `url:` wins over the credential's url.
+        let mut cfg = serde_json::json!({
+            "kind": "nats",
+            "auth": "nats_e2e",
+            "url": "nats://override:4222",
+        });
+        let c = cred(
+            "nats_e2e",
+            "nats",
+            serde_json::json!({ "url": "nats://cred:4222", "user": "noetl" }),
+        );
+        let map = cfg.as_object_mut().unwrap();
+        apply_credential(map, "nats_e2e", &c).unwrap();
+        assert_eq!(map.get("url").unwrap(), "nats://override:4222");
+        assert_eq!(map.get("user").unwrap(), "noetl");
     }
 
     #[test]
