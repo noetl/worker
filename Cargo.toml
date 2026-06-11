@@ -96,6 +96,10 @@ path = "src/main.rs"
 #   `gcp` (Google Secret Manager via ambient GKE Workload-Identity token).
 #   Secrets Wallet Phase 3a (noetl/ai-meta#61).  (Cargo.lock now resolves
 #   noetl-tools 2.19.0; `^2.18` covers it.)
+# - Multi-tool sibling references (3.1.1, noetl/ai-meta#87): in a
+#   `tool: [list]` step, a later sub-tool can read an earlier sibling's
+#   output via `{{ <label>.<field> }}` (was rendering empty).  (Cargo.lock
+#   now resolves noetl-tools 3.1.1; `^3` covers it.)
 noetl-tools = "3"
 
 # Shared execution core -- types and utilities shared with the noetl
