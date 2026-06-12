@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.17.0](https://github.com/noetl/worker/compare/v5.16.0...v5.17.0) (2026-06-12)
+
+### Features
+
+* wire store-and-forward spool + circuit breaker into subscription runtime ([#90](https://github.com/noetl/worker/issues/90) Phase 4) ([#75](https://github.com/noetl/worker/issues/75)) ([c612c8a](https://github.com/noetl/worker/commit/c612c8aef8bd11cb029cf15f321cb1b3a66c5922))
+
 ## [5.16.0](https://github.com/noetl/worker/compare/v5.15.2...v5.16.0) (2026-06-12)
 
 ### Features
