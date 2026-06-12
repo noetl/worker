@@ -462,9 +462,18 @@ impl SubscriptionRuntime {
         )
         .await
         .context("build spool runtime")?;
-        if let Some(s) = &spool {
-            let _ = s; // built; the loop drives it.
+        if let Some(s) = spool.as_mut() {
             tracing::info!(subscription_id, "store-and-forward spool enabled");
+            // Cross-restart recovery (noetl/ai-meta#93): seed recv_seq from
+            // any surviving backlog and auto-drain a spool that outlived a
+            // restart mid-outage, before the live loop starts.
+            if let Err(e) = s.recover_on_startup(&spec.payload_from).await {
+                tracing::warn!(
+                    subscription_id,
+                    error = %e,
+                    "spool startup recovery drain failed (will retry in loop)"
+                );
+            }
         }
 
         // 4. The loop.

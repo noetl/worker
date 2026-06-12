@@ -36,11 +36,12 @@
 use anyhow::{Context, Result};
 use noetl_tools::spool::{
     probe_downstream, Admission, CircuitDecision, CircuitRegistry, GcsBackend, LocalDiskBackend,
-    NatsObjectBackend, SpoolBackend, SpoolBackendKind, SpoolEngine, SpoolItem, SpoolMode, SpoolSpec,
+    NatsObjectBackend, S3Backend, SpoolBackend, SpoolBackendKind, SpoolEngine, SpoolItem, SpoolMode,
+    SpoolSpec,
 };
 use noetl_tools::tools::source::{DispatchPlan, PolledMessage};
 
-use crate::client::{ControlPlaneClient, ExecutorEvent};
+use crate::client::{ControlPlaneClient, Credential, ExecutorEvent};
 
 /// Wall-clock epoch millis. The spool/circuit logic takes `now_ms` as an
 /// argument so the core stays deterministic + testable; the runtime feeds
@@ -160,13 +161,44 @@ impl SpoolRuntime {
                 // for the Cloud-Run hardening pass (RFC §8.6).
                 (Box::new(backend), Box::new(dlq), None)
             }
-            other => {
-                anyhow::bail!(
-                    "spool.backend '{}' is implemented as a SpoolBackend but not yet wired in the \
-                     runtime (s3 backend tracked: tenant-bucket path); \
-                     use nats_object, local_disk, or gcs",
-                    other.as_str()
+            SpoolBackendKind::S3 => {
+                // S3 / S3-compatible (MinIO, R2, B2) spool backend
+                // (noetl/ai-meta#94).  The bucket credential is an *external
+                // system* (data-access-boundary.md), so it resolves from the
+                // NoETL keychain by alias — never a worker env var.  One
+                // bucket holds the live spool + the dead-letter sibling,
+                // separated by prefix; `recv_seq`-keyed objects list in
+                // receive order for `ordering: global`.
+                let bucket = spec
+                    .bucket
+                    .clone()
+                    .context("spool.backend s3 requires a bucket")?;
+                let alias = spec
+                    .credential
+                    .clone()
+                    .context("spool.backend s3 requires a keychain 'credential' alias")?;
+                let cred = client
+                    .get_credential(&alias, subscription_id)
+                    .await
+                    .with_context(|| format!("resolve s3 spool credential '{alias}'"))?
+                    .with_context(|| format!("s3 spool credential '{alias}' not found in keychain"))?;
+                let s3 = S3Creds::from_credential(&alias, &cred)?;
+                let prefix = format!("{subscription_path}/spool");
+                let dlq_prefix = format!("{subscription_path}/dlq");
+                let backend = S3Backend::new(
+                    &bucket, &prefix, &s3.endpoint, &s3.region, &s3.access_key, &s3.secret_key,
+                    s3.session_token.clone(),
                 );
+                let dlq = S3Backend::new(
+                    &bucket, &dlq_prefix, &s3.endpoint, &s3.region, &s3.access_key, &s3.secret_key,
+                    s3.session_token.clone(),
+                );
+                // Circuit state is in-memory for the out-of-cluster S3 path
+                // (no in-cluster NATS KV to reach).  The startup spool
+                // recovery (noetl/ai-meta#93) lists the durable S3 spool on
+                // boot and auto-drains it, so a restart mid-outage replays
+                // correctly without a persisted breaker phase.
+                (Box::new(backend), Box::new(dlq), None)
             }
         };
 
@@ -211,6 +243,60 @@ impl SpoolRuntime {
             last_probe_ms: 0,
             recv_seq: 0,
         }))
+    }
+
+    /// On runtime startup, recover from a spool that survived a restart
+    /// mid-outage (noetl/ai-meta#93).
+    ///
+    /// Two things happen:
+    /// 1. The `recv_seq` counter is seeded from the surviving spool's
+    ///    high-water mark, so items spooled *after* the restart continue the
+    ///    monotone receive sequence instead of colliding with the backlog
+    ///    (which would corrupt `ordering: global` replay — a fresh
+    ///    `recv_seq = 1` object key sorts ahead of the survivors).
+    /// 2. If the spool is non-empty, an ordered drain auto-triggers. For the
+    ///    in-cluster `nats_object` backend the circuit phase was already
+    ///    rehydrated from NATS KV in [`Self::build`]; for the out-of-cluster
+    ///    `gcs`/`s3` backends (in-memory circuit, `kv = None`) this spool
+    ///    listing is the *only* signal that a drain is owed — without it a
+    ///    message buffered during an outage would sit until the breaker
+    ///    happened to re-open then re-close (RFC §8.6 cross-restart gap).
+    ///
+    /// The drain is idempotent (the engine's dedup window + the
+    /// at-least-once dispatch contract), so re-running it on every boot is
+    /// safe. A still-down downstream stalls the drain gracefully (items
+    /// re-buffer) and the normal probe loop retries.
+    pub async fn recover_on_startup(&mut self, payload_from: &str) -> Result<()> {
+        let hw = self.engine.high_water_recv_seq().await.unwrap_or(0);
+        if hw > self.recv_seq {
+            self.recv_seq = hw;
+        }
+
+        let pending = self.engine.len().await.unwrap_or(0);
+        if pending == 0 {
+            return Ok(());
+        }
+
+        tracing::info!(
+            subscription_id = self.subscription_id,
+            pending,
+            recovered_recv_seq = self.recv_seq,
+            backend = self.engine.spec().backend.as_str(),
+            "spool backlog detected on startup — auto-draining (cross-restart recovery)"
+        );
+        self.emit(
+            self.subscription_id,
+            "subscription.spool.recovered",
+            "RECOVERED",
+            serde_json::json!({
+                "pending": pending,
+                "recv_seq_high_water": self.recv_seq,
+                "backend": self.engine.spec().backend.as_str(),
+            }),
+        )
+        .await;
+
+        self.drain(payload_from).await
     }
 
     /// Resolve a message to its downstream + circuit decision. The resolved
@@ -630,6 +716,51 @@ impl SpoolRuntime {
 /// Map a `ToolError` into `anyhow` with context.
 fn de(e: noetl_tools::ToolError) -> anyhow::Error {
     anyhow::anyhow!("spool: {e}")
+}
+
+/// Resolved S3 bucket credential (noetl/ai-meta#94) — the access-key pair +
+/// region + endpoint the [`S3Backend`] signs requests with. Parsed from a
+/// keychain credential's `data` block (`type: aws` / `s3`); tolerant of the
+/// common field-name spellings so an operator can register the alias the way
+/// the AWS CLI / SDK env vars name them.
+struct S3Creds {
+    access_key: String,
+    secret_key: String,
+    region: String,
+    endpoint: String,
+    session_token: Option<String>,
+}
+
+impl S3Creds {
+    fn from_credential(alias: &str, cred: &Credential) -> Result<Self> {
+        let get = |keys: &[&str]| -> Option<String> {
+            for k in keys {
+                if let Some(v) = cred.data.get(*k).and_then(|v| v.as_str()) {
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+            None
+        };
+        let access_key = get(&["access_key_id", "aws_access_key_id", "access_key"])
+            .with_context(|| format!("s3 spool credential '{alias}' missing access_key_id"))?;
+        let secret_key = get(&["secret_access_key", "aws_secret_access_key", "secret_key"])
+            .with_context(|| format!("s3 spool credential '{alias}' missing secret_access_key"))?;
+        let region = get(&["region", "aws_region"]).unwrap_or_else(|| "us-east-1".to_string());
+        // Default to the regional AWS endpoint; an S3-compatible store (MinIO,
+        // R2, B2) carries an explicit `endpoint`.
+        let endpoint = get(&["endpoint", "endpoint_url"])
+            .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+        let session_token = get(&["session_token", "aws_session_token"]);
+        Ok(Self {
+            access_key,
+            secret_key,
+            region,
+            endpoint,
+            session_token,
+        })
+    }
 }
 
 /// Connect a JetStream context to the platform NATS (a runtime credential,

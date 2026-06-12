@@ -104,7 +104,13 @@ path = "src/main.rs"
 #   (`noetl_tools::spool`) for the subscription runtime (RFC #90 Phase 4).
 # - v3.5: `gcs` spool backend (`noetl_tools::spool::GcsBackend`) — the
 #   durable buffer for the out-of-cluster Cloud Run runtime (RFC #90 Phase 5).
-noetl-tools = "3.5"
+# - v3.6: `s3` spool backend (`noetl_tools::spool::S3Backend`) — AWS SigV4
+#   over reqwest, S3/MinIO/R2/B2 (noetl/ai-meta#94).
+# - v3.7: spool cross-restart recovery helpers (`recv_seq_from_object_key` +
+#   `SpoolEngine::high_water_recv_seq`) for the startup drain auto-trigger
+#   (noetl/ai-meta#93); 3.7.1 pins `time` =0.3.47 to dodge the async-nats
+#   E0119 under rustc 1.92.
+noetl-tools = "3.7"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
@@ -140,6 +146,13 @@ async-trait = "0.1"
 # NATS messaging
 async-nats = "0.38"
 futures = "0.3"
+
+# Build-fix pin (NOT used directly).  time 0.3.48 (2026-06-12) collides with
+# async-nats 0.38.0's blanket `From<Kind> for Error<Kind>` under rustc 1.92
+# (E0119, HourBase).  Pin the transitive dep to the last good release so a
+# fresh CI / image build stays off 0.3.48.  Mirrors the same pin in
+# noetl-tools 3.7.1.  Revisit when async-nats ships a fix.
+time = "=0.3.47"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -201,3 +214,4 @@ tokio-test = "0.4"
 # uuid used in integration tests (dispatch_nats_mcp.rs) to generate unique
 # NATS KV bucket names so concurrent test runs don't collide.
 uuid = { version = "1", features = ["v4"] }
+
