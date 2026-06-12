@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.18.0](https://github.com/noetl/worker/compare/v5.17.0...v5.18.0) (2026-06-12)
+
+### Features
+
+* **subscription:** Cloud Run parity — gcs spool + bearer auth + $PORT bind ([f36ba68](https://github.com/noetl/worker/commit/f36ba68e8436067fc0cc056e2f9c6c6ea46ea4eb)), closes [noetl/worker#76](https://github.com/noetl/worker/issues/76) [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90)
+
 ## [5.17.0](https://github.com/noetl/worker/compare/v5.16.0...v5.17.0) (2026-06-12)
 
 ### Features
