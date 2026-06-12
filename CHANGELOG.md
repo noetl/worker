@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.20.0](https://github.com/noetl/worker/compare/v5.19.0...v5.20.0) (2026-06-12)
+
+### Features
+
+* wire s3 spool backend + cross-restart spool drain recovery ([c441813](https://github.com/noetl/worker/commit/c4418132a98ef2fe866eb6f435871e828c8d6f50)), closes [noetl/ai-meta#94](https://github.com/noetl/ai-meta/issues/94) [noetl/ai-meta#93](https://github.com/noetl/ai-meta/issues/93) [noetl/ai-meta#94](https://github.com/noetl/ai-meta/issues/94) [noetl/ai-meta#93](https://github.com/noetl/ai-meta/issues/93)
+
 ## [5.19.0](https://github.com/noetl/worker/compare/v5.18.0...v5.19.0) (2026-06-12)
 
 ### Features
