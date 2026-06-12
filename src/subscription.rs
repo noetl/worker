@@ -87,7 +87,40 @@ pub struct ParsedSpec {
     pub batch: u32,
     /// Poll wait.
     pub timeout_ms: Option<u64>,
+    /// Dispatch a drained batch via `POST /api/execute/batch` instead of one
+    /// HTTP round-trip per message (noetl/ai-meta#90 Phase 7, RFC §10 OQ12).
+    /// Default off — the per-message path stays the live-proven default.
+    pub batch_dispatch: bool,
+    /// Cap on messages per batch HTTP call when `batch_dispatch` is on.
+    pub batch_max: u32,
+    /// Opt-in exactly-once dedup window (noetl/ai-meta#90 Phase 7, RFC §10
+    /// OQ1).  `None` → no dedup (the default).
+    pub dedup: Option<DedupCfg>,
+    /// Per-subscription rate limit / backpressure caps (RFC §9).
+    pub limits: LimitsCfg,
 }
+
+/// Opt-in dedup config (noetl/ai-meta#90 Phase 7).  The runtime stamps a
+/// `dedup` block onto every `/api/execute` so the server collapses a duplicate
+/// delivery (same key within the window) to a single execution.
+#[derive(Debug, Clone)]
+pub struct DedupCfg {
+    /// Bounded dedup window in seconds.
+    pub window_secs: u64,
+}
+
+/// Per-subscription rate-limit / backpressure caps (noetl/ai-meta#90 Phase 7,
+/// RFC §9).  Both default to unlimited (`None`).
+#[derive(Debug, Clone, Default)]
+pub struct LimitsCfg {
+    /// Most un-dispatched messages held at once — clamps the poll batch.
+    pub max_in_flight: Option<u32>,
+    /// Token-bucket dispatch rate; when exhausted the runtime stops fetching.
+    pub max_dispatch_per_sec: Option<u32>,
+}
+
+/// Default dedup window when `dedup.enabled` is set without a `window_secs`.
+const DEFAULT_DEDUP_WINDOW_SECS: u64 = 300;
 
 /// Parse a `kind: Subscription` catalog YAML into the runtime's [`ParsedSpec`].
 pub fn parse_spec(yaml: &serde_yaml::Value) -> Result<ParsedSpec> {
@@ -165,6 +198,49 @@ pub fn parse_spec(yaml: &serde_yaml::Value) -> Result<ParsedSpec> {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    // Phase 7 scale knobs (noetl/ai-meta#90).
+    let batch_dispatch = dispatch
+        .get("batch_dispatch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let batch_max = dispatch
+        .get("batch_max")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .filter(|n| *n > 0)
+        .unwrap_or(batch);
+
+    // dedup block (opt-in exactly-once window, RFC §10 OQ1) — only honored
+    // when `enabled: true`.
+    let dedup = match spec.get("dedup") {
+        Some(d) if d.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) => {
+            let window_secs = d
+                .get("window_secs")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .unwrap_or(DEFAULT_DEDUP_WINDOW_SECS);
+            Some(DedupCfg { window_secs })
+        }
+        _ => None,
+    };
+
+    // limits block (rate limit / backpressure, RFC §9) — both optional.
+    let limits = match spec.get("limits") {
+        Some(l) => LimitsCfg {
+            max_in_flight: l
+                .get("max_in_flight")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .map(|n| n as u32),
+            max_dispatch_per_sec: l
+                .get("max_dispatch_per_sec")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .map(|n| n as u32),
+        },
+        None => LimitsCfg::default(),
+    };
+
     // headers (directive allowlist) — optional.
     let directives = match spec.get("headers") {
         Some(h) => {
@@ -197,6 +273,28 @@ pub fn parse_spec(yaml: &serde_yaml::Value) -> Result<ParsedSpec> {
         spool,
         batch,
         timeout_ms,
+        batch_dispatch,
+        batch_max,
+        dedup,
+        limits,
+    })
+}
+
+/// Resolve the dedup key for a message: the `idempotency_key` header directive
+/// wins, falling back to the source `message_id` (RFC §10 OQ8).  Returns the
+/// `dedup` block to stamp on the execute request, or `None` when the
+/// subscription hasn't opted in.
+fn dedup_block(
+    dedup: &Option<DedupCfg>,
+    plan: &DispatchPlan,
+    msg: &PolledMessage,
+) -> Option<serde_json::Value> {
+    dedup.as_ref().map(|cfg| {
+        let key = plan
+            .idempotency_key
+            .clone()
+            .unwrap_or_else(|| msg.id.clone());
+        serde_json::json!({ "key": key, "window_secs": cfg.window_secs })
     })
 }
 
@@ -349,8 +447,6 @@ impl SubscriptionRuntime {
             "Subscription runtime activated"
         );
 
-        let opts = PollOptions::new(Some(spec.batch), spec.timeout_ms, AckMode::OnSuccess);
-
         // 3b. Build the store-and-forward spool runtime (RFC §8, Phase 4) —
         // `None` when the spec declares no buffering (`spool.mode: off`).
         let mut spool = SpoolRuntime::build(
@@ -378,7 +474,6 @@ impl SubscriptionRuntime {
                 source_name,
                 subscription_id,
                 &spec,
-                &opts,
                 spool.as_mut(),
                 shutdown,
             )
@@ -407,18 +502,36 @@ impl SubscriptionRuntime {
         source_name: &str,
         subscription_id: i64,
         spec: &ParsedSpec,
-        opts: &PollOptions,
         mut spool: Option<&mut SpoolRuntime>,
         shutdown: F,
     ) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
+        use crate::ratelimit::{FetchPlan, RateGovernor};
         tokio::pin!(shutdown);
         let mut paused = false;
         let mut last_state_check = std::time::Instant::now()
             .checked_sub(STATE_CHECK_INTERVAL)
             .unwrap_or_else(std::time::Instant::now);
+
+        // Per-subscription rate-limit / backpressure governor (RFC §9).  Both
+        // caps default to unlimited; when set, they throttle the fetch side so
+        // an over-limit subscription stops pulling (source keeps the backlog,
+        // no loss) instead of flooding the control plane.
+        let mut governor = RateGovernor::new(
+            spec.limits.max_in_flight,
+            spec.limits.max_dispatch_per_sec,
+            std::time::Instant::now(),
+        );
+        if !governor.is_unlimited() {
+            tracing::info!(
+                subscription_id,
+                max_in_flight = ?spec.limits.max_in_flight,
+                max_dispatch_per_sec = ?spec.limits.max_dispatch_per_sec,
+                "per-subscription rate limits engaged"
+            );
+        }
 
         loop {
             // Periodically reconcile lifecycle state (pause/resume/deactivate).
@@ -471,6 +584,47 @@ impl SubscriptionRuntime {
                 }
             }
 
+            // Rate-limit / backpressure planning (RFC §9).  The governor decides
+            // how deep the next poll may be; when the dispatch-rate budget is
+            // exhausted it returns Throttle and we skip the poll entirely so the
+            // unfetched messages stay in the source (no loss, source redelivers).
+            let fetch_batch = match governor.plan_fetch(spec.batch, std::time::Instant::now()) {
+                FetchPlan::Throttle { wait, newly_limited } => {
+                    if newly_limited {
+                        crate::metrics::record_subscription_rate_limited(source_name, "dispatch_rate");
+                        self.emit_rate_limited(subscription_id, "dispatch_rate", &spec.limits)
+                            .await;
+                        tracing::info!(
+                            subscription_id,
+                            source = source_name,
+                            wait_ms = wait.as_millis() as u64,
+                            "rate limit engaged — pausing fetch (source retains backlog, no loss)"
+                        );
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown => { tracing::info!(subscription_id, "shutdown signal received"); break; }
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    continue;
+                }
+                FetchPlan::Fetch { batch, newly_limited } => {
+                    if newly_limited {
+                        crate::metrics::record_subscription_rate_limited(source_name, "max_in_flight");
+                        self.emit_rate_limited(subscription_id, "max_in_flight", &spec.limits)
+                            .await;
+                        tracing::info!(
+                            subscription_id,
+                            source = source_name,
+                            batch,
+                            "in-flight cap clamped the fetch batch (backpressure)"
+                        );
+                    }
+                    batch
+                }
+            };
+            let opts = PollOptions::new(Some(fetch_batch), spec.timeout_ms, AckMode::OnSuccess);
+
             // One bounded drain, racing the shutdown signal so a `poll`
             // waiting out its `timeout_ms` doesn't delay shutdown.
             let outcome = {
@@ -483,7 +637,7 @@ impl SubscriptionRuntime {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown => { tracing::info!(subscription_id, "shutdown signal received"); break; }
-                    r = source.poll(opts) => r,
+                    r = source.poll(&opts) => r,
                 }
             };
             let outcome = match outcome {
@@ -495,6 +649,8 @@ impl SubscriptionRuntime {
                 }
             };
             let received = outcome.count() as u64;
+            // Charge the rate budget for what was actually pulled (RFC §9).
+            governor.record_fetched(received as u32, std::time::Instant::now());
 
             if received == 0 {
                 tokio::time::sleep(Duration::from_millis(POLL_IDLE_MS)).await;
@@ -504,13 +660,14 @@ impl SubscriptionRuntime {
             let mut dispatched = 0u64;
             let mut errors = 0u64;
             let mut spooled = 0u64;
-            for msg in &outcome.messages {
-                let plan = spec.directives.resolve(&msg.headers);
 
-                // Route through the spool/circuit first. When a downstream's
-                // circuit is open, the message is durably buffered here
-                // (already acked by the poll → no loss) instead of hammering
-                // the dead dependency.
+            // Phase 1 — resolve each message's directive plan and route it
+            // through the spool/circuit.  A message whose downstream circuit is
+            // open is durably buffered here (already acked by the poll → no
+            // loss); the rest are collected as dispatch-eligible.
+            let mut eligible: Vec<(usize, DispatchPlan)> = Vec::with_capacity(outcome.messages.len());
+            for (idx, msg) in outcome.messages.iter().enumerate() {
+                let plan = spec.directives.resolve(&msg.headers);
                 if let Some(s) = spool.as_deref_mut() {
                     match s.route_message(msg, &plan).await {
                         Routing::Spooled => {
@@ -524,27 +681,51 @@ impl SubscriptionRuntime {
                         Routing::Dispatch => {}
                     }
                 }
+                eligible.push((idx, plan));
+            }
 
-                let outcome = self
-                    .dispatch_message(msg, &plan, spec, source_name, subscription_id)
-                    .await;
-                // Feed the dispatch outcome back to the breaker (passive
-                // signal: a failed POST /api/execute for a downstream
-                // increments it; success records the dedup key).
-                if let Some(s) = spool.as_deref_mut() {
-                    s.report_dispatch(&plan, msg, outcome.is_ok()).await;
-                }
-                match outcome {
-                    Ok(()) => dispatched += 1,
-                    Err(e) => {
-                        errors += 1;
-                        tracing::warn!(
+            // Phase 2 — dispatch the eligible messages.  When batch_dispatch is
+            // on and there's more than one, collapse them into
+            // `POST /api/execute/batch` calls of up to `batch_max`; each item
+            // still carries its own directive-resolved playbook/pool/trace/dedup
+            // so per-message traceability is intact.  Otherwise fall back to the
+            // per-message path (the live-proven default).
+            if spec.batch_dispatch && eligible.len() > 1 {
+                for chunk in eligible.chunks(spec.batch_max.max(1) as usize) {
+                    let (d, e) = self
+                        .dispatch_chunk(
+                            &outcome.messages,
+                            chunk,
+                            spec,
+                            source_name,
                             subscription_id,
-                            source = source_name,
-                            message_id = %msg.id,
-                            error = %e,
-                            "message dispatch failed"
-                        );
+                            spool.as_deref_mut(),
+                        )
+                        .await;
+                    dispatched += d;
+                    errors += e;
+                }
+            } else {
+                for (idx, plan) in &eligible {
+                    let msg = &outcome.messages[*idx];
+                    let res = self
+                        .dispatch_message(msg, plan, spec, source_name, subscription_id)
+                        .await;
+                    if let Some(s) = spool.as_deref_mut() {
+                        s.report_dispatch(plan, msg, res.is_ok()).await;
+                    }
+                    match res {
+                        Ok(()) => dispatched += 1,
+                        Err(e) => {
+                            errors += 1;
+                            tracing::warn!(
+                                subscription_id,
+                                source = source_name,
+                                message_id = %msg.id,
+                                error = %e,
+                                "message dispatch failed"
+                            );
+                        }
                     }
                 }
             }
@@ -554,6 +735,129 @@ impl SubscriptionRuntime {
             }
         }
         Ok(())
+    }
+
+    /// Dispatch a chunk of eligible messages via `POST /api/execute/batch`
+    /// (noetl/ai-meta#90 Phase 7).  Builds one [`DispatchItem`] per message —
+    /// each with its directive-resolved playbook / pool / trace / dedup — so a
+    /// batch is N independent executions in one HTTP round-trip with per-message
+    /// traceability intact.  Returns `(dispatched, errors)`.  A whole-batch HTTP
+    /// failure reports every item failed to the circuit breaker (and, when a
+    /// spool is configured, that signal is what trips it for the next round);
+    /// per-item failures inside a 200 response are contained.
+    async fn dispatch_chunk(
+        &self,
+        messages: &[PolledMessage],
+        chunk: &[(usize, DispatchPlan)],
+        spec: &ParsedSpec,
+        source_name: &str,
+        subscription_id: i64,
+        mut spool: Option<&mut SpoolRuntime>,
+    ) -> (u64, u64) {
+        let items: Vec<crate::client::DispatchItem> = chunk
+            .iter()
+            .map(|(idx, plan)| {
+                let msg = &messages[*idx];
+                let playbook = plan
+                    .playbook_override
+                    .clone()
+                    .unwrap_or_else(|| spec.default_playbook.clone());
+                let pool = plan
+                    .execution_pool_override
+                    .clone()
+                    .or_else(|| spec.default_pool.clone());
+                let trace = plan.trace.as_ref().and_then(|t| serde_json::to_value(t).ok());
+                let dedup = dedup_block(&spec.dedup, plan, msg);
+                let payload =
+                    build_payload(msg, &spec.payload_from, plan, &self.subscription_path, source_name);
+                crate::client::DispatchItem::new(
+                    &playbook,
+                    payload,
+                    pool.as_deref(),
+                    trace.as_ref(),
+                    Some(subscription_id),
+                    dedup.as_ref(),
+                )
+            })
+            .collect();
+
+        let batch_span = tracing::info_span!(
+            "subscription.dispatch.batch",
+            source = source_name,
+            subscription_id,
+            batch_size = items.len(),
+        );
+        let _g = batch_span.enter();
+
+        crate::metrics::record_subscription_batch_dispatch(source_name, items.len() as u64);
+
+        match self.client.execute_batch(&items).await {
+            Ok(results) => {
+                let mut dispatched = 0u64;
+                let mut errors = 0u64;
+                for (slot, (idx, plan)) in chunk.iter().enumerate() {
+                    let msg = &messages[*idx];
+                    // Results are returned in request order; correlate by slot.
+                    let ok = results.get(slot).map(|r| r.is_ok()).unwrap_or(false);
+                    if let Some(s) = spool.as_deref_mut() {
+                        s.report_dispatch(plan, msg, ok).await;
+                    }
+                    match results.get(slot) {
+                        Some(r) if r.is_ok() => {
+                            dispatched += 1;
+                            if let Some(eid) = r.execution_id_i64() {
+                                self.audit_directives(eid, msg, plan).await;
+                            }
+                        }
+                        Some(r) => {
+                            errors += 1;
+                            tracing::warn!(
+                                subscription_id,
+                                source = source_name,
+                                message_id = %msg.id,
+                                error = r.error.as_deref().unwrap_or("unknown"),
+                                "batch item failed"
+                            );
+                        }
+                        None => {
+                            errors += 1;
+                            tracing::warn!(
+                                subscription_id,
+                                source = source_name,
+                                message_id = %msg.id,
+                                "batch response missing item for slot {slot}"
+                            );
+                        }
+                    }
+                }
+                tracing::info!(
+                    subscription_id,
+                    source = source_name,
+                    dispatched,
+                    errors,
+                    "batch dispatch complete"
+                );
+                (dispatched, errors)
+            }
+            Err(e) => {
+                // Whole-batch HTTP failure: report every item failed so the
+                // circuit breaker sees the downstream as down for next round.
+                tracing::warn!(
+                    subscription_id,
+                    source = source_name,
+                    batch_size = chunk.len(),
+                    error = %e,
+                    "batch dispatch failed (whole chunk)"
+                );
+                for (idx, plan) in chunk {
+                    let msg = &messages[*idx];
+                    if let Some(s) = spool.as_deref_mut() {
+                        s.report_dispatch(plan, msg, false).await;
+                    }
+                }
+                (0, chunk.len() as u64)
+            }
+        }
     }
 
     /// POST /api/execute for one message using a pre-resolved directive
@@ -580,6 +884,10 @@ impl SubscriptionRuntime {
             .as_ref()
             .and_then(|t| serde_json::to_value(t).ok());
 
+        // Opt-in exactly-once dedup block (RFC §10 OQ1) — only stamped when the
+        // subscription declared `dedup.enabled: true`.
+        let dedup = dedup_block(&spec.dedup, plan, msg);
+
         let payload = build_payload(msg, &spec.payload_from, plan, &self.subscription_path, source_name);
 
         let exec_span = tracing::info_span!(
@@ -602,6 +910,7 @@ impl SubscriptionRuntime {
                 // The subscription is the parent execution; per-message runs
                 // are its children (carries trace inheritance + audit lineage).
                 Some(subscription_id),
+                dedup.as_ref(),
             )
             .await?;
 
@@ -613,15 +922,50 @@ impl SubscriptionRuntime {
             "dispatched one execution per message"
         );
 
-        // Audit the applied directives (RFC §7.6) — best-effort.
-        if !plan.applied.is_empty() || plan.trace.is_some() {
-            for d in &plan.applied {
-                crate::metrics::record_subscription_directive(&d.controls);
-            }
-            self.emit_directives_applied(execution_id, msg, plan).await;
-        }
+        self.audit_directives(execution_id, msg, plan).await;
 
         Ok(())
+    }
+
+    /// Record directive metrics + emit the `directives_applied` audit event
+    /// (RFC §7.6) for one dispatched execution.  Shared by the per-message and
+    /// batch dispatch paths; best-effort.
+    async fn audit_directives(&self, execution_id: i64, msg: &PolledMessage, plan: &DispatchPlan) {
+        if plan.applied.is_empty() && plan.trace.is_none() {
+            return;
+        }
+        for d in &plan.applied {
+            crate::metrics::record_subscription_directive(&d.controls);
+        }
+        self.emit_directives_applied(execution_id, msg, plan).await;
+    }
+
+    /// Emit a `subscription.rate_limited` event (RFC §9) on the subscription's
+    /// lifecycle log when a per-subscription limit engages.  Emitted on the
+    /// off→on edge only (not per message) so it's an auditable signal without
+    /// flooding the event log.  Best-effort.
+    async fn emit_rate_limited(&self, subscription_id: i64, reason: &str, limits: &LimitsCfg) {
+        let context = serde_json::json!({
+            "reason": reason,
+            "max_in_flight": limits.max_in_flight,
+            "max_dispatch_per_sec": limits.max_dispatch_per_sec,
+            "action": "stopped_fetching",
+            "loss_safe": true,
+        });
+        let event = crate::client::ExecutorEvent {
+            execution_id: subscription_id,
+            event_type: "subscription.rate_limited".to_string(),
+            step: "ingress".to_string(),
+            status: "RATE_LIMITED".to_string(),
+            created_at: chrono::Utc::now(),
+            context,
+            event_id: None,
+            worker_id: Some(self.worker_id.clone()),
+            meta: Some(serde_json::json!({ "emitter": "subscription_runtime" })),
+        };
+        if let Err(e) = self.client.emit_event(event).await {
+            tracing::debug!(subscription_id, error = %e, "rate_limited audit emit failed (non-fatal)");
+        }
     }
 
     /// Emit a `subscription.message.directives_applied` event (RFC §7.6) keyed
@@ -811,6 +1155,87 @@ spec:
         let m = msg(json!("raw-text"), json!({}));
         let payload = build_payload(&m, "message.json", &DispatchPlan::default(), "p", "nats");
         assert_eq!(payload["body"], "raw-text");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 7 — batch dispatch / dedup / limits parsing + dedup key resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_spec_defaults_phase7_off() {
+        let spec = parse_spec(&yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n",
+        ))
+        .unwrap();
+        assert!(!spec.batch_dispatch);
+        assert_eq!(spec.batch_max, spec.batch); // defaults to runtime batch
+        assert!(spec.dedup.is_none());
+        assert!(spec.limits.max_in_flight.is_none());
+        assert!(spec.limits.max_dispatch_per_sec.is_none());
+    }
+
+    #[test]
+    fn parse_spec_extracts_phase7_knobs() {
+        let spec = parse_spec(&yaml(
+            r#"
+kind: Subscription
+spec:
+  source: nats
+  stream: ORDERS
+  consumer: orders-drain
+  runtime: { batch: 500 }
+  dispatch: { playbook: domain/order, batch_dispatch: true, batch_max: 100 }
+  dedup: { enabled: true, window_secs: 600 }
+  limits: { max_in_flight: 1000, max_dispatch_per_sec: 200 }
+"#,
+        ))
+        .unwrap();
+        assert!(spec.batch_dispatch);
+        assert_eq!(spec.batch_max, 100);
+        assert_eq!(spec.dedup.as_ref().unwrap().window_secs, 600);
+        assert_eq!(spec.limits.max_in_flight, Some(1000));
+        assert_eq!(spec.limits.max_dispatch_per_sec, Some(200));
+    }
+
+    #[test]
+    fn parse_spec_dedup_disabled_when_enabled_false() {
+        let spec = parse_spec(&yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  dedup: { enabled: false, window_secs: 99 }\n",
+        ))
+        .unwrap();
+        assert!(spec.dedup.is_none(), "enabled: false → no dedup");
+    }
+
+    #[test]
+    fn parse_spec_dedup_default_window() {
+        let spec = parse_spec(&yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  dedup: { enabled: true }\n",
+        ))
+        .unwrap();
+        assert_eq!(spec.dedup.as_ref().unwrap().window_secs, DEFAULT_DEDUP_WINDOW_SECS);
+    }
+
+    #[test]
+    fn dedup_block_prefers_idempotency_key_over_message_id() {
+        let cfg = Some(DedupCfg { window_secs: 120 });
+        let m = msg(json!({}), json!({}));
+        // With an idempotency_key on the plan → that key wins.
+        let plan = DispatchPlan {
+            idempotency_key: Some("idem-123".to_string()),
+            ..Default::default()
+        };
+        let block = dedup_block(&cfg, &plan, &m).unwrap();
+        assert_eq!(block["key"], "idem-123");
+        assert_eq!(block["window_secs"], 120);
+        // Without one → falls back to message_id (msg.id).
+        let block = dedup_block(&cfg, &DispatchPlan::default(), &m).unwrap();
+        assert_eq!(block["key"], m.id);
+    }
+
+    #[test]
+    fn dedup_block_none_when_not_opted_in() {
+        let m = msg(json!({}), json!({}));
+        assert!(dedup_block(&None, &DispatchPlan::default(), &m).is_none());
     }
 
     #[test]

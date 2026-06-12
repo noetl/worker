@@ -742,6 +742,7 @@ impl ControlPlaneClient {
     /// run to `execution_pool` and stamping the W3C `trace` context.  Returns
     /// the new `execution_id`.  This is the continuous runtime's "one
     /// execution per message" call.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         path: &str,
@@ -749,19 +750,11 @@ impl ControlPlaneClient {
         execution_pool: Option<&str>,
         trace: Option<&serde_json::Value>,
         parent_execution_id: Option<i64>,
+        dedup: Option<&serde_json::Value>,
     ) -> Result<i64> {
-        let mut body = serde_json::json!({ "path": path, "payload": payload });
-        if let serde_json::Value::Object(ref mut m) = body {
-            if let Some(pool) = execution_pool {
-                m.insert("execution_pool".to_string(), serde_json::json!(pool));
-            }
-            if let Some(t) = trace {
-                m.insert("trace".to_string(), t.clone());
-            }
-            if let Some(parent) = parent_execution_id {
-                m.insert("parent_execution_id".to_string(), serde_json::json!(parent));
-            }
-        }
+        let item =
+            DispatchItem::new(path, payload, execution_pool, trace, parent_execution_id, dedup);
+        let body = item.to_request_body();
         let response = self
             .client
             .post(format!("{}/api/execute", self.server_url))
@@ -779,6 +772,34 @@ impl ControlPlaneClient {
             .and_then(|e| e.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| e.as_i64()))
             .ok_or_else(|| anyhow::anyhow!("execute response missing execution_id: {v}"))?;
         Ok(eid)
+    }
+
+    /// Batch-dispatch N executions in one HTTP round-trip
+    /// (`POST /api/execute/batch`, noetl/ai-meta#90 Phase 7).
+    ///
+    /// Each item is a full per-message request (its own path / pool / trace /
+    /// dedup), so the directive-resolved routing + trace propagation + opt-in
+    /// dedup are preserved exactly as in the per-message path — a batch is N
+    /// independent executions in one call, not one shared run.  Returns the
+    /// per-item outcomes **in request order**; partial failure is contained
+    /// (a bad item is an `error` outcome, the rest still run).
+    pub async fn execute_batch(&self, items: &[DispatchItem]) -> Result<Vec<BatchItemOutcome>> {
+        let executions: Vec<serde_json::Value> =
+            items.iter().map(|i| i.to_request_body()).collect();
+        let body = serde_json::json!({ "executions": executions });
+        let response = self
+            .client
+            .post(format!("{}/api/execute/batch", self.server_url))
+            .json(&body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("execute batch ({} items) failed ({status}): {text}", items.len());
+        }
+        let resp: BatchExecuteResponse = response.json().await?;
+        Ok(resp.results)
     }
 
     /// Register a `kind: Subscription` and return its lifecycle id + state
@@ -839,6 +860,102 @@ impl ControlPlaneClient {
         }
         Ok(response.json().await?)
     }
+}
+
+/// One execute request for the single or batch dispatch path
+/// (noetl/ai-meta#90 Phase 7).  Owns its fields so a batch can be assembled
+/// before the HTTP call.
+#[derive(Debug, Clone)]
+pub struct DispatchItem {
+    pub path: String,
+    pub payload: serde_json::Value,
+    pub execution_pool: Option<String>,
+    pub trace: Option<serde_json::Value>,
+    pub parent_execution_id: Option<i64>,
+    /// Opt-in server-side dedup block (`{ "key", "window_secs" }`); only set
+    /// when the subscription declares `dedup.enabled: true`.
+    pub dedup: Option<serde_json::Value>,
+}
+
+impl DispatchItem {
+    pub fn new(
+        path: &str,
+        payload: serde_json::Value,
+        execution_pool: Option<&str>,
+        trace: Option<&serde_json::Value>,
+        parent_execution_id: Option<i64>,
+        dedup: Option<&serde_json::Value>,
+    ) -> Self {
+        DispatchItem {
+            path: path.to_string(),
+            payload,
+            execution_pool: execution_pool.map(str::to_string),
+            trace: trace.cloned(),
+            parent_execution_id,
+            dedup: dedup.cloned(),
+        }
+    }
+
+    /// Render to the `/api/execute` JSON request body (also one element of a
+    /// batch `executions` array).
+    pub fn to_request_body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({ "path": self.path, "payload": self.payload });
+        if let serde_json::Value::Object(ref mut m) = body {
+            if let Some(pool) = self.execution_pool.as_ref() {
+                m.insert("execution_pool".to_string(), serde_json::json!(pool));
+            }
+            if let Some(t) = self.trace.as_ref() {
+                m.insert("trace".to_string(), t.clone());
+            }
+            if let Some(parent) = self.parent_execution_id {
+                m.insert("parent_execution_id".to_string(), serde_json::json!(parent));
+            }
+            if let Some(d) = self.dedup.as_ref() {
+                m.insert("dedup".to_string(), d.clone());
+            }
+        }
+        body
+    }
+}
+
+/// One per-item result from `POST /api/execute/batch`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BatchItemOutcome {
+    pub index: usize,
+    pub status: String,
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub commands_generated: i32,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl BatchItemOutcome {
+    /// The created (or deduplicated) execution id, parsed.  `None` for an
+    /// `error` item.
+    pub fn execution_id_i64(&self) -> Option<i64> {
+        self.execution_id.as_ref().and_then(|s| s.parse().ok())
+    }
+
+    /// Whether the item created or deduplicated an execution (not an error).
+    pub fn is_ok(&self) -> bool {
+        self.status != "error"
+    }
+}
+
+/// The `POST /api/execute/batch` response envelope.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BatchExecuteResponse {
+    #[serde(default)]
+    pub count: usize,
+    #[serde(default)]
+    pub started: usize,
+    #[serde(default)]
+    pub duplicates: usize,
+    #[serde(default)]
+    pub failed: usize,
+    pub results: Vec<BatchItemOutcome>,
 }
 
 /// Subscription lifecycle status returned by the `/api/subscriptions` routes.

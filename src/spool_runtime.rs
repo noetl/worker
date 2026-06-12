@@ -461,6 +461,7 @@ impl SpoolRuntime {
                             default_pool.as_deref(),
                             None,
                             Some(subscription_id),
+                            None,
                         )
                         .await
                         .map_err(|e| {

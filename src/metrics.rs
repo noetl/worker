@@ -99,6 +99,15 @@ pub struct WorkerMetrics {
     pub subscription_dead_lettered_total: IntCounterVec,
     /// Live spool size in bytes, by source — the cost ceiling gauge (OQ3).
     pub subscription_spool_bytes: IntGaugeVec,
+    /// Batch dispatches (`POST /api/execute/batch`) issued, by source
+    /// (noetl/ai-meta#90 Phase 7).
+    pub subscription_batch_dispatch_total: IntCounterVec,
+    /// Messages dispatched inside a batch, by source — divided by
+    /// `subscription_batch_dispatch_total` gives average batch depth.
+    pub subscription_batch_messages_total: IntCounterVec,
+    /// Times a per-subscription rate limit engaged, by source + reason
+    /// (`dispatch_rate` / `max_in_flight`) — RFC §9 backpressure.
+    pub subscription_rate_limited_total: IntCounterVec,
 }
 
 impl WorkerMetrics {
@@ -369,6 +378,42 @@ impl WorkerMetrics {
             .register(Box::new(subscription_spool_bytes.clone()))
             .expect("register subscription_spool_bytes");
 
+        let subscription_batch_dispatch_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_batch_dispatch_total",
+                "Batch dispatches (POST /api/execute/batch) issued by the subscription runtime, by source (RFC #90 Phase 7).",
+            ),
+            &["source"],
+        )
+        .expect("subscription_batch_dispatch_total metric");
+        registry
+            .register(Box::new(subscription_batch_dispatch_total.clone()))
+            .expect("register subscription_batch_dispatch_total");
+
+        let subscription_batch_messages_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_batch_messages_total",
+                "Messages dispatched inside a batch, by source (RFC #90 Phase 7).",
+            ),
+            &["source"],
+        )
+        .expect("subscription_batch_messages_total metric");
+        registry
+            .register(Box::new(subscription_batch_messages_total.clone()))
+            .expect("register subscription_batch_messages_total");
+
+        let subscription_rate_limited_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_rate_limited_total",
+                "Times a per-subscription rate limit engaged, by source + reason (RFC #90 Phase 7 §9).",
+            ),
+            &["source", "reason"],
+        )
+        .expect("subscription_rate_limited_total metric");
+        registry
+            .register(Box::new(subscription_rate_limited_total.clone()))
+            .expect("register subscription_rate_limited_total");
+
         Self {
             registry,
             pulls_total,
@@ -391,6 +436,9 @@ impl WorkerMetrics {
             subscription_dead_lettered_total,
             subscription_spool_bytes,
             subscription_directives_applied_total,
+            subscription_batch_dispatch_total,
+            subscription_batch_messages_total,
+            subscription_rate_limited_total,
         }
     }
 
@@ -474,6 +522,29 @@ pub fn record_subscription_batch(source: &str, received: u64, dispatched: u64, e
             .with_label_values(&[source, "error"])
             .inc_by(errors);
     }
+}
+
+/// Record one batch dispatch (`POST /api/execute/batch`) of `count` messages
+/// (noetl/ai-meta#90 Phase 7).
+pub fn record_subscription_batch_dispatch(source: &str, count: u64) {
+    let m = WorkerMetrics::global();
+    m.subscription_batch_dispatch_total
+        .with_label_values(&[source])
+        .inc();
+    if count > 0 {
+        m.subscription_batch_messages_total
+            .with_label_values(&[source])
+            .inc_by(count);
+    }
+}
+
+/// Record that a per-subscription rate limit engaged, by `reason`
+/// (`dispatch_rate` / `max_in_flight`) — RFC §9 backpressure.
+pub fn record_subscription_rate_limited(source: &str, reason: &str) {
+    WorkerMetrics::global()
+        .subscription_rate_limited_total
+        .with_label_values(&[source, reason])
+        .inc();
 }
 
 /// Record one applied header directive, by control kind.
