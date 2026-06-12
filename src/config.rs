@@ -97,8 +97,21 @@ impl WorkerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(4);
 
-        let metrics_bind =
-            std::env::var("WORKER_METRICS_BIND").unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+        // Metrics/health HTTP bind.  Cloud Run injects `PORT` and expects the
+        // container to listen on it (the startup probe is a TCP check on that
+        // port); the worker's metrics server (/healthz + /metrics) satisfies
+        // it with no extra HTTP code (RFC #90 Phase 5).  Precedence:
+        // explicit WORKER_METRICS_BIND → `0.0.0.0:$PORT` (Cloud Run) → :9090.
+        let metrics_bind = std::env::var("WORKER_METRICS_BIND")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("PORT")
+                    .ok()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| format!("0.0.0.0:{p}"))
+            })
+            .unwrap_or_else(|| "0.0.0.0:9090".to_string());
 
         Ok(Self {
             worker_id,

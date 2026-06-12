@@ -81,15 +81,34 @@ pub fn resolve(
 /// and/or trusts a private CA.  Errors are fatal for a worker that must reach
 /// an mTLS server — the caller fails fast rather than silently downgrading.
 pub fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
-    build_http_client_with(timeout, from_env()?)
+    // Service-account bearer token for the out-of-cluster (Cloud Run) runtime
+    // authenticating to the control plane (RFC #90 Phase 5, the
+    // NOETL_INTERNAL_API_TOKEN shape the system pool uses).  Unset in-cluster
+    // (the worker reaches the server over the trusted pod network); set on
+    // Cloud Run so every /api/* call carries `Authorization: Bearer <token>`.
+    let bearer = std::env::var("NOETL_INTERNAL_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    build_http_client_with(timeout, from_env()?, bearer)
 }
 
 /// Pure builder over already-resolved params (testable without env).
 pub fn build_http_client_with(
     timeout: Duration,
     tls: Option<WorkerClientTls>,
+    bearer: Option<String>,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(timeout);
+
+    if let Some(token) = bearer {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut val = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .context("worker: invalid NOETL_INTERNAL_API_TOKEN (not a valid header value)")?;
+        val.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, val);
+        builder = builder.default_headers(headers);
+        tracing::info!("control-plane HTTP client: bearer auth enabled (NOETL_INTERNAL_API_TOKEN)");
+    }
 
     if let Some(tls) = tls {
         if let (Some(cert), Some(key)) = (&tls.client_cert_path, &tls.client_key_path) {
@@ -163,7 +182,7 @@ mod tests {
     #[test]
     fn build_plain_when_no_tls() {
         // None params ⇒ a plain client builds fine (default path unchanged).
-        assert!(build_http_client_with(Duration::from_secs(1), None).is_ok());
+        assert!(build_http_client_with(Duration::from_secs(1), None, None).is_ok());
     }
 
     #[test]
@@ -175,7 +194,7 @@ mod tests {
             client_key_path: Some("/nonexistent/k.pem".into()),
             ca_path: None,
         };
-        let err = build_http_client_with(Duration::from_secs(1), Some(p)).unwrap_err();
+        let err = build_http_client_with(Duration::from_secs(1), Some(p), None).unwrap_err();
         assert!(
             format!("{err:#}").contains("read cert"),
             "expected a cert-read error, got: {err:#}"

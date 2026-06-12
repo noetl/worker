@@ -35,7 +35,7 @@
 
 use anyhow::{Context, Result};
 use noetl_tools::spool::{
-    probe_downstream, Admission, CircuitDecision, CircuitRegistry, LocalDiskBackend,
+    probe_downstream, Admission, CircuitDecision, CircuitRegistry, GcsBackend, LocalDiskBackend,
     NatsObjectBackend, SpoolBackend, SpoolBackendKind, SpoolEngine, SpoolItem, SpoolMode, SpoolSpec,
 };
 use noetl_tools::tools::source::{DispatchPlan, PolledMessage};
@@ -135,11 +135,36 @@ impl SpoolRuntime {
                 // local_disk circuit state lives next to the spool, not KV.
                 (Box::new(backend), Box::new(dlq), None)
             }
+            SpoolBackendKind::Gcs => {
+                // The out-of-cluster (Cloud Run) spool backend, RFC #90 Phase 5.
+                // Authenticates with ADC — the runtime service account via
+                // Workload Identity on Cloud Run, or the gcloud ADC file
+                // locally ("already-in-place trust", execution-model.md). One
+                // bucket holds both the live spool and the dead-letter sibling,
+                // separated by prefix; `recv_seq`-keyed objects list in receive
+                // order for `ordering: global`.
+                let bucket = spec
+                    .bucket
+                    .clone()
+                    .context("spool.backend gcs requires a bucket")?;
+                let prefix = format!("{subscription_path}/spool");
+                let dlq_prefix = format!("{subscription_path}/dlq");
+                let backend = GcsBackend::open(&bucket, &prefix).await.map_err(de)?;
+                let dlq = GcsBackend::open(&bucket, &dlq_prefix).await.map_err(de)?;
+                // Circuit state is in-memory for the Cloud Run runtime: there
+                // is no in-cluster NATS to reach for a KV bucket, and the
+                // service holds the subscription for its lifetime. A restart
+                // mid-outage re-probes from `closed` and re-opens on the next
+                // failure — correct, just without persisted breaker phase.
+                // Persisting circuit state to a server KV endpoint is tracked
+                // for the Cloud-Run hardening pass (RFC §8.6).
+                (Box::new(backend), Box::new(dlq), None)
+            }
             other => {
                 anyhow::bail!(
                     "spool.backend '{}' is implemented as a SpoolBackend but not yet wired in the \
-                     in-cluster runtime (tracked: Cloud-Run / tenant-bucket path); \
-                     use nats_object or local_disk",
+                     runtime (s3 backend tracked: tenant-bucket path); \
+                     use nats_object, local_disk, or gcs",
                     other.as_str()
                 );
             }
