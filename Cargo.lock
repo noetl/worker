@@ -2701,9 +2701,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "3.3.0"
+version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09516202d8759720979b3fb2c2cd02358c3f61be9b9669524944fdba880a98ba"
+checksum = "fc5ed8604227607c8dc0e0ae6643380744eaa2a71b659c7b53a5489d9dab3f15"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -2728,6 +2728,7 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -17,6 +17,7 @@ pub mod metrics_server;
 pub mod nats;
 pub mod scrub;
 pub mod snowflake;
+pub mod spool_runtime;
 pub mod subscription;
 pub mod worker;
 

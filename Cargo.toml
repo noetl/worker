@@ -100,7 +100,9 @@ path = "src/main.rs"
 #   `tool: [list]` step, a later sub-tool can read an earlier sibling's
 #   output via `{{ <label>.<field> }}` (was rendering empty).  (Cargo.lock
 #   now resolves noetl-tools 3.1.1; `^3` covers it.)
-noetl-tools = "3.3"
+# - v3.4: store-and-forward spool engine + per-downstream circuit breaker
+#   (`noetl_tools::spool`) for the subscription runtime (RFC #90 Phase 4).
+noetl-tools = "3.4"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:

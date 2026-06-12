@@ -89,6 +89,16 @@ pub struct WorkerMetrics {
     pub subscription_executions_total: IntCounterVec,
     /// Header directives the runtime applied, by control kind.
     pub subscription_directives_applied_total: IntCounterVec,
+    /// Messages written to the store-and-forward spool, by source
+    /// (RFC #90 Phase 4 §8).
+    pub subscription_spooled_total: IntCounterVec,
+    /// Circuit-breaker transitions, by downstream + transition
+    /// (`opened` / `closed`).
+    pub subscription_circuit_transitions_total: IntCounterVec,
+    /// Messages dead-lettered (poison / evicted / expired), by source.
+    pub subscription_dead_lettered_total: IntCounterVec,
+    /// Live spool size in bytes, by source — the cost ceiling gauge (OQ3).
+    pub subscription_spool_bytes: IntGaugeVec,
 }
 
 impl WorkerMetrics {
@@ -311,6 +321,54 @@ impl WorkerMetrics {
             .register(Box::new(subscription_directives_applied_total.clone()))
             .expect("register subscription_directives_applied_total");
 
+        let subscription_spooled_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_spooled_total",
+                "Messages written to the store-and-forward spool, by source (RFC #90 Phase 4).",
+            ),
+            &["source"],
+        )
+        .expect("subscription_spooled_total metric");
+        registry
+            .register(Box::new(subscription_spooled_total.clone()))
+            .expect("register subscription_spooled_total");
+
+        let subscription_circuit_transitions_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_circuit_transitions_total",
+                "Circuit-breaker transitions, by downstream + transition.",
+            ),
+            &["downstream", "transition"],
+        )
+        .expect("subscription_circuit_transitions_total metric");
+        registry
+            .register(Box::new(subscription_circuit_transitions_total.clone()))
+            .expect("register subscription_circuit_transitions_total");
+
+        let subscription_dead_lettered_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_dead_lettered_total",
+                "Messages dead-lettered from the spool (poison / evicted / expired), by source.",
+            ),
+            &["source"],
+        )
+        .expect("subscription_dead_lettered_total metric");
+        registry
+            .register(Box::new(subscription_dead_lettered_total.clone()))
+            .expect("register subscription_dead_lettered_total");
+
+        let subscription_spool_bytes = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_spool_bytes",
+                "Live store-and-forward spool size in bytes, by source — the cost ceiling gauge.",
+            ),
+            &["source"],
+        )
+        .expect("subscription_spool_bytes metric");
+        registry
+            .register(Box::new(subscription_spool_bytes.clone()))
+            .expect("register subscription_spool_bytes");
+
         Self {
             registry,
             pulls_total,
@@ -328,6 +386,10 @@ impl WorkerMetrics {
             call_done_skipped_pending_callback_total,
             subscription_messages_received_total,
             subscription_executions_total,
+            subscription_spooled_total,
+            subscription_circuit_transitions_total,
+            subscription_dead_lettered_total,
+            subscription_spool_bytes,
             subscription_directives_applied_total,
         }
     }
@@ -420,6 +482,38 @@ pub fn record_subscription_directive(controls: &str) {
         .subscription_directives_applied_total
         .with_label_values(&[controls])
         .inc();
+}
+
+/// Record one message written to the spool (RFC #90 Phase 4 §8).
+pub fn record_subscription_spooled(source: &str) {
+    WorkerMetrics::global()
+        .subscription_spooled_total
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Record a circuit-breaker transition (`opened` / `closed`) for a downstream.
+pub fn record_subscription_circuit(downstream: &str, transition: &str) {
+    WorkerMetrics::global()
+        .subscription_circuit_transitions_total
+        .with_label_values(&[downstream, transition])
+        .inc();
+}
+
+/// Record one dead-lettered message (poison / evicted / expired).
+pub fn record_subscription_dead_lettered(source: &str) {
+    WorkerMetrics::global()
+        .subscription_dead_lettered_total
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Set the live spool byte total for a source — the cost-ceiling gauge.
+pub fn set_subscription_spool_bytes(source: &str, bytes: u64) {
+    WorkerMetrics::global()
+        .subscription_spool_bytes
+        .with_label_values(&[source])
+        .set(bytes as i64);
 }
 
 /// Bump the in-flight dispatches gauge when a permit is acquired.
