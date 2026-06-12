@@ -82,6 +82,13 @@ pub struct WorkerMetrics {
     pub result_store_put_bytes_total: IntCounter,
     pub result_store_put_errors_total: IntCounter,
     pub call_done_skipped_pending_callback_total: IntCounterVec,
+    /// Messages received by the continuous subscription runtime, by source.
+    pub subscription_messages_received_total: IntCounterVec,
+    /// Per-message executions the runtime dispatched, by source + outcome
+    /// (`dispatched` / `error`).
+    pub subscription_executions_total: IntCounterVec,
+    /// Header directives the runtime applied, by control kind.
+    pub subscription_directives_applied_total: IntCounterVec,
 }
 
 impl WorkerMetrics {
@@ -268,6 +275,42 @@ impl WorkerMetrics {
             .register(Box::new(call_done_skipped_pending_callback_total.clone()))
             .expect("register call_done_skipped_pending_callback_total");
 
+        let subscription_messages_received_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_messages_received_total",
+                "Messages received by the continuous subscription runtime, by source.",
+            ),
+            &["source"],
+        )
+        .expect("subscription_messages_received_total metric");
+        registry
+            .register(Box::new(subscription_messages_received_total.clone()))
+            .expect("register subscription_messages_received_total");
+
+        let subscription_executions_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_executions_total",
+                "Per-message executions dispatched by the subscription runtime, by source + outcome.",
+            ),
+            &["source", "outcome"],
+        )
+        .expect("subscription_executions_total metric");
+        registry
+            .register(Box::new(subscription_executions_total.clone()))
+            .expect("register subscription_executions_total");
+
+        let subscription_directives_applied_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_subscription_directives_applied_total",
+                "Header directives applied by the subscription runtime, by control kind.",
+            ),
+            &["controls"],
+        )
+        .expect("subscription_directives_applied_total metric");
+        registry
+            .register(Box::new(subscription_directives_applied_total.clone()))
+            .expect("register subscription_directives_applied_total");
+
         Self {
             registry,
             pulls_total,
@@ -283,6 +326,9 @@ impl WorkerMetrics {
             result_store_put_bytes_total,
             result_store_put_errors_total,
             call_done_skipped_pending_callback_total,
+            subscription_messages_received_total,
+            subscription_executions_total,
+            subscription_directives_applied_total,
         }
     }
 
@@ -344,6 +390,36 @@ pub fn record_event_emit(event_type: &str, duration_seconds: f64, retries: u32) 
             .with_label_values(&[event_type])
             .inc_by(retries as u64);
     }
+}
+
+/// Record subscription-runtime activity for one poll batch
+/// (noetl/ai-meta#90 Phase 2).  `received` messages, of which
+/// `dispatched` turned into executions and `errors` failed to dispatch.
+pub fn record_subscription_batch(source: &str, received: u64, dispatched: u64, errors: u64) {
+    let m = WorkerMetrics::global();
+    if received > 0 {
+        m.subscription_messages_received_total
+            .with_label_values(&[source])
+            .inc_by(received);
+    }
+    if dispatched > 0 {
+        m.subscription_executions_total
+            .with_label_values(&[source, "dispatched"])
+            .inc_by(dispatched);
+    }
+    if errors > 0 {
+        m.subscription_executions_total
+            .with_label_values(&[source, "error"])
+            .inc_by(errors);
+    }
+}
+
+/// Record one applied header directive, by control kind.
+pub fn record_subscription_directive(controls: &str) {
+    WorkerMetrics::global()
+        .subscription_directives_applied_total
+        .with_label_values(&[controls])
+        .inc();
 }
 
 /// Bump the in-flight dispatches gauge when a permit is acquired.

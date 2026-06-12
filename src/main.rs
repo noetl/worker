@@ -5,7 +5,7 @@
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use noetl_worker::{Worker, WorkerConfig};
+use noetl_worker::{SubscriptionRuntime, Worker, WorkerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,27 +21,67 @@ async fn main() -> Result<()> {
     // Load environment variables
     dotenvy::dotenv().ok();
 
-    tracing::info!("Starting NoETL Worker Pool");
-
     // Load configuration
     let config = WorkerConfig::from_env()?;
+
+    // Handle shutdown signals.  Kubernetes terminates pods with SIGTERM, so
+    // the continuous subscription runtime must drain + deactivate on SIGTERM
+    // (not only SIGINT/ctrl_c) — otherwise a rollout / scale-down SIGKILLs it
+    // mid-flight and the drain/deactivate lifecycle events never land
+    // (noetl/ai-meta#90 Phase 2).
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+                _ = sigint.recv()  => tracing::info!("SIGINT received"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C handler");
+        }
+        tracing::info!("Shutdown signal received");
+    };
+
+    // Run-mode selection (noetl/ai-meta#90 Phase 2).  `WORKER_MODE=subscription`
+    // turns the binary into the continuous subscription runtime (Mode B);
+    // anything else (default) is the ordinary command-pull worker pool.  Both
+    // are the same binary with distinct configuration — the system-pool
+    // philosophy, no new compiled artifact.
+    let mode = std::env::var("WORKER_MODE").unwrap_or_else(|_| "command".to_string());
+    if mode == "subscription" {
+        tracing::info!(
+            worker_id = %config.worker_id,
+            server_url = %config.server_url,
+            subscription_path = %std::env::var("NOETL_SUBSCRIPTION_PATH").unwrap_or_default(),
+            "Starting NoETL Subscription Runtime (Mode B)"
+        );
+        let runtime = SubscriptionRuntime::new(&config)?;
+        if let Err(e) = runtime.run(shutdown).await {
+            tracing::error!(error = %e, "Subscription runtime error");
+            return Err(e);
+        }
+        tracing::info!("Subscription runtime stopped");
+        return Ok(());
+    }
+
     tracing::info!(
         worker_id = %config.worker_id,
         pool_name = %config.pool_name,
         server_url = %config.server_url,
-        "Worker configuration loaded"
+        "Starting NoETL Worker Pool"
     );
 
     // Create and run worker
     let worker = Worker::new(config).await?;
-
-    // Handle shutdown signals
-    let shutdown = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C handler");
-        tracing::info!("Shutdown signal received");
-    };
 
     tokio::select! {
         result = worker.run() => {
