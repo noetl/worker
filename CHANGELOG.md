@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.16.0](https://github.com/noetl/worker/compare/v5.15.2...v5.16.0) (2026-06-12)
+
+### Features
+
+* continuous subscription runtime (Mode B) run-mode ([#90](https://github.com/noetl/worker/issues/90) Phase 2) ([#73](https://github.com/noetl/worker/issues/73)) ([d7370b3](https://github.com/noetl/worker/commit/d7370b3bb05c5cb7d64355be0fa4d6c840d97bb2))
+
 ## [5.15.2](https://github.com/noetl/worker/compare/v5.15.1...v5.15.2) (2026-06-11)
 
 ### Bug Fixes
