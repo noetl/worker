@@ -102,7 +102,9 @@ path = "src/main.rs"
 #   now resolves noetl-tools 3.1.1; `^3` covers it.)
 # - v3.4: store-and-forward spool engine + per-downstream circuit breaker
 #   (`noetl_tools::spool`) for the subscription runtime (RFC #90 Phase 4).
-noetl-tools = "3.4"
+# - v3.5: `gcs` spool backend (`noetl_tools::spool::GcsBackend`) — the
+#   durable buffer for the out-of-cluster Cloud Run runtime (RFC #90 Phase 5).
+noetl-tools = "3.5"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
