@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.19.0](https://github.com/noetl/worker/compare/v5.18.0...v5.19.0) (2026-06-12)
+
+### Features
+
+* batch dispatch + dedup opt-in + per-subscription rate limits ([#79](https://github.com/noetl/worker/issues/79)) ([83d4d2a](https://github.com/noetl/worker/commit/83d4d2ac21f3cf9eab2eed910fb720a38dc1cdb0)), closes [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90) [noetl/worker#78](https://github.com/noetl/worker/issues/78)
+
 ## [5.18.0](https://github.com/noetl/worker/compare/v5.17.0...v5.18.0) (2026-06-12)
 
 ### Features
