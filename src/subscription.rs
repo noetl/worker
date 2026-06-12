@@ -43,12 +43,14 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use noetl_tools::spool::SpoolSpec;
 use noetl_tools::tools::source::{AckMode, DirectiveSpec, DispatchPlan, PollOptions, PolledMessage};
 use noetl_tools::tools::{build_source, SubscriptionConfig};
 use noetl_tools::ExecutionContext;
 
 use crate::client::ControlPlaneClient;
 use crate::config::WorkerConfig;
+use crate::spool_runtime::{Routing, SpoolRuntime};
 
 /// Hard cap on the runtime poll batch, mirroring the bounded-drain tool.
 const RUNTIME_BATCH_DEFAULT: u32 = 100;
@@ -78,6 +80,9 @@ pub struct ParsedSpec {
     pub default_pool: Option<String>,
     /// The header-directive allowlist (RFC §7).
     pub directives: DirectiveSpec,
+    /// Store-and-forward spool config (RFC §8, Phase 4). [`SpoolSpec::off`]
+    /// when no `spool:` block is declared.
+    pub spool: SpoolSpec,
     /// Poll batch size.
     pub batch: u32,
     /// Poll wait.
@@ -171,6 +176,17 @@ pub fn parse_spec(yaml: &serde_yaml::Value) -> Result<ParsedSpec> {
         None => DirectiveSpec::default(),
     };
 
+    // spool block (RFC §8, Phase 4) — optional; absent → off.
+    let spool = match spec.get("spool") {
+        Some(s) => {
+            let json = serde_json::to_value(s)
+                .context("subscription spec 'spool' is not serializable")?;
+            SpoolSpec::parse(Some(&json))
+                .map_err(|e| anyhow::anyhow!("invalid subscription 'spool' block: {e}"))?
+        }
+        None => SpoolSpec::off(),
+    };
+
     Ok(ParsedSpec {
         source_cfg,
         auth_alias,
@@ -178,6 +194,7 @@ pub fn parse_spec(yaml: &serde_yaml::Value) -> Result<ParsedSpec> {
         payload_from,
         default_pool,
         directives,
+        spool,
         batch,
         timeout_ms,
     })
@@ -247,6 +264,9 @@ pub struct SubscriptionRuntime {
     worker_id: String,
     subscription_path: String,
     metrics_bind: String,
+    /// Platform NATS URL — the spool's `nats_object` backend + circuit KV
+    /// connect here (a runtime credential, direct access allowed).
+    nats_url: String,
 }
 
 impl SubscriptionRuntime {
@@ -261,6 +281,7 @@ impl SubscriptionRuntime {
             worker_id: worker_cfg.worker_id.clone(),
             subscription_path,
             metrics_bind: worker_cfg.metrics_bind.clone(),
+            nats_url: worker_cfg.nats_url.clone(),
         })
     }
 
@@ -330,9 +351,37 @@ impl SubscriptionRuntime {
 
         let opts = PollOptions::new(Some(spec.batch), spec.timeout_ms, AckMode::OnSuccess);
 
+        // 3b. Build the store-and-forward spool runtime (RFC §8, Phase 4) —
+        // `None` when the spec declares no buffering (`spool.mode: off`).
+        let mut spool = SpoolRuntime::build(
+            &spec.spool,
+            &self.nats_url,
+            self.client.clone(),
+            self.worker_id.clone(),
+            self.subscription_path.clone(),
+            subscription_id,
+            source_name.to_string(),
+            spec.default_playbook.clone(),
+            spec.default_pool.clone(),
+        )
+        .await
+        .context("build spool runtime")?;
+        if let Some(s) = &spool {
+            let _ = s; // built; the loop drives it.
+            tracing::info!(subscription_id, "store-and-forward spool enabled");
+        }
+
         // 4. The loop.
         let result = self
-            .run_loop(&*source, source_name, subscription_id, &spec, &opts, shutdown)
+            .run_loop(
+                &*source,
+                source_name,
+                subscription_id,
+                &spec,
+                &opts,
+                spool.as_mut(),
+                shutdown,
+            )
             .await;
 
         // 5. Drain + deactivate on the way out (best-effort).
@@ -359,6 +408,7 @@ impl SubscriptionRuntime {
         subscription_id: i64,
         spec: &ParsedSpec,
         opts: &PollOptions,
+        mut spool: Option<&mut SpoolRuntime>,
         shutdown: F,
     ) -> Result<()>
     where
@@ -408,6 +458,19 @@ impl SubscriptionRuntime {
                 continue;
             }
 
+            // Spool maintenance (RFC §8, Phase 4): probe declared downstreams
+            // on the configured cadence; when one recovers (circuit closes),
+            // drain its backlog in order before resuming live (or interleaved
+            // per `drain.on_recovery`).
+            if let Some(s) = spool.as_deref_mut() {
+                let recovered = s.maybe_probe().await;
+                if !recovered.is_empty() && s.drain_before_live() {
+                    if let Err(e) = s.drain(&spec.payload_from).await {
+                        tracing::warn!(subscription_id, error = %e, "spool drain failed (will retry)");
+                    }
+                }
+            }
+
             // One bounded drain, racing the shutdown signal so a `poll`
             // waiting out its `timeout_ms` doesn't delay shutdown.
             let outcome = {
@@ -440,11 +503,38 @@ impl SubscriptionRuntime {
 
             let mut dispatched = 0u64;
             let mut errors = 0u64;
+            let mut spooled = 0u64;
             for msg in &outcome.messages {
-                match self
-                    .dispatch_message(msg, spec, source_name, subscription_id)
-                    .await
-                {
+                let plan = spec.directives.resolve(&msg.headers);
+
+                // Route through the spool/circuit first. When a downstream's
+                // circuit is open, the message is durably buffered here
+                // (already acked by the poll → no loss) instead of hammering
+                // the dead dependency.
+                if let Some(s) = spool.as_deref_mut() {
+                    match s.route_message(msg, &plan).await {
+                        Routing::Spooled => {
+                            spooled += 1;
+                            continue;
+                        }
+                        Routing::Dropped => {
+                            errors += 1;
+                            continue;
+                        }
+                        Routing::Dispatch => {}
+                    }
+                }
+
+                let outcome = self
+                    .dispatch_message(msg, &plan, spec, source_name, subscription_id)
+                    .await;
+                // Feed the dispatch outcome back to the breaker (passive
+                // signal: a failed POST /api/execute for a downstream
+                // increments it; success records the dedup key).
+                if let Some(s) = spool.as_deref_mut() {
+                    s.report_dispatch(&plan, msg, outcome.is_ok()).await;
+                }
+                match outcome {
                     Ok(()) => dispatched += 1,
                     Err(e) => {
                         errors += 1;
@@ -453,26 +543,30 @@ impl SubscriptionRuntime {
                             source = source_name,
                             message_id = %msg.id,
                             error = %e,
-                            "message dispatch failed (ack-on-fetch; spool is Phase 4)"
+                            "message dispatch failed"
                         );
                     }
                 }
             }
             crate::metrics::record_subscription_batch(source_name, received, dispatched, errors);
+            if spooled > 0 {
+                tracing::info!(subscription_id, source = source_name, spooled, "messages buffered to spool (circuit open)");
+            }
         }
         Ok(())
     }
 
-    /// Resolve directives for one message and POST /api/execute.
+    /// POST /api/execute for one message using a pre-resolved directive
+    /// [`DispatchPlan`] (the caller resolves it once so the spool can route
+    /// on the same plan before deciding dispatch-vs-spool).
     async fn dispatch_message(
         &self,
         msg: &PolledMessage,
+        plan: &DispatchPlan,
         spec: &ParsedSpec,
         source_name: &str,
         subscription_id: i64,
     ) -> Result<()> {
-        let plan = spec.directives.resolve(&msg.headers);
-
         let playbook = plan
             .playbook_override
             .clone()
@@ -486,7 +580,7 @@ impl SubscriptionRuntime {
             .as_ref()
             .and_then(|t| serde_json::to_value(t).ok());
 
-        let payload = build_payload(msg, &spec.payload_from, &plan, &self.subscription_path, source_name);
+        let payload = build_payload(msg, &spec.payload_from, plan, &self.subscription_path, source_name);
 
         let exec_span = tracing::info_span!(
             "subscription.dispatch",
@@ -524,7 +618,7 @@ impl SubscriptionRuntime {
             for d in &plan.applied {
                 crate::metrics::record_subscription_directive(&d.controls);
             }
-            self.emit_directives_applied(execution_id, msg, &plan).await;
+            self.emit_directives_applied(execution_id, msg, plan).await;
         }
 
         Ok(())
@@ -613,6 +707,64 @@ spec:
         assert_eq!(spec.batch, 50);
         assert_eq!(spec.timeout_ms, Some(3000));
         assert_eq!(spec.source_cfg.stream.as_deref(), Some("ORDERS"));
+    }
+
+    #[test]
+    fn parse_spec_defaults_spool_off_when_absent() {
+        let spec = parse_spec(&yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n",
+        ))
+        .unwrap();
+        assert!(!spec.spool.buffers());
+    }
+
+    #[test]
+    fn parse_spec_extracts_spool_block() {
+        let spec = parse_spec(&yaml(
+            r#"
+kind: Subscription
+spec:
+  source: nats
+  stream: IOT
+  consumer: iot-drain
+  dispatch: { playbook: domain/ingest, execution_pool: iot }
+  spool:
+    mode: buffer_and_ack
+    backend: nats_object
+    bucket: noetl_spool_iot
+    ordering: per_key
+    ordering_key: device_id
+    circuit:
+      trip_after: 3
+      probe_after_ms: 5000
+      probe_interval_ms: 2000
+      downstream:
+        - { name: warehouse, type: http, target: "http://warehouse.svc/health" }
+    retention: { max_bytes: 1048576, on_full: drop_to_dlq }
+    drain: { max_replay_attempts: 4, on_recovery: ordered_then_live }
+"#,
+        ))
+        .unwrap();
+        assert!(spec.spool.buffers());
+        assert_eq!(spec.spool.mode.as_str(), "buffer_and_ack");
+        assert_eq!(spec.spool.backend.as_str(), "nats_object");
+        assert_eq!(spec.spool.bucket.as_deref(), Some("noetl_spool_iot"));
+        assert_eq!(spec.spool.ordering.as_str(), "per_key");
+        assert_eq!(spec.spool.ordering_key.as_deref(), Some("device_id"));
+        assert_eq!(spec.spool.circuit.trip_after, 3);
+        assert_eq!(spec.spool.circuit.downstream.len(), 1);
+        assert_eq!(spec.spool.circuit.downstream[0].name, "warehouse");
+        assert_eq!(spec.spool.drain.max_replay_attempts, 4);
+    }
+
+    #[test]
+    fn parse_spec_rejects_invalid_spool() {
+        // buffer_and_ack with nats_object but no bucket → reject.
+        let err = parse_spec(&yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  spool: { mode: buffer_and_ack, backend: nats_object }\n",
+        ))
+        .unwrap_err();
+        assert!(format!("{err}").contains("spool"));
     }
 
     #[test]
