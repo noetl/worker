@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.20.1](https://github.com/noetl/worker/compare/v5.20.0...v5.20.1) (2026-06-14)
+
+### Bug Fixes
+
+* **auth:** map nats_url/nats_user/nats_password credential fields to flat tool config names ([#81](https://github.com/noetl/worker/issues/81)) ([9ce4d6d](https://github.com/noetl/worker/commit/9ce4d6dd2951233e4fcb53da2b4de8805c762568)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [5.20.0](https://github.com/noetl/worker/compare/v5.19.0...v5.20.0) (2026-06-12)
 
 ### Features
