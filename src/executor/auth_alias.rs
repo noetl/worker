@@ -176,6 +176,25 @@ const POSTGRES_FIELD_MAP: &[(&str, &str)] = &[
     ("database", "database"),
 ];
 
+/// Field aliases for message-source credentials (`nats` / `pubsub` / `kafka`).
+///
+/// Mirrors [`POSTGRES_FIELD_MAP`]: keychain rows commonly store the connection
+/// under a tool-prefixed name (`nats_url`), but the `nats` / `subscription`
+/// tool config deserializes the flat name (`url`).  Without this mapping the
+/// prefixed fields land in the config as serde-unknown keys and are silently
+/// dropped, so `resolve_nats_conn` sees no `url` and fails with
+/// "NATS connection requires 'url' …".  Map the known prefixed shapes to the
+/// flat names so a shipped `nats`-type credential resolves without the
+/// operator hand-editing field names.  Unprefixed fields pass through the
+/// verbatim loop in `apply_source_credential`.
+const SOURCE_FIELD_MAP: &[(&str, &str)] = &[
+    ("nats_url", "url"),
+    ("nats_user", "user"),
+    ("nats_username", "user"),
+    ("nats_password", "password"),
+    ("nats_token", "token"),
+];
+
 /// Resolve a string `auth:` value into concrete tool config fields.
 ///
 /// Mutates `tool_config_value` in place.  Returns the secret name
@@ -528,8 +547,20 @@ fn apply_source_credential(
     map: &mut serde_json::Map<String, Value>,
     data: &HashMap<String, Value>,
 ) -> HashMap<String, String> {
+    // First, map known tool-prefixed connection fields (`nats_url` → `url`)
+    // to the flat names the tool config deserializes.  Don't clobber an
+    // explicit playbook override.
+    for (src, dst) in SOURCE_FIELD_MAP {
+        if let Some(value) = data.get(*src) {
+            map.entry((*dst).to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    // Then inject any remaining fields verbatim — covers explicit flat names
+    // (`url` / `user` / …) and pubsub/kafka-specific keys.  Leftover prefixed
+    // keys (`nats_url`) are harmless: the tool config ignores serde-unknown
+    // fields.  Still don't clobber an explicit playbook override.
     for (key, value) in data {
-        // Don't clobber an explicit playbook override.
         map.entry(key.clone()).or_insert_with(|| value.clone());
     }
     HashMap::new()
@@ -624,6 +655,49 @@ mod tests {
         // Tool-specific fields untouched.
         assert_eq!(map.get("source").unwrap(), "nats");
         assert_eq!(map.get("consumer").unwrap(), "orders-drain");
+    }
+
+    #[test]
+    fn nats_alias_maps_prefixed_connection_fields_to_flat_names() {
+        // The shipped `nats_credential` (repos/e2e/fixtures/credentials/
+        // nats_credential.json) stores its connection under tool-prefixed
+        // names (`nats_url` / `nats_user` / `nats_password`).  Those must be
+        // mapped to the flat `url` / `user` / `password` the NatsConfig
+        // deserializes — otherwise they're dropped as serde-unknown keys and
+        // resolve_nats_conn fails with "NATS connection requires 'url' …".
+        // Regression for the auth0_login cache_and_callback prod failure
+        // (noetl/ai-meta#49 Phase F R5 cutover).
+        let mut cfg = serde_json::json!({
+            "kind": "nats",
+            "auth": "nats_credential",
+            "operation": "kv_put",
+            "bucket": "sessions",
+        });
+        let c = cred(
+            "nats_credential",
+            "nats",
+            serde_json::json!({
+                "nats_url": "nats://noetl:noetl@nats.nats.svc.cluster.local:4222",
+                "nats_user": "noetl",
+                "nats_password": "noetl",
+            }),
+        );
+
+        let map = cfg.as_object_mut().unwrap();
+        let secrets = apply_credential(map, "nats_credential", &c).unwrap();
+
+        assert!(secrets.is_empty(), "source path seeds no secrets");
+        assert!(!map.contains_key("auth"), "auth alias stripped");
+        // Prefixed fields mapped to the flat names the tool reads.
+        assert_eq!(
+            map.get("url").unwrap(),
+            "nats://noetl:noetl@nats.nats.svc.cluster.local:4222"
+        );
+        assert_eq!(map.get("user").unwrap(), "noetl");
+        assert_eq!(map.get("password").unwrap(), "noetl");
+        // Tool-specific fields untouched.
+        assert_eq!(map.get("operation").unwrap(), "kv_put");
+        assert_eq!(map.get("bucket").unwrap(), "sessions");
     }
 
     #[test]
