@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.21.0](https://github.com/noetl/worker/compare/v5.20.2...v5.21.0) (2026-06-15)
+
+### Features
+
+* **auth:** map sf_public_key -> public_key for Snowflake keypair JWT ([#83](https://github.com/noetl/worker/issues/83)) ([b79afcb](https://github.com/noetl/worker/commit/b79afcb7b857736475cb83e9f35047df20c7ba1c)), closes [noetl/tools#62](https://github.com/noetl/tools/issues/62) [noetl/ai-meta#98](https://github.com/noetl/ai-meta/issues/98)
+
 ## [5.20.2](https://github.com/noetl/worker/compare/v5.20.1...v5.20.2) (2026-06-15)
 
 ### Bug Fixes
