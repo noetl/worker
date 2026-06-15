@@ -114,7 +114,11 @@ path = "src/main.rs"
 #   `generate_keypair_jwt` (noetl/tools#62).  Pairs with the
 #   `sf_public_key -> public_key` field mapping in auth_alias.rs
 #   (noetl/worker#83, noetl/ai-meta#98).  Bumped from 3.7 to enable it.
-noetl-tools = "3.9.2"
+# - v3.10: Snowflake<->Postgres transfer directions + credential-alias
+#   resolution for transfer endpoints (noetl/tools#65).  Pairs with the
+#   transfer source/target alias pre-resolution in auth_alias.rs
+#   (noetl/ai-meta#99).
+noetl-tools = "3.10"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:

@@ -248,6 +248,32 @@ pub async fn resolve_auth_alias(
         return Ok(all_secrets);
     }
 
+    // The `transfer` tool carries a keychain alias on each ENDPOINT
+    // (`source.auth` / `target.auth`), not on the outer envelope — one
+    // credential per end (e.g. a Snowflake source + a Postgres target).  Like
+    // task_sequence, the transfer tool dispatches through noetl-tools' registry
+    // with no ControlPlaneClient, so it can't resolve those aliases itself.
+    // Pre-resolve each endpoint here so the cred fields land in
+    // `source`/`target` before the transfer runs.  See noetl/ai-meta#99.
+    let is_transfer = tool_config_value
+        .as_object()
+        .and_then(|m| m.get("kind"))
+        .and_then(|v| v.as_str())
+        == Some("transfer");
+
+    if is_transfer {
+        let mut all_secrets = HashMap::new();
+        if let Some(obj) = tool_config_value.as_object_mut() {
+            for endpoint in ["source", "target"] {
+                if let Some(sub) = obj.get_mut(endpoint) {
+                    let secrets = resolve_single_tool_alias(sub, client, execution_id).await?;
+                    all_secrets.extend(secrets);
+                }
+            }
+        }
+        return Ok(all_secrets);
+    }
+
     resolve_single_tool_alias(tool_config_value, client, execution_id).await
 }
 

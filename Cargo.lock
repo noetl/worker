@@ -2154,15 +2154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2727,9 +2718,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "3.9.2"
+version = "3.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c96deab75f141d5a3982a253a01a34b59db567589eb84fea409cdbd6284de17"
+checksum = "a58bc20727abe80855a38f2e16c7b372fe6f5c360b31fe175622fb538d110e2e"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -2946,7 +2937,7 @@ dependencies = [
  "futures",
  "humantime",
  "hyper",
- "itertools 0.13.0",
+ "itertools",
  "parking_lot",
  "percent-encoding",
  "quick-xml",
@@ -3296,7 +3287,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
