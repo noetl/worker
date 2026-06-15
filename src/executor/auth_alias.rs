@@ -390,12 +390,54 @@ fn apply_credential(
         // noetl/ai-meta#90 Phase 1 surfaced this during the in-cluster
         // subscription-tool E2E.
         "nats" | "pubsub" | "kafka" => Ok(apply_source_credential(map, &credential.data)),
+        // Snowflake credentials carry sf_*-prefixed connection fields; map them
+        // to the flat names the `snowflake` tool reads (account / user / ...),
+        // same shape as `apply_postgres`.
+        "snowflake" => apply_snowflake(map, &credential.data),
         other => Err(anyhow::anyhow!(
-            "Credential alias '{}' has unsupported type '{}'.  Supported types: postgres, bearer, api_key, basic.  File an issue if your tool needs another type.",
+            "Credential alias '{}' has unsupported type '{}'.  Supported types: postgres, snowflake, bearer, api_key, basic, nats, pubsub, kafka.  File an issue if your tool needs another type.",
             alias,
             other
         )),
     }
+}
+
+/// Field aliases for `snowflake`-type credentials → the flat names the
+/// `snowflake` tool config deserializes.  Mirrors [`POSTGRES_FIELD_MAP`].
+const SNOWFLAKE_FIELD_MAP: &[(&str, &str)] = &[
+    ("sf_account", "account"),
+    ("sf_user", "user"),
+    ("sf_password", "password"),
+    ("sf_private_key", "private_key"),
+    ("sf_private_key_passphrase", "private_key_passphrase"),
+    ("sf_warehouse", "warehouse"),
+    ("sf_database", "database"),
+    ("sf_schema", "schema"),
+    ("sf_role", "role"),
+    // accept unprefixed shapes too (hand-edited keychain rows).
+    ("account", "account"),
+    ("user", "user"),
+    ("password", "password"),
+    ("private_key", "private_key"),
+    ("warehouse", "warehouse"),
+    ("database", "database"),
+    ("schema", "schema"),
+    ("role", "role"),
+];
+
+fn apply_snowflake(
+    map: &mut serde_json::Map<String, Value>,
+    data: &HashMap<String, Value>,
+) -> Result<HashMap<String, String>> {
+    for (src, dst) in SNOWFLAKE_FIELD_MAP {
+        let Some(value) = data.get(*src) else {
+            continue;
+        };
+        // Don't clobber an explicit playbook override.
+        map.entry((*dst).to_string())
+            .or_insert_with(|| value.clone());
+    }
+    Ok(HashMap::new())
 }
 
 fn apply_postgres(
@@ -698,6 +740,41 @@ mod tests {
         // Tool-specific fields untouched.
         assert_eq!(map.get("operation").unwrap(), "kv_put");
         assert_eq!(map.get("bucket").unwrap(), "sessions");
+    }
+
+    #[test]
+    fn snowflake_alias_maps_sf_fields_to_flat_config() {
+        // sf_test ships sf_*-prefixed fields; map them to the flat names the
+        // snowflake tool deserializes (account/user/warehouse/...).  Regression
+        // for "Credential alias 'sf_test' has unsupported type 'snowflake'".
+        let mut cfg = serde_json::json!({
+            "kind": "snowflake",
+            "auth": "sf_test",
+            "command": "SELECT 1",
+        });
+        let c = cred(
+            "sf_test",
+            "snowflake",
+            serde_json::json!({
+                "sf_account": "abc-xy123",
+                "sf_user": "noetl",
+                "sf_password": "pw",
+                "sf_warehouse": "WH",
+                "sf_database": "DB",
+                "sf_schema": "PUBLIC",
+                "sf_role": "SYSADMIN",
+            }),
+        );
+        let map = cfg.as_object_mut().unwrap();
+        let secrets = apply_credential(map, "sf_test", &c).unwrap();
+        assert!(secrets.is_empty());
+        assert!(!map.contains_key("auth"), "auth alias stripped");
+        assert_eq!(map.get("account").unwrap(), "abc-xy123");
+        assert_eq!(map.get("user").unwrap(), "noetl");
+        assert_eq!(map.get("warehouse").unwrap(), "WH");
+        assert_eq!(map.get("schema").unwrap(), "PUBLIC");
+        assert_eq!(map.get("role").unwrap(), "SYSADMIN");
+        assert_eq!(map.get("command").unwrap(), "SELECT 1");
     }
 
     #[test]
