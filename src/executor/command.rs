@@ -851,6 +851,17 @@ impl CommandExecutor {
 /// so operators see a WARN log instead of a silent drop).
 const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
 
+/// Effective inline budget — `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES` overrides
+/// the [`INLINE_CONTEXT_MAX_BYTES`] default.  Lowering it pushes more tool
+/// results into the result store (events carry only a reference), keeping the
+/// event log lean for the orchestrator's results-by-reference resolution.
+fn inline_context_max_bytes() -> usize {
+    std::env::var("NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(INLINE_CONTEXT_MAX_BYTES)
+}
+
 /// Encoding choice for the over-budget shm cache write.  R-2.2:
 /// tabular tool outputs (DuckDB / Postgres / Snowflake rowsets)
 /// encode as Arrow IPC stream bytes so colocated consumers benefit
@@ -933,7 +944,7 @@ async fn build_call_done_result(
     let context = &context;
 
     let serialised = serde_json::to_string(context)?;
-    if serialised.len() <= INLINE_CONTEXT_MAX_BYTES {
+    if serialised.len() <= inline_context_max_bytes() {
         return Ok(serde_json::json!({ "status": status, "context": context }));
     }
 
@@ -1123,7 +1134,7 @@ async fn build_call_done_result(
                 execution_id,
                 step,
                 context_bytes = serialised.len(),
-                inline_budget_bytes = INLINE_CONTEXT_MAX_BYTES,
+                inline_budget_bytes = inline_context_max_bytes(),
                 durable_error = %durable_err,
                 shm_error = %shm_err,
                 "Tool result exceeds inline budget and BOTH durable + shm staging failed; \
