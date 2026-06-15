@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.20.2](https://github.com/noetl/worker/compare/v5.20.1...v5.20.2) (2026-06-15)
+
+### Bug Fixes
+
+* **auth:** support snowflake credential type (sf_* field mapping) ([#82](https://github.com/noetl/worker/issues/82)) ([446468e](https://github.com/noetl/worker/commit/446468ec7d43fceed0f36f187f03b8310848612f)), closes [noetl/ai-meta#98](https://github.com/noetl/ai-meta/issues/98) [noetl/ai-meta#98](https://github.com/noetl/ai-meta/issues/98)
+
 ## [5.20.1](https://github.com/noetl/worker/compare/v5.20.0...v5.20.1) (2026-06-14)
 
 ### Bug Fixes
