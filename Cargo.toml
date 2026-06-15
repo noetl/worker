@@ -118,7 +118,7 @@ path = "src/main.rs"
 #   resolution for transfer endpoints (noetl/tools#65).  Pairs with the
 #   transfer source/target alias pre-resolution in auth_alias.rs
 #   (noetl/ai-meta#99).
-noetl-tools = "3.10"
+noetl-tools = "3.10.1"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
