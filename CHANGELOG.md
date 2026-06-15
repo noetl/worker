@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.22.0](https://github.com/noetl/worker/compare/v5.21.0...v5.22.0) (2026-06-15)
+
+### Features
+
+* **auth:** resolve transfer source/target credential aliases + noetl-tools 3.10 ([#87](https://github.com/noetl/worker/issues/87)) ([0e57e78](https://github.com/noetl/worker/commit/0e57e78f0159342c96d1a067e2292df35f963489)), closes [noetl/tools#65](https://github.com/noetl/tools/issues/65) [noetl/ai-meta#99](https://github.com/noetl/ai-meta/issues/99)
+
 ## [5.21.0](https://github.com/noetl/worker/compare/v5.20.2...v5.21.0) (2026-06-15)
 
 ### Features
