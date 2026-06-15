@@ -409,6 +409,7 @@ const SNOWFLAKE_FIELD_MAP: &[(&str, &str)] = &[
     ("sf_user", "user"),
     ("sf_password", "password"),
     ("sf_private_key", "private_key"),
+    ("sf_public_key", "public_key"),
     ("sf_private_key_passphrase", "private_key_passphrase"),
     ("sf_warehouse", "warehouse"),
     ("sf_database", "database"),
