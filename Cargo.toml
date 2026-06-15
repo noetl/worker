@@ -110,7 +110,11 @@ path = "src/main.rs"
 #   `SpoolEngine::high_water_recv_seq`) for the startup drain auto-trigger
 #   (noetl/ai-meta#93); 3.7.1 pins `time` =0.3.47 to dodge the async-nats
 #   E0119 under rustc 1.92.
-noetl-tools = "3.7"
+# - v3.9: Snowflake key-pair (JWT) auth — `SnowflakeConfig.public_key` +
+#   `generate_keypair_jwt` (noetl/tools#62).  Pairs with the
+#   `sf_public_key -> public_key` field mapping in auth_alias.rs
+#   (noetl/worker#83, noetl/ai-meta#98).  Bumped from 3.7 to enable it.
+noetl-tools = "3.9"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
