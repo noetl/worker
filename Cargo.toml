@@ -114,7 +114,7 @@ path = "src/main.rs"
 #   `generate_keypair_jwt` (noetl/tools#62).  Pairs with the
 #   `sf_public_key -> public_key` field mapping in auth_alias.rs
 #   (noetl/worker#83, noetl/ai-meta#98).  Bumped from 3.7 to enable it.
-noetl-tools = "3.9.1"
+noetl-tools = "3.9.2"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
