@@ -303,6 +303,14 @@ impl CommandExecutor {
             .entry("node_name".to_string())
             .or_insert_with(|| serde_json::json!(command.step.clone()));
 
+        // References-in-state (noetl/ai-meta#101 phase 2, consume side): when the
+        // orchestrator runs with NOETL_REFS_IN_STATE, step outputs in the context
+        // carry a `{reference}` + `extracted` summary instead of inline data.
+        // Resolve those references to their full payload here so templates needing
+        // the bulk data (`{{ step.messages }}`) still get it.  No-op when nothing
+        // is referenced — the default path costs one map lookup.
+        resolve_context_references(&mut ctx.variables, &dispatch_client).await;
+
         // Emit command.started event.  R-1.2 PR-EE-3: `step` +
         // `worker_id` are top-level fields on the `ExecutorEvent`
         // shape, so the context payload only carries the
@@ -722,6 +730,7 @@ impl CommandExecutor {
     /// configured `NOETL_SERVER_URL` server.  Every callsite inside
     /// `execute_with_server_url` passes a per-dispatch
     /// `ControlPlaneClient`.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_event_via(
         &self,
         client: &ControlPlaneClient,
@@ -1139,6 +1148,90 @@ async fn build_call_done_result(
     }
 }
 
+/// Locate a result-reference URI on a step result (nested or top-level envelope).
+fn reference_uri(result: &serde_json::Value) -> Option<String> {
+    result
+        .pointer("/context/result/reference/ref")
+        .and_then(|v| v.as_str())
+        .or_else(|| result.pointer("/reference/ref").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// Splice resolved full `data` back into a step result where
+/// `extract_user_data` reads it, dropping the `reference` block — reconstructing
+/// the inline shape the orchestrator kept out of the durable state.
+fn splice_resolved(result: &mut serde_json::Value, data: serde_json::Value) {
+    let wrapped = serde_json::json!({ "data": data });
+    if let Some(inner) = result
+        .pointer_mut("/context/result")
+        .and_then(|r| r.as_object_mut())
+    {
+        inner.insert("context".to_string(), wrapped);
+        inner.remove("reference");
+    } else if let Some(obj) = result.as_object_mut() {
+        obj.insert("context".to_string(), wrapped);
+        obj.remove("reference");
+    }
+}
+
+/// Mirror `build_context`'s flat user-data shape: expose `data` fields directly
+/// AND under a `.data` accessor so `{{ step.field }}` and `{{ step.data.field }}`
+/// both resolve.
+fn flat_with_data(data: &serde_json::Value) -> serde_json::Value {
+    match data {
+        serde_json::Value::Object(map) if !map.contains_key("data") => {
+            let mut m = map.clone();
+            m.insert("data".to_string(), data.clone());
+            serde_json::Value::Object(m)
+        }
+        _ => data.clone(),
+    }
+}
+
+/// Resolve over-budget result references in the render context to their full
+/// payload (references-in-state, noetl/ai-meta#101 phase 2 — the consume side).
+/// With `NOETL_REFS_IN_STATE` on, step outputs carry a `{reference}` + `extracted`
+/// summary instead of inline data; a template like `{{ step.messages }}` would
+/// otherwise see only the summary.  This resolves each referenced step's `ref`
+/// and splices the full data back into both the flat `<step>` binding and
+/// `steps.<step>`, reconstructing the context the worker would have seen
+/// pre-references.  No references → no-op (the default flag-off path costs one
+/// map lookup).
+async fn resolve_context_references(
+    variables: &mut std::collections::HashMap<String, serde_json::Value>,
+    client: &ControlPlaneClient,
+) {
+    // `steps` carries the full step results (build_context inserts result.clone()).
+    let to_resolve: Vec<(String, String)> = match variables.get("steps") {
+        Some(serde_json::Value::Object(steps)) => steps
+            .iter()
+            .filter_map(|(name, result)| reference_uri(result).map(|uri| (name.clone(), uri)))
+            .collect(),
+        _ => return,
+    };
+    if to_resolve.is_empty() {
+        return;
+    }
+    for (name, uri) in to_resolve {
+        match client.resolve_ref(&uri).await {
+            Ok(Some(data)) => {
+                variables.insert(name.clone(), flat_with_data(&data));
+                if let Some(serde_json::Value::Object(steps)) = variables.get_mut("steps") {
+                    if let Some(result) = steps.get_mut(&name) {
+                        splice_resolved(result, data);
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(step = %name, uri, "context reference not found in store; left as summary")
+            }
+            Err(e) => {
+                tracing::warn!(step = %name, uri, %e, "context reference resolve failed; left as summary")
+            }
+        }
+    }
+}
+
 /// Cap on the serialized `extracted` predicate block — keep the reference small
 /// (the whole point of references-in-state).
 const MAX_EXTRACTED_BYTES: usize = 4096;
@@ -1206,6 +1299,36 @@ fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
     use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
+
+    #[test]
+    fn context_reference_splice_reconstructs_inline() {
+        // A nested step result holding `{reference}` + `extracted` (the
+        // references-in-state shape) splices the resolved data where
+        // extract_user_data reads it, and drops the reference.
+        let mut result = serde_json::json!({
+            "status": "ok",
+            "context": { "result": {
+                "context": { "data": { "count": 2 } },   // extracted summary
+                "reference": { "ref": "noetl://execution/1/result/drain/9", "extracted": {} }
+            }}
+        });
+        assert_eq!(
+            reference_uri(&result).as_deref(),
+            Some("noetl://execution/1/result/drain/9")
+        );
+        let full = serde_json::json!({ "messages": [{"id": 1}, {"id": 2}], "count": 2 });
+        splice_resolved(&mut result, full.clone());
+        // The reference is gone; the full data sits where the orchestrator reads it.
+        assert!(reference_uri(&result).is_none());
+        assert_eq!(
+            result.pointer("/context/result/context/data"),
+            Some(&full)
+        );
+        // flat_with_data exposes both `{{ step.field }}` and `{{ step.data.field }}`.
+        let flat = flat_with_data(&full);
+        assert_eq!(flat["count"], serde_json::json!(2));
+        assert_eq!(flat["data"]["count"], serde_json::json!(2));
+    }
 
     #[test]
     fn extracted_keeps_scalars_collapses_collections() {
