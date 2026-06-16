@@ -310,6 +310,22 @@ impl CommandExecutor {
 
         // Add render context variables from command payload.
         ctx.variables = command.render_context.clone();
+
+        // Rebuild the `ctx` / `workload` namespace shims the server stopped
+        // persisting on the command (noetl/ai-meta#103): they're deep copies of
+        // the whole context, and persisting them doubled/tripled every step
+        // output in the durable `command.issued` payload (a 1.7MB drain output
+        // ballooned to 5MB).  Rebuild them transiently here so `{{ ctx.X }}` /
+        // `{{ workload.X }}` templates in worker-rendered pipeline `input:`
+        // blocks still resolve — without the durable command carrying the copy.
+        // Idempotent: a pre-#103 server that still persists `ctx` is not
+        // clobbered, and an already-structured `workload` block is preserved.
+        if !ctx.variables.contains_key("ctx") {
+            let flat = serde_json::to_value(&ctx.variables).unwrap_or(serde_json::Value::Null);
+            ctx.variables.insert("ctx".to_string(), flat.clone());
+            ctx.variables.entry("workload".to_string()).or_insert(flat);
+        }
+
         ctx.variables
             .entry("action".to_string())
             .or_insert_with(|| serde_json::json!(command.tool_kind));
