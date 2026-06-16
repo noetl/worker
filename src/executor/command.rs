@@ -1017,6 +1017,11 @@ async fn build_call_done_result(
             if let Some(expiry) = durable.expires_at.as_ref() {
                 reference["expires_at"] = serde_json::Value::String(expiry.clone());
             }
+            // References-in-state (noetl/ai-meta#101 phase 1): attach a bounded
+            // `extracted` predicate block so the orchestrator can evaluate
+            // `when:`/`set:`/cursor fan-out off the reference without resolving
+            // the full payload (which stays in the store).
+            reference["extracted"] = build_extracted(context);
             if let Ok(mut hint) = shm_result {
                 hint.media_type = shm_payload.media_type.clone();
                 // Stamp the hint as the `ipc` field on the
@@ -1134,10 +1139,95 @@ async fn build_call_done_result(
     }
 }
 
+/// Cap on the serialized `extracted` predicate block — keep the reference small
+/// (the whole point of references-in-state).
+const MAX_EXTRACTED_BYTES: usize = 4096;
+/// Inline a scalar string up to this; larger strings collapse to a length marker.
+const MAX_EXTRACTED_SCALAR_BYTES: usize = 512;
+
+/// Summarise one value into a predicate-sized shape: scalars pass through (small
+/// strings inline, large ones collapse to `{_len}`); collections collapse to a
+/// `{_count, _keys}` shape (the keys of the first array element / the object) so
+/// the orchestrator can see the columns + size without the bulk payload.
+fn summarise_value(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) => v.clone(),
+        Value::String(s) if s.len() <= MAX_EXTRACTED_SCALAR_BYTES => v.clone(),
+        Value::String(s) => serde_json::json!({ "_len": s.len() }),
+        Value::Array(a) => {
+            let keys = a
+                .first()
+                .and_then(|e| e.as_object())
+                .map(|o| o.keys().take(64).cloned().collect::<Vec<_>>());
+            match keys {
+                Some(k) => serde_json::json!({ "_count": a.len(), "_keys": k }),
+                None => serde_json::json!({ "_count": a.len() }),
+            }
+        }
+        Value::Object(o) => serde_json::json!({
+            "_count": o.len(),
+            "_keys": o.keys().take(64).cloned().collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// Build a bounded `extracted` predicate block from an over-budget result
+/// context (noetl/ai-meta#101 references-in-state, phase 1).  The orchestrator
+/// reads these scalar/shape fields to evaluate `when:` / `set:` / cursor fan-out
+/// WITHOUT resolving the full payload (which stays in the store).  Top-level
+/// scalars pass through (so `{{ step.count }}` / `{{ step.status }}` resolve);
+/// collections collapse to `{_count, _keys}`.  Bounded to [`MAX_EXTRACTED_BYTES`]
+/// so the reference never bloats — a truncated extract sets `_truncated: true`.
+fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match context {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            let mut used = 0usize;
+            for (k, v) in map {
+                let entry = summarise_value(v);
+                let cost = k.len() + entry.to_string().len() + 4;
+                if used + cost > MAX_EXTRACTED_BYTES {
+                    out.insert("_truncated".to_string(), Value::Bool(true));
+                    break;
+                }
+                used += cost;
+                out.insert(k.clone(), entry);
+            }
+            Value::Object(out)
+        }
+        Value::Array(a) => serde_json::json!({ "_count": a.len() }),
+        scalar => summarise_value(scalar),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
+
+    #[test]
+    fn extracted_keeps_scalars_collapses_collections() {
+        let ctx = serde_json::json!({
+            "count": 500,
+            "status": "ok",
+            "messages": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}],
+            "blob": "x".repeat(2000),
+        });
+        let ex = build_extracted(&ctx);
+        // Scalars pass through.
+        assert_eq!(ex["count"], serde_json::json!(500));
+        assert_eq!(ex["status"], serde_json::json!("ok"));
+        // Array collapses to count + the first element's keys (the columns).
+        assert_eq!(ex["messages"]["_count"], serde_json::json!(2));
+        let keys = ex["messages"]["_keys"].as_array().unwrap();
+        assert!(keys.contains(&serde_json::json!("id")) && keys.contains(&serde_json::json!("name")));
+        // The big string collapses to a length marker — no bulk data inline.
+        assert_eq!(ex["blob"]["_len"], serde_json::json!(2000));
+        // The whole extract is small.
+        assert!(ex.to_string().len() <= MAX_EXTRACTED_BYTES);
+    }
     use noetl_arrow_cache::CacheConfig;
     use tokio::net::TcpListener;
 
