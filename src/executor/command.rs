@@ -143,6 +143,13 @@ pub struct CommandExecutor {
     /// the worker's lifetime.  Empty when the allow-list env var
     /// is unset (pre-#34 behaviour, no breakage).
     keychain_env: HashMap<String, String>,
+
+    /// WASM plug-in dispatcher for `tool_kind: "wasm"` commands
+    /// (noetl/ai-meta#105). Behind the off-by-default `wasm-plugin` feature.
+    /// The host's module cache persists across commands, and the dispatch path
+    /// is `&self`, so it lives here behind a `Mutex`.
+    #[cfg(feature = "wasm-plugin")]
+    wasm_dispatcher: tokio::sync::Mutex<crate::plugin::WasmDispatcher>,
 }
 
 impl CommandExecutor {
@@ -176,6 +183,11 @@ impl CommandExecutor {
                 "Loaded keychain credentials from NOETL_KEYCHAIN_ENV_VARS"
             );
         }
+        #[cfg(feature = "wasm-plugin")]
+        let wasm_dispatcher = tokio::sync::Mutex::new(
+            crate::plugin::WasmDispatcher::http(server_url.clone())
+                .expect("WASM plug-in host init failed"),
+        );
         Self {
             tool_registry: create_default_registry(),
             case_evaluator: CaseEvaluator::new(),
@@ -185,6 +197,8 @@ impl CommandExecutor {
             snowflake,
             arrow_cache,
             keychain_env,
+            #[cfg(feature = "wasm-plugin")]
+            wasm_dispatcher,
         }
     }
 
@@ -458,12 +472,25 @@ impl CommandExecutor {
             "Executing tool"
         );
 
-        // Execute the tool
-        let tool_result = match self
+        // Execute the tool — route `tool_kind: "wasm"` to the plug-in host
+        // (noetl/ai-meta#105), everything else to the tool registry. The wasm
+        // branch only exists with the `wasm-plugin` feature, so the default
+        // build dispatches exactly as before.
+        #[cfg(feature = "wasm-plugin")]
+        let dispatch_outcome = if tool_config.kind == "wasm" {
+            self.dispatch_wasm(&tool_config, command, &dispatch_client).await
+        } else {
+            self.tool_registry
+                .execute_from_config(&tool_config, &ctx)
+                .await
+        };
+        #[cfg(not(feature = "wasm-plugin"))]
+        let dispatch_outcome = self
             .tool_registry
             .execute_from_config(&tool_config, &ctx)
-            .await
-        {
+            .await;
+
+        let tool_result = match dispatch_outcome {
             Ok(result) => {
                 // Emit call.done event with a reference-only result
                 // payload.  The Python broker's
@@ -1176,6 +1203,92 @@ async fn build_call_done_result(
     }
 }
 
+#[cfg(feature = "wasm-plugin")]
+impl CommandExecutor {
+    /// Dispatch a `tool_kind: "wasm"` command to the plug-in host: resolve the
+    /// plug-in by `(path, version)`, run it over the data-plane, flush its
+    /// capability intents, and bridge the output to a `ToolResult` so the rest
+    /// of the dispatch flow is unchanged.
+    async fn dispatch_wasm(
+        &self,
+        tool_config: &ToolConfig,
+        command: &Command,
+        client: &ControlPlaneClient,
+    ) -> Result<noetl_tools::result::ToolResult, noetl_tools::error::ToolError> {
+        let (path, version, input) = wasm_config_to_ref(&tool_config.config)
+            .map_err(noetl_tools::error::ToolError::Configuration)?;
+        let (output, report) = {
+            let mut dispatcher = self.wasm_dispatcher.lock().await;
+            dispatcher
+                .run_and_apply_by_ref(
+                    &path,
+                    version,
+                    &input,
+                    client,
+                    command.execution_id,
+                    &command.step,
+                )
+                .await
+                .map_err(|e| {
+                    noetl_tools::error::ToolError::ExecutionFailed(format!(
+                        "wasm dispatch {path}@{version}: {e}"
+                    ))
+                })?
+        };
+        Ok(plugin_outcome_to_tool_result(output, &report))
+    }
+}
+
+/// Parse a `tool_kind: "wasm"` config into the plug-in ref + input bytes.
+/// Config shape: `{ plugin: { path, version }, input: <any JSON> }`. The input
+/// passed to the plug-in is the JSON bytes of `config.input` (empty if absent).
+#[cfg(feature = "wasm-plugin")]
+fn wasm_config_to_ref(config: &serde_json::Value) -> Result<(String, u32, Vec<u8>), String> {
+    let plugin = config
+        .get("plugin")
+        .ok_or("wasm tool config missing `plugin`")?;
+    let path = plugin
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or("plugin.path missing or not a string")?
+        .to_string();
+    let version = u32::try_from(
+        plugin
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .ok_or("plugin.version missing or not an integer")?,
+    )
+    .map_err(|_| "plugin.version out of range".to_string())?;
+    let input = match config.get("input") {
+        Some(v) => serde_json::to_vec(v).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    Ok((path, version, input))
+}
+
+/// Bridge a plug-in's output + flush report to a `ToolResult`.
+#[cfg(feature = "wasm-plugin")]
+fn plugin_outcome_to_tool_result(
+    output: Vec<u8>,
+    report: &crate::plugin::FlushReport,
+) -> noetl_tools::result::ToolResult {
+    use base64::Engine;
+    let data = serde_json::json!({
+        "output_b64": base64::engine::general_purpose::STANDARD.encode(&output),
+        "flush": {
+            "results_stored": report.results_stored,
+            "objects_stored": report.objects_stored,
+            "events_published": report.events_published,
+            "errors": report.errors,
+        }
+    });
+    if report.errors.is_empty() {
+        noetl_tools::result::ToolResult::success(data)
+    } else {
+        noetl_tools::result::ToolResult::error(report.errors.join("; ")).with_data(data)
+    }
+}
+
 /// Stamp the stable logical URI (noetl/ai-meta#104 R02b) on an over-budget
 /// result's **durable** `reference` block, so the materialiser and any consumer
 /// address the result by the §8 Resource Locator
@@ -1526,6 +1639,62 @@ mod tests {
         let mut inline = serde_json::json!({ "status": "COMPLETED", "context": { "data": {} } });
         stamp_logical_uri(&mut inline, 1, "s", &rc);
         assert!(inline.get("reference").is_none());
+    }
+
+    // --- #105 routing: the wasm dispatch helpers ---
+
+    #[cfg(feature = "wasm-plugin")]
+    #[test]
+    fn wasm_config_parses_plugin_ref_and_input() {
+        let cfg = serde_json::json!({
+            "plugin": { "path": "system/materialiser", "version": 3 },
+            "input": { "batch": [1, 2] }
+        });
+        let (path, version, input) = wasm_config_to_ref(&cfg).unwrap();
+        assert_eq!(path, "system/materialiser");
+        assert_eq!(version, 3);
+        assert_eq!(
+            input,
+            serde_json::to_vec(&serde_json::json!({ "batch": [1, 2] })).unwrap()
+        );
+    }
+
+    #[cfg(feature = "wasm-plugin")]
+    #[test]
+    fn wasm_config_rejects_missing_plugin_or_version() {
+        assert!(wasm_config_to_ref(&serde_json::json!({})).is_err());
+        assert!(wasm_config_to_ref(&serde_json::json!({ "plugin": { "path": "p" } })).is_err());
+        // No `input` is fine — empty bytes.
+        let (_, _, input) =
+            wasm_config_to_ref(&serde_json::json!({ "plugin": { "path": "p", "version": 1 } }))
+                .unwrap();
+        assert!(input.is_empty());
+    }
+
+    #[cfg(feature = "wasm-plugin")]
+    #[test]
+    fn plugin_outcome_maps_to_tool_result() {
+        use noetl_tools::result::ToolStatus;
+        let ok = crate::plugin::FlushReport {
+            results_stored: 1,
+            objects_stored: 1,
+            events_published: 0,
+            errors: vec![],
+        };
+        let r = plugin_outcome_to_tool_result(b"OUT".to_vec(), &ok);
+        assert!(matches!(r.status, ToolStatus::Success));
+        assert_eq!(
+            r.data.as_ref().unwrap()["flush"]["objects_stored"],
+            serde_json::json!(1)
+        );
+
+        let bad = crate::plugin::FlushReport {
+            errors: vec!["boom".to_string()],
+            ..Default::default()
+        };
+        let r2 = plugin_outcome_to_tool_result(vec![], &bad);
+        assert!(matches!(r2.status, ToolStatus::Error));
+        assert!(r2.error.as_deref().unwrap().contains("boom"));
     }
 
     use noetl_arrow_cache::CacheConfig;
