@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.26.0](https://github.com/noetl/worker/compare/v5.25.0...v5.26.0) (2026-06-17)
+
+### Features
+
+* **executor:** stamp the logical URI on over-budget result references ([#104](https://github.com/noetl/worker/issues/104) R02b) ([#99](https://github.com/noetl/worker/issues/99)) ([961797e](https://github.com/noetl/worker/commit/961797e3ffc791e648392618006ca4635c306dec)), closes [noetl/worker#98](https://github.com/noetl/worker/issues/98)
+
 ## [5.25.0](https://github.com/noetl/worker/compare/v5.24.0...v5.25.0) (2026-06-17)
 
 ### Features
