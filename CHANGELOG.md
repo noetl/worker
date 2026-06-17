@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.24.0](https://github.com/noetl/worker/compare/v5.23.0...v5.24.0) (2026-06-17)
+
+### Features
+
+* **plugin:** HTTP PluginSource — fetch modules from the server registry ([#105](https://github.com/noetl/worker/issues/105) Round 4b) ([#95](https://github.com/noetl/worker/issues/95)) ([581c9c3](https://github.com/noetl/worker/commit/581c9c311ca3622ba6e566581896b52b999a5f60)), closes [noetl/server#210](https://github.com/noetl/server/issues/210)
+
 ## [5.23.0](https://github.com/noetl/worker/compare/v5.22.0...v5.23.0) (2026-06-17)
 
 ### Features
