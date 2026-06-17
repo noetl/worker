@@ -1247,6 +1247,106 @@ mod tests {
         ));
     }
 
+    /// A source that models an operator **republishing the same `path@version`
+    /// with new content** while the worker runs: each `resolve` returns the
+    /// next published revision (a new digest + new bytes). This is the live
+    /// hot-reload trigger the dispatch path (`ensure_loaded_by_ref`) must honor
+    /// without a worker restart.
+    struct RepublishSource {
+        revisions: Vec<(String, Vec<u8>)>,
+        next: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RepublishSource {
+        fn new(revisions: Vec<(&str, &str)>) -> Self {
+            Self {
+                revisions: revisions
+                    .into_iter()
+                    .map(|(d, wat)| (d.to_string(), wat.as_bytes().to_vec()))
+                    .collect(),
+                next: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PluginSource for RepublishSource {
+        async fn fetch(&self, _key: &PluginKey) -> Result<Vec<u8>, PluginError> {
+            unreachable!("ensure_loaded_by_ref resolves, never fetches")
+        }
+
+        async fn resolve(
+            &self,
+            _path: &str,
+            _version: u32,
+        ) -> Result<(String, Vec<u8>), PluginError> {
+            // Advance to the next published revision, clamping at the last so a
+            // repeat claim after the final republish stays on it (a stable
+            // digest → host cache hit, the steady state).
+            let i = self
+                .next
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .min(self.revisions.len() - 1);
+            Ok(self.revisions[i].clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn republish_same_version_hot_reloads_through_ensure_loaded_by_ref() {
+        // Two revisions of the SAME path@version: rev A doubles + emits 42,
+        // rev B triples + emits 99. Only the content (digest) differs.
+        const REV_B_WAT: &str = r#"
+            (module
+              (import "noetl" "emit" (func $emit (param i32)))
+              (func (export "run") (param $x i32) (result i32)
+                (call $emit (i32.const 99))
+                (i32.mul (local.get $x) (i32.const 3))))
+        "#;
+        let src =
+            RepublishSource::new(vec![("sha-a", REFERENCE_PLUGIN_WAT), ("sha-b", REV_B_WAT)]);
+        let mut h = host();
+
+        // First dispatch resolves rev A → compiles → behaves as A.
+        let key_a = h
+            .ensure_loaded_by_ref("system/reference", 1, &src)
+            .await
+            .unwrap();
+        assert_eq!(key_a.digest, "sha-a");
+        assert_eq!(
+            h.invoke(&key_a, 10).unwrap(),
+            PluginOutcome {
+                output: 20,
+                emitted: vec![42]
+            }
+        );
+
+        // Operator republishes the SAME version with new bytes. The very next
+        // dispatch resolves the new digest → a distinct cache key → fresh
+        // compile → new behavior, all on the running host (no restart).
+        let key_b = h
+            .ensure_loaded_by_ref("system/reference", 1, &src)
+            .await
+            .unwrap();
+        assert_eq!(key_b.version, 1, "same version");
+        assert_ne!(key_a.digest, key_b.digest, "new digest = hot-reload trigger");
+        assert_eq!(h.compiles(), 2, "the republished bytes compiled fresh");
+        assert_eq!(
+            h.invoke(&key_b, 10).unwrap(),
+            PluginOutcome {
+                output: 30,
+                emitted: vec![99]
+            }
+        );
+
+        // Steady state: a repeat claim at the settled digest is a cache hit.
+        let key_b2 = h
+            .ensure_loaded_by_ref("system/reference", 1, &src)
+            .await
+            .unwrap();
+        assert_eq!(key_b2.digest, "sha-b");
+        assert_eq!(h.compiles(), 2, "unchanged digest must not recompile");
+    }
+
     // --- Round 4b: the HTTP PluginSource against the server's registry ---
 
     /// A mock of `GET /api/internal/plugins/{*path}` — serves the echo module
