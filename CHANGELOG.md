@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.31.2](https://github.com/noetl/worker/compare/v5.31.1...v5.31.2) (2026-06-17)
+
+### Performance Improvements
+
+* **orch:** rebuild ctx/workload shims at render (paired with server dedup) ([#90](https://github.com/noetl/worker/issues/90)) ([516d172](https://github.com/noetl/worker/commit/516d172957fb68b3d0e521febd38482de9d36939)), closes [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103)
+
 ## [5.31.1](https://github.com/noetl/worker/compare/v5.31.0...v5.31.1) (2026-06-17)
 
 ### Bug Fixes
