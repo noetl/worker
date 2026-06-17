@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.23.0](https://github.com/noetl/worker/compare/v5.22.0...v5.23.0) (2026-06-17)
+
+### Features
+
+* **plugin:** wasmtime host skeleton for system-pool plug-ins (v5.23.0) ([#93](https://github.com/noetl/worker/issues/93)) ([fcfef01](https://github.com/noetl/worker/commit/fcfef01ac70e4d146b4ab355b84322e62933f2ae)), closes [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [#13](https://github.com/noetl/worker/issues/13) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [server#208](https://github.com/noetl/server/issues/208) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105) [#105](https://github.com/noetl/worker/issues/105) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105) [#105](https://github.com/noetl/worker/issues/105) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105)
+
 ## [5.22.0](https://github.com/noetl/worker/compare/v5.21.0...v5.22.0) (2026-06-15)
 
 ### Features
