@@ -1098,15 +1098,17 @@ async fn build_call_done_result(
             // accessor) finds the same shape regardless of which
             // branch produced the call.done.
             //
-            // Future expansion (when `output.output_select` plumbing
-            // lands at the server-side ToolSpec layer): also project
-            // the selected fields here alongside `_ref` so
-            // `{{ step.<selected_field> }}` resolves directly without
-            // a result_fetch round-trip.  Today only `_ref` lives
-            // here; consumers that need full data dispatch the
-            // `artifact` tool (`kind: artifact, action: get, input:
-            // {result_ref: '{{ step._ref }}'}`) which uses the URI
-            // to read the durable result.
+            // The orchestrator navigates predicate fields off
+            // `reference.extracted` (built below via `build_extracted`),
+            // which preserves the result structure so
+            // `{{ output.data.rows[0].<field>` }}` resolves without a
+            // result_fetch round-trip.  Consumers that need the FULL data
+            // (every row, every column) dispatch the `artifact` tool
+            // (`kind: artifact, action: get, input: {result_ref: '{{
+            // step._ref }}'}`) which uses the URI to read the durable
+            // result.  A future server-side `output.output_select` could
+            // declare exactly which fields land here, but the structural
+            // summary covers the common navigation paths today.
             let inline_data = serde_json::json!({ "_ref": durable.r#ref });
             Ok(serde_json::json!({
                 "status": status,
@@ -1253,62 +1255,82 @@ async fn resolve_context_references(
 const MAX_EXTRACTED_BYTES: usize = 4096;
 /// Inline a scalar string up to this; larger strings collapse to a length marker.
 const MAX_EXTRACTED_SCALAR_BYTES: usize = 512;
+/// Recursion guard for the structural summary — deep enough to navigate the
+/// common `data.rows[0].<field>` path (depth 4) with headroom; the byte budget
+/// is the real bound.
+const MAX_EXTRACTED_DEPTH: usize = 8;
 
-/// Summarise one value into a predicate-sized shape: scalars pass through (small
-/// strings inline, large ones collapse to `{_len}`); collections collapse to a
-/// `{_count, _keys}` shape (the keys of the first array element / the object) so
-/// the orchestrator can see the columns + size without the bulk payload.
-fn summarise_value(v: &serde_json::Value) -> serde_json::Value {
+/// Summarise one value into a predicate-sized but **navigable** shape.
+///
+/// The orchestrator evaluates `when:` / `set:` against a step's result through
+/// its `output.<path>` namespace.  A guard like
+/// `{{ output.data.rows[0].facility_mapping_id }}` has to *navigate* the result
+/// structure — so a flat `{_count, _keys}` collapse breaks it (`data` becomes a
+/// count, `rows` vanishes).  Instead we preserve the structure and summarise the
+/// **bulk**:
+///
+/// - scalars pass through (small strings inline; large ones collapse to `{_len}`);
+/// - objects recurse, keeping every key so navigation survives;
+/// - arrays keep their **first element only** (as a real 1-element array) so
+///   `arr[0].<field>` resolves without walking — or copying — the other N-1
+///   elements (a 500-row rowset summarises one row, not 500).
+///
+/// `budget` is decremented as we go; when it runs out the node truncates with a
+/// `_truncated: true` marker so the reference never bloats.  Cursor fan-out is
+/// unaffected — it resolves `claim_ref` to the full rows separately.
+fn summarise_value(v: &serde_json::Value, depth: usize, budget: &mut usize) -> serde_json::Value {
     use serde_json::Value;
     match v {
-        Value::Null | Value::Bool(_) | Value::Number(_) => v.clone(),
-        Value::String(s) if s.len() <= MAX_EXTRACTED_SCALAR_BYTES => v.clone(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {
+            *budget = budget.saturating_sub(v.to_string().len());
+            v.clone()
+        }
+        Value::String(s) if s.len() <= MAX_EXTRACTED_SCALAR_BYTES => {
+            *budget = budget.saturating_sub(s.len());
+            v.clone()
+        }
         Value::String(s) => serde_json::json!({ "_len": s.len() }),
         Value::Array(a) => {
-            let keys = a
-                .first()
-                .and_then(|e| e.as_object())
-                .map(|o| o.keys().take(64).cloned().collect::<Vec<_>>());
-            match keys {
-                Some(k) => serde_json::json!({ "_count": a.len(), "_keys": k }),
-                None => serde_json::json!({ "_count": a.len() }),
+            if a.is_empty() || depth >= MAX_EXTRACTED_DEPTH {
+                serde_json::json!({ "_count": a.len() })
+            } else {
+                // Keep only the first element so `arr[0].<field>` resolves; the
+                // 1-element array preserves index-0 access without the bulk.
+                Value::Array(vec![summarise_value(&a[0], depth + 1, budget)])
             }
         }
-        Value::Object(o) => serde_json::json!({
-            "_count": o.len(),
-            "_keys": o.keys().take(64).cloned().collect::<Vec<_>>(),
-        }),
-    }
-}
-
-/// Build a bounded `extracted` predicate block from an over-budget result
-/// context (noetl/ai-meta#101 references-in-state, phase 1).  The orchestrator
-/// reads these scalar/shape fields to evaluate `when:` / `set:` / cursor fan-out
-/// WITHOUT resolving the full payload (which stays in the store).  Top-level
-/// scalars pass through (so `{{ step.count }}` / `{{ step.status }}` resolve);
-/// collections collapse to `{_count, _keys}`.  Bounded to [`MAX_EXTRACTED_BYTES`]
-/// so the reference never bloats — a truncated extract sets `_truncated: true`.
-fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match context {
-        Value::Object(map) => {
+        Value::Object(o) => {
+            if depth >= MAX_EXTRACTED_DEPTH {
+                return serde_json::json!({
+                    "_count": o.len(),
+                    "_keys": o.keys().take(64).cloned().collect::<Vec<_>>(),
+                });
+            }
             let mut out = serde_json::Map::new();
-            let mut used = 0usize;
-            for (k, v) in map {
-                let entry = summarise_value(v);
-                let cost = k.len() + entry.to_string().len() + 4;
-                if used + cost > MAX_EXTRACTED_BYTES {
+            for (k, val) in o {
+                if *budget == 0 {
                     out.insert("_truncated".to_string(), Value::Bool(true));
                     break;
                 }
-                used += cost;
-                out.insert(k.clone(), entry);
+                *budget = budget.saturating_sub(k.len() + 4);
+                out.insert(k.clone(), summarise_value(val, depth + 1, budget));
             }
             Value::Object(out)
         }
-        Value::Array(a) => serde_json::json!({ "_count": a.len() }),
-        scalar => summarise_value(scalar),
     }
+}
+
+/// Build a bounded, navigable `extracted` predicate block from an over-budget
+/// result context (noetl/ai-meta#101 references-in-state, phase 1).  The
+/// orchestrator reads this to evaluate `when:` / `set:` / cursor fan-out WITHOUT
+/// resolving the full payload (which stays in the store).  Structure is
+/// preserved so navigation expressions resolve (`{{ output.data.rows[0].x }}`,
+/// `{{ step.count }}`, `{{ step.status }}`); the bulk is summarised (arrays keep
+/// their first element, large strings collapse to `{_len}`).  Bounded to
+/// [`MAX_EXTRACTED_BYTES`] — a truncated node sets `_truncated: true`.
+fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
+    let mut budget = MAX_EXTRACTED_BYTES;
+    summarise_value(context, 0, &mut budget)
 }
 
 #[cfg(test)]
@@ -1347,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn extracted_keeps_scalars_collapses_collections() {
+    fn extracted_keeps_scalars_and_navigable_structure() {
         let ctx = serde_json::json!({
             "count": 500,
             "status": "ok",
@@ -1358,14 +1380,50 @@ mod tests {
         // Scalars pass through.
         assert_eq!(ex["count"], serde_json::json!(500));
         assert_eq!(ex["status"], serde_json::json!("ok"));
-        // Array collapses to count + the first element's keys (the columns).
-        assert_eq!(ex["messages"]["_count"], serde_json::json!(2));
-        let keys = ex["messages"]["_keys"].as_array().unwrap();
-        assert!(keys.contains(&serde_json::json!("id")) && keys.contains(&serde_json::json!("name")));
+        // Arrays keep their FIRST element as a real 1-element array so
+        // `messages[0].<field>` navigation resolves off the reference — without
+        // copying the other N-1 elements.
+        assert_eq!(ex["messages"][0]["id"], serde_json::json!(1));
+        assert_eq!(ex["messages"][0]["name"], serde_json::json!("a"));
+        assert_eq!(ex["messages"].as_array().unwrap().len(), 1);
         // The big string collapses to a length marker — no bulk data inline.
         assert_eq!(ex["blob"]["_len"], serde_json::json!(2000));
         // The whole extract is small.
         assert!(ex.to_string().len() <= MAX_EXTRACTED_BYTES);
+    }
+
+    #[test]
+    fn extracted_navigates_nested_rowset_and_stays_bounded() {
+        // The exact shape the orchestrator stalled on: a tabular result where a
+        // `set:` reads `output.data.rows[0].facility_mapping_id`.  The old flat
+        // `{_count,_keys}` collapse made `data` a count and dropped `rows`.
+        let mut rows = Vec::new();
+        for i in 0..800 {
+            rows.push(serde_json::json!({
+                "facility_mapping_id": i,
+                "name": format!("facility-{i}"),
+                "payload": "y".repeat(1000),
+            }));
+        }
+        let ctx = serde_json::json!({
+            "status": "COMPLETED",
+            "data": { "columns": ["facility_mapping_id", "name", "payload"], "rows": rows },
+        });
+        let ex = build_extracted(&ctx);
+        // The navigation path the guard needs resolves off the reference.
+        assert_eq!(
+            ex["data"]["rows"][0]["facility_mapping_id"],
+            serde_json::json!(0)
+        );
+        // Only the first row is kept — not all 800.
+        assert_eq!(ex["data"]["rows"].as_array().unwrap().len(), 1);
+        // Per-row bulk string collapsed; the extract stays under budget.
+        assert_eq!(ex["data"]["rows"][0]["payload"]["_len"], serde_json::json!(1000));
+        assert!(
+            ex.to_string().len() <= MAX_EXTRACTED_BYTES,
+            "extracted must stay bounded, got {} bytes",
+            ex.to_string().len()
+        );
     }
     use noetl_arrow_cache::CacheConfig;
     use tokio::net::TcpListener;
