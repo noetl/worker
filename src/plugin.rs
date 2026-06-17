@@ -109,6 +109,8 @@ pub enum PluginError {
     NotLoaded(String),
     #[error("module is missing the required `{0}` export")]
     MissingExport(String),
+    #[error("linear-memory access failed: {0}")]
+    Memory(String),
     #[error("invocation trapped: {0}")]
     Invoke(#[source] anyhow::Error),
 }
@@ -215,7 +217,95 @@ impl WasmPluginHost {
         let emitted = std::mem::take(&mut store.data_mut().emitted);
         Ok(PluginOutcome { output, emitted })
     }
+
+    /// Invoke a plug-in over the **byte data-plane ABI** — the contract real
+    /// data plug-ins (the materialiser, transforms) use to move Arrow IPC /
+    /// Feather buffers across the boundary **without JSON serialization**.
+    ///
+    /// The production pattern (per the Arrow-on-Wasm design): the module exports
+    /// an allocator, the host asks it for a block, writes the input buffer
+    /// straight into the module's linear memory, and passes `(ptr, len)`:
+    ///
+    /// 1. `alloc(len) -> in_ptr` — the module hands back an isolated block (the
+    ///    host never writes to an arbitrary offset).
+    /// 2. host copies `input` into linear memory at `in_ptr` (one memcpy into
+    ///    the sandbox — no encode/decode; the plug-in reads the Arrow buffers in
+    ///    place).
+    /// 3. `run(in_ptr, len) -> packed` where `packed = (out_ptr << 32) | out_len`.
+    /// 4. host reads `out_len` bytes from `out_ptr`.
+    ///
+    /// Arrow `RecordBatch` / Feather bytes transit intact; the plug-in reads them
+    /// as Arrow buffers via pointers + lengths. Cross-*network* plug-ins use Arrow
+    /// Flight instead; this is the in-process path.
+    pub fn invoke_bytes(&self, key: &PluginKey, input: &[u8]) -> Result<Vec<u8>, PluginError> {
+        let module = self
+            .cache
+            .get(key)
+            .ok_or_else(|| PluginError::NotLoaded(format!("{}@{}", key.path, key.version)))?;
+        let mut store = Store::new(&self.engine, HostState::default());
+        let instance =
+            self.linker
+                .instantiate(&mut store, module)
+                .map_err(|e| PluginError::Instantiate {
+                    path: key.path.clone(),
+                    source: e,
+                })?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| PluginError::MissingExport("memory".into()))?;
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "alloc")
+            .map_err(|_| PluginError::MissingExport("alloc".into()))?;
+        let run = instance
+            .get_typed_func::<(i32, i32), i64>(&mut store, "run")
+            .map_err(|_| PluginError::MissingExport("run".into()))?;
+
+        let len = i32::try_from(input.len())
+            .map_err(|_| PluginError::Memory(format!("input {} bytes exceeds i32", input.len())))?;
+        let in_ptr = alloc.call(&mut store, len).map_err(PluginError::Invoke)?;
+        memory
+            .write(&mut store, in_ptr as usize, input)
+            .map_err(|e| PluginError::Memory(e.to_string()))?;
+
+        let packed = run.call(&mut store, (in_ptr, len)).map_err(PluginError::Invoke)?;
+        let out_ptr = ((packed >> 32) & 0xffff_ffff) as usize;
+        let out_len = (packed & 0xffff_ffff) as usize;
+
+        let mut out = vec![0u8; out_len];
+        memory
+            .read(&store, out_ptr, &mut out)
+            .map_err(|e| PluginError::Memory(e.to_string()))?;
+        Ok(out)
+    }
 }
+
+/// Reference data-plane plug-in (WAT): a bump allocator + a `run` that copies
+/// the input buffer through **unchanged** — the identity transform that proves
+/// an Arrow buffer survives the boundary byte-for-byte. Real plug-ins replace
+/// `run`'s body; the `memory` + `alloc` + `run(ptr,len)->packed` exports are the
+/// data-plane contract.
+pub const ECHO_PLUGIN_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $bump (mut i32) (i32.const 1024))
+  (func $alloc (export "alloc") (param $n i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  (func (export "run") (param $ptr i32) (param $len i32) (result i64)
+    (local $out i32) (local $i i32)
+    (local.set $out (call $alloc (local.get $len)))
+    (local.set $i (i32.const 0))
+    (block $done (loop $loop
+      (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+      (i32.store8 (i32.add (local.get $out) (local.get $i))
+                  (i32.load8_u (i32.add (local.get $ptr) (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $loop)))
+    (i64.or (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+            (i64.extend_i32_u (local.get $len)))))
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -312,5 +402,87 @@ mod tests {
         let h = host();
         let key = PluginKey::new("system/absent", 1, "sha-a");
         assert!(matches!(h.invoke(&key, 0), Err(PluginError::NotLoaded(_))));
+    }
+
+    // --- Round 2: the byte data-plane ABI (alloc-export + linear memory) ---
+
+    /// A data plug-in that adds 1 to every input byte — proves the host writes
+    /// into the module's linear memory, the module reads the host-provided
+    /// bytes, transforms them, and the host reads the result back.
+    const TRANSFORM_PLUS_ONE_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (global $bump (mut i32) (i32.const 1024))
+          (func $alloc (export "alloc") (param $n i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $bump))
+            (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+            (local.get $p))
+          (func (export "run") (param $ptr i32) (param $len i32) (result i64)
+            (local $out i32) (local $i i32)
+            (local.set $out (call $alloc (local.get $len)))
+            (local.set $i (i32.const 0))
+            (block $done (loop $loop
+              (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+              (i32.store8 (i32.add (local.get $out) (local.get $i))
+                          (i32.add (i32.load8_u (i32.add (local.get $ptr) (local.get $i)))
+                                   (i32.const 1)))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br $loop)))
+            (i64.or (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+                    (i64.extend_i32_u (local.get $len)))))
+    "#;
+
+    #[test]
+    fn invoke_bytes_transforms_through_linear_memory() {
+        let mut h = host();
+        let key = PluginKey::new("system/transform", 1, "sha-t");
+        h.load(&key, TRANSFORM_PLUS_ONE_WAT).unwrap();
+        let out = h.invoke_bytes(&key, &[1, 2, 3, 254]).unwrap();
+        // each byte +1, wrapping at the 8-bit store (254 -> 255).
+        assert_eq!(out, vec![2, 3, 4, 255]);
+    }
+
+    #[test]
+    fn invoke_bytes_echo_preserves_an_arrow_ipc_buffer() {
+        // Encode a real Arrow IPC buffer via the same codec the worker uses for
+        // over-budget results, push it through the wasm boundary, and assert it
+        // comes back byte-identical — Arrow buffers transit without any
+        // serialization, the property the data-plane ABI exists for.
+        let table = serde_json::json!({
+            "columns": ["id", "name"],
+            "rows": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}],
+        });
+        let enc = noetl_tools::arrow_codec::try_encode_tabular_json(&table)
+            .expect("tabular json encodes to Arrow IPC");
+        assert!(!enc.bytes.is_empty());
+        assert_eq!(enc.row_count, 2);
+
+        let mut h = host();
+        let key = PluginKey::new("system/echo", 1, "sha-e");
+        h.load(&key, ECHO_PLUGIN_WAT).unwrap();
+        let out = h.invoke_bytes(&key, &enc.bytes).unwrap();
+        assert_eq!(out, enc.bytes, "Arrow IPC buffer must survive the boundary intact");
+    }
+
+    #[test]
+    fn invoke_bytes_handles_empty_input() {
+        let mut h = host();
+        let key = PluginKey::new("system/echo", 1, "sha-e");
+        h.load(&key, ECHO_PLUGIN_WAT).unwrap();
+        assert_eq!(h.invoke_bytes(&key, &[]).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn invoke_bytes_requires_the_memory_abi_exports() {
+        // The Round-1 reference plug-in has `run` but no `alloc`/`memory` data
+        // ABI — invoke_bytes must report the missing export, not misbehave.
+        let mut h = host();
+        let key = PluginKey::new("system/reference", 1, "sha-1");
+        h.load(&key, REFERENCE_PLUGIN_WAT).unwrap();
+        assert!(matches!(
+            h.invoke_bytes(&key, &[1, 2, 3]),
+            Err(PluginError::MissingExport(_))
+        ));
     }
 }
