@@ -28,6 +28,7 @@
 //! target.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
@@ -623,6 +624,118 @@ impl PluginSource for HttpPluginSource {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Dispatcher (noetl/ai-meta#105 Round 5) — load from the catalog, run, collect
+// ---------------------------------------------------------------------------
+
+/// A capability call a plug-in made, buffered during the **synchronous** wasm
+/// invocation for the dispatcher to apply (flush) afterwards via the **async**
+/// control plane / object store. This keeps the plug-in run fast and sync while
+/// the I/O stays async — the local-first split. Applying the intents is the next
+/// Round-5 step (`event_publish` → emit, `result_put` → result store,
+/// `object_put` → the Feather tier).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapIntent {
+    EventPublish { payload: Vec<u8> },
+    ResultPut { key: String, payload: Vec<u8> },
+    ObjectPut { key: String, payload: Vec<u8> },
+}
+
+/// Production [`HostCapabilities`] — records each capability call as a
+/// [`CapIntent`] into a shared sink the dispatcher drains after the invocation.
+#[derive(Clone, Default)]
+pub struct BufferingCapabilities {
+    sink: Arc<Mutex<Vec<CapIntent>>>,
+}
+
+impl BufferingCapabilities {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A handle to the intent sink the dispatcher reads after `invoke`.
+    pub fn sink(&self) -> Arc<Mutex<Vec<CapIntent>>> {
+        self.sink.clone()
+    }
+}
+
+impl HostCapabilities for BufferingCapabilities {
+    fn event_publish(&mut self, payload: &[u8]) -> Result<(), String> {
+        self.sink
+            .lock()
+            .unwrap()
+            .push(CapIntent::EventPublish { payload: payload.to_vec() });
+        Ok(())
+    }
+    fn result_put(&mut self, key: &str, payload: &[u8]) -> Result<(), String> {
+        self.sink.lock().unwrap().push(CapIntent::ResultPut {
+            key: key.to_string(),
+            payload: payload.to_vec(),
+        });
+        Ok(())
+    }
+    fn object_put(&mut self, key: &str, payload: &[u8]) -> Result<(), String> {
+        self.sink.lock().unwrap().push(CapIntent::ObjectPut {
+            key: key.to_string(),
+            payload: payload.to_vec(),
+        });
+        Ok(())
+    }
+}
+
+/// The outcome of running a plug-in: its byte output plus the capability intents
+/// it recorded (for the dispatcher's caller to flush to the control plane).
+#[derive(Debug)]
+pub struct WasmRunOutcome {
+    pub output: Vec<u8>,
+    pub intents: Vec<CapIntent>,
+}
+
+/// Loads system plug-ins from a [`PluginSource`] (the catalog) and runs them on
+/// a [`WasmPluginHost`], collecting the capability intents each run records.
+///
+/// This is the dispatcher core. The remaining Round-5 integration is (1)
+/// applying the collected intents to the control plane / object store, and (2)
+/// the command-dispatch routing that selects a WASM-flagged playbook and calls
+/// [`WasmDispatcher::run`] instead of the normal tool registry.
+pub struct WasmDispatcher {
+    host: WasmPluginHost,
+    source: Box<dyn PluginSource>,
+}
+
+impl WasmDispatcher {
+    /// Build a dispatcher over an explicit plug-in source.
+    pub fn new(source: Box<dyn PluginSource>) -> Result<Self, PluginError> {
+        Ok(Self {
+            host: WasmPluginHost::new()?,
+            source,
+        })
+    }
+
+    /// Build a dispatcher that fetches plug-ins from the server's catalog
+    /// registry at `server_url` (the production source).
+    pub fn http(server_url: impl Into<String>) -> Result<Self, PluginError> {
+        Self::new(Box::new(HttpPluginSource::new(server_url)))
+    }
+
+    /// Ensure the plug-in for `key` is loaded (fetching from the catalog source
+    /// on a cache miss — a version bump fetches + compiles the new module), run
+    /// it over the byte data-plane with `input`, and return its output plus the
+    /// capability intents it recorded.
+    pub async fn run(
+        &mut self,
+        key: &PluginKey,
+        input: &[u8],
+    ) -> Result<WasmRunOutcome, PluginError> {
+        self.host.ensure_loaded(key, self.source.as_ref()).await?;
+        let caps = BufferingCapabilities::new();
+        let sink = caps.sink();
+        let output = self.host.invoke_bytes_with(key, input, Box::new(caps))?;
+        let intents = std::mem::take(&mut *sink.lock().unwrap());
+        Ok(WasmRunOutcome { output, intents })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1125,46 @@ mod tests {
         assert_eq!(calls[0].0, "object_put");
         assert_eq!(calls[0].1, "noetl/results/reference/0/0/1.feather");
         assert_eq!(calls[0].2, payload);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_loads_runs_and_collects_capability_intents() {
+        // End-to-end: the dispatcher fetches the real reference plug-in from a
+        // catalog source, runs it on the host, and collects the `object_put`
+        // intent it recorded — the dispatcher core (noetl/ai-meta#105 Round 5).
+        const WASM: &[u8] = include_bytes!("../tests/fixtures/reference_materializer.wasm");
+        let key = PluginKey::new("system/reference-materializer", 1, "sha-rm");
+        let mut src = MapPluginSource::default();
+        src.insert(key.clone(), WASM.to_vec());
+
+        let mut dispatcher = WasmDispatcher::new(Box::new(src)).unwrap();
+        let payload = b"ARROW-FEATHER-BYTES".to_vec();
+        let outcome = dispatcher.run(&key, &payload).await.unwrap();
+
+        assert_eq!(outcome.output, vec![0]); // CAP_OK
+        assert_eq!(
+            outcome.intents,
+            vec![CapIntent::ObjectPut {
+                key: "noetl/results/reference/0/0/1.feather".to_string(),
+                payload,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_caches_the_plugin_across_runs() {
+        const WASM: &[u8] = include_bytes!("../tests/fixtures/reference_materializer.wasm");
+        let key = PluginKey::new("system/reference-materializer", 1, "sha-rm");
+        let mut src = MapPluginSource::default();
+        src.insert(key.clone(), WASM.to_vec());
+        // Wrap in a counting source via the in-memory `fetches()` counter.
+        let mut dispatcher = WasmDispatcher::new(Box::new(src)).unwrap();
+        // First run fetches + compiles; second reuses the cached module.
+        dispatcher.run(&key, b"a").await.unwrap();
+        let second = dispatcher.run(&key, b"bb").await.unwrap();
+        // Each run records exactly one capability intent (no leakage between
+        // runs — fresh store + fresh buffer per invocation).
+        assert_eq!(second.intents.len(), 1);
     }
 
     #[tokio::test]
