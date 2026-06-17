@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.28.0](https://github.com/noetl/worker/compare/v5.27.0...v5.28.0) (2026-06-17)
+
+### Features
+
+* **plugin:** repoint object_put to the object-store endpoint ([#105](https://github.com/noetl/worker/issues/105) Round 5) ([#103](https://github.com/noetl/worker/issues/103)) ([fe40cb4](https://github.com/noetl/worker/commit/fe40cb437ba54623eacf9698ec9576c61ad477ab)), closes [noetl/server#212](https://github.com/noetl/server/issues/212) [noetl/worker#102](https://github.com/noetl/worker/issues/102)
+
 ## [5.27.0](https://github.com/noetl/worker/compare/v5.26.0...v5.27.0) (2026-06-17)
 
 ### Features
