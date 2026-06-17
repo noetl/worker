@@ -985,6 +985,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn loads_and_runs_a_real_rust_compiled_plugin() {
+        // The reference plug-in is hand-written Rust compiled to
+        // wasm32-unknown-unknown (`plugins/reference-materializer`) — proving a
+        // REAL compiled plug-in, not just WAT, runs on the host: no_std + no
+        // WASI, importing only the granted `noetl.object_put` capability, over
+        // the data-plane ABI. This is the hybrid model's "reference plug-in
+        // first" milestone (noetl/ai-meta#105 Round 5).
+        const WASM: &[u8] = include_bytes!("../tests/fixtures/reference_materializer.wasm");
+        let mut h = host();
+        let key = PluginKey::new("system/reference-materializer", 1, "sha-rm");
+        h.load(&key, WASM).unwrap();
+
+        let rec = RecordingCapabilities::default();
+        let log = rec.calls.clone();
+        let payload = b"ARROW-FEATHER-BYTES".to_vec();
+        let out = h.invoke_bytes_with(&key, &payload, Box::new(rec)).unwrap();
+
+        // The plug-in returns the host status (0 = CAP_OK) as its 1-byte output.
+        assert_eq!(out, vec![0]);
+        // It wrote our exact payload to object store under its derived key,
+        // through the granted capability.
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "object_put");
+        assert_eq!(calls[0].1, "noetl/results/reference/0/0/1.feather");
+        assert_eq!(calls[0].2, payload);
+    }
+
     #[tokio::test]
     async fn http_source_maps_digest_mismatch_to_source_error() {
         let base = spawn_plugin_registry().await;
