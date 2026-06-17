@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.29.0](https://github.com/noetl/worker/compare/v5.28.0...v5.29.0) (2026-06-17)
+
+### Features
+
+* **plugin:** digest resolution at dispatch — load a plug-in by (path, version) ([#105](https://github.com/noetl/worker/issues/105) Round 5 routing) ([#105](https://github.com/noetl/worker/issues/105)) ([45a5f43](https://github.com/noetl/worker/commit/45a5f431922fbc85dce62955692deffc147c07f4)), closes [noetl/worker#104](https://github.com/noetl/worker/issues/104)
+
 ## [5.28.0](https://github.com/noetl/worker/compare/v5.27.0...v5.28.0) (2026-06-17)
 
 ### Features
