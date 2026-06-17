@@ -860,6 +860,22 @@ impl CommandExecutor {
 /// so operators see a WARN log instead of a silent drop).
 const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
 
+/// The effective inline budget, read once from `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`
+/// (default [`INLINE_CONTEXT_MAX_BYTES`] = 100KB).  Lets ops tune when a tool
+/// result spills to the durable store + a reference — the lever for
+/// references-in-state (noetl/ai-meta#101) and for matching the Python broker's
+/// configurable bound.
+fn inline_budget_bytes() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(INLINE_CONTEXT_MAX_BYTES)
+    })
+}
+
 /// Encoding choice for the over-budget shm cache write.  R-2.2:
 /// tabular tool outputs (DuckDB / Postgres / Snowflake rowsets)
 /// encode as Arrow IPC stream bytes so colocated consumers benefit
@@ -942,7 +958,7 @@ async fn build_call_done_result(
     let context = &context;
 
     let serialised = serde_json::to_string(context)?;
-    if serialised.len() <= INLINE_CONTEXT_MAX_BYTES {
+    if serialised.len() <= inline_budget_bytes() {
         return Ok(serde_json::json!({ "status": status, "context": context }));
     }
 
@@ -1137,7 +1153,7 @@ async fn build_call_done_result(
                 execution_id,
                 step,
                 context_bytes = serialised.len(),
-                inline_budget_bytes = INLINE_CONTEXT_MAX_BYTES,
+                inline_budget_bytes = inline_budget_bytes(),
                 durable_error = %durable_err,
                 shm_error = %shm_err,
                 "Tool result exceeds inline budget and BOTH durable + shm staging failed; \
