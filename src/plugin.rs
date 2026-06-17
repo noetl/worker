@@ -70,15 +70,156 @@ impl PluginKey {
     }
 }
 
-/// Host-side state a plug-in invocation can affect through its granted capability
-/// imports. Round 1 grants a single `noetl.emit` capability that records the
-/// values a plug-in emits; later rounds widen this to the real system-pool
-/// capability set (event publish, result-store write, object-store put), each
-/// added to the [`WasmPluginHost`] `Linker`.
-#[derive(Default)]
+/// The NoETL capability ring — the host functions a system plug-in may call.
+///
+/// A plug-in reaches the outside world ONLY through these; the host implements
+/// the actual write (server API, result store, object store) so placement,
+/// scrub, audit, and RBAC stay enforced. This is why plug-ins target
+/// `wasm32-wasip1` for the toolchain but are NOT granted raw WASI fs/net — that
+/// would bypass the [data-access boundary](https://github.com/noetl/noetl/blob/main/agents/rules/data-access-boundary.md).
+///
+/// Each method takes a borrowed key/payload (read out of the plug-in's linear
+/// memory by the host) and returns a result the host maps to a status code the
+/// plug-in sees. The real worker impl wraps `ControlPlaneClient` + the object
+/// store; tests use a recording impl.
+pub trait HostCapabilities: Send {
+    /// Publish an event envelope (the `noetl.event_publish` import).
+    fn event_publish(&mut self, payload: &[u8]) -> Result<(), String>;
+    /// Store a result payload at a logical-URI key (the `noetl.result_put`
+    /// import) — `key` is the §8 Resource Locator.
+    fn result_put(&mut self, key: &str, payload: &[u8]) -> Result<(), String>;
+    /// Write a buffer (Arrow Feather, …) to object store at a physical key
+    /// (the `noetl.object_put` import).
+    fn object_put(&mut self, key: &str, payload: &[u8]) -> Result<(), String>;
+}
+
+/// Deny-by-default capabilities — every call fails. A plug-in invoked without an
+/// explicit capability impl cannot reach any host function, so forgetting to
+/// wire capabilities fails closed rather than silently succeeding.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullCapabilities;
+
+impl HostCapabilities for NullCapabilities {
+    fn event_publish(&mut self, _: &[u8]) -> Result<(), String> {
+        Err("no capabilities granted to this invocation".into())
+    }
+    fn result_put(&mut self, _: &str, _: &[u8]) -> Result<(), String> {
+        Err("no capabilities granted to this invocation".into())
+    }
+    fn object_put(&mut self, _: &str, _: &[u8]) -> Result<(), String> {
+        Err("no capabilities granted to this invocation".into())
+    }
+}
+
+/// Host-side state for one plug-in invocation: the granted capability sink plus
+/// the Round-1 `noetl.emit` scratch. A fresh `HostState` is built per invocation
+/// so no state leaks between claims.
 pub struct HostState {
     /// Values the plug-in emitted through `noetl.emit`, in call order.
     pub emitted: Vec<i32>,
+    /// The capability ring this invocation may call. Deny-by-default.
+    caps: Box<dyn HostCapabilities>,
+}
+
+impl Default for HostState {
+    fn default() -> Self {
+        Self {
+            emitted: Vec::new(),
+            caps: Box::new(NullCapabilities),
+        }
+    }
+}
+
+// Host-function status codes returned to the plug-in across the boundary.
+const CAP_OK: i32 = 0;
+const CAP_ERR_NO_MEMORY: i32 = 1;
+const CAP_ERR_BOUNDS: i32 = 2;
+const CAP_ERR_DENIED: i32 = 3;
+
+/// Borrow a byte range out of a plug-in's linear memory, bounds-checked.
+fn slice_guest(data: &[u8], ptr: i32, len: i32) -> Result<&[u8], i32> {
+    let start = ptr as usize;
+    let end = start.checked_add(len as usize).ok_or(CAP_ERR_BOUNDS)?;
+    data.get(start..end).ok_or(CAP_ERR_BOUNDS)
+}
+
+/// Fetch the plug-in's exported `memory`, copy out an owned key (UTF-8) + payload
+/// from the given linear-memory ranges, releasing the borrow before the
+/// capability call. Returns a status code on any failure.
+fn read_key_and_payload(
+    caller: &mut Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    data_ptr: i32,
+    data_len: i32,
+) -> Result<(String, Vec<u8>), i32> {
+    let mem = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or(CAP_ERR_NO_MEMORY)?;
+    let data = mem.data(&*caller);
+    let key = std::str::from_utf8(slice_guest(data, key_ptr, key_len)?)
+        .map_err(|_| CAP_ERR_BOUNDS)?
+        .to_owned();
+    let payload = slice_guest(data, data_ptr, data_len)?.to_vec();
+    Ok((key, payload))
+}
+
+/// `noetl.event_publish(ptr, len) -> status` — publish an event envelope.
+fn host_event_publish(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
+    let payload = {
+        let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            Some(m) => m,
+            None => return CAP_ERR_NO_MEMORY,
+        };
+        let data = mem.data(&caller);
+        match slice_guest(data, ptr, len) {
+            Ok(b) => b.to_vec(),
+            Err(code) => return code,
+        }
+    };
+    match caller.data_mut().caps.event_publish(&payload) {
+        Ok(()) => CAP_OK,
+        Err(_) => CAP_ERR_DENIED,
+    }
+}
+
+/// `noetl.result_put(key_ptr, key_len, data_ptr, data_len) -> status`.
+fn host_result_put(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    data_ptr: i32,
+    data_len: i32,
+) -> i32 {
+    let (key, payload) =
+        match read_key_and_payload(&mut caller, key_ptr, key_len, data_ptr, data_len) {
+            Ok(kp) => kp,
+            Err(code) => return code,
+        };
+    match caller.data_mut().caps.result_put(&key, &payload) {
+        Ok(()) => CAP_OK,
+        Err(_) => CAP_ERR_DENIED,
+    }
+}
+
+/// `noetl.object_put(key_ptr, key_len, data_ptr, data_len) -> status`.
+fn host_object_put(
+    mut caller: Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    data_ptr: i32,
+    data_len: i32,
+) -> i32 {
+    let (key, payload) =
+        match read_key_and_payload(&mut caller, key_ptr, key_len, data_ptr, data_len) {
+            Ok(kp) => kp,
+            Err(code) => return code,
+        };
+    match caller.data_mut().caps.object_put(&key, &payload) {
+        Ok(()) => CAP_OK,
+        Err(_) => CAP_ERR_DENIED,
+    }
 }
 
 /// The outcome of one plug-in invocation.
@@ -146,6 +287,21 @@ impl WasmPluginHost {
                 path: "<linker:noetl.emit>".into(),
                 source: e,
             })?;
+
+        // The materialiser capability ring (noetl/ai-meta#105 Round 3). A plug-in
+        // reaches the platform only through these; the host impl
+        // ([`HostCapabilities`]) does the real write so the data-access boundary
+        // holds. A module that imports one of these gets it; a module that
+        // imports a host function NOT registered here fails `instantiate`.
+        linker
+            .func_wrap("noetl", "event_publish", host_event_publish)
+            .and_then(|l| l.func_wrap("noetl", "result_put", host_result_put))
+            .and_then(|l| l.func_wrap("noetl", "object_put", host_object_put))
+            .map_err(|e| PluginError::Instantiate {
+                path: "<linker:noetl.capabilities>".into(),
+                source: e,
+            })?;
+
         Ok(Self {
             engine,
             linker,
@@ -193,6 +349,24 @@ impl WasmPluginHost {
         self.cache.len()
     }
 
+    /// Ensure the module for `key` is loaded, fetching its bytes from `source`
+    /// on a cache miss. This is the catalog-driven load path: `key` is the
+    /// catalog identity `(path, version, digest)`, and `source` is the plug-in
+    /// library (the catalog). A hit neither fetches nor recompiles, so repeated
+    /// claims of an unchanged plug-in are cheap; a version bump is a new key, so
+    /// the next claim fetches + compiles the new module — the hot-reload path.
+    pub fn ensure_loaded(
+        &mut self,
+        key: &PluginKey,
+        source: &dyn PluginSource,
+    ) -> Result<(), PluginError> {
+        if self.cache.contains_key(key) {
+            return Ok(());
+        }
+        let bytes = source.fetch(key)?;
+        self.load(key, bytes)
+    }
+
     /// Invoke the plug-in's `run(i32) -> i32` export in a fresh store, returning
     /// its result plus whatever it emitted through granted capabilities. A new
     /// [`Store`] per call keeps invocations isolated — no state leaks between
@@ -238,11 +412,31 @@ impl WasmPluginHost {
     /// as Arrow buffers via pointers + lengths. Cross-*network* plug-ins use Arrow
     /// Flight instead; this is the in-process path.
     pub fn invoke_bytes(&self, key: &PluginKey, input: &[u8]) -> Result<Vec<u8>, PluginError> {
+        self.invoke_bytes_with(key, input, Box::new(NullCapabilities))
+    }
+
+    /// Invoke the byte data-plane ABI with an explicit capability ring — what a
+    /// real plug-in invocation uses. `caps` is moved into the per-call store, so
+    /// the plug-in's `noetl.object_put` / `result_put` / `event_publish` imports
+    /// route to it. The materialiser passes an impl wrapping `ControlPlaneClient`
+    /// + the object store; deny-by-default ([`NullCapabilities`]) otherwise.
+    pub fn invoke_bytes_with(
+        &self,
+        key: &PluginKey,
+        input: &[u8],
+        caps: Box<dyn HostCapabilities>,
+    ) -> Result<Vec<u8>, PluginError> {
         let module = self
             .cache
             .get(key)
             .ok_or_else(|| PluginError::NotLoaded(format!("{}@{}", key.path, key.version)))?;
-        let mut store = Store::new(&self.engine, HostState::default());
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                emitted: Vec::new(),
+                caps,
+            },
+        );
         let instance =
             self.linker
                 .instantiate(&mut store, module)
@@ -306,6 +500,48 @@ pub const ECHO_PLUGIN_WAT: &str = r#"
     (i64.or (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
             (i64.extend_i32_u (local.get $len)))))
 "#;
+
+/// The plug-in library a [`WasmPluginHost`] loads modules from — the catalog.
+/// A miss in the host cache fetches the compiled module bytes for a
+/// `(path, version, digest)` key. The live impl is an HTTP client to the
+/// server's catalog plug-in endpoint (deferred until that endpoint lands — it
+/// is the server-side half of Round 3); [`MapPluginSource`] is the in-memory
+/// stand-in used in tests and local runs.
+pub trait PluginSource {
+    /// Fetch the module bytes (wasm or WAT) for `key`, or error if absent.
+    fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError>;
+}
+
+/// An in-memory [`PluginSource`] — the plug-in library backed by a map. Counts
+/// fetches so a caller can confirm cache hits avoid the source.
+#[derive(Default)]
+pub struct MapPluginSource {
+    modules: HashMap<PluginKey, Vec<u8>>,
+    fetches: std::cell::Cell<u64>,
+}
+
+impl MapPluginSource {
+    /// Register a module's bytes under its catalog key.
+    pub fn insert(&mut self, key: PluginKey, bytes: impl Into<Vec<u8>>) {
+        self.modules.insert(key, bytes.into());
+    }
+
+    /// Number of `fetch` calls served — a cache hit on the host should not
+    /// increment this.
+    pub fn fetches(&self) -> u64 {
+        self.fetches.get()
+    }
+}
+
+impl PluginSource for MapPluginSource {
+    fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError> {
+        self.fetches.set(self.fetches.get() + 1);
+        self.modules
+            .get(key)
+            .cloned()
+            .ok_or_else(|| PluginError::NotLoaded(format!("{}@{} not in source", key.path, key.version)))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -484,5 +720,117 @@ mod tests {
             h.invoke_bytes(&key, &[1, 2, 3]),
             Err(PluginError::MissingExport(_))
         ));
+    }
+
+    // --- Round 3: the materialiser capability ring + catalog-source loading ---
+
+    /// A recording capability ring — captures `(op, key, payload)` per call so a
+    /// test can assert what a plug-in invoked. Backed by an `Arc<Mutex<…>>` the
+    /// test keeps a handle to after the caps are moved into the store.
+    #[derive(Clone, Default)]
+    struct RecordingCapabilities {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+    }
+    impl HostCapabilities for RecordingCapabilities {
+        fn event_publish(&mut self, p: &[u8]) -> Result<(), String> {
+            self.calls.lock().unwrap().push(("event_publish".into(), String::new(), p.to_vec()));
+            Ok(())
+        }
+        fn result_put(&mut self, k: &str, p: &[u8]) -> Result<(), String> {
+            self.calls.lock().unwrap().push(("result_put".into(), k.into(), p.to_vec()));
+            Ok(())
+        }
+        fn object_put(&mut self, k: &str, p: &[u8]) -> Result<(), String> {
+            self.calls.lock().unwrap().push(("object_put".into(), k.into(), p.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// A materialiser-shaped plug-in: it builds a key (`obj/k` at offset 16) and
+    /// a payload (`DATA` at offset 32) in its own memory, calls
+    /// `noetl.object_put`, and returns the host's status code as its 4-byte
+    /// output — so the test sees both the recorded capability call and the
+    /// status the plug-in observed.
+    const MATERIALISER_WAT: &str = r#"
+        (module
+          (import "noetl" "object_put" (func $object_put (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 16) "obj/k")
+          (data (i32.const 32) "DATA")
+          (global $bump (mut i32) (i32.const 1024))
+          (func $alloc (export "alloc") (param $n i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $bump))
+            (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+            (local.get $p))
+          (func (export "run") (param $ptr i32) (param $len i32) (result i64)
+            (local $status i32) (local $out i32)
+            (local.set $status
+              (call $object_put (i32.const 16) (i32.const 5) (i32.const 32) (i32.const 4)))
+            (local.set $out (call $alloc (i32.const 4)))
+            (i32.store (local.get $out) (local.get $status))
+            (i64.or (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+                    (i64.extend_i32_u (i32.const 4)))))
+    "#;
+
+    #[test]
+    fn plugin_calls_granted_object_put_capability() {
+        let mut h = host();
+        let key = PluginKey::new("system/materialiser", 1, "sha-m");
+        h.load(&key, MATERIALISER_WAT).unwrap();
+
+        let rec = RecordingCapabilities::default();
+        let log = rec.calls.clone();
+        let out = h.invoke_bytes_with(&key, b"ignored", Box::new(rec)).unwrap();
+
+        // status 0 (CAP_OK) returned to the plug-in, little-endian.
+        assert_eq!(out, vec![0, 0, 0, 0]);
+        // The host received the exact key + payload the plug-in built in memory.
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            ("object_put".to_string(), "obj/k".to_string(), b"DATA".to_vec())
+        );
+    }
+
+    #[test]
+    fn capabilities_deny_by_default() {
+        // Same plug-in, invoked WITHOUT a capability ring (the default
+        // NullCapabilities). The host function returns the denied status, which
+        // the plug-in surfaces — fail closed, nothing reaches a backend.
+        let mut h = host();
+        let key = PluginKey::new("system/materialiser", 1, "sha-m");
+        h.load(&key, MATERIALISER_WAT).unwrap();
+        let out = h.invoke_bytes(&key, b"ignored").unwrap();
+        assert_eq!(out, vec![3, 0, 0, 0]); // CAP_ERR_DENIED
+    }
+
+    #[test]
+    fn ensure_loaded_fetches_from_source_then_caches() {
+        let mut src = MapPluginSource::default();
+        let key = PluginKey::new("system/echo", 1, "sha-e");
+        src.insert(key.clone(), ECHO_PLUGIN_WAT.as_bytes().to_vec());
+
+        let mut h = host();
+        h.ensure_loaded(&key, &src).unwrap();
+        assert_eq!(src.fetches(), 1);
+        assert_eq!(h.compiles(), 1);
+
+        // Cache hit: neither the source nor the compiler is touched again.
+        h.ensure_loaded(&key, &src).unwrap();
+        assert_eq!(src.fetches(), 1, "cache hit must not fetch from the source");
+        assert_eq!(h.compiles(), 1, "cache hit must not recompile");
+
+        // The catalog-loaded module runs.
+        assert_eq!(h.invoke_bytes(&key, b"hi").unwrap(), b"hi");
+    }
+
+    #[test]
+    fn ensure_loaded_reports_a_missing_module() {
+        let src = MapPluginSource::default();
+        let mut h = host();
+        let key = PluginKey::new("system/absent", 9, "sha-x");
+        assert!(matches!(h.ensure_loaded(&key, &src), Err(PluginError::NotLoaded(_))));
     }
 }
