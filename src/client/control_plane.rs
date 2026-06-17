@@ -461,6 +461,31 @@ impl ControlPlaneClient {
         Ok(Some(value))
     }
 
+    /// Resolve a `noetl://` result reference to its stored payload via
+    /// `GET /api/result/resolve?ref=<uri>` (references-in-state,
+    /// noetl/ai-meta#101 phase 2).  The response body IS the data JSON; `None`
+    /// on 404.  Used by the worker's render-time reference resolution so
+    /// `{{ step.<bulk_field> }}` templates get the full payload the orchestrator
+    /// kept in the store instead of carrying inline.
+    pub async fn resolve_ref(&self, uri: &str) -> Result<Option<serde_json::Value>> {
+        let response = self
+            .client
+            .get(format!("{}/api/result/resolve", self.server_url))
+            .query(&[("ref", uri)])
+            .send()
+            .await?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to resolve result reference {uri}: {body}");
+        }
+        let value: serde_json::Value = response.json().await?;
+        Ok(Some(value))
+    }
+
     /// Resolve a keychain credential alias to its full record.
     ///
     /// Calls `GET /api/credentials/{alias}?include_data=true` on the

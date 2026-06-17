@@ -1,6 +1,6 @@
 [package]
 name = "noetl-worker"
-version = "5.22.0"
+version = "5.23.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"
@@ -11,7 +11,16 @@ description = "NoETL Worker Pool - Executes workflow commands via NATS"
 name = "noetl-worker"
 path = "src/main.rs"
 
+[features]
+# WASM plug-in host for system-pool playbooks (noetl/ai-meta#105 — Phase 4
+# of the System Pool + WASM Plug-in ADR). Off by default while the host is a
+# skeleton not yet wired into command dispatch; flip into `default` once the
+# dispatcher mode lands so the deployed worker carries the host.
+wasm-plugin = ["dep:wasmtime"]
+
 [dependencies]
+# WASM plug-in host (optional; enabled by the `wasm-plugin` feature).
+wasmtime = { version = "27", optional = true }
 # Tool library.
 #
 # `noetl-tools = "2.18"` picks up:

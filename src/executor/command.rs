@@ -303,6 +303,14 @@ impl CommandExecutor {
             .entry("node_name".to_string())
             .or_insert_with(|| serde_json::json!(command.step.clone()));
 
+        // References-in-state (noetl/ai-meta#101 phase 2, consume side): when the
+        // orchestrator runs with NOETL_REFS_IN_STATE, step outputs in the context
+        // carry a `{reference}` + `extracted` summary instead of inline data.
+        // Resolve those references to their full payload here so templates needing
+        // the bulk data (`{{ step.messages }}`) still get it.  No-op when nothing
+        // is referenced — the default path costs one map lookup.
+        resolve_context_references(&mut ctx.variables, &dispatch_client).await;
+
         // Emit command.started event.  R-1.2 PR-EE-3: `step` +
         // `worker_id` are top-level fields on the `ExecutorEvent`
         // shape, so the context payload only carries the
@@ -722,6 +730,7 @@ impl CommandExecutor {
     /// configured `NOETL_SERVER_URL` server.  Every callsite inside
     /// `execute_with_server_url` passes a per-dispatch
     /// `ControlPlaneClient`.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_event_via(
         &self,
         client: &ControlPlaneClient,
@@ -851,6 +860,22 @@ impl CommandExecutor {
 /// so operators see a WARN log instead of a silent drop).
 const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
 
+/// The effective inline budget, read once from `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`
+/// (default [`INLINE_CONTEXT_MAX_BYTES`] = 100KB).  Lets ops tune when a tool
+/// result spills to the durable store + a reference — the lever for
+/// references-in-state (noetl/ai-meta#101) and for matching the Python broker's
+/// configurable bound.
+fn inline_budget_bytes() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(INLINE_CONTEXT_MAX_BYTES)
+    })
+}
+
 /// Encoding choice for the over-budget shm cache write.  R-2.2:
 /// tabular tool outputs (DuckDB / Postgres / Snowflake rowsets)
 /// encode as Arrow IPC stream bytes so colocated consumers benefit
@@ -933,7 +958,7 @@ async fn build_call_done_result(
     let context = &context;
 
     let serialised = serde_json::to_string(context)?;
-    if serialised.len() <= INLINE_CONTEXT_MAX_BYTES {
+    if serialised.len() <= inline_budget_bytes() {
         return Ok(serde_json::json!({ "status": status, "context": context }));
     }
 
@@ -1017,6 +1042,11 @@ async fn build_call_done_result(
             if let Some(expiry) = durable.expires_at.as_ref() {
                 reference["expires_at"] = serde_json::Value::String(expiry.clone());
             }
+            // References-in-state (noetl/ai-meta#101 phase 1): attach a bounded
+            // `extracted` predicate block so the orchestrator can evaluate
+            // `when:`/`set:`/cursor fan-out off the reference without resolving
+            // the full payload (which stays in the store).
+            reference["extracted"] = build_extracted(context);
             if let Ok(mut hint) = shm_result {
                 hint.media_type = shm_payload.media_type.clone();
                 // Stamp the hint as the `ipc` field on the
@@ -1068,15 +1098,17 @@ async fn build_call_done_result(
             // accessor) finds the same shape regardless of which
             // branch produced the call.done.
             //
-            // Future expansion (when `output.output_select` plumbing
-            // lands at the server-side ToolSpec layer): also project
-            // the selected fields here alongside `_ref` so
-            // `{{ step.<selected_field> }}` resolves directly without
-            // a result_fetch round-trip.  Today only `_ref` lives
-            // here; consumers that need full data dispatch the
-            // `artifact` tool (`kind: artifact, action: get, input:
-            // {result_ref: '{{ step._ref }}'}`) which uses the URI
-            // to read the durable result.
+            // The orchestrator navigates predicate fields off
+            // `reference.extracted` (built below via `build_extracted`),
+            // which preserves the result structure so
+            // `{{ output.data.rows[0].<field>` }}` resolves without a
+            // result_fetch round-trip.  Consumers that need the FULL data
+            // (every row, every column) dispatch the `artifact` tool
+            // (`kind: artifact, action: get, input: {result_ref: '{{
+            // step._ref }}'}`) which uses the URI to read the durable
+            // result.  A future server-side `output.output_select` could
+            // declare exactly which fields land here, but the structural
+            // summary covers the common navigation paths today.
             let inline_data = serde_json::json!({ "_ref": durable.r#ref });
             Ok(serde_json::json!({
                 "status": status,
@@ -1123,7 +1155,7 @@ async fn build_call_done_result(
                 execution_id,
                 step,
                 context_bytes = serialised.len(),
-                inline_budget_bytes = INLINE_CONTEXT_MAX_BYTES,
+                inline_budget_bytes = inline_budget_bytes(),
                 durable_error = %durable_err,
                 shm_error = %shm_err,
                 "Tool result exceeds inline budget and BOTH durable + shm staging failed; \
@@ -1134,10 +1166,265 @@ async fn build_call_done_result(
     }
 }
 
+/// Locate a result-reference URI on a step result (nested or top-level envelope).
+fn reference_uri(result: &serde_json::Value) -> Option<String> {
+    result
+        .pointer("/context/result/reference/ref")
+        .and_then(|v| v.as_str())
+        .or_else(|| result.pointer("/reference/ref").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// Splice resolved full `data` back into a step result where
+/// `extract_user_data` reads it, dropping the `reference` block — reconstructing
+/// the inline shape the orchestrator kept out of the durable state.
+fn splice_resolved(result: &mut serde_json::Value, data: serde_json::Value) {
+    let wrapped = serde_json::json!({ "data": data });
+    if let Some(inner) = result
+        .pointer_mut("/context/result")
+        .and_then(|r| r.as_object_mut())
+    {
+        inner.insert("context".to_string(), wrapped);
+        inner.remove("reference");
+    } else if let Some(obj) = result.as_object_mut() {
+        obj.insert("context".to_string(), wrapped);
+        obj.remove("reference");
+    }
+}
+
+/// Mirror `build_context`'s flat user-data shape: expose `data` fields directly
+/// AND under a `.data` accessor so `{{ step.field }}` and `{{ step.data.field }}`
+/// both resolve.
+fn flat_with_data(data: &serde_json::Value) -> serde_json::Value {
+    match data {
+        serde_json::Value::Object(map) if !map.contains_key("data") => {
+            let mut m = map.clone();
+            m.insert("data".to_string(), data.clone());
+            serde_json::Value::Object(m)
+        }
+        _ => data.clone(),
+    }
+}
+
+/// Resolve over-budget result references in the render context to their full
+/// payload (references-in-state, noetl/ai-meta#101 phase 2 — the consume side).
+/// With `NOETL_REFS_IN_STATE` on, step outputs carry a `{reference}` + `extracted`
+/// summary instead of inline data; a template like `{{ step.messages }}` would
+/// otherwise see only the summary.  This resolves each referenced step's `ref`
+/// and splices the full data back into both the flat `<step>` binding and
+/// `steps.<step>`, reconstructing the context the worker would have seen
+/// pre-references.  No references → no-op (the default flag-off path costs one
+/// map lookup).
+async fn resolve_context_references(
+    variables: &mut std::collections::HashMap<String, serde_json::Value>,
+    client: &ControlPlaneClient,
+) {
+    // `steps` carries the full step results (build_context inserts result.clone()).
+    let to_resolve: Vec<(String, String)> = match variables.get("steps") {
+        Some(serde_json::Value::Object(steps)) => steps
+            .iter()
+            .filter_map(|(name, result)| reference_uri(result).map(|uri| (name.clone(), uri)))
+            .collect(),
+        _ => return,
+    };
+    if to_resolve.is_empty() {
+        return;
+    }
+    for (name, uri) in to_resolve {
+        match client.resolve_ref(&uri).await {
+            Ok(Some(data)) => {
+                variables.insert(name.clone(), flat_with_data(&data));
+                if let Some(serde_json::Value::Object(steps)) = variables.get_mut("steps") {
+                    if let Some(result) = steps.get_mut(&name) {
+                        splice_resolved(result, data);
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(step = %name, uri, "context reference not found in store; left as summary")
+            }
+            Err(e) => {
+                tracing::warn!(step = %name, uri, %e, "context reference resolve failed; left as summary")
+            }
+        }
+    }
+}
+
+/// Cap on the serialized `extracted` predicate block — keep the reference small
+/// (the whole point of references-in-state).
+const MAX_EXTRACTED_BYTES: usize = 4096;
+/// Inline a scalar string up to this; larger strings collapse to a length marker.
+const MAX_EXTRACTED_SCALAR_BYTES: usize = 512;
+/// Recursion guard for the structural summary — deep enough to navigate the
+/// common `data.rows[0].<field>` path (depth 4) with headroom; the byte budget
+/// is the real bound.
+const MAX_EXTRACTED_DEPTH: usize = 8;
+
+/// Summarise one value into a predicate-sized but **navigable** shape.
+///
+/// The orchestrator evaluates `when:` / `set:` against a step's result through
+/// its `output.<path>` namespace.  A guard like
+/// `{{ output.data.rows[0].facility_mapping_id }}` has to *navigate* the result
+/// structure — so a flat `{_count, _keys}` collapse breaks it (`data` becomes a
+/// count, `rows` vanishes).  Instead we preserve the structure and summarise the
+/// **bulk**:
+///
+/// - scalars pass through (small strings inline; large ones collapse to `{_len}`);
+/// - objects recurse, keeping every key so navigation survives;
+/// - arrays keep their **first element only** (as a real 1-element array) so
+///   `arr[0].<field>` resolves without walking — or copying — the other N-1
+///   elements (a 500-row rowset summarises one row, not 500).
+///
+/// `budget` is decremented as we go; when it runs out the node truncates with a
+/// `_truncated: true` marker so the reference never bloats.  Cursor fan-out is
+/// unaffected — it resolves `claim_ref` to the full rows separately.
+fn summarise_value(v: &serde_json::Value, depth: usize, budget: &mut usize) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) => {
+            *budget = budget.saturating_sub(v.to_string().len());
+            v.clone()
+        }
+        Value::String(s) if s.len() <= MAX_EXTRACTED_SCALAR_BYTES => {
+            *budget = budget.saturating_sub(s.len());
+            v.clone()
+        }
+        Value::String(s) => serde_json::json!({ "_len": s.len() }),
+        Value::Array(a) => {
+            if a.is_empty() || depth >= MAX_EXTRACTED_DEPTH {
+                serde_json::json!({ "_count": a.len() })
+            } else {
+                // Keep only the first element so `arr[0].<field>` resolves; the
+                // 1-element array preserves index-0 access without the bulk.
+                Value::Array(vec![summarise_value(&a[0], depth + 1, budget)])
+            }
+        }
+        Value::Object(o) => {
+            if depth >= MAX_EXTRACTED_DEPTH {
+                return serde_json::json!({
+                    "_count": o.len(),
+                    "_keys": o.keys().take(64).cloned().collect::<Vec<_>>(),
+                });
+            }
+            let mut out = serde_json::Map::new();
+            for (k, val) in o {
+                if *budget == 0 {
+                    out.insert("_truncated".to_string(), Value::Bool(true));
+                    break;
+                }
+                *budget = budget.saturating_sub(k.len() + 4);
+                out.insert(k.clone(), summarise_value(val, depth + 1, budget));
+            }
+            Value::Object(out)
+        }
+    }
+}
+
+/// Build a bounded, navigable `extracted` predicate block from an over-budget
+/// result context (noetl/ai-meta#101 references-in-state, phase 1).  The
+/// orchestrator reads this to evaluate `when:` / `set:` / cursor fan-out WITHOUT
+/// resolving the full payload (which stays in the store).  Structure is
+/// preserved so navigation expressions resolve (`{{ output.data.rows[0].x }}`,
+/// `{{ step.count }}`, `{{ step.status }}`); the bulk is summarised (arrays keep
+/// their first element, large strings collapse to `{_len}`).  Bounded to
+/// [`MAX_EXTRACTED_BYTES`] — a truncated node sets `_truncated: true`.
+fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
+    let mut budget = MAX_EXTRACTED_BYTES;
+    summarise_value(context, 0, &mut budget)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
+
+    #[test]
+    fn context_reference_splice_reconstructs_inline() {
+        // A nested step result holding `{reference}` + `extracted` (the
+        // references-in-state shape) splices the resolved data where
+        // extract_user_data reads it, and drops the reference.
+        let mut result = serde_json::json!({
+            "status": "ok",
+            "context": { "result": {
+                "context": { "data": { "count": 2 } },   // extracted summary
+                "reference": { "ref": "noetl://execution/1/result/drain/9", "extracted": {} }
+            }}
+        });
+        assert_eq!(
+            reference_uri(&result).as_deref(),
+            Some("noetl://execution/1/result/drain/9")
+        );
+        let full = serde_json::json!({ "messages": [{"id": 1}, {"id": 2}], "count": 2 });
+        splice_resolved(&mut result, full.clone());
+        // The reference is gone; the full data sits where the orchestrator reads it.
+        assert!(reference_uri(&result).is_none());
+        assert_eq!(
+            result.pointer("/context/result/context/data"),
+            Some(&full)
+        );
+        // flat_with_data exposes both `{{ step.field }}` and `{{ step.data.field }}`.
+        let flat = flat_with_data(&full);
+        assert_eq!(flat["count"], serde_json::json!(2));
+        assert_eq!(flat["data"]["count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn extracted_keeps_scalars_and_navigable_structure() {
+        let ctx = serde_json::json!({
+            "count": 500,
+            "status": "ok",
+            "messages": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}],
+            "blob": "x".repeat(2000),
+        });
+        let ex = build_extracted(&ctx);
+        // Scalars pass through.
+        assert_eq!(ex["count"], serde_json::json!(500));
+        assert_eq!(ex["status"], serde_json::json!("ok"));
+        // Arrays keep their FIRST element as a real 1-element array so
+        // `messages[0].<field>` navigation resolves off the reference — without
+        // copying the other N-1 elements.
+        assert_eq!(ex["messages"][0]["id"], serde_json::json!(1));
+        assert_eq!(ex["messages"][0]["name"], serde_json::json!("a"));
+        assert_eq!(ex["messages"].as_array().unwrap().len(), 1);
+        // The big string collapses to a length marker — no bulk data inline.
+        assert_eq!(ex["blob"]["_len"], serde_json::json!(2000));
+        // The whole extract is small.
+        assert!(ex.to_string().len() <= MAX_EXTRACTED_BYTES);
+    }
+
+    #[test]
+    fn extracted_navigates_nested_rowset_and_stays_bounded() {
+        // The exact shape the orchestrator stalled on: a tabular result where a
+        // `set:` reads `output.data.rows[0].facility_mapping_id`.  The old flat
+        // `{_count,_keys}` collapse made `data` a count and dropped `rows`.
+        let mut rows = Vec::new();
+        for i in 0..800 {
+            rows.push(serde_json::json!({
+                "facility_mapping_id": i,
+                "name": format!("facility-{i}"),
+                "payload": "y".repeat(1000),
+            }));
+        }
+        let ctx = serde_json::json!({
+            "status": "COMPLETED",
+            "data": { "columns": ["facility_mapping_id", "name", "payload"], "rows": rows },
+        });
+        let ex = build_extracted(&ctx);
+        // The navigation path the guard needs resolves off the reference.
+        assert_eq!(
+            ex["data"]["rows"][0]["facility_mapping_id"],
+            serde_json::json!(0)
+        );
+        // Only the first row is kept — not all 800.
+        assert_eq!(ex["data"]["rows"].as_array().unwrap().len(), 1);
+        // Per-row bulk string collapsed; the extract stays under budget.
+        assert_eq!(ex["data"]["rows"][0]["payload"]["_len"], serde_json::json!(1000));
+        assert!(
+            ex.to_string().len() <= MAX_EXTRACTED_BYTES,
+            "extracted must stay bounded, got {} bytes",
+            ex.to_string().len()
+        );
+    }
     use noetl_arrow_cache::CacheConfig;
     use tokio::net::TcpListener;
 
