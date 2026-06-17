@@ -13,9 +13,11 @@ path = "src/main.rs"
 
 [features]
 # WASM plug-in host for system-pool playbooks (noetl/ai-meta#105 — Phase 4
-# of the System Pool + WASM Plug-in ADR). Off by default while the host is a
-# skeleton not yet wired into command dispatch; flip into `default` once the
-# dispatcher mode lands so the deployed worker carries the host.
+# of the System Pool + WASM Plug-in ADR). Now ON by default: the dispatch
+# routing landed (Round 5), so the deployed worker carries the host and
+# routes `tool_kind: "wasm"` commands to it. Build `--no-default-features`
+# for a lean worker without wasmtime.
+default = ["wasm-plugin"]
 wasm-plugin = ["dep:wasmtime"]
 
 [dependencies]
