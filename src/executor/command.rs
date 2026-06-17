@@ -495,7 +495,7 @@ impl CommandExecutor {
                 // round-trips cleanly through the validator.
                 let result_context = serde_json::to_value(&result)
                     .unwrap_or_else(|_| serde_json::json!({ "status": result.status.to_string() }));
-                let result_obj = match build_call_done_result(
+                let mut result_obj = match build_call_done_result(
                     &result_context,
                     &result.status.to_string(),
                     command.execution_id,
@@ -516,6 +516,16 @@ impl CommandExecutor {
                         serde_json::json!({ "status": result.status.to_string() })
                     }
                 };
+                // noetl/ai-meta#104 R02b — stamp the stable logical URI on an
+                // over-budget result's durable reference so the materialiser
+                // addresses it by the §8 Resource Locator. `cursor.{frame,row}`
+                // come from the dispatched command's metadata.
+                stamp_logical_uri(
+                    &mut result_obj,
+                    command.execution_id,
+                    &command.step,
+                    &command.render_context,
+                );
                 // noetl/ai-meta#43 Round 4 — `pending_callback` adoption.
                 //
                 // `Tool::Container` (and any future tool that dispatches a
@@ -1166,6 +1176,48 @@ async fn build_call_done_result(
     }
 }
 
+/// Stamp the stable logical URI (noetl/ai-meta#104 R02b) on an over-budget
+/// result's **durable** `reference` block, so the materialiser and any consumer
+/// address the result by the §8 Resource Locator
+/// (`noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`)
+/// — a stable, derivable name independent of the physical store.
+///
+/// The fan-out coordinate comes from `__cursor_frame` / `__cursor_row` in the
+/// command's `render_context` — the worker's [`crate::nats::source`] `translate`
+/// copies them there from the dispatched command's `metadata.cursor` (the
+/// orchestrator stamps body commands with `{phase:"body", frame, row}`), since
+/// the executor `Command` carries `render_context` but not the raw metadata.
+/// Non-cursor steps default to `0/0`. `attempt` is fixed at `1` so retries
+/// overwrite the same key (the blueprint's default), keeping the name
+/// derivable. Only the durable `kind: "result_ref"` reference is stamped — a
+/// shm-only `arrow_ipc` hint (degraded path) and inline results are skipped.
+fn stamp_logical_uri(
+    result_obj: &mut serde_json::Value,
+    execution_id: i64,
+    step: &str,
+    render_context: &std::collections::HashMap<String, serde_json::Value>,
+) {
+    let Some(reference) = result_obj.get_mut("reference").and_then(|r| r.as_object_mut()) else {
+        return;
+    };
+    if reference.get("kind").and_then(|k| k.as_str()) != Some("result_ref") {
+        return;
+    }
+    let frame = render_context
+        .get("__cursor_frame")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let row = render_context
+        .get("__cursor_row")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let uri = noetl_tools::locator::ResultCoordinates::new(
+        None, None, execution_id, step, frame, row, 1,
+    )
+    .logical_uri();
+    reference.insert("uri".to_string(), serde_json::Value::String(uri));
+}
+
 /// Locate a result-reference URI on a step result (nested or top-level envelope).
 fn reference_uri(result: &serde_json::Value) -> Option<String> {
     result
@@ -1425,6 +1477,57 @@ mod tests {
             ex.to_string().len()
         );
     }
+
+    // --- #104 R02b: stamp the logical URI on over-budget references ---
+
+    #[test]
+    fn stamps_logical_uri_with_cursor_frame_and_row() {
+        let mut obj = serde_json::json!({
+            "status": "COMPLETED",
+            "reference": { "kind": "result_ref", "ref": "noetl://execution/325/result/s/9" }
+        });
+        // `translate` copies metadata.cursor.{frame,row} into render_context.
+        let mut rc = std::collections::HashMap::new();
+        rc.insert("__cursor_frame".to_string(), serde_json::json!(2));
+        rc.insert("__cursor_row".to_string(), serde_json::json!(4));
+        stamp_logical_uri(&mut obj, 325, "load_next_facility", &rc);
+        assert_eq!(
+            obj["reference"]["uri"],
+            serde_json::json!("noetl://default/default/results/325/load_next_facility/2/4/1")
+        );
+        // The existing physical `ref` is left intact.
+        assert_eq!(obj["reference"]["ref"], serde_json::json!("noetl://execution/325/result/s/9"));
+    }
+
+    #[test]
+    fn stamps_frame0_row0_for_non_cursor_step() {
+        let mut obj = serde_json::json!({ "status": "COMPLETED", "reference": { "kind": "result_ref" } });
+        // No cursor coords in render_context → 0/0.
+        stamp_logical_uri(&mut obj, 7, "s", &std::collections::HashMap::new());
+        assert_eq!(
+            obj["reference"]["uri"],
+            serde_json::json!("noetl://default/default/results/7/s/0/0/1")
+        );
+    }
+
+    #[test]
+    fn does_not_stamp_non_durable_reference_or_inline_result() {
+        let rc = std::collections::HashMap::new();
+        // A shm-only IpcHint (degraded path, kind arrow_ipc) is not a durable
+        // logical location — left unstamped.
+        let mut ipc = serde_json::json!({
+            "status": "COMPLETED",
+            "reference": { "kind": "arrow_ipc", "shm_name": "x" }
+        });
+        stamp_logical_uri(&mut ipc, 1, "s", &rc);
+        assert!(ipc["reference"].get("uri").is_none());
+
+        // An inline (under-budget) result has no reference — no-op.
+        let mut inline = serde_json::json!({ "status": "COMPLETED", "context": { "data": {} } });
+        stamp_logical_uri(&mut inline, 1, "s", &rc);
+        assert!(inline.get("reference").is_none());
+    }
+
     use noetl_arrow_cache::CacheConfig;
     use tokio::net::TcpListener;
 
