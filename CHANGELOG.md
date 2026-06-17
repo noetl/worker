@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.27.0](https://github.com/noetl/worker/compare/v5.26.0...v5.27.0) (2026-06-17)
+
+### Features
+
+* **plugin:** WASM dispatcher core — load from catalog, run, collect intents ([#101](https://github.com/noetl/worker/issues/101)) ([da6dec5](https://github.com/noetl/worker/commit/da6dec529b9334dfe55650b4d20f216bcb5de6c3)), closes [#105](https://github.com/noetl/worker/issues/105) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105) [#105](https://github.com/noetl/worker/issues/105) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105)
+
 ## [5.26.0](https://github.com/noetl/worker/compare/v5.25.0...v5.26.0) (2026-06-17)
 
 ### Features
