@@ -640,6 +640,28 @@ impl ControlPlaneClient {
         Ok(parsed)
     }
 
+    /// Write a raw object (Arrow Feather, etc.) to the server's object store at
+    /// the §7 physical key — `PUT /api/internal/objects/{key}` (noetl/ai-meta#105).
+    /// The server is the digest authority; workers never touch the object store
+    /// directly (data-access boundary). `key` may contain slashes (the §7 key);
+    /// they pass through to the server's `{*key}` catch-all.
+    pub async fn object_put(&self, key: &str, bytes: Vec<u8>, media_type: &str) -> Result<()> {
+        let response = self
+            .client
+            .put(format!("{}/api/internal/objects/{}", self.server_url, key))
+            .query(&[("media_type", media_type)])
+            .header(reqwest::header::CONTENT_TYPE, media_type)
+            .body(bytes)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("object_put failed: HTTP {} {}", status.as_u16(), body);
+        }
+        Ok(())
+    }
+
     /// Register the worker pool with the control plane.
     ///
     /// Wire shape matches the Python broker's `RuntimeRegistrationRequest`:

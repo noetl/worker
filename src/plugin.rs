@@ -774,27 +774,19 @@ fn result_payload_to_json(payload: &[u8]) -> serde_json::Value {
     }
 }
 
-/// Encode an `object_put` payload (Arrow Feather / binary) for the result store
-/// — base64 bytes + the physical key + media type. Interim backend until a
-/// dedicated object-store endpoint writes at the §7 physical key.
-fn object_payload_to_json(key: &str, payload: &[u8]) -> serde_json::Value {
-    use base64::Engine;
-    serde_json::json!({
-        "_object_key": key,
-        "_media_type": "application/vnd.apache.arrow.feather",
-        "_bytes_b64": base64::engine::general_purpose::STANDARD.encode(payload),
-    })
-}
-
 /// Apply a plug-in's buffered [`CapIntent`]s to the control plane — the async
 /// half of the sync-record / async-flush bridge.
 ///
-/// - `result_put` / `object_put` → the durable result store via
-///   `ControlPlaneClient::put_result` (server-mediated, so the data-access
-///   boundary holds). The dedicated Feather-tier object-store endpoint at the
-///   §7 physical key is a follow-up; the interim path stores the bytes durably.
+/// - `result_put` → the durable result store via
+///   `ControlPlaneClient::put_result` (JSON results pass through; binary is
+///   base64-wrapped).
+/// - `object_put` → the Feather tier via `ControlPlaneClient::object_put`
+///   (`PUT /api/internal/objects/{key}`) — raw bytes at the §7 physical key.
 /// - `event_publish` → `ControlPlaneClient::emit_event` (the payload is a
 ///   serialized `ExecutorEvent`).
+///
+/// All paths are server-mediated, so the data-access boundary holds — workers
+/// never touch the object store directly.
 ///
 /// Best-effort: a failed intent is recorded in [`FlushReport::errors`] and the
 /// rest still flush — the plug-in output already returned to the caller.
@@ -818,12 +810,13 @@ pub async fn apply_intents(
                 }
             }
             CapIntent::ObjectPut { key, payload } => {
-                let data = object_payload_to_json(&key, &payload);
+                // The Feather tier: a raw object write at the §7 physical key via
+                // the server's object store (noetl/server#212), server-mediated.
                 match client
-                    .put_result(execution_id, &key, &data, "execution", Some(step))
+                    .object_put(&key, payload, "application/vnd.apache.arrow.feather")
                     .await
                 {
-                    Ok(_) => report.objects_stored += 1,
+                    Ok(()) => report.objects_stored += 1,
                     Err(e) => report.errors.push(format!("object_put {key}: {e}")),
                 }
             }
@@ -1285,20 +1278,13 @@ mod tests {
         assert!(wrapped.get("_bytes_b64").and_then(|v| v.as_str()).is_some());
     }
 
-    #[test]
-    fn object_payload_carries_key_media_type_and_b64() {
-        let v = object_payload_to_json("noetl/results/x/0/0/1.feather", b"AB");
-        assert_eq!(v["_object_key"], serde_json::json!("noetl/results/x/0/0/1.feather"));
-        assert_eq!(
-            v["_media_type"],
-            serde_json::json!("application/vnd.apache.arrow.feather")
-        );
-        assert!(v["_bytes_b64"].as_str().is_some());
-    }
-
-    /// Mock control plane that records the `name` of each `PUT /api/result/{eid}`
-    /// and 200s `POST /api/events`.
-    async fn spawn_control_plane(recorded: Arc<Mutex<Vec<String>>>) -> String {
+    /// Mock control plane recording the result `name` of each
+    /// `PUT /api/result/{eid}`, the object key of each
+    /// `PUT /api/internal/objects/{*key}`, and 200ing `POST /api/events`.
+    async fn spawn_control_plane(
+        results: Arc<Mutex<Vec<String>>>,
+        objects: Arc<Mutex<Vec<String>>>,
+    ) -> String {
         use axum::{
             extract::Path as AxPath,
             http::StatusCode,
@@ -1311,21 +1297,28 @@ mod tests {
             .route(
                 "/api/result/{eid}",
                 put(move |AxPath(_eid): AxPath<String>, body: String| {
-                    let recorded = recorded.clone();
+                    let results = results.clone();
                     async move {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                             if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
-                                recorded.lock().unwrap().push(name.to_string());
+                                results.lock().unwrap().push(name.to_string());
                             }
                         }
                         Json(serde_json::json!({
                             "ref": "noetl://execution/325/result/x/1",
-                            "store": "db",
-                            "scope": "execution",
-                            "bytes": 1,
-                            "sha256": null,
-                            "expires_at": null
+                            "store": "db", "scope": "execution",
+                            "bytes": 1, "sha256": null, "expires_at": null
                         }))
+                    }
+                }),
+            )
+            .route(
+                "/api/internal/objects/{*key}",
+                put(move |AxPath(key): AxPath<String>, _body: axum::body::Bytes| {
+                    let objects = objects.clone();
+                    async move {
+                        objects.lock().unwrap().push(key);
+                        Json(serde_json::json!({ "key": "k", "digest": "d", "bytes": 1 }))
                     }
                 }),
             )
@@ -1341,8 +1334,9 @@ mod tests {
     #[tokio::test]
     async fn apply_intents_flushes_to_the_control_plane() {
         use crate::client::ControlPlaneClient;
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let base = spawn_control_plane(recorded.clone()).await;
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let objects = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_control_plane(results.clone(), objects.clone()).await;
         let client = ControlPlaneClient::new(&base);
 
         let intents = vec![
@@ -1361,10 +1355,12 @@ mod tests {
         assert_eq!(report.results_stored, 1);
         assert!(report.errors.is_empty(), "unexpected errors: {:?}", report.errors);
 
-        // Both stored under their keys via put_result.
-        let names = recorded.lock().unwrap();
-        assert!(names.contains(&"noetl/results/ref/0/0/1.feather".to_string()));
-        assert!(names.contains(&"load_facility".to_string()));
+        // object_put → the object store endpoint at its §7 key; result_put → put_result.
+        assert!(objects
+            .lock()
+            .unwrap()
+            .contains(&"noetl/results/ref/0/0/1.feather".to_string()));
+        assert!(results.lock().unwrap().contains(&"load_facility".to_string()));
     }
 
     #[tokio::test]
