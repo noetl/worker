@@ -1259,7 +1259,10 @@ fn wasm_config_to_ref(config: &serde_json::Value) -> Result<(String, u32, Vec<u8
             .ok_or("plugin.version missing or not an integer")?,
     )
     .map_err(|_| "plugin.version out of range".to_string())?;
-    let input = match config.get("input") {
+    // The plug-in input: the server canonicalizes the step's `input:` to `args`
+    // (the noetl-tools field name), so read `args` first and fall back to
+    // `input` for a directly-crafted command.
+    let input = match config.get("args").or_else(|| config.get("input")) {
         Some(v) => serde_json::to_vec(v).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
@@ -1646,9 +1649,10 @@ mod tests {
     #[cfg(feature = "wasm-plugin")]
     #[test]
     fn wasm_config_parses_plugin_ref_and_input() {
+        // The server canonicalizes the step's `input:` to `args`.
         let cfg = serde_json::json!({
             "plugin": { "path": "system/materialiser", "version": 3 },
-            "input": { "batch": [1, 2] }
+            "args": { "batch": [1, 2] }
         });
         let (path, version, input) = wasm_config_to_ref(&cfg).unwrap();
         assert_eq!(path, "system/materialiser");
@@ -1657,6 +1661,14 @@ mod tests {
             input,
             serde_json::to_vec(&serde_json::json!({ "batch": [1, 2] })).unwrap()
         );
+
+        // `input` still works as a fallback (a directly-crafted command).
+        let cfg2 = serde_json::json!({
+            "plugin": { "path": "p", "version": 1 },
+            "input": { "x": 1 }
+        });
+        let (_, _, input2) = wasm_config_to_ref(&cfg2).unwrap();
+        assert_eq!(input2, serde_json::to_vec(&serde_json::json!({ "x": 1 })).unwrap());
     }
 
     #[cfg(feature = "wasm-plugin")]
