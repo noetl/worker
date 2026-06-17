@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
 
 /// The canonical reference plug-in, in WebAssembly text. It imports the single
@@ -254,6 +255,8 @@ pub enum PluginError {
     Memory(String),
     #[error("invocation trapped: {0}")]
     Invoke(#[source] anyhow::Error),
+    #[error("plug-in source error: {0}")]
+    Source(String),
 }
 
 /// The wasmtime host that loads, caches, hot-reloads, and invokes system
@@ -355,7 +358,7 @@ impl WasmPluginHost {
     /// library (the catalog). A hit neither fetches nor recompiles, so repeated
     /// claims of an unchanged plug-in are cheap; a version bump is a new key, so
     /// the next claim fetches + compiles the new module — the hot-reload path.
-    pub fn ensure_loaded(
+    pub async fn ensure_loaded(
         &mut self,
         key: &PluginKey,
         source: &dyn PluginSource,
@@ -363,7 +366,7 @@ impl WasmPluginHost {
         if self.cache.contains_key(key) {
             return Ok(());
         }
-        let bytes = source.fetch(key)?;
+        let bytes = source.fetch(key).await?;
         self.load(key, bytes)
     }
 
@@ -507,9 +510,10 @@ pub const ECHO_PLUGIN_WAT: &str = r#"
 /// server's catalog plug-in endpoint (deferred until that endpoint lands — it
 /// is the server-side half of Round 3); [`MapPluginSource`] is the in-memory
 /// stand-in used in tests and local runs.
-pub trait PluginSource {
+#[async_trait]
+pub trait PluginSource: Send + Sync {
     /// Fetch the module bytes (wasm or WAT) for `key`, or error if absent.
-    fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError>;
+    async fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError>;
 }
 
 /// An in-memory [`PluginSource`] — the plug-in library backed by a map. Counts
@@ -517,7 +521,7 @@ pub trait PluginSource {
 #[derive(Default)]
 pub struct MapPluginSource {
     modules: HashMap<PluginKey, Vec<u8>>,
-    fetches: std::cell::Cell<u64>,
+    fetches: std::sync::atomic::AtomicU64,
 }
 
 impl MapPluginSource {
@@ -529,17 +533,93 @@ impl MapPluginSource {
     /// Number of `fetch` calls served — a cache hit on the host should not
     /// increment this.
     pub fn fetches(&self) -> u64 {
-        self.fetches.get()
+        self.fetches.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
+#[async_trait]
 impl PluginSource for MapPluginSource {
-    fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError> {
-        self.fetches.set(self.fetches.get() + 1);
+    async fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError> {
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.modules
             .get(key)
             .cloned()
             .ok_or_else(|| PluginError::NotLoaded(format!("{}@{} not in source", key.path, key.version)))
+    }
+}
+
+/// The live [`PluginSource`] — an HTTP client to the server's plug-in module
+/// registry (`GET /api/internal/plugins/{path}?version=&digest=`, noetl/server
+/// Round 4). The system worker pool points this at its control plane; the host's
+/// [`WasmPluginHost::ensure_loaded`] fetches a module on a cache miss and the
+/// server's digest check (409) guards against a stale cache key.
+pub struct HttpPluginSource {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+impl HttpPluginSource {
+    /// Build a source pointed at the control-plane base URL (e.g.
+    /// `http://noetl.noetl.svc.cluster.local:8082`).
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into(),
+        }
+    }
+
+    /// Build with a shared `reqwest::Client` (connection-pool reuse with the
+    /// rest of the worker's HTTP).
+    pub fn with_client(client: reqwest::Client, base_url: impl Into<String>) -> Self {
+        Self {
+            client,
+            base_url: base_url.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl PluginSource for HttpPluginSource {
+    async fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError> {
+        // `path` carries slashes (`system/materialiser`) — left literal to match
+        // the server's `{*path}` catch-all; version + hex digest are URL-safe.
+        let url = format!(
+            "{}/api/internal/plugins/{}?version={}&digest={}",
+            self.base_url.trim_end_matches('/'),
+            key.path,
+            key.version,
+            key.digest,
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| PluginError::Source(format!("GET {}@{}: {e}", key.path, key.version)))?;
+        let status = resp.status();
+        if status.is_success() {
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| PluginError::Source(format!("read body for {}: {e}", key.path)))?;
+            Ok(bytes.to_vec())
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            Err(PluginError::NotLoaded(format!(
+                "{}@{} not in catalog",
+                key.path, key.version
+            )))
+        } else if status == reqwest::StatusCode::CONFLICT {
+            Err(PluginError::Source(format!(
+                "digest mismatch for {}@{} (cache key stale)",
+                key.path, key.version
+            )))
+        } else {
+            Err(PluginError::Source(format!(
+                "unexpected {status} fetching {}@{}",
+                key.path, key.version
+            )))
+        }
     }
 }
 
@@ -806,19 +886,19 @@ mod tests {
         assert_eq!(out, vec![3, 0, 0, 0]); // CAP_ERR_DENIED
     }
 
-    #[test]
-    fn ensure_loaded_fetches_from_source_then_caches() {
+    #[tokio::test]
+    async fn ensure_loaded_fetches_from_source_then_caches() {
         let mut src = MapPluginSource::default();
         let key = PluginKey::new("system/echo", 1, "sha-e");
         src.insert(key.clone(), ECHO_PLUGIN_WAT.as_bytes().to_vec());
 
         let mut h = host();
-        h.ensure_loaded(&key, &src).unwrap();
+        h.ensure_loaded(&key, &src).await.unwrap();
         assert_eq!(src.fetches(), 1);
         assert_eq!(h.compiles(), 1);
 
         // Cache hit: neither the source nor the compiler is touched again.
-        h.ensure_loaded(&key, &src).unwrap();
+        h.ensure_loaded(&key, &src).await.unwrap();
         assert_eq!(src.fetches(), 1, "cache hit must not fetch from the source");
         assert_eq!(h.compiles(), 1, "cache hit must not recompile");
 
@@ -826,11 +906,91 @@ mod tests {
         assert_eq!(h.invoke_bytes(&key, b"hi").unwrap(), b"hi");
     }
 
-    #[test]
-    fn ensure_loaded_reports_a_missing_module() {
+    #[tokio::test]
+    async fn ensure_loaded_reports_a_missing_module() {
         let src = MapPluginSource::default();
         let mut h = host();
         let key = PluginKey::new("system/absent", 9, "sha-x");
-        assert!(matches!(h.ensure_loaded(&key, &src), Err(PluginError::NotLoaded(_))));
+        assert!(matches!(
+            h.ensure_loaded(&key, &src).await,
+            Err(PluginError::NotLoaded(_))
+        ));
+    }
+
+    // --- Round 4b: the HTTP PluginSource against the server's registry ---
+
+    /// A mock of `GET /api/internal/plugins/{*path}` — serves the echo module
+    /// for `system/echo@1`, 409 on a digest mismatch, 404 otherwise.
+    async fn spawn_plugin_registry() -> String {
+        use axum::{
+            extract::{Path as AxPath, Query},
+            http::StatusCode,
+            response::IntoResponse,
+            routing::get,
+            Router,
+        };
+        use std::collections::HashMap as Map;
+        use tokio::net::TcpListener;
+
+        let body = ECHO_PLUGIN_WAT.as_bytes().to_vec();
+        let app = Router::new().route(
+            "/api/internal/plugins/{*path}",
+            get(
+                move |AxPath(path): AxPath<String>, Query(q): Query<Map<String, String>>| {
+                    let body = body.clone();
+                    async move {
+                        let version = q.get("version").map(String::as_str).unwrap_or("");
+                        if path != "system/echo" || version != "1" {
+                            return (StatusCode::NOT_FOUND, Vec::new()).into_response();
+                        }
+                        if let Some(d) = q.get("digest") {
+                            if d != "sha-e" {
+                                return (StatusCode::CONFLICT, Vec::new()).into_response();
+                            }
+                        }
+                        (StatusCode::OK, body).into_response()
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn http_source_fetches_and_loads_through_the_host() {
+        let base = spawn_plugin_registry().await;
+        let src = HttpPluginSource::new(base);
+        let key = PluginKey::new("system/echo", 1, "sha-e");
+
+        let mut h = host();
+        // ensure_loaded drives the HTTP fetch + compile end to end.
+        h.ensure_loaded(&key, &src).await.unwrap();
+        assert!(h.is_loaded(&key));
+        assert_eq!(h.invoke_bytes(&key, b"abc").unwrap(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn http_source_maps_404_to_not_loaded() {
+        let base = spawn_plugin_registry().await;
+        let src = HttpPluginSource::new(base);
+        let key = PluginKey::new("system/absent", 9, "sha-x");
+        assert!(matches!(
+            src.fetch(&key).await,
+            Err(PluginError::NotLoaded(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_source_maps_digest_mismatch_to_source_error() {
+        let base = spawn_plugin_registry().await;
+        let src = HttpPluginSource::new(base);
+        // Right path+version, wrong digest → 409 → Source error (stale cache key).
+        let key = PluginKey::new("system/echo", 1, "wrong-digest");
+        assert!(matches!(src.fetch(&key).await, Err(PluginError::Source(_))));
     }
 }
