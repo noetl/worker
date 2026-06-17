@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.25.0](https://github.com/noetl/worker/compare/v5.24.0...v5.25.0) (2026-06-17)
+
+### Features
+
+* **plugin:** reference Rust→wasm system plug-in + host end-to-end test ([#105](https://github.com/noetl/worker/issues/105) Round 5) ([#97](https://github.com/noetl/worker/issues/97)) ([7298ee7](https://github.com/noetl/worker/commit/7298ee79e87bb611d74cc9ec3fc5a8bd9818f0ce))
+
 ## [5.24.0](https://github.com/noetl/worker/compare/v5.23.0...v5.24.0) (2026-06-17)
 
 ### Features
