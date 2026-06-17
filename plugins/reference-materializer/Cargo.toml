@@ -1,0 +1,19 @@
+# Reference system plug-in (noetl/ai-meta#105 Round 5, hybrid lowering model).
+#
+# A hand-written Rust plug-in compiled to wasm32-unknown-unknown that the
+# worker's `WasmPluginHost` loads + runs. Standalone crate — NOT a member of the
+# worker build; built explicitly with `cargo build --release
+# --target wasm32-unknown-unknown` and the artifact loaded via the catalog.
+[package]
+name = "noetl-reference-materializer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
