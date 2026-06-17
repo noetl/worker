@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.31.1](https://github.com/noetl/worker/compare/v5.31.0...v5.31.1) (2026-06-17)
+
+### Bug Fixes
+
+* **plugin:** read wasm plug-in input from `args` (the server's canonical field) ([#110](https://github.com/noetl/worker/issues/110)) ([c03648f](https://github.com/noetl/worker/commit/c03648f3f945f1a021aefe6cc0f1f0d6f83617e0)), closes [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105)
+
 ## [5.31.0](https://github.com/noetl/worker/compare/v5.30.0...v5.31.0) (2026-06-17)
 
 ### Features
