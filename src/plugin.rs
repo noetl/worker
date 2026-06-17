@@ -734,6 +734,112 @@ impl WasmDispatcher {
         let intents = std::mem::take(&mut *sink.lock().unwrap());
         Ok(WasmRunOutcome { output, intents })
     }
+
+    /// [`run`](Self::run) then flush the recorded intents to the control plane
+    /// via [`apply_intents`]. Returns the plug-in output and the flush report.
+    pub async fn run_and_apply(
+        &mut self,
+        key: &PluginKey,
+        input: &[u8],
+        client: &crate::client::ControlPlaneClient,
+        execution_id: i64,
+        step: &str,
+    ) -> Result<(Vec<u8>, FlushReport), PluginError> {
+        let outcome = self.run(key, input).await?;
+        let report = apply_intents(outcome.intents, client, execution_id, step).await;
+        Ok((outcome.output, report))
+    }
+}
+
+/// Outcome of flushing a plug-in's [`CapIntent`]s to the control plane.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FlushReport {
+    pub results_stored: usize,
+    pub objects_stored: usize,
+    pub events_published: usize,
+    pub errors: Vec<String>,
+}
+
+/// Encode a `result_put` payload for the result store: keep it as-is if the
+/// bytes are already JSON, otherwise wrap the raw bytes base64.
+fn result_payload_to_json(payload: &[u8]) -> serde_json::Value {
+    match serde_json::from_slice::<serde_json::Value>(payload) {
+        Ok(v) => v,
+        Err(_) => {
+            use base64::Engine;
+            serde_json::json!({
+                "_bytes_b64": base64::engine::general_purpose::STANDARD.encode(payload),
+            })
+        }
+    }
+}
+
+/// Encode an `object_put` payload (Arrow Feather / binary) for the result store
+/// — base64 bytes + the physical key + media type. Interim backend until a
+/// dedicated object-store endpoint writes at the §7 physical key.
+fn object_payload_to_json(key: &str, payload: &[u8]) -> serde_json::Value {
+    use base64::Engine;
+    serde_json::json!({
+        "_object_key": key,
+        "_media_type": "application/vnd.apache.arrow.feather",
+        "_bytes_b64": base64::engine::general_purpose::STANDARD.encode(payload),
+    })
+}
+
+/// Apply a plug-in's buffered [`CapIntent`]s to the control plane — the async
+/// half of the sync-record / async-flush bridge.
+///
+/// - `result_put` / `object_put` → the durable result store via
+///   `ControlPlaneClient::put_result` (server-mediated, so the data-access
+///   boundary holds). The dedicated Feather-tier object-store endpoint at the
+///   §7 physical key is a follow-up; the interim path stores the bytes durably.
+/// - `event_publish` → `ControlPlaneClient::emit_event` (the payload is a
+///   serialized `ExecutorEvent`).
+///
+/// Best-effort: a failed intent is recorded in [`FlushReport::errors`] and the
+/// rest still flush — the plug-in output already returned to the caller.
+pub async fn apply_intents(
+    intents: Vec<CapIntent>,
+    client: &crate::client::ControlPlaneClient,
+    execution_id: i64,
+    step: &str,
+) -> FlushReport {
+    let mut report = FlushReport::default();
+    for intent in intents {
+        match intent {
+            CapIntent::ResultPut { key, payload } => {
+                let data = result_payload_to_json(&payload);
+                match client
+                    .put_result(execution_id, &key, &data, "execution", Some(step))
+                    .await
+                {
+                    Ok(_) => report.results_stored += 1,
+                    Err(e) => report.errors.push(format!("result_put {key}: {e}")),
+                }
+            }
+            CapIntent::ObjectPut { key, payload } => {
+                let data = object_payload_to_json(&key, &payload);
+                match client
+                    .put_result(execution_id, &key, &data, "execution", Some(step))
+                    .await
+                {
+                    Ok(_) => report.objects_stored += 1,
+                    Err(e) => report.errors.push(format!("object_put {key}: {e}")),
+                }
+            }
+            CapIntent::EventPublish { payload } => {
+                match serde_json::from_slice::<crate::client::ExecutorEvent>(&payload)
+                {
+                    Ok(event) => match client.emit_event(event).await {
+                        Ok(()) => report.events_published += 1,
+                        Err(e) => report.errors.push(format!("event_publish: {e}")),
+                    },
+                    Err(e) => report.errors.push(format!("event_publish parse: {e}")),
+                }
+            }
+        }
+    }
+    report
 }
 
 #[cfg(test)]
@@ -1165,6 +1271,100 @@ mod tests {
         // Each run records exactly one capability intent (no leakage between
         // runs — fresh store + fresh buffer per invocation).
         assert_eq!(second.intents.len(), 1);
+    }
+
+    #[test]
+    fn result_payload_passthrough_json_or_wraps_binary() {
+        // Already-JSON result payload passes through unchanged.
+        assert_eq!(
+            result_payload_to_json(br#"{"rows":3}"#),
+            serde_json::json!({ "rows": 3 })
+        );
+        // Non-JSON binary is base64-wrapped.
+        let wrapped = result_payload_to_json(&[0xff, 0x00, 0x01]);
+        assert!(wrapped.get("_bytes_b64").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[test]
+    fn object_payload_carries_key_media_type_and_b64() {
+        let v = object_payload_to_json("noetl/results/x/0/0/1.feather", b"AB");
+        assert_eq!(v["_object_key"], serde_json::json!("noetl/results/x/0/0/1.feather"));
+        assert_eq!(
+            v["_media_type"],
+            serde_json::json!("application/vnd.apache.arrow.feather")
+        );
+        assert!(v["_bytes_b64"].as_str().is_some());
+    }
+
+    /// Mock control plane that records the `name` of each `PUT /api/result/{eid}`
+    /// and 200s `POST /api/events`.
+    async fn spawn_control_plane(recorded: Arc<Mutex<Vec<String>>>) -> String {
+        use axum::{
+            extract::Path as AxPath,
+            http::StatusCode,
+            routing::{post, put},
+            Json, Router,
+        };
+        use tokio::net::TcpListener;
+
+        let app = Router::new()
+            .route(
+                "/api/result/{eid}",
+                put(move |AxPath(_eid): AxPath<String>, body: String| {
+                    let recorded = recorded.clone();
+                    async move {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                                recorded.lock().unwrap().push(name.to_string());
+                            }
+                        }
+                        Json(serde_json::json!({
+                            "ref": "noetl://execution/325/result/x/1",
+                            "store": "db",
+                            "scope": "execution",
+                            "bytes": 1,
+                            "sha256": null,
+                            "expires_at": null
+                        }))
+                    }
+                }),
+            )
+            .route("/api/events", post(|| async { StatusCode::OK }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn apply_intents_flushes_to_the_control_plane() {
+        use crate::client::ControlPlaneClient;
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_control_plane(recorded.clone()).await;
+        let client = ControlPlaneClient::new(&base);
+
+        let intents = vec![
+            CapIntent::ObjectPut {
+                key: "noetl/results/ref/0/0/1.feather".to_string(),
+                payload: b"FEATHER".to_vec(),
+            },
+            CapIntent::ResultPut {
+                key: "load_facility".to_string(),
+                payload: br#"{"rows":3}"#.to_vec(),
+            },
+        ];
+        let report = apply_intents(intents, &client, 325, "step").await;
+
+        assert_eq!(report.objects_stored, 1);
+        assert_eq!(report.results_stored, 1);
+        assert!(report.errors.is_empty(), "unexpected errors: {:?}", report.errors);
+
+        // Both stored under their keys via put_result.
+        let names = recorded.lock().unwrap();
+        assert!(names.contains(&"noetl/results/ref/0/0/1.feather".to_string()));
+        assert!(names.contains(&"load_facility".to_string()));
     }
 
     #[tokio::test]
