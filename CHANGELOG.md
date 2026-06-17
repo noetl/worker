@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.30.0](https://github.com/noetl/worker/compare/v5.29.0...v5.30.0) (2026-06-17)
+
+### Features
+
+* **executor:** route tool_kind "wasm" to the plug-in host ([#105](https://github.com/noetl/worker/issues/105) Round 5 routing) ([#107](https://github.com/noetl/worker/issues/107)) ([3c480f3](https://github.com/noetl/worker/commit/3c480f3e10fb75f3368ebb39f2a492c63a7d585d)), closes [noetl/worker#106](https://github.com/noetl/worker/issues/106)
+
 ## [5.29.0](https://github.com/noetl/worker/compare/v5.28.0...v5.29.0) (2026-06-17)
 
 ### Features
