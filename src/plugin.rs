@@ -371,6 +371,27 @@ impl WasmPluginHost {
         self.load(key, bytes)
     }
 
+    /// Ensure the module for `(path, version)` is loaded when the digest is not
+    /// known up front — the dispatch path. Resolves `(digest, bytes)` from the
+    /// `source` (the registry is the digest authority), keys the compile cache
+    /// by the resolved digest, and returns the full [`PluginKey`] to invoke
+    /// with. A version bump resolves a new digest → a new key → fresh compile
+    /// (the hot-reload path); a repeat claim at an unchanged digest reuses the
+    /// cached module.
+    pub async fn ensure_loaded_by_ref(
+        &mut self,
+        path: &str,
+        version: u32,
+        source: &dyn PluginSource,
+    ) -> Result<PluginKey, PluginError> {
+        let (digest, bytes) = source.resolve(path, version).await?;
+        let key = PluginKey::new(path, version, digest);
+        if !self.cache.contains_key(&key) {
+            self.load(&key, bytes)?;
+        }
+        Ok(key)
+    }
+
     /// Invoke the plug-in's `run(i32) -> i32` export in a fresh store, returning
     /// its result plus whatever it emitted through granted capabilities. A new
     /// [`Store`] per call keeps invocations isolated — no state leaks between
@@ -513,8 +534,16 @@ pub const ECHO_PLUGIN_WAT: &str = r#"
 /// stand-in used in tests and local runs.
 #[async_trait]
 pub trait PluginSource: Send + Sync {
-    /// Fetch the module bytes (wasm or WAT) for `key`, or error if absent.
+    /// Fetch the module bytes (wasm or WAT) for a fully-identified `key`
+    /// (digest known) — the hot-reload cache-keyed path.
     async fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError>;
+
+    /// Resolve a module by `(path, version)` when the digest is **not** known —
+    /// the dispatch path, where a command carries only `{path, version}` (the
+    /// registry is the digest authority, per the WASM dispatch convention).
+    /// Returns `(digest, bytes)`; the host keys its compile cache by the
+    /// resolved digest.
+    async fn resolve(&self, path: &str, version: u32) -> Result<(String, Vec<u8>), PluginError>;
 }
 
 /// An in-memory [`PluginSource`] — the plug-in library backed by a map. Counts
@@ -547,6 +576,16 @@ impl PluginSource for MapPluginSource {
             .get(key)
             .cloned()
             .ok_or_else(|| PluginError::NotLoaded(format!("{}@{} not in source", key.path, key.version)))
+    }
+
+    async fn resolve(&self, path: &str, version: u32) -> Result<(String, Vec<u8>), PluginError> {
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.modules
+            .iter()
+            .find(|(k, _)| k.path == path && k.version == version)
+            .map(|(k, bytes)| (k.digest.clone(), bytes.clone()))
+            .ok_or_else(|| PluginError::NotLoaded(format!("{path}@{version} not in source")))
     }
 }
 
@@ -621,6 +660,46 @@ impl PluginSource for HttpPluginSource {
                 key.path, key.version
             )))
         }
+    }
+
+    async fn resolve(&self, path: &str, version: u32) -> Result<(String, Vec<u8>), PluginError> {
+        // No digest in the query — the server returns the bytes + the digest as
+        // the ETag, which becomes the host's cache key.
+        let url = format!(
+            "{}/api/internal/plugins/{}?version={}",
+            self.base_url.trim_end_matches('/'),
+            path,
+            version,
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| PluginError::Source(format!("GET {path}@{version}: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(PluginError::NotLoaded(format!(
+                "{path}@{version} not in catalog"
+            )));
+        }
+        if !status.is_success() {
+            return Err(PluginError::Source(format!(
+                "unexpected {status} resolving {path}@{version}"
+            )));
+        }
+        let digest = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string())
+            .ok_or_else(|| PluginError::Source(format!("no ETag digest for {path}@{version}")))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| PluginError::Source(format!("read body for {path}: {e}")))?
+            .to_vec();
+        Ok((digest, bytes))
     }
 }
 
@@ -728,6 +807,28 @@ impl WasmDispatcher {
         input: &[u8],
     ) -> Result<WasmRunOutcome, PluginError> {
         self.host.ensure_loaded(key, self.source.as_ref()).await?;
+        self.invoke_collected(key, input)
+    }
+
+    /// Like [`run`](Self::run) but addressed by `(path, version)` — the dispatch
+    /// path. Resolves the digest from the catalog source, loads (hot-reload on a
+    /// version bump), invokes, and collects intents.
+    pub async fn run_by_ref(
+        &mut self,
+        path: &str,
+        version: u32,
+        input: &[u8],
+    ) -> Result<WasmRunOutcome, PluginError> {
+        let key = self
+            .host
+            .ensure_loaded_by_ref(path, version, self.source.as_ref())
+            .await?;
+        self.invoke_collected(&key, input)
+    }
+
+    /// Invoke a loaded plug-in over the byte data-plane with a fresh buffering
+    /// capability ring, returning its output + collected intents.
+    fn invoke_collected(&self, key: &PluginKey, input: &[u8]) -> Result<WasmRunOutcome, PluginError> {
         let caps = BufferingCapabilities::new();
         let sink = caps.sink();
         let output = self.host.invoke_bytes_with(key, input, Box::new(caps))?;
@@ -746,6 +847,23 @@ impl WasmDispatcher {
         step: &str,
     ) -> Result<(Vec<u8>, FlushReport), PluginError> {
         let outcome = self.run(key, input).await?;
+        let report = apply_intents(outcome.intents, client, execution_id, step).await;
+        Ok((outcome.output, report))
+    }
+
+    /// [`run_by_ref`](Self::run_by_ref) then flush — the entry point the command
+    /// dispatcher calls for a `tool_kind: "wasm"` command carrying `{path,
+    /// version}`.
+    pub async fn run_and_apply_by_ref(
+        &mut self,
+        path: &str,
+        version: u32,
+        input: &[u8],
+        client: &crate::client::ControlPlaneClient,
+        execution_id: i64,
+        step: &str,
+    ) -> Result<(Vec<u8>, FlushReport), PluginError> {
+        let outcome = self.run_by_ref(path, version, input).await?;
         let report = apply_intents(outcome.intents, client, execution_id, step).await;
         Ok((outcome.output, report))
     }
@@ -1136,7 +1254,7 @@ mod tests {
     async fn spawn_plugin_registry() -> String {
         use axum::{
             extract::{Path as AxPath, Query},
-            http::StatusCode,
+            http::{header, StatusCode},
             response::IntoResponse,
             routing::get,
             Router,
@@ -1160,7 +1278,9 @@ mod tests {
                                 return (StatusCode::CONFLICT, Vec::new()).into_response();
                             }
                         }
-                        (StatusCode::OK, body).into_response()
+                        // ETag carries the digest — what `resolve` reads when the
+                        // caller doesn't supply one.
+                        ([(header::ETAG, "\"sha-e\"")], body).into_response()
                     }
                 },
             ),
@@ -1184,6 +1304,51 @@ mod tests {
         h.ensure_loaded(&key, &src).await.unwrap();
         assert!(h.is_loaded(&key));
         assert_eq!(h.invoke_bytes(&key, b"abc").unwrap(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn http_source_resolve_reads_digest_from_etag() {
+        let base = spawn_plugin_registry().await;
+        let src = HttpPluginSource::new(base);
+        // No digest supplied — resolve learns it from the ETag.
+        let (digest, bytes) = src.resolve("system/echo", 1).await.unwrap();
+        assert_eq!(digest, "sha-e");
+        assert_eq!(bytes, ECHO_PLUGIN_WAT.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_run_by_ref_resolves_digest_then_runs() {
+        // The dispatch path: the command carries only (path, version); the
+        // dispatcher resolves the digest from the source, loads, and runs.
+        const WASM: &[u8] = include_bytes!("../tests/fixtures/reference_materializer.wasm");
+        let key = PluginKey::new("system/reference-materializer", 1, "sha-rm");
+        let mut src = MapPluginSource::default();
+        src.insert(key, WASM.to_vec());
+
+        let mut dispatcher = WasmDispatcher::new(Box::new(src)).unwrap();
+        let payload = b"FEATHER".to_vec();
+        let outcome = dispatcher
+            .run_by_ref("system/reference-materializer", 1, &payload)
+            .await
+            .unwrap();
+        assert_eq!(outcome.output, vec![0]); // CAP_OK
+        assert_eq!(
+            outcome.intents,
+            vec![CapIntent::ObjectPut {
+                key: "noetl/results/reference/0/0/1.feather".to_string(),
+                payload,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_by_ref_reports_a_missing_module() {
+        let src = MapPluginSource::default();
+        let mut dispatcher = WasmDispatcher::new(Box::new(src)).unwrap();
+        assert!(matches!(
+            dispatcher.run_by_ref("system/absent", 9, b"x").await,
+            Err(PluginError::NotLoaded(_))
+        ));
     }
 
     #[tokio::test]
