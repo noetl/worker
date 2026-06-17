@@ -121,7 +121,20 @@ fn translate(worker: WorkerCommand) -> ExecutorCommand {
         .map(|n| n as u32)
         .unwrap_or(0);
 
-    let render_context = worker.render_context();
+    let mut render_context = worker.render_context();
+    // noetl/ai-meta#104 R02b: the executor `Command` carries `render_context`
+    // but not the raw `metadata`, so copy the cursor fan-out coordinate
+    // (`metadata.cursor.{frame,row}`, stamped on body commands by the
+    // orchestrator) into `render_context` under reserved keys. The dispatch
+    // site reads them to build the result's collision-free logical URI.
+    if let Some(cursor) = worker.meta.get("cursor") {
+        if let Some(frame) = cursor.get("frame") {
+            render_context.insert("__cursor_frame".to_string(), frame.clone());
+        }
+        if let Some(row) = cursor.get("row") {
+            render_context.insert("__cursor_row".to_string(), row.clone());
+        }
+    }
     let command_id = worker.command_id();
     let step = worker.step().to_string();
     let execution_id = worker.execution_id;

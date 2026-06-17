@@ -127,7 +127,12 @@ wasmtime = { version = "27", optional = true }
 #   resolution for transfer endpoints (noetl/tools#65).  Pairs with the
 #   transfer source/target alias pre-resolution in auth_alias.rs
 #   (noetl/ai-meta#99).
-noetl-tools = "3.10.1"
+# - v3.12: `noetl_tools::locator` — Resource Locator + `ResultCoordinates`
+#   with the two-level cursor fan-out coordinate `(frame,row)`.  R02b stamps
+#   the stable logical URI on over-budget result references
+#   (`ResultCoordinates::new(...).logical_uri()`), collision-free across
+#   cursor fan-out (noetl/ai-meta#104).
+noetl-tools = "3.12"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
