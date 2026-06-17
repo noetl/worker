@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.31.0](https://github.com/noetl/worker/compare/v5.30.0...v5.31.0) (2026-06-17)
+
+### Features
+
+* **plugin:** flip wasm-plugin into default features ([#105](https://github.com/noetl/worker/issues/105) Round 5 routing 3) ([#108](https://github.com/noetl/worker/issues/108)) ([83e2c32](https://github.com/noetl/worker/commit/83e2c3255167f6a4cad4d47a06deccfbfda32a3f))
+
 ## [5.30.0](https://github.com/noetl/worker/compare/v5.29.0...v5.30.0) (2026-06-17)
 
 ### Features
