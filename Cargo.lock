@@ -3086,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "noetl-worker"
-version = "5.31.2"
+version = "5.32.0"
 dependencies = [
  "anyhow",
  "async-nats",

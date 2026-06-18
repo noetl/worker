@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.32.0](https://github.com/noetl/worker/compare/v5.31.2...v5.32.0) (2026-06-18)
+
+### Features
+
+* **plugin:** configurable guest entry export (run_state) for wasm dispatch ([#113](https://github.com/noetl/worker/issues/113)) ([04420d0](https://github.com/noetl/worker/commit/04420d0048ff86316f11f4e69b991ce206a56a8a)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [#105](https://github.com/noetl/worker/issues/105) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [5.31.2](https://github.com/noetl/worker/compare/v5.31.1...v5.31.2) (2026-06-17)
 
 ### Performance Improvements
