@@ -72,6 +72,7 @@ impl Worker {
             subscriber,
             client.clone(),
             config.worker_id.clone(),
+            crate::nats::segment_from_filter(&config.nats_filter_subject),
         )));
 
         // One snowflake generator per worker process — populates the
