@@ -1231,23 +1231,24 @@ impl CommandExecutor {
         command: &Command,
         client: &ControlPlaneClient,
     ) -> Result<noetl_tools::result::ToolResult, noetl_tools::error::ToolError> {
-        let (path, version, input) = wasm_config_to_ref(&tool_config.config)
+        let (path, version, entry, input) = wasm_config_to_ref(&tool_config.config)
             .map_err(noetl_tools::error::ToolError::Configuration)?;
         let (output, report) = {
             let mut dispatcher = self.wasm_dispatcher.lock().await;
             dispatcher
-                .run_and_apply_by_ref(
+                .run_and_apply_by_ref_entry(
                     &path,
                     version,
                     &input,
                     client,
                     command.execution_id,
                     &command.step,
+                    &entry,
                 )
                 .await
                 .map_err(|e| {
                     noetl_tools::error::ToolError::ExecutionFailed(format!(
-                        "wasm dispatch {path}@{version}: {e}"
+                        "wasm dispatch {path}@{version} ({entry}): {e}"
                     ))
                 })?
         };
@@ -1255,11 +1256,14 @@ impl CommandExecutor {
     }
 }
 
-/// Parse a `tool_kind: "wasm"` config into the plug-in ref + input bytes.
-/// Config shape: `{ plugin: { path, version }, input: <any JSON> }`. The input
-/// passed to the plug-in is the JSON bytes of `config.input` (empty if absent).
+/// Parse a `tool_kind: "wasm"` config into the plug-in ref + entry + input bytes.
+/// Config shape: `{ plugin: { path, version, entry? }, input: <any JSON> }`.
+/// `plugin.entry` is the guest export to invoke (default `run`); the worker-driven
+/// orchestrator sets `entry: "run_state"` (noetl/ai-meta#108). The input passed to
+/// the plug-in is the JSON bytes of `config.args` (or `config.input`, empty if
+/// absent).
 #[cfg(feature = "wasm-plugin")]
-fn wasm_config_to_ref(config: &serde_json::Value) -> Result<(String, u32, Vec<u8>), String> {
+fn wasm_config_to_ref(config: &serde_json::Value) -> Result<(String, u32, String, Vec<u8>), String> {
     let plugin = config
         .get("plugin")
         .ok_or("wasm tool config missing `plugin`")?;
@@ -1275,6 +1279,11 @@ fn wasm_config_to_ref(config: &serde_json::Value) -> Result<(String, u32, Vec<u8
             .ok_or("plugin.version missing or not an integer")?,
     )
     .map_err(|_| "plugin.version out of range".to_string())?;
+    let entry = plugin
+        .get("entry")
+        .and_then(|v| v.as_str())
+        .unwrap_or("run")
+        .to_string();
     // The plug-in input: the server canonicalizes the step's `input:` to `args`
     // (the noetl-tools field name), so read `args` first and fall back to
     // `input` for a directly-crafted command.
@@ -1282,7 +1291,7 @@ fn wasm_config_to_ref(config: &serde_json::Value) -> Result<(String, u32, Vec<u8
         Some(v) => serde_json::to_vec(v).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    Ok((path, version, input))
+    Ok((path, version, entry, input))
 }
 
 /// Bridge a plug-in's output + flush report to a `ToolResult`.
@@ -1670,9 +1679,10 @@ mod tests {
             "plugin": { "path": "system/materialiser", "version": 3 },
             "args": { "batch": [1, 2] }
         });
-        let (path, version, input) = wasm_config_to_ref(&cfg).unwrap();
+        let (path, version, entry, input) = wasm_config_to_ref(&cfg).unwrap();
         assert_eq!(path, "system/materialiser");
         assert_eq!(version, 3);
+        assert_eq!(entry, "run", "entry defaults to `run` when unset");
         assert_eq!(
             input,
             serde_json::to_vec(&serde_json::json!({ "batch": [1, 2] })).unwrap()
@@ -1683,8 +1693,16 @@ mod tests {
             "plugin": { "path": "p", "version": 1 },
             "input": { "x": 1 }
         });
-        let (_, _, input2) = wasm_config_to_ref(&cfg2).unwrap();
+        let (_, _, _, input2) = wasm_config_to_ref(&cfg2).unwrap();
         assert_eq!(input2, serde_json::to_vec(&serde_json::json!({ "x": 1 })).unwrap());
+
+        // An explicit `entry` (the worker-driven orchestrator's `run_state`) parses.
+        let cfg3 = serde_json::json!({
+            "plugin": { "path": "system/orchestrate", "version": 1, "entry": "run_state" },
+            "args": { "state": {} }
+        });
+        let (_, _, entry3, _) = wasm_config_to_ref(&cfg3).unwrap();
+        assert_eq!(entry3, "run_state");
     }
 
     #[cfg(feature = "wasm-plugin")]
@@ -1693,7 +1711,7 @@ mod tests {
         assert!(wasm_config_to_ref(&serde_json::json!({})).is_err());
         assert!(wasm_config_to_ref(&serde_json::json!({ "plugin": { "path": "p" } })).is_err());
         // No `input` is fine — empty bytes.
-        let (_, _, input) =
+        let (_, _, _, input) =
             wasm_config_to_ref(&serde_json::json!({ "plugin": { "path": "p", "version": 1 } }))
                 .unwrap();
         assert!(input.is_empty());

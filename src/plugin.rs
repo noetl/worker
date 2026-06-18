@@ -451,6 +451,21 @@ impl WasmPluginHost {
         input: &[u8],
         caps: Box<dyn HostCapabilities>,
     ) -> Result<Vec<u8>, PluginError> {
+        self.invoke_bytes_with_entry(key, input, caps, "run")
+    }
+
+    /// Like [`invoke_bytes_with`](Self::invoke_bytes_with) but invokes a named
+    /// guest export `entry` rather than the default `run`. The worker-driven
+    /// orchestrator dispatches `system/orchestrate` via its `run_state` export
+    /// (noetl/ai-meta#108) — the data-plane ABI (`alloc` + `entry(ptr,len)->packed`)
+    /// is identical, only the export name differs.
+    pub fn invoke_bytes_with_entry(
+        &self,
+        key: &PluginKey,
+        input: &[u8],
+        caps: Box<dyn HostCapabilities>,
+        entry: &str,
+    ) -> Result<Vec<u8>, PluginError> {
         let module = self
             .cache
             .get(key)
@@ -476,8 +491,8 @@ impl WasmPluginHost {
             .get_typed_func::<i32, i32>(&mut store, "alloc")
             .map_err(|_| PluginError::MissingExport("alloc".into()))?;
         let run = instance
-            .get_typed_func::<(i32, i32), i64>(&mut store, "run")
-            .map_err(|_| PluginError::MissingExport("run".into()))?;
+            .get_typed_func::<(i32, i32), i64>(&mut store, entry)
+            .map_err(|_| PluginError::MissingExport(entry.into()))?;
 
         let len = i32::try_from(input.len())
             .map_err(|_| PluginError::Memory(format!("input {} bytes exceeds i32", input.len())))?;
@@ -807,7 +822,7 @@ impl WasmDispatcher {
         input: &[u8],
     ) -> Result<WasmRunOutcome, PluginError> {
         self.host.ensure_loaded(key, self.source.as_ref()).await?;
-        self.invoke_collected(key, input)
+        self.invoke_collected(key, input, "run")
     }
 
     /// Like [`run`](Self::run) but addressed by `(path, version)` — the dispatch
@@ -819,19 +834,39 @@ impl WasmDispatcher {
         version: u32,
         input: &[u8],
     ) -> Result<WasmRunOutcome, PluginError> {
+        self.run_by_ref_entry(path, version, input, "run").await
+    }
+
+    /// Like [`run_by_ref`](Self::run_by_ref) but invokes a named guest export
+    /// `entry` (e.g. `run_state` for the worker-driven orchestrator,
+    /// noetl/ai-meta#108).
+    pub async fn run_by_ref_entry(
+        &mut self,
+        path: &str,
+        version: u32,
+        input: &[u8],
+        entry: &str,
+    ) -> Result<WasmRunOutcome, PluginError> {
         let key = self
             .host
             .ensure_loaded_by_ref(path, version, self.source.as_ref())
             .await?;
-        self.invoke_collected(&key, input)
+        self.invoke_collected(&key, input, entry)
     }
 
     /// Invoke a loaded plug-in over the byte data-plane with a fresh buffering
     /// capability ring, returning its output + collected intents.
-    fn invoke_collected(&self, key: &PluginKey, input: &[u8]) -> Result<WasmRunOutcome, PluginError> {
+    fn invoke_collected(
+        &self,
+        key: &PluginKey,
+        input: &[u8],
+        entry: &str,
+    ) -> Result<WasmRunOutcome, PluginError> {
         let caps = BufferingCapabilities::new();
         let sink = caps.sink();
-        let output = self.host.invoke_bytes_with(key, input, Box::new(caps))?;
+        let output = self
+            .host
+            .invoke_bytes_with_entry(key, input, Box::new(caps), entry)?;
         let intents = std::mem::take(&mut *sink.lock().unwrap());
         Ok(WasmRunOutcome { output, intents })
     }
@@ -863,7 +898,27 @@ impl WasmDispatcher {
         execution_id: i64,
         step: &str,
     ) -> Result<(Vec<u8>, FlushReport), PluginError> {
-        let outcome = self.run_by_ref(path, version, input).await?;
+        self.run_and_apply_by_ref_entry(path, version, input, client, execution_id, step, "run")
+            .await
+    }
+
+    /// Like [`run_and_apply_by_ref`](Self::run_and_apply_by_ref) but invokes a
+    /// named guest export `entry`. The worker-driven orchestrator dispatches
+    /// `system/orchestrate` with `entry = "run_state"` (noetl/ai-meta#108): the
+    /// plug-in returns the next commands as its output (no capability intents),
+    /// which the server applies on the command's completion.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_and_apply_by_ref_entry(
+        &mut self,
+        path: &str,
+        version: u32,
+        input: &[u8],
+        client: &crate::client::ControlPlaneClient,
+        execution_id: i64,
+        step: &str,
+        entry: &str,
+    ) -> Result<(Vec<u8>, FlushReport), PluginError> {
+        let outcome = self.run_by_ref_entry(path, version, input, entry).await?;
         let report = apply_intents(outcome.intents, client, execution_id, step).await;
         Ok((outcome.output, report))
     }
@@ -1439,6 +1494,60 @@ mod tests {
                 payload,
             }]
         );
+    }
+
+    // Exports both `run` and `run_state`; each returns a single distinct byte so
+    // a test can tell which export the dispatcher invoked.
+    const TWO_ENTRY_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $bump (mut i32) (i32.const 1024))
+  (func $alloc (export "alloc") (param $n i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $bump))
+    (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+    (local.get $p))
+  (func $emit1 (param $byte i32) (result i64)
+    (local $out i32)
+    (local.set $out (call $alloc (i32.const 1)))
+    (i32.store8 (local.get $out) (local.get $byte))
+    (i64.or (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+            (i64.extend_i32_u (i32.const 1))))
+  (func (export "run") (param $ptr i32) (param $len i32) (result i64)
+    (call $emit1 (i32.const 170)))      ;; 0xAA
+  (func (export "run_state") (param $ptr i32) (param $len i32) (result i64)
+    (call $emit1 (i32.const 187))))     ;; 0xBB
+"#;
+
+    #[tokio::test]
+    async fn dispatcher_invokes_named_entry_export() {
+        // The worker-driven orchestrator dispatches `system/orchestrate` with
+        // entry `run_state` (noetl/ai-meta#108). Same data-plane ABI, different
+        // export — the dispatcher must call the one the command names.
+        let key = PluginKey::new("system/two-entry", 1, "sha-2e");
+        let mut src = MapPluginSource::default();
+        src.insert(key, TWO_ENTRY_WAT.as_bytes().to_vec());
+        let mut dispatcher = WasmDispatcher::new(Box::new(src)).unwrap();
+
+        // Default `run` export.
+        let run = dispatcher
+            .run_by_ref("system/two-entry", 1, b"x")
+            .await
+            .unwrap();
+        assert_eq!(run.output, vec![0xAA], "default path invokes `run`");
+
+        // Named `run_state` export — the worker-driven path.
+        let run_state = dispatcher
+            .run_by_ref_entry("system/two-entry", 1, b"x", "run_state")
+            .await
+            .unwrap();
+        assert_eq!(run_state.output, vec![0xBB], "entry path invokes `run_state`");
+
+        // A missing export surfaces a clear error, not a panic.
+        let missing = dispatcher
+            .run_by_ref_entry("system/two-entry", 1, b"x", "nope")
+            .await;
+        assert!(matches!(missing, Err(PluginError::MissingExport(e)) if e == "nope"));
     }
 
     #[tokio::test]
