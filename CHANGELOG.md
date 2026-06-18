@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.33.0](https://github.com/noetl/worker/compare/v5.32.0...v5.33.0) (2026-06-18)
+
+### Features
+
+* **nats:** pool-affinity — decline command notifications not for this worker's pool ([#114](https://github.com/noetl/worker/issues/114)) ([e2162b7](https://github.com/noetl/worker/commit/e2162b742bd64306d9cb837d6ec989d97d57e0d5)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [5.32.0](https://github.com/noetl/worker/compare/v5.31.2...v5.32.0) (2026-06-18)
 
 ### Features
