@@ -36,6 +36,16 @@ pub struct CommandNotification {
 
     /// Server URL for fetching command details.
     pub server_url: String,
+
+    /// Target worker-pool segment the server routed this command to
+    /// (`shared` / `system` / a subscription override), mirroring the NATS
+    /// subject `noetl.commands.<segment>.<execution_id>` (noetl/ai-meta#108).
+    /// `None` for legacy notifications that predate pool stamping. The worker
+    /// uses it to decline commands that aren't for its pool — defence-in-depth
+    /// against a JetStream consumer whose `filter_subject` drifted broad and so
+    /// delivers another pool's commands.
+    #[serde(default)]
+    pub execution_pool: Option<String>,
 }
 
 /// Accept either a JSON string OR a JSON integer for `command_id`;
@@ -399,6 +409,7 @@ mod tests {
             command_id: "cmd-abc123".to_string(),
             step: "process_data".to_string(),
             server_url: "http://localhost:8082".to_string(),
+            execution_pool: None,
         };
 
         let json = serde_json::to_string(&notification).unwrap();

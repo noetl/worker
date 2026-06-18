@@ -83,23 +83,66 @@ pub struct NatsCommandSource {
     subscriber: NatsSubscriber,
     client: ControlPlaneClient,
     worker_id: String,
+    /// This worker's pool segment, parsed from its `NATS_FILTER_SUBJECT`
+    /// (`noetl.commands.<segment>.>` → `<segment>`); `None` for a bare/wildcard
+    /// filter (single-pool deployments — no affinity enforced). The source
+    /// declines a notification whose `execution_pool` names a *different*
+    /// segment (noetl/ai-meta#108) — defence-in-depth against a JetStream
+    /// consumer whose `filter_subject` drifted broad.
+    segment: Option<String>,
+}
+
+/// Decline predicate: given this worker's segment and a command's target
+/// `execution_pool`, return `Some(target)` when they're both set and differ
+/// (the worker should skip the command), else `None` (run it). Affinity is
+/// enforced only when BOTH sides name a concrete segment.
+fn pool_mismatch<'a>(mine: Option<&str>, target: Option<&'a str>) -> Option<&'a str> {
+    match (mine, target) {
+        (Some(mine), Some(target)) if mine != target => Some(target),
+        _ => None,
+    }
+}
+
+/// Parse the pool segment out of a NATS filter subject
+/// (`noetl.commands.<segment>.>` → `Some("<segment>")`). A bare or wildcard
+/// segment (`noetl.commands`, `noetl.commands.>`) yields `None` — that worker
+/// accepts every command (the single-pool default, unchanged).
+pub fn segment_from_filter(filter: &str) -> Option<String> {
+    let parts: Vec<&str> = filter.split('.').collect();
+    let idx = parts.iter().position(|&p| p == "commands")?;
+    let seg = parts.get(idx + 1)?;
+    if *seg == ">" || *seg == "*" || seg.is_empty() {
+        None
+    } else {
+        Some((*seg).to_string())
+    }
 }
 
 impl NatsCommandSource {
     /// Construct a source from its component dependencies.  The
     /// subscriber must already be connected and bound to the right
     /// stream / consumer; the client must be configured with the
-    /// control-plane URL.
+    /// control-plane URL.  `segment` is this worker's pool segment (see the
+    /// field doc) — pass `segment_from_filter(&config.nats_filter_subject)`.
     pub fn new(
         subscriber: NatsSubscriber,
         client: ControlPlaneClient,
         worker_id: impl Into<String>,
+        segment: Option<String>,
     ) -> Self {
         Self {
             subscriber,
             client,
             worker_id: worker_id.into(),
+            segment,
         }
+    }
+
+    /// If this notification targets a *different* pool segment than ours,
+    /// return that target (the worker should decline + skip it). `None` =
+    /// run it (matching segment, or affinity not enforced on either side).
+    fn declines<'a>(&self, n: &'a CommandNotification) -> Option<&'a str> {
+        pool_mismatch(self.segment.as_deref(), n.execution_pool.as_deref())
     }
 
     /// Borrow the subscriber.  Useful for callers that need to read
@@ -174,8 +217,28 @@ impl CommandSource for NatsCommandSource {
         // `noetl_worker_pull_duration_seconds` histogram.
         let pull_start = std::time::Instant::now();
 
-        let Some((notification, msg)) = self.subscriber.receive().await? else {
-            return Ok(None);
+        // Pull a notification, declining (ack + skip) any that targets a
+        // different pool segment than ours — defence-in-depth against a drifted
+        // consumer filter (noetl/ai-meta#108). The correct pool's consumer
+        // receives the message on its own delivery and claims it; we just don't
+        // run another pool's command. ACK (not NAK): we're done with our copy,
+        // and NAK would only redeliver it to us again.
+        let (notification, msg) = loop {
+            let Some((notification, msg)) = self.subscriber.receive().await? else {
+                return Ok(None);
+            };
+            if let Some(target) = self.declines(&notification) {
+                tracing::debug!(
+                    execution_id = notification.execution_id,
+                    command_id = %notification.command_id,
+                    target_pool = target,
+                    my_segment = self.segment.as_deref().unwrap_or("-"),
+                    "Declining out-of-pool command notification (ack + skip)"
+                );
+                self.subscriber.ack(&msg).await?;
+                continue;
+            }
+            break (notification, msg);
         };
 
         tracing::debug!(
@@ -238,6 +301,28 @@ impl CommandSource for NatsCommandSource {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn segment_parsed_from_filter_subject() {
+        assert_eq!(segment_from_filter("noetl.commands.system.>").as_deref(), Some("system"));
+        assert_eq!(segment_from_filter("noetl.commands.shared.>").as_deref(), Some("shared"));
+        assert_eq!(segment_from_filter("noetl.commands.subscription.>").as_deref(), Some("subscription"));
+        // Bare / wildcard filters enforce no affinity (single-pool default).
+        assert_eq!(segment_from_filter("noetl.commands.>"), None);
+        assert_eq!(segment_from_filter("noetl.commands"), None);
+        assert_eq!(segment_from_filter("noetl.commands.*"), None);
+    }
+
+    #[test]
+    fn pool_mismatch_declines_only_a_different_targeted_pool() {
+        // A `system` worker: declines a `shared`-targeted command; runs `system`.
+        assert_eq!(pool_mismatch(Some("system"), Some("shared")), Some("shared"));
+        assert_eq!(pool_mismatch(Some("system"), Some("system")), None);
+        // Untagged command (legacy) → run it. Unenforced worker (bare filter) → run anything.
+        assert_eq!(pool_mismatch(Some("system"), None), None);
+        assert_eq!(pool_mismatch(None, Some("system")), None);
+        assert_eq!(pool_mismatch(None, None), None);
+    }
 
     /// Build a minimal worker `Command` JSON for translation tests.
     fn worker_command(
