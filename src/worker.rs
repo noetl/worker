@@ -147,9 +147,30 @@ impl Worker {
         // logs.  Cadence is `WORKER_NATS_LAG_POLL_INTERVAL` env (s),
         // default 5s.  Per `observability.md` Principle 2.
         let lag_poll_interval = crate::nats::lag_poller::poll_interval_from_env();
-        let lag_handle = crate::nats::lag_poller::spawn(self.source.clone(), lag_poll_interval);
+        // When this worker runs the materializer (system pool, under
+        // NOETL_MATERIALIZER_ENABLED), the lag poller also tracks the
+        // noetl_events/noetl_materializer consumer backlog — the
+        // earliest signal that events are piling up un-materialized
+        // under the PUBLISH_ONLY gate (noetl/ai-meta#103 flip
+        // guardrail).  An independent task is what catches a stalled
+        // or dead materializer loop, which can't report its own lag.
+        let materializer_lag_target = if crate::materializer::enabled() {
+            let stream = std::env::var("NOETL_MATERIALIZER_STREAM")
+                .unwrap_or_else(|_| crate::materializer::EVENT_STREAM.to_string());
+            let consumer = std::env::var("NOETL_MATERIALIZER_CONSUMER")
+                .unwrap_or_else(|_| crate::materializer::MATERIALIZER_CONSUMER.to_string());
+            Some((stream, consumer))
+        } else {
+            None
+        };
+        let lag_handle = crate::nats::lag_poller::spawn(
+            self.source.clone(),
+            lag_poll_interval,
+            materializer_lag_target.clone(),
+        );
         tracing::info!(
             interval_secs = lag_poll_interval.as_secs(),
+            materializer_lag = ?materializer_lag_target,
             "NATS consumer-lag poller started"
         );
 
