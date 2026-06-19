@@ -108,6 +108,23 @@ pub struct WorkerMetrics {
     /// Times a per-subscription rate limit engaged, by source + reason
     /// (`dispatch_rate` / `max_in_flight`) — RFC §9 backpressure.
     pub subscription_rate_limited_total: IntCounterVec,
+
+    // --- CQRS event materializer (noetl/ai-meta#103) -------------------------
+    /// Events drained from `noetl_events` by the materializer consume-loop.
+    pub materializer_drained_total: IntCounter,
+    /// Events durably inserted into `noetl.event` (events/project `projected`).
+    pub materializer_projected_total: IntCounter,
+    /// Events that collided with an already-materialized row (idempotent
+    /// redelivery path — events/project `duplicates`).
+    pub materializer_duplicates_total: IntCounter,
+    /// Ack handles disposed (positive ack) after a successful project — the
+    /// ack-after-materialize commit point.
+    pub materializer_acked_total: IntCounter,
+    /// Project failures: the batch was NOT acked and will redeliver. This is
+    /// the durability-event counter — the metric that proves no silent loss.
+    pub materializer_project_errors_total: IntCounter,
+    /// One materializer drain→project→ack cycle latency.
+    pub materializer_cycle_duration_seconds: Histogram,
 }
 
 impl WorkerMetrics {
@@ -414,6 +431,62 @@ impl WorkerMetrics {
             .register(Box::new(subscription_rate_limited_total.clone()))
             .expect("register subscription_rate_limited_total");
 
+        let materializer_drained_total = IntCounter::new(
+            "noetl_worker_materializer_drained_total",
+            "Events drained from noetl_events by the CQRS materializer (noetl/ai-meta#103).",
+        )
+        .expect("materializer_drained_total metric");
+        registry
+            .register(Box::new(materializer_drained_total.clone()))
+            .expect("register materializer_drained_total");
+
+        let materializer_projected_total = IntCounter::new(
+            "noetl_worker_materializer_projected_total",
+            "Events durably inserted into noetl.event by the materializer (events/project projected).",
+        )
+        .expect("materializer_projected_total metric");
+        registry
+            .register(Box::new(materializer_projected_total.clone()))
+            .expect("register materializer_projected_total");
+
+        let materializer_duplicates_total = IntCounter::new(
+            "noetl_worker_materializer_duplicates_total",
+            "Events that collided with an already-materialized row (idempotent redelivery path).",
+        )
+        .expect("materializer_duplicates_total metric");
+        registry
+            .register(Box::new(materializer_duplicates_total.clone()))
+            .expect("register materializer_duplicates_total");
+
+        let materializer_acked_total = IntCounter::new(
+            "noetl_worker_materializer_acked_total",
+            "Ack handles disposed after a successful project — the ack-after-materialize commit point.",
+        )
+        .expect("materializer_acked_total metric");
+        registry
+            .register(Box::new(materializer_acked_total.clone()))
+            .expect("register materializer_acked_total");
+
+        let materializer_project_errors_total = IntCounter::new(
+            "noetl_worker_materializer_project_errors_total",
+            "Project failures: the batch was NOT acked and will redeliver (no silent loss).",
+        )
+        .expect("materializer_project_errors_total metric");
+        registry
+            .register(Box::new(materializer_project_errors_total.clone()))
+            .expect("register materializer_project_errors_total");
+
+        let materializer_cycle_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_worker_materializer_cycle_duration_seconds",
+                "Latency of one materializer drain→project→ack cycle.",
+            ),
+        )
+        .expect("materializer_cycle_duration_seconds metric");
+        registry
+            .register(Box::new(materializer_cycle_duration_seconds.clone()))
+            .expect("register materializer_cycle_duration_seconds");
+
         Self {
             registry,
             pulls_total,
@@ -439,6 +512,12 @@ impl WorkerMetrics {
             subscription_batch_dispatch_total,
             subscription_batch_messages_total,
             subscription_rate_limited_total,
+            materializer_drained_total,
+            materializer_projected_total,
+            materializer_duplicates_total,
+            materializer_acked_total,
+            materializer_project_errors_total,
+            materializer_cycle_duration_seconds,
         }
     }
 
@@ -646,6 +725,41 @@ pub fn record_call_done_skipped_pending_callback(tool_kind: &str) {
         .call_done_skipped_pending_callback_total
         .with_label_values(&[tool_kind])
         .inc();
+}
+
+/// Record one materializer drain→project→ack cycle (noetl/ai-meta#103).
+/// `drained` messages were pulled; `projected`/`duplicates` came back from
+/// events/project; `acked` handles were disposed. Call
+/// [`record_materializer_project_error`] instead when the project failed (the
+/// batch is left un-acked to redeliver).
+pub fn record_materializer_cycle(
+    drained: u64,
+    projected: u64,
+    duplicates: u64,
+    acked: u64,
+    duration_seconds: f64,
+) {
+    let m = WorkerMetrics::global();
+    if drained > 0 {
+        m.materializer_drained_total.inc_by(drained);
+    }
+    if projected > 0 {
+        m.materializer_projected_total.inc_by(projected);
+    }
+    if duplicates > 0 {
+        m.materializer_duplicates_total.inc_by(duplicates);
+    }
+    if acked > 0 {
+        m.materializer_acked_total.inc_by(acked);
+    }
+    m.materializer_cycle_duration_seconds.observe(duration_seconds);
+}
+
+/// Record a materializer project failure — the batch is NOT acked and will
+/// redeliver after the consumer's ack-wait. This is the no-loss guarantee's
+/// observability surface.
+pub fn record_materializer_project_error() {
+    WorkerMetrics::global().materializer_project_errors_total.inc();
 }
 
 // Unused-warning suppression for fields that aren't read directly

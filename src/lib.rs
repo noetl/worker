@@ -12,6 +12,7 @@ pub mod client;
 pub mod config;
 pub mod events;
 pub mod executor;
+pub mod materializer;
 pub mod metrics;
 pub mod metrics_server;
 pub mod nats;

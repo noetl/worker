@@ -153,13 +153,32 @@ impl Worker {
             "NATS consumer-lag poller started"
         );
 
+        // Start the CQRS event materializer (noetl/ai-meta#103) when enabled
+        // (system worker pool only).  It drains noetl_events with deferred ack
+        // and is the sole noetl.event writer under PUBLISH_ONLY — acking each
+        // batch only after events/project durably inserts it, so a transient
+        // failure redelivers instead of losing events.  Default off.
+        let materializer_handle = match crate::materializer::MaterializerConfig::from_env(&self.config)
+        {
+            Ok(Some(cfg)) => Some(crate::materializer::spawn(cfg)),
+            Ok(None) => None,
+            Err(e) => {
+                // Enabled-but-misconfigured: fail loud rather than silently
+                // not materializing under the sole-writer gate.
+                return Err(e);
+            }
+        };
+
         // Process commands
         let result = self.process_commands().await;
 
-        // Stop heartbeat + metrics server + lag poller
+        // Stop heartbeat + metrics server + lag poller + materializer
         heartbeat_handle.abort();
         metrics_handle.abort();
         lag_handle.abort();
+        if let Some(h) = materializer_handle {
+            h.abort();
+        }
 
         // Deregister worker
         self.deregister().await?;
