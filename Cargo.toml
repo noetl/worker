@@ -134,7 +134,12 @@ wasmtime = { version = "27", optional = true }
 #   the stable logical URI on over-budget result references
 #   (`ResultCoordinates::new(...).logical_uri()`), collision-free across
 #   cursor fan-out (noetl/ai-meta#104).
-noetl-tools = "3.12"
+# - v3.13: deferred (ack-after-processing) ack — `AckMode::Defer`,
+#   `SourceClient::ack(ack_ids, AckDisposition)`, NATS `$JS.ACK` durable
+#   handles.  The CQRS materializer loop (`src/materializer.rs`) drives it
+#   to ack noetl_events batches only after events/project succeeds
+#   (noetl/ai-meta#103).
+noetl-tools = "3.13"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
@@ -238,4 +243,3 @@ tokio-test = "0.4"
 # uuid used in integration tests (dispatch_nats_mcp.rs) to generate unique
 # NATS KV bucket names so concurrent test runs don't collide.
 uuid = { version = "1", features = ["v4"] }
-
