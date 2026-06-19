@@ -333,13 +333,18 @@ impl CommandExecutor {
             .entry("node_name".to_string())
             .or_insert_with(|| serde_json::json!(command.step.clone()));
 
-        // References-in-state (noetl/ai-meta#101 phase 2, consume side): when the
-        // orchestrator runs with NOETL_REFS_IN_STATE, step outputs in the context
-        // carry a `{reference}` + `extracted` summary instead of inline data.
-        // Resolve those references to their full payload here so templates needing
-        // the bulk data (`{{ step.messages }}`) still get it.  No-op when nothing
-        // is referenced — the default path costs one map lookup.
-        resolve_context_references(&mut ctx.variables, &dispatch_client).await;
+        // References-in-state consume side (noetl/ai-meta#115 Phase 1 / #101): when
+        // the orchestrator runs with NOETL_REFS_IN_STATE, step outputs in the
+        // context carry a `{reference}` + bounded `extracted` summary (+ the
+        // `_ref`/`_store` accessors) instead of inline data.  Resolve a step's
+        // full payload **only** when this step's input template binds its bulk
+        // (a path the summary can't satisfy) — predicate / scalar / `_ref` access
+        // reads off the bounded summary without a store round-trip, and unrelated
+        // upstream results stay as references.  The template source is this
+        // command's `input` (the tool config + args the tool will render).  No-op
+        // when nothing is referenced — the default flag-off path costs one lookup.
+        let template_src = serde_json::to_string(&command.input).unwrap_or_default();
+        resolve_context_references(&mut ctx.variables, &template_src, &dispatch_client).await;
 
         // Emit command.started event.  R-1.2 PR-EE-3: `step` +
         // `worker_id` are top-level fields on the `ExecutorEvent`
@@ -1400,33 +1405,63 @@ fn flat_with_data(data: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Resolve over-budget result references in the render context to their full
-/// payload (references-in-state, noetl/ai-meta#101 phase 2 — the consume side).
-/// With `NOETL_REFS_IN_STATE` on, step outputs carry a `{reference}` + `extracted`
-/// summary instead of inline data; a template like `{{ step.messages }}` would
-/// otherwise see only the summary.  This resolves each referenced step's `ref`
-/// and splices the full data back into both the flat `<step>` binding and
-/// `steps.<step>`, reconstructing the context the worker would have seen
-/// pre-references.  No references → no-op (the default flag-off path costs one
-/// map lookup).
+/// payload — **selectively** (references-in-state consume side, noetl/ai-meta#115
+/// Phase 1 / #101).
+///
+/// With `NOETL_REFS_IN_STATE` on, step outputs carry a `{reference}` + bounded
+/// `extracted` summary (+ the `_ref`/`_store` locator accessors) instead of
+/// inline data.  Most downstream access is predicate / scalar / `_ref` —
+/// `{{ step.status }}`, `{{ step._ref is defined }}`, `{{ step._ref }}` (an
+/// explicit `artifact.get` lazy-load) — which the bounded summary already
+/// satisfies.  Only a template that binds the **bulk** of an upstream result
+/// (`{{ step.data }}` over a summarised rowset, a whole-object bind, an array
+/// element past `[0]`) needs the full payload.
+///
+/// This resolves a step's `ref` **only** when `template_src` (this command's
+/// tool input) binds that step's bulk, and resolves **only** those refs — so an
+/// over-budget upstream result a step doesn't consume stays a reference and the
+/// worker render never inflates foreign bulk.  Predicate-only / `_ref`-only /
+/// summary-satisfiable access leaves the small summary in place.  No references
+/// → no-op (the default flag-off path costs one map lookup).
 async fn resolve_context_references(
     variables: &mut std::collections::HashMap<String, serde_json::Value>,
+    template_src: &str,
     client: &ControlPlaneClient,
 ) {
     // `steps` carries the full step results (build_context inserts result.clone()).
-    let to_resolve: Vec<(String, String)> = match variables.get("steps") {
+    let candidates: Vec<(String, String)> = match variables.get("steps") {
         Some(serde_json::Value::Object(steps)) => steps
             .iter()
             .filter_map(|(name, result)| reference_uri(result).map(|uri| (name.clone(), uri)))
             .collect(),
         _ => return,
     };
-    if to_resolve.is_empty() {
+    if candidates.is_empty() {
         return;
     }
-    for (name, uri) in to_resolve {
+    for (name, uri) in candidates {
+        // The flat `<name>` binding is the bounded summary (+ `_ref`/`_store`).
+        // Decide off it whether this command's template needs the bulk.
+        let summary = variables.get(&name);
+        if !step_needs_bulk_resolution(template_src, &name, summary) {
+            tracing::debug!(step = %name, uri, "ref kept as summary (no bulk binding in template)");
+            continue;
+        }
         match client.resolve_ref(&uri).await {
             Ok(Some(data)) => {
-                variables.insert(name.clone(), flat_with_data(&data));
+                // Preserve the locator accessors so a template that binds bulk
+                // AND `{{ step._ref }}` keeps both after the splice.
+                let mut flat = flat_with_data(&data);
+                if let (Some(flat_obj), Some(serde_json::Value::Object(prev))) =
+                    (flat.as_object_mut(), summary)
+                {
+                    for acc in ["_ref", "_store", "_uri"] {
+                        if let Some(v) = prev.get(acc) {
+                            flat_obj.entry(acc.to_string()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+                variables.insert(name.clone(), flat);
                 if let Some(serde_json::Value::Object(steps)) = variables.get_mut("steps") {
                     if let Some(result) = steps.get_mut(&name) {
                         splice_resolved(result, data);
@@ -1440,6 +1475,175 @@ async fn resolve_context_references(
                 tracing::warn!(step = %name, uri, %e, "context reference resolve failed; left as summary")
             }
         }
+    }
+}
+
+/// Decide whether `template_src` binds the **bulk** of step `<name>` — i.e.
+/// whether the worker must resolve `<name>`'s full reference rather than reading
+/// off the bounded summary.  The driving observation: `summarise_value` keeps
+/// **every object key** and collapses only the *bulk* (arrays → first element,
+/// large strings → `{_len}`, over-depth/over-budget → `{_count}`/`{_truncated}`).
+/// So a path is **summary-satisfiable** unless it navigates into collapsed bulk;
+/// a key absent from the summary is absent from the full payload too (resolving
+/// is futile, so we don't).
+///
+/// Conservative bias: when `summary` is missing or a reference is parsed
+/// ambiguously, resolve.  Never under-resolves (correctness over size).
+fn step_needs_bulk_resolution(
+    template_src: &str,
+    name: &str,
+    summary: Option<&serde_json::Value>,
+) -> bool {
+    let accessors = accessor_paths(template_src, name);
+    if accessors.is_empty() {
+        return false; // step not referenced by this command's template
+    }
+    let Some(summary) = summary else {
+        return true; // referenced but no summary to read off → resolve
+    };
+    accessors
+        .iter()
+        .any(|path| !path_satisfiable(summary, path))
+}
+
+/// Find the accessor paths a template applies to identifier `name`.  Each entry
+/// is the dotted/indexed chain after `name` (`["data"]` for `{{ name.data }}`,
+/// `["rows", "0", "x"]` for `{{ name.rows[0].x }}`); an **empty** path marks a
+/// whole-object bind (`{{ name }}`, `{{ name | tojson }}`).  Plain string scan —
+/// robust to JSON-escaping since identifiers/dots/brackets aren't escaped.
+fn accessor_paths(template_src: &str, name: &str) -> Vec<Vec<String>> {
+    let bytes = template_src.as_bytes();
+    let name_bytes = name.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(pos) = template_src[i..].find(name) {
+        let start = i + pos;
+        let end = start + name_bytes.len();
+        i = end; // advance regardless of match outcome
+        // Left boundary: previous char must not be part of a longer identifier
+        // or a member access (`other.name` is a field of `other`, not `name`).
+        if start > 0 {
+            let prev = bytes[start - 1];
+            if is_ident(prev) || prev == b'.' {
+                continue;
+            }
+        }
+        // Right boundary: next char must not extend the identifier.
+        if end < bytes.len() && is_ident(bytes[end]) {
+            continue;
+        }
+        out.push(parse_accessor_chain(bytes, end));
+    }
+    out
+}
+
+/// Parse the `.key` / `["key"]` / `[n]` chain starting at `pos`.
+fn parse_accessor_chain(bytes: &[u8], mut pos: usize) -> Vec<String> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut path = Vec::new();
+    loop {
+        match bytes.get(pos) {
+            Some(b'.') => {
+                pos += 1;
+                let seg_start = pos;
+                while pos < bytes.len() && is_ident(bytes[pos]) {
+                    pos += 1;
+                }
+                if pos == seg_start {
+                    break; // `.` not followed by an identifier
+                }
+                path.push(String::from_utf8_lossy(&bytes[seg_start..pos]).into_owned());
+            }
+            Some(b'[') => {
+                pos += 1;
+                // Skip an opening quote if present.
+                let quoted = matches!(bytes.get(pos), Some(b'\'') | Some(b'"') | Some(b'\\'));
+                while matches!(bytes.get(pos), Some(b'\'') | Some(b'"') | Some(b'\\')) {
+                    pos += 1;
+                }
+                let seg_start = pos;
+                while pos < bytes.len()
+                    && bytes[pos] != b']'
+                    && bytes[pos] != b'\''
+                    && bytes[pos] != b'"'
+                    && bytes[pos] != b'\\'
+                {
+                    pos += 1;
+                }
+                let seg = String::from_utf8_lossy(&bytes[seg_start..pos]).into_owned();
+                // Advance past closing quote(s) + `]`.
+                while matches!(bytes.get(pos), Some(b'\'') | Some(b'"') | Some(b'\\')) {
+                    pos += 1;
+                }
+                if bytes.get(pos) == Some(&b']') {
+                    pos += 1;
+                }
+                let _ = quoted;
+                path.push(seg);
+            }
+            _ => break,
+        }
+    }
+    path
+}
+
+/// Is `path` resolvable off the bounded summary without the full payload?
+fn path_satisfiable(summary: &serde_json::Value, path: &[String]) -> bool {
+    use serde_json::Value;
+    let mut cur = summary;
+    for (i, seg) in path.iter().enumerate() {
+        // The injected locator accessors are always present scalars.
+        if i == 0 && matches!(seg.as_str(), "_ref" | "_store" | "_uri") {
+            return true;
+        }
+        match cur {
+            Value::Object(o) => match o.get(seg) {
+                // Absent in the summary ⇒ absent in the full payload (summarise
+                // keeps every object key) ⇒ resolving can't help ⇒ satisfiable.
+                // Exception: a budget-`_truncated` object may have *dropped* keys
+                // the full payload still has — resolve to be safe.
+                None => return !o.contains_key("_truncated"),
+                Some(v) => cur = v,
+            },
+            Value::Array(a) => {
+                // Summary keeps only element 0.  Index 0 navigates; any other
+                // index or a field access (iteration) needs the full array.
+                if seg == "0" {
+                    match a.first() {
+                        Some(v) => cur = v,
+                        None => return true,
+                    }
+                } else {
+                    return false;
+                }
+            }
+            // Navigating into a scalar yields undefined either way.
+            _ => return true,
+        }
+    }
+    // Whole bound value: satisfiable only if it carries no collapsed bulk.
+    !contains_summary_bulk(cur)
+}
+
+/// True if `v` contains anything the summary collapsed (an array — which keeps
+/// only its first element — or a `_len`/`_count`/`_truncated`/`_keys` marker),
+/// meaning a template binding it whole would see truncated data.
+fn contains_summary_bulk(v: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::Array(_) => true,
+        Value::Object(o) => {
+            if o.contains_key("_len")
+                || o.contains_key("_truncated")
+                || o.contains_key("_keys")
+                || o.contains_key("_count")
+            {
+                return true;
+            }
+            o.values().any(contains_summary_bulk)
+        }
+        _ => false,
     }
 }
 
@@ -1617,6 +1821,79 @@ mod tests {
             "extracted must stay bounded, got {} bytes",
             ex.to_string().len()
         );
+    }
+
+    // --- #115 Phase 1: selective render-time ref resolution (consume side) ---
+
+    #[test]
+    fn accessor_paths_finds_member_and_index_chains() {
+        let tpl = r#"{"input":{"a":"{{ start.status }}","b":"{{ start._ref }}","c":"{{ start.rows[0].id }}","d":"{{ start }}","e":"{{ other.start }}"}}"#;
+        let paths = accessor_paths(tpl, "start");
+        // `other.start` is a member of `other`, not a `start` reference.
+        assert!(paths.contains(&vec!["status".to_string()]));
+        assert!(paths.contains(&vec!["_ref".to_string()]));
+        assert!(paths.contains(&vec!["rows".to_string(), "0".to_string(), "id".to_string()]));
+        assert!(paths.contains(&vec![]), "bare {{ start }} → whole-object bind");
+        // No spurious accessor from `other.start`.
+        assert_eq!(paths.iter().filter(|p| p.is_empty()).count(), 1);
+    }
+
+    #[test]
+    fn ref_and_scalar_access_does_not_force_resolution() {
+        // output_select's verify/lazy_load shape: scalar + `_ref` + a key absent
+        // from the summary.  None of these need the bulk.
+        let summary = serde_json::json!({
+            "status": "success",
+            "data": { "generate_data": { "count": 1000 } },
+            "_ref": "noetl://execution/1/result/start/9",
+            "_store": "kv",
+        });
+        let tpl = r#"{"status":"{{ start.status }}","has":"{{ start._ref is defined }}","ref":"{{ start._ref }}","store":"{{ start._store }}","absent":"{{ start.count }}"}"#;
+        assert!(!step_needs_bulk_resolution(tpl, "start", Some(&summary)));
+    }
+
+    #[test]
+    fn data_bind_over_summarised_rowset_forces_resolution() {
+        // process_full_data binds `{{ lazy_load_full_data.data }}` whole; the
+        // summary collapsed `items` to one element, so it must resolve.
+        let summary = serde_json::json!({
+            "data": { "items": [{ "id": 0 }], "count": 1000 },
+            "_ref": "noetl://execution/1/result/lazy/9",
+        });
+        let tpl = r#"{"data":"{{ lazy_load_full_data.data }}"}"#;
+        assert!(step_needs_bulk_resolution(tpl, "lazy_load_full_data", Some(&summary)));
+    }
+
+    #[test]
+    fn unreferenced_step_is_not_resolved() {
+        let summary = serde_json::json!({ "status": "ok", "_ref": "noetl://x/y/z/1" });
+        let tpl = r#"{"input":"{{ some_other_step.value }}"}"#;
+        assert!(!step_needs_bulk_resolution(tpl, "upstream", Some(&summary)));
+    }
+
+    #[test]
+    fn whole_object_bind_forces_resolution() {
+        let summary = serde_json::json!({ "data": { "rows": [{ "id": 1 }] }, "_ref": "noetl://x/y/z/1" });
+        let tpl = r#"{"all":"{{ build_batch_plan }}"}"#;
+        assert!(step_needs_bulk_resolution(tpl, "build_batch_plan", Some(&summary)));
+    }
+
+    #[test]
+    fn scalar_field_present_is_satisfiable_even_when_a_ref_exists() {
+        // storage_tiers final_summary reads `{{ load_kv_data.count }}` off a
+        // referenced (over-budget) artifact output — count is a kept scalar.
+        let summary = serde_json::json!({
+            "status": "ok", "count": 500, "tier": "kv_expected",
+            "items": [{ "id": 0 }], "_ref": "noetl://x/y/z/1",
+        });
+        let tpl = r#"{"n":"{{ load_kv_data.count | default(0) }}"}"#;
+        assert!(!step_needs_bulk_resolution(tpl, "load_kv_data", Some(&summary)));
+    }
+
+    #[test]
+    fn missing_summary_resolves_conservatively() {
+        let tpl = r#"{"x":"{{ start.anything }}"}"#;
+        assert!(step_needs_bulk_resolution(tpl, "start", None));
     }
 
     // --- #104 R02b: stamp the logical URI on over-budget references ---
