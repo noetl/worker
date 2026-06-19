@@ -52,8 +52,17 @@ pub fn poll_interval_from_env() -> Duration {
 ///
 /// On every tick:
 /// 1. Acquire the source mutex.
-/// 2. Read `subscriber.consumer_lag()`.
-/// 3. Update `record_nats_consumer_lag(stream, consumer, ...)`.
+/// 2. Read `subscriber.consumer_lag()` for the command consumer.
+/// 3. When `materializer` is `Some((stream, consumer))`, also read
+///    `subscriber.consumer_lag_for(stream, consumer)` — the
+///    `noetl_events` / `noetl_materializer` pair — over the same
+///    connection.  This is the materializer-lag guardrail for the
+///    `NOETL_EVENT_INGEST_PUBLISH_ONLY` flip (noetl/ai-meta#103):
+///    the materializer loop can't report its own backlog when it's
+///    stalled or dead, so this independent task does it instead.
+/// 4. Update `record_nats_consumer_lag(stream, consumer, ...)` for
+///    each pair — the gauge is labelled by `(stream, consumer)`, so
+///    both pairs land on the same metric with distinct label sets.
 ///
 /// Errors are logged at WARN and don't abort the loop.  A future
 /// follow-up could expose a `noetl_worker_nats_lag_poll_errors_total`
@@ -61,6 +70,7 @@ pub fn poll_interval_from_env() -> Duration {
 pub fn spawn(
     source: Arc<Mutex<NatsCommandSource>>,
     poll_interval: Duration,
+    materializer: Option<(String, String)>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(poll_interval);
@@ -68,53 +78,69 @@ pub fn spawn(
         // BEFORE the first scrape, even on a freshly-started pod.
         ticker.tick().await;
         loop {
-            let snapshot = {
+            // Snapshot both consumers under a single mutex acquisition.
+            let (cmd, mat) = {
                 let source = source.lock().await;
                 let subscriber = source.subscriber();
-                let stream = subscriber.stream_name().to_string();
-                let consumer = subscriber.consumer_name().to_string();
-                let result = subscriber.consumer_lag().await;
-                (stream, consumer, result)
+                let cmd_stream = subscriber.stream_name().to_string();
+                let cmd_consumer = subscriber.consumer_name().to_string();
+                let cmd_result = subscriber.consumer_lag().await;
+                let cmd = (cmd_stream, cmd_consumer, cmd_result);
+
+                let mat = if let Some((stream, consumer)) = materializer.as_ref() {
+                    let result = subscriber.consumer_lag_for(stream, consumer).await;
+                    Some((stream.clone(), consumer.clone(), result))
+                } else {
+                    None
+                };
+                (cmd, mat)
             };
 
-            let (stream, consumer, result) = snapshot;
-            match result {
-                Ok(lag) => {
-                    // i64 cast: JetStream returns u64 for num_pending
-                    // and usize for num_ack_pending.  Both are
-                    // realistically <<< i64::MAX (a queue of 9e18
-                    // messages would have exhausted disk long ago);
-                    // we saturate to MAX defensively rather than
-                    // truncate.
-                    let pending = i64::try_from(lag.pending).unwrap_or(i64::MAX);
-                    let ack_pending = i64::try_from(lag.ack_pending).unwrap_or(i64::MAX);
-                    crate::metrics::record_nats_consumer_lag(
-                        &stream,
-                        &consumer,
-                        pending,
-                        ack_pending,
-                    );
-                    tracing::debug!(
-                        stream = %stream,
-                        consumer = %consumer,
-                        pending,
-                        ack_pending,
-                        "Updated consumer lag gauges"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        stream = %stream,
-                        consumer = %consumer,
-                        error = %e,
-                        "Failed to fetch consumer info; gauges stale until next tick"
-                    );
-                }
+            record_pair(cmd.0, cmd.1, cmd.2);
+            if let Some((stream, consumer, result)) = mat {
+                record_pair(stream, consumer, result);
             }
 
             ticker.tick().await;
         }
     })
+}
+
+/// Record one consumer's lag snapshot into the gauges, or WARN on
+/// fetch failure.  Shared by the command-consumer poll and the
+/// materializer-consumer poll so both land identical behaviour.
+fn record_pair(
+    stream: String,
+    consumer: String,
+    result: anyhow::Result<crate::nats::ConsumerLag>,
+) {
+    match result {
+        Ok(lag) => {
+            // i64 cast: JetStream returns u64 for num_pending and
+            // usize for num_ack_pending.  Both are realistically
+            // <<< i64::MAX (a queue of 9e18 messages would have
+            // exhausted disk long ago); we saturate to MAX
+            // defensively rather than truncate.
+            let pending = i64::try_from(lag.pending).unwrap_or(i64::MAX);
+            let ack_pending = i64::try_from(lag.ack_pending).unwrap_or(i64::MAX);
+            crate::metrics::record_nats_consumer_lag(&stream, &consumer, pending, ack_pending);
+            tracing::debug!(
+                stream = %stream,
+                consumer = %consumer,
+                pending,
+                ack_pending,
+                "Updated consumer lag gauges"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                stream = %stream,
+                consumer = %consumer,
+                error = %e,
+                "Failed to fetch consumer info; gauges stale until next tick"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

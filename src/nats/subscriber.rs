@@ -249,12 +249,38 @@ impl NatsSubscriber {
     /// the lag-poll cadence (seconds, not millis) makes the
     /// allocation noise irrelevant.
     pub async fn consumer_lag(&self) -> Result<ConsumerLag> {
-        let stream = self.js.get_stream(&self.stream).await?;
+        self.consumer_lag_for(&self.stream, &self.consumer).await
+    }
+
+    /// Fetch a lag snapshot for an *arbitrary* stream + consumer over
+    /// this subscriber's JetStream connection.
+    ///
+    /// The materializer drains a different stream/consumer pair
+    /// (`noetl_events` / `noetl_materializer`) than the command
+    /// dispatch loop, and it has no independent lag observer: a stuck
+    /// or dead materializer loop can't report its own growing
+    /// backlog.  The lag poller — an independent task on the same
+    /// worker — calls this with the materializer pair so the
+    /// `noetl_worker_nats_consumer_pending{consumer="noetl_materializer"}`
+    /// gauge keeps climbing even when the materializer loop has
+    /// stalled.  That gauge is the earliest signal that, under the
+    /// `NOETL_EVENT_INGEST_PUBLISH_ONLY` gate, published events are
+    /// piling up un-materialized (noetl/ai-meta#103 flip guardrail).
+    ///
+    /// Same JetStream account/connection as the command consumer —
+    /// both streams live in the worker's NATS account — so no extra
+    /// connection is opened.
+    pub async fn consumer_lag_for(
+        &self,
+        stream_name: &str,
+        consumer_name: &str,
+    ) -> Result<ConsumerLag> {
+        let stream = self.js.get_stream(stream_name).await?;
         // The pull-consumer type is what the subscriber created in
         // `ensure_consumer`; reusing it here keeps the consumer
         // handle compatible with the same generic instantiation.
         let mut consumer: jetstream::consumer::Consumer<jetstream::consumer::pull::Config> = stream
-            .get_consumer(&self.consumer)
+            .get_consumer(consumer_name)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch consumer: {}", e))?;
         let info = consumer
