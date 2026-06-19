@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.35.0](https://github.com/noetl/worker/compare/v5.34.0...v5.35.0) (2026-06-19)
+
+### Features
+
+* **materializer:** expose materializer-consumer lag gauge (CQRS PUBLISH_ONLY flip guardrail) ([#116](https://github.com/noetl/worker/issues/116)) ([bbd2dd9](https://github.com/noetl/worker/commit/bbd2dd95f671b4956a60e8800bce1cc115e990c3)), closes [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103)
+
 ## [5.34.0](https://github.com/noetl/worker/compare/v5.33.0...v5.34.0) (2026-06-19)
 
 ### Features
