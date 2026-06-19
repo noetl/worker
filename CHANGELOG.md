@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.34.0](https://github.com/noetl/worker/compare/v5.33.0...v5.34.0) (2026-06-19)
+
+### Features
+
+* **materializer:** in-process CQRS event materializer (ack-after-materialize) ([#115](https://github.com/noetl/worker/issues/115)) ([af34a92](https://github.com/noetl/worker/commit/af34a92ce8ea57f21e8318c896ad6a9ee00e0505)), closes [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+
 ## [5.33.0](https://github.com/noetl/worker/compare/v5.32.0...v5.33.0) (2026-06-18)
 
 ### Features
