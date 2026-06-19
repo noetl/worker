@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.36.0](https://github.com/noetl/worker/compare/v5.35.0...v5.36.0) (2026-06-19)
+
+### Features
+
+* **executor:** selective render-time ref resolution (refs-in-state consume side) ([#117](https://github.com/noetl/worker/issues/117)) ([10d2721](https://github.com/noetl/worker/commit/10d272163ade85e0c21e25ffb70a0c69b6055154)), closes [noetl/ai-meta#115](https://github.com/noetl/ai-meta/issues/115) [#101](https://github.com/noetl/worker/issues/101) [noetl/ai-meta#115](https://github.com/noetl/ai-meta/issues/115) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#113](https://github.com/noetl/ai-meta/issues/113)
+
 ## [5.35.0](https://github.com/noetl/worker/compare/v5.34.0...v5.35.0) (2026-06-19)
 
 ### Features
