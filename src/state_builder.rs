@@ -703,6 +703,32 @@ pub fn shadow_enabled() -> bool {
     )
 }
 
+/// True when `NOETL_STATE_BUILDER_DURABLE` is truthy — opts the authoritative
+/// drain back into a **durable** `noetl_state_builder` consumer (the pre-#119
+/// behavior).  Default **off**.
+///
+/// The default authoritative drain uses an **ephemeral** `DeliverPolicy::All`
+/// consumer that rebuilds the full in-memory [`WalEventIndex`] from the retained
+/// `noetl_events` WAL on **every boot** — exactly the shadow consumer shape — so
+/// a persisted consumer cursor can never outrun the freshly-empty index and
+/// strand in-flight executions after a worker restart (noetl/ai-meta#119).  The
+/// durable form persists a cursor across restarts while the in-memory index
+/// rebuilds empty, so the cursor sits ahead of the events the fresh index needs
+/// → `build_spine_to(expected_head)` is permanently `Incomplete` → the off-server
+/// drive loops `offserver_retry` and executions never complete.  It is NOT
+/// restart-safe until the index is snapshotted alongside the cursor; kept only as
+/// an instant revert for the steady-state ack/backlog-observability shape.
+pub fn durable_consumer_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_STATE_BUILDER_DURABLE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Resolved drain-loop configuration (shadow OR authoritative — RFC #115
 /// Phase 4).  The loop drains the `noetl_events` WAL into the shared
 /// [`SharedWalIndex`]; the [`BuilderMode`] decides whether that index is
@@ -714,11 +740,15 @@ pub struct DrainConfig {
     pub nats_user: Option<String>,
     pub nats_password: Option<String>,
     pub stream: String,
-    /// Durable consumer name for the authoritative drain — makes the
-    /// state-builder a first-class system component whose backlog is observable
-    /// (KEDA/VMAlert), mirroring the materializer's durable consumer.  `None`
-    /// (shadow) → a fresh ephemeral DeliverAll consumer that cold-replays the
-    /// retained stream on each start.
+    /// Durable consumer name for the drain, or `None` for an **ephemeral**
+    /// `DeliverPolicy::All` consumer that cold-replays the retained stream on each
+    /// start.  `None` is the default for BOTH shadow and authoritative
+    /// (noetl/ai-meta#119): the ephemeral rebuild-on-boot guarantees the in-memory
+    /// index is always repopulated to cover the retained WAL, so no persisted
+    /// cursor can outrun a freshly-restarted worker's empty index.  A durable name
+    /// is set only when `NOETL_STATE_BUILDER_DURABLE` opts back into the pre-#119
+    /// durable consumer (see [`durable_consumer_enabled`]) — which is NOT
+    /// restart-safe without an index snapshot.
     pub durable: Option<String>,
     /// Bounded pull batch size + wait.
     pub batch: u32,
@@ -741,10 +771,15 @@ impl DrainConfig {
             return None;
         }
         let (nats_url, nats_user, nats_password) = parse_nats_credentials(nats_url);
-        // Authoritative: a durable consumer so the backlog is observable and the
-        // cursor survives restarts (incremental tail-advance instead of a full
-        // cold replay each boot).  Shadow: ephemeral, cold-replay on each start.
-        let durable = if mode == BuilderMode::Authoritative {
+        // noetl/ai-meta#119: the authoritative drain defaults to an **ephemeral**
+        // DeliverAll consumer that rebuilds the full in-memory index from the
+        // retained `noetl_events` WAL on every boot — so a persisted cursor can
+        // never outrun the freshly-empty index and strand in-flight executions
+        // after a worker restart.  Shadow is ephemeral too.  Only when
+        // `NOETL_STATE_BUILDER_DURABLE` is set does the authoritative drain take a
+        // durable consumer (the pre-#119 shape; not restart-safe without an index
+        // snapshot) — kept as an instant revert.
+        let durable = if mode == BuilderMode::Authoritative && durable_consumer_enabled() {
             Some(
                 std::env::var("NOETL_STATE_BUILDER_CONSUMER")
                     .unwrap_or_else(|_| STATE_BUILDER_CONSUMER.to_string()),
@@ -782,13 +817,18 @@ pub fn spawn_drain(config: DrainConfig, index: SharedWalIndex) -> tokio::task::J
 /// Connect → consumer (durable authoritative, or ephemeral DeliverAll/AckNone
 /// shadow) → drain → index → advance.
 ///
-/// The **shadow** consumer is ephemeral `DeliverPolicy::All` + `AckPolicy::None`:
-/// it replays the whole retained stream into the index on each start (the
-/// cold-rebuild / crash-recovery model — RFC §7.3) and never competes for acks.
-/// The **authoritative** consumer is durable (`AckPolicy::Explicit`,
-/// `DeliverPolicy::All` on first create) so its backlog is observable and the
-/// cursor survives restarts; it acks each drained batch.  Either way the index
-/// is the same — the chain walk + cache produce identical state.
+/// Both shadow and the **default** authoritative drain use an ephemeral
+/// `DeliverPolicy::All` + `AckPolicy::None` consumer: it replays the whole
+/// retained stream into the index on each start (the cold-rebuild / crash-recovery
+/// model — RFC §7.3) and never competes for acks.  This is the noetl/ai-meta#119
+/// fix — rebuilding the full index from the retained WAL on every boot means a
+/// persisted consumer cursor can never outrun a freshly-restarted worker's empty
+/// index (the stall: cursor acked past events a fresh index still needs →
+/// `build_spine_to(expected_head)` permanently `Incomplete` → off-server drive
+/// loops `offserver_retry`).  Only under `NOETL_STATE_BUILDER_DURABLE` does the
+/// authoritative drain use a durable (`AckPolicy::Explicit`) consumer (the
+/// pre-#119 shape, an instant revert).  Either way the index is the same — the
+/// chain walk + cache produce identical state.
 async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()> {
     let client = match (&config.nats_user, &config.nats_password) {
         (Some(u), Some(p)) => {
@@ -807,16 +847,21 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         .await
         .with_context(|| format!("state-builder get_stream {}", config.stream))?;
 
-    // Shadow: ephemeral, all-history, no-ack consumer (own consumer, never the
-    // materializer's).  Authoritative: durable, explicit-ack consumer so the
-    // backlog is observable + the cursor survives restarts.
+    // `authoritative` (mode) governs the *advance timing* (advance-on-demand in
+    // the command dispatch vs. advance-in-loop for shadow) + terminal eviction.
+    // `durable` (a consumer name is configured) governs the *ack policy*: only a
+    // durable consumer has a cursor to advance, so it acks; the ephemeral
+    // DeliverAll consumer (the #119 default) re-delivers the full retained WAL on
+    // every boot and never acks.  The two are now independent — a default
+    // authoritative drain is `authoritative && !durable`.
     let authoritative = config.mode == BuilderMode::Authoritative;
+    let durable = config.durable.is_some();
     let consumer = stream
         .create_consumer(PullConfig {
             durable_name: config.durable.clone(),
             filter_subject: "noetl.events.>".to_string(),
             deliver_policy: DeliverPolicy::All,
-            ack_policy: if authoritative {
+            ack_policy: if durable {
                 AckPolicy::Explicit
             } else {
                 AckPolicy::None
@@ -829,10 +874,17 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
     tracing::info!(
         stream = %config.stream,
         durable = ?config.durable,
+        ephemeral_rebuild = !durable,
         mode = ?config.mode,
         batch = config.batch,
-        "off-server state-builder drain started (WAL drain, zero noetl.event scans)"
+        "off-server state-builder drain started (WAL drain, zero noetl.event scans; \
+         rebuilds the in-memory index from the retained WAL on boot — noetl/ai-meta#119)"
     );
+
+    // One-shot rehydration breadcrumb: log the first batch that populates the
+    // index after boot, so a restart leaves a clear "index rehydrated from the
+    // retained WAL" marker (the #119 stall was a permanently-empty index).
+    let mut rehydrated = false;
 
     loop {
         let mut batch = match consumer
@@ -878,7 +930,7 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
                         {
                             Some(v) => v,
                             None => {
-                                if authoritative {
+                                if durable {
                                     let _ = msg.ack().await;
                                 }
                                 continue;
@@ -894,10 +946,11 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
                         terminals.push(execution_id);
                     }
                 }
-                // Authoritative durable consumer: ack after the event is indexed
-                // (at-least-once; re-apply on redelivery is idempotent — same
-                // event_id overwrites identical data).
-                if authoritative {
+                // Durable consumer: ack after the event is indexed (at-least-once;
+                // re-apply on redelivery is idempotent — same event_id overwrites
+                // identical data).  The ephemeral DeliverAll consumer (the #119
+                // default) has no cursor to advance and never acks.
+                if durable {
                     let _ = msg.ack().await;
                 }
             }
@@ -945,11 +998,26 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
                 }
             }
         }
-        {
+        let indexed = {
             let mut idx = index.lock().await;
             for eid in terminals {
                 idx.evict(eid);
             }
+            idx.execution_count()
+        };
+        // noetl/ai-meta#119 rehydration proof: surface the indexed-execution count
+        // (the bug was this stuck at 0 after a restart — the durable cursor outran
+        // the empty index).  A non-zero count after boot means the index rebuilt
+        // from the retained WAL.  Log the first non-empty rebuild once per process.
+        crate::metrics::set_state_builder_indexed_executions(indexed as i64);
+        if !rehydrated && indexed > 0 {
+            rehydrated = true;
+            tracing::info!(
+                indexed_executions = indexed,
+                wal_events = consumed,
+                durable,
+                "off-server state-builder index rehydrated from retained noetl_events WAL (noetl/ai-meta#119)"
+            );
         }
     }
 }
@@ -1146,6 +1214,56 @@ mod tests {
         // Tail walk 10→9(missing) fails to reach cached head 3 → not incremental.
         // The full walk from head 10 also hits the missing hop → Incomplete.
         assert_eq!(chain.advance(), AdvanceOutcome::Incomplete);
+    }
+
+    #[test]
+    fn fresh_index_rebuilds_from_full_replay_after_restart() {
+        // noetl/ai-meta#119: a worker restart drops the in-memory index.  The
+        // pre-#119 durable consumer cursor persisted PAST the events a fresh index
+        // needed, so the empty index was never repopulated → build_spine_to was
+        // permanently Incomplete → the off-server drive looped offserver_retry and
+        // executions never completed.  The fix re-delivers the FULL retained WAL
+        // into a FRESH index on every boot (ephemeral DeliverAll), so the rebuilt
+        // index serves the same complete spine the pre-restart index did.
+        let retained = linear_spine(5); // playbook_started … command.completed (id 5)
+        let tip = 5; // the server's expected_head (ChainHeads watermark)
+
+        // Pre-restart: the index serves the complete spine to the tip.
+        let mut before = WalEventIndex::new();
+        for e in &retained {
+            before.apply(e);
+        }
+        let (o1, s1) = before.build_spine_to(42, tip);
+        assert!(matches!(o1, AdvanceOutcome::ColdRebuild(5)));
+        let ids_before: Vec<i64> = s1
+            .expect("pre-restart index serves the spine")
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+
+        // Restart: a brand-new empty index can't serve — the #119 stall symptom
+        // (build Incomplete, the drive would loop offserver_retry forever).
+        let mut after = WalEventIndex::new();
+        let (o_empty, s_empty) = after.build_spine_to(42, tip);
+        assert!(matches!(o_empty, AdvanceOutcome::Incomplete));
+        assert!(s_empty.is_none(), "empty post-restart index stalls (the bug)");
+
+        // Rehydrate: replay the same retained WAL into the fresh index → it serves
+        // the identical complete spine again (the fix — full DeliverAll replay).
+        for e in &retained {
+            after.apply(e);
+        }
+        let (o2, s2) = after.build_spine_to(42, tip);
+        assert!(matches!(o2, AdvanceOutcome::ColdRebuild(5)));
+        let ids_after: Vec<i64> = s2
+            .expect("rehydrated index serves the spine")
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            ids_before, ids_after,
+            "rehydrated index serves the same spine as before the restart"
+        );
     }
 
     #[test]
