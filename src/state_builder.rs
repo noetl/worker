@@ -143,6 +143,16 @@ impl ExecutionChain {
         self.head
     }
 
+    /// The event type of an indexed event, if present.  Used by the stateless
+    /// off-server drive (RFC #115 Phase 4 remainder) to resolve
+    /// `trigger_event_type` off the WAL from the server-supplied
+    /// `trigger_event_id` — so the server need not read `noetl.event` to classify
+    /// the trigger.  Returns `None` when the id isn't indexed (the caller defaults
+    /// to `command.completed`, the only triggering type).
+    pub fn event_type_of(&self, event_id: i64) -> Option<&str> {
+        self.events.get(&event_id).map(|e| e.event_type.as_str())
+    }
+
     /// Number of events indexed for this execution.
     pub fn len(&self) -> usize {
         self.events.len()
@@ -428,13 +438,24 @@ pub async fn build_offserver_input(
     execution_id: i64,
     playbook: &serde_json::Value,
     trigger_event_type: Option<&str>,
+    trigger_event_id: Option<i64>,
     expected_head: Option<i64>,
 ) -> Option<Vec<u8>> {
-    let (outcome, spine, head) = {
+    let (outcome, spine, head, resolved_trigger_type) = {
         let mut idx = index.lock().await;
         let (outcome, spine) = idx.build_spine(execution_id);
-        let head = idx.chain(execution_id).and_then(|c| c.head());
-        (outcome, spine, head)
+        let chain = idx.chain(execution_id);
+        let head = chain.and_then(|c| c.head());
+        // Stateless off-server drive (RFC #115 Phase 4 remainder): when the
+        // server did NOT supply `trigger_event_type` (it no longer reads
+        // `noetl.event` to classify the trigger), resolve it off the WAL index
+        // from the server-supplied `trigger_event_id`.  Falls back to
+        // `command.completed` (the only triggering type) if the id isn't indexed.
+        let resolved_trigger_type = trigger_event_type.map(|s| s.to_string()).or_else(|| {
+            trigger_event_id
+                .and_then(|tid| chain.and_then(|c| c.event_type_of(tid)).map(|s| s.to_string()))
+        });
+        (outcome, spine, head, resolved_trigger_type)
     };
     // Staleness guard (RFC #115 Phase 4): the worker's WAL drain is an
     // independent consumer that can lag the server's view.  A spine that is
@@ -462,10 +483,13 @@ pub async fn build_offserver_input(
         AdvanceOutcome::Incomplete => crate::metrics::record_state_builder_build("incomplete"),
     }
     let events = spine?;
+    let trigger_type = resolved_trigger_type
+        .as_deref()
+        .unwrap_or("command.completed");
     let input = serde_json::json!({
         "events": events,
         "playbook": playbook,
-        "trigger_event_type": trigger_event_type,
+        "trigger_event_type": trigger_type,
     });
     serde_json::to_vec(&input).ok()
 }
@@ -1006,9 +1030,10 @@ mod tests {
             }
         }
         let playbook = serde_json::json!({ "metadata": { "path": "t" } });
-        let bytes = build_offserver_input(&index, 42, &playbook, Some("command.completed"), Some(3))
-            .await
-            .expect("complete chain builds input");
+        let bytes =
+            build_offserver_input(&index, 42, &playbook, Some("command.completed"), None, Some(3))
+                .await
+                .expect("complete chain builds input");
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["trigger_event_type"], "command.completed");
         assert_eq!(v["playbook"]["metadata"]["path"], "t");
@@ -1016,15 +1041,33 @@ mod tests {
         assert_eq!(evs.len(), 3, "all three spine events");
         assert_eq!(evs[0]["event_id"], 1);
 
+        // Stateless edge (RFC #115 Phase 4 remainder): trigger_event_type=None +
+        // a trigger_event_id resolves the type off the WAL index (event 3 is
+        // command.completed in the linear spine).
+        let bytes2 = build_offserver_input(&index, 42, &playbook, None, Some(3), Some(3))
+            .await
+            .expect("complete chain builds input (resolved trigger type)");
+        let v2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(
+            v2["trigger_event_type"], "command.completed",
+            "trigger type resolved off the WAL index from trigger_event_id"
+        );
+        // An unindexed trigger_event_id defaults to command.completed.
+        let bytes3 = build_offserver_input(&index, 42, &playbook, None, Some(999), Some(3))
+            .await
+            .expect("complete chain builds input (default trigger type)");
+        let v3: serde_json::Value = serde_json::from_slice(&bytes3).unwrap();
+        assert_eq!(v3["trigger_event_type"], "command.completed");
+
         // Staleness guard: an expected_head ahead of the index head → None (the
         // drain hasn't caught up to the server's dispatch watermark yet).
         assert!(
-            build_offserver_input(&index, 42, &playbook, None, Some(99)).await.is_none(),
+            build_offserver_input(&index, 42, &playbook, None, None, Some(99)).await.is_none(),
             "stale index (head < expected_head) must not serve"
         );
 
         // An unknown execution → None (the caller falls back to run_state).
-        assert!(build_offserver_input(&index, 7, &playbook, None, None).await.is_none());
+        assert!(build_offserver_input(&index, 7, &playbook, None, None, None).await.is_none());
     }
 
     #[test]
