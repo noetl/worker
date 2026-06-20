@@ -1379,6 +1379,13 @@ impl CommandExecutor {
 
         let playbook = args.get("playbook").cloned().unwrap_or(serde_json::Value::Null);
         let trigger_event_type = args.get("trigger_event_type").and_then(|v| v.as_str());
+        // RFC #115 Phase 5: the server stamps the atomic-item-context flag on the
+        // dispatch args; forward it onto the from_events drive input so the
+        // off-server drive narrows worker-bound command contexts too.
+        let atomic_item_context = args
+            .get("atomic_item_context")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // The server supplies `trigger_event_id` on the stateless edge so the
         // worker resolves `trigger_event_type` off its WAL index.
         let trigger_event_id = args.get("trigger_event_id").and_then(|v| v.as_i64());
@@ -1408,6 +1415,7 @@ impl CommandExecutor {
                 trigger_event_type,
                 trigger_event_id,
                 expected_head,
+                atomic_item_context,
             )
             .await
             {
