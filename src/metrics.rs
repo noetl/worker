@@ -145,6 +145,14 @@ pub struct WorkerMetrics {
     /// Chain-walk depth (events on the spine) per cold rebuild — the analogue of
     /// the server's `noetl_state_build_chain_hops` (server#245), now off-server.
     pub state_builder_chain_hops: Histogram,
+    /// Off-server **drive** builds by outcome (RFC #115 Phase 4 drive cutover):
+    /// `served` — the drive obtained its state from the WAL spine (the wasm `run`
+    /// from_events entry); `fallback_incomplete` — the WAL chain was incomplete
+    /// (lag / cold) so the drive used the server-built `run_state` state carried
+    /// on the same command; `fallback_disabled` — the worker's builder isn't
+    /// authoritative so it used the server-built state.  The proof that the WAL
+    /// build is authoritative is `served` dominating in steady state.
+    pub state_builder_drive_builds_total: IntCounterVec,
 }
 
 impl WorkerMetrics {
@@ -549,6 +557,18 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_chain_hops.clone()))
             .expect("register state_builder_chain_hops");
 
+        let state_builder_drive_builds_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_drive_builds_total",
+                "Off-server DRIVE builds by outcome — served (WAL spine) vs fallback (RFC #115 Phase 4 cutover).",
+            ),
+            &["outcome"],
+        )
+        .expect("state_builder_drive_builds_total metric");
+        registry
+            .register(Box::new(state_builder_drive_builds_total.clone()))
+            .expect("register state_builder_drive_builds_total");
+
         Self {
             registry,
             pulls_total,
@@ -584,6 +604,7 @@ impl WorkerMetrics {
             state_builder_event_scans_total,
             state_builder_builds_total,
             state_builder_chain_hops,
+            state_builder_drive_builds_total,
         }
     }
 
@@ -850,6 +871,15 @@ pub fn record_state_builder_chain_hops(hops: usize) {
     WorkerMetrics::global()
         .state_builder_chain_hops
         .observe(hops as f64);
+}
+
+/// Record one off-server DRIVE build outcome (`served` | `fallback_incomplete` |
+/// `fallback_disabled`) — RFC #115 Phase 4 cutover.
+pub fn record_state_builder_drive(outcome: &str) {
+    WorkerMetrics::global()
+        .state_builder_drive_builds_total
+        .with_label_values(&[outcome])
+        .inc();
 }
 
 // Unused-warning suppression for fields that aren't read directly

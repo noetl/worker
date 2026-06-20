@@ -42,6 +42,13 @@ pub struct Worker {
 
     /// Semaphore for concurrency control.
     semaphore: Arc<Semaphore>,
+
+    /// Shared pool-side WAL event index (RFC #115 Phase 4).  The drain loop
+    /// ([`crate::state_builder::spawn_drain`]) feeds it from the `noetl_events`
+    /// WAL; the executor reads it to build off-server drive state under
+    /// `NOETL_STATE_BUILDER=offserver`.  Always constructed (cheap, empty); the
+    /// drain loop spawns only when the builder is enabled.
+    state_builder_index: crate::state_builder::SharedWalIndex,
 }
 
 impl Worker {
@@ -104,13 +111,23 @@ impl Worker {
             "Arrow IPC shared-memory cache initialised"
         );
 
-        // Create executor
+        // Shared pool-side WAL event index (RFC #115 Phase 4).  Built here so
+        // the executor and the drain loop share one index; the drain loop
+        // (spawned in `run` when the builder is enabled) feeds it from the WAL.
+        let state_builder_index: crate::state_builder::SharedWalIndex =
+            Arc::new(Mutex::new(crate::state_builder::WalEventIndex::new()));
+
+        // Create executor.  Under `NOETL_STATE_BUILDER=offserver` it builds the
+        // orchestrate drive's state from `state_builder_index` (the WAL spine)
+        // instead of the server-built `run_state` payload.
         let executor = Arc::new(CommandExecutor::new(
             client.clone(),
             config.worker_id.clone(),
             config.server_url.clone(),
             snowflake.clone(),
             arrow_cache.clone(),
+            crate::state_builder::builder_mode(),
+            state_builder_index.clone(),
         ));
 
         // Create semaphore for concurrency control
@@ -122,6 +139,7 @@ impl Worker {
             client,
             executor,
             semaphore,
+            state_builder_index,
         })
     }
 
@@ -190,14 +208,16 @@ impl Worker {
             }
         };
 
-        // Off-server state-builder SHADOW (noetl/ai-meta#115 Phase 4): when
-        // NOETL_STATE_BUILDER_SHADOW is set (system worker pool), drain the
-        // noetl_events WAL into a pool-side chain index and exercise the
-        // chain-walk + cache (hit / incremental / cold-rebuild) — observation
-        // only, zero noetl.event scans, no drive impact. Default off.
+        // Off-server state-builder drain (noetl/ai-meta#115 Phase 4): drain the
+        // noetl_events WAL into the shared pool-side chain index (system worker
+        // pool).  Under NOETL_STATE_BUILDER_SHADOW it's observation-only (exercises
+        // the chain-walk + cache, no drive impact); under NOETL_STATE_BUILDER=offserver
+        // it's authoritative — a durable consumer feeds the index the orchestrate
+        // command dispatch reads to build drive state off the WAL spine. Zero
+        // noetl.event scans either way. Default off.
         let state_builder_handle =
-            crate::state_builder::ShadowConfig::from_env(&self.config.nats_url)
-                .map(crate::state_builder::spawn_shadow);
+            crate::state_builder::DrainConfig::from_env(&self.config.nats_url)
+                .map(|cfg| crate::state_builder::spawn_drain(cfg, self.state_builder_index.clone()));
 
         // Process commands
         let result = self.process_commands().await;

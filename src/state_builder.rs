@@ -342,6 +342,115 @@ impl WalEventIndex {
     pub fn execution_count(&self) -> usize {
         self.chains.len()
     }
+
+    /// Advance an execution's cached spine (exercising the cache: hit /
+    /// incremental / cold-rebuild) and return the **ordered event spine** as the
+    /// raw `noetl_events` payloads — the verbatim `OrchestrateInput.events` the
+    /// `system/orchestrate` plug-in's `run` (from_events) entry consumes — when
+    /// the chain is complete (genesis-rooted, no gap).  `None` when the chain
+    /// can't be trusted complete (cold / WAL ordering gap / non-genesis tail) —
+    /// the off-server drive then falls back to the server-built state.  Returns
+    /// the [`AdvanceOutcome`] alongside so the caller can record the cache metric
+    /// even on an incomplete read.
+    pub fn build_spine(&mut self, execution_id: i64) -> (AdvanceOutcome, Option<Vec<serde_json::Value>>) {
+        match self.chains.get_mut(&execution_id) {
+            Some(chain) => {
+                let outcome = chain.advance();
+                (outcome, chain.ordered_events())
+            }
+            // No chain indexed for this execution yet (the WAL drain hasn't seen
+            // any of its events) — incomplete, fall back.
+            None => (AdvanceOutcome::Incomplete, None),
+        }
+    }
+}
+
+// ── Off-server drive build (RFC #115 Phase 4 drive cutover) ──────────────────
+//
+// The shared, pool-side WAL index is fed by the drain loop ([`spawn_drain`]) and
+// read by the worker's `system/orchestrate` command dispatch
+// (`executor::command::dispatch_wasm`) when the server marks the command
+// `__offserver_build__`.  Under `NOETL_STATE_BUILDER=offserver` the drive
+// obtains its `WorkflowState` from HERE (the WAL spine fed to the wasm `run` /
+// `from_events` entry) instead of the server-built `run_state` payload — so
+// state CONSTRUCTION runs on the pool, off the server, with zero `noetl.event`
+// reads (the spine comes from the `noetl_events` WAL).
+
+/// The shared, pool-side WAL index: written by the drain loop, read by the
+/// command-dispatch off-server-build path.  A `tokio::Mutex` because both sides
+/// are async tasks in the same worker process; critical sections are short
+/// (a per-batch apply, or a single chain advance + spine read).
+pub type SharedWalIndex = std::sync::Arc<tokio::sync::Mutex<WalEventIndex>>;
+
+/// Where the worker's state builder operates — resolved from env at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuilderMode {
+    /// Disabled (default) — no drain loop, no off-server build.  The drive uses
+    /// the server-built `run_state` payload exactly as today.
+    Off,
+    /// Observation-only WAL drain (`NOETL_STATE_BUILDER_SHADOW`) — proves the
+    /// chain index + cache mechanics on the running cluster, never touches the
+    /// drive.
+    Shadow,
+    /// Authoritative (`NOETL_STATE_BUILDER=offserver`) — the drain feeds a shared
+    /// index the orchestrate-command dispatch reads to build the drive state off
+    /// the WAL spine.  A complete spine drives the decision; an incomplete one
+    /// falls back to the server-built state carried on the same command, so
+    /// progress + correctness never regress below the server-built path.
+    Authoritative,
+}
+
+/// Resolve the builder mode from env.  `NOETL_STATE_BUILDER=offserver` →
+/// authoritative (takes precedence); else `NOETL_STATE_BUILDER_SHADOW` truthy →
+/// shadow; else off.  Default off — prod/default unchanged.
+pub fn builder_mode() -> BuilderMode {
+    let sb = std::env::var("NOETL_STATE_BUILDER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if sb == "offserver" {
+        return BuilderMode::Authoritative;
+    }
+    if shadow_enabled() {
+        return BuilderMode::Shadow;
+    }
+    BuilderMode::Off
+}
+
+/// Build the off-server drive input from the shared WAL index, for one trigger.
+/// Advances the cached spine (recording the cache outcome) and, when the chain
+/// is complete, returns the JSON `OrchestrateInput { events, playbook,
+/// trigger_event_type }` bytes for the wasm `run` (from_events) entry.  Returns
+/// `None` when the chain is incomplete (the caller falls back to the
+/// server-built `run_state` state).  Records the drive-build outcome metric.
+pub async fn build_offserver_input(
+    index: &SharedWalIndex,
+    execution_id: i64,
+    playbook: &serde_json::Value,
+    trigger_event_type: Option<&str>,
+) -> Option<Vec<u8>> {
+    let (outcome, spine) = {
+        let mut idx = index.lock().await;
+        idx.build_spine(execution_id)
+    };
+    // Record the cache outcome (the same labels the shadow loop records) so the
+    // authoritative path's hit/incremental/cold distribution is observable.
+    match outcome {
+        AdvanceOutcome::CacheHit => crate::metrics::record_state_builder_build("cache_hit"),
+        AdvanceOutcome::Incremental(_) => crate::metrics::record_state_builder_build("incremental"),
+        AdvanceOutcome::ColdRebuild(hops) => {
+            crate::metrics::record_state_builder_build("cold_rebuild");
+            crate::metrics::record_state_builder_chain_hops(hops);
+        }
+        AdvanceOutcome::Incomplete => crate::metrics::record_state_builder_build("incomplete"),
+    }
+    let events = spine?;
+    let input = serde_json::json!({
+        "events": events,
+        "playbook": playbook,
+        "trigger_event_type": trigger_event_type,
+    });
+    serde_json::to_vec(&input).ok()
 }
 
 // ── Live WAL shadow drain loop ───────────────────────────────────────────────
@@ -371,31 +480,63 @@ pub fn shadow_enabled() -> bool {
     )
 }
 
-/// Resolved shadow-loop configuration.
-pub struct ShadowConfig {
+/// Resolved drain-loop configuration (shadow OR authoritative — RFC #115
+/// Phase 4).  The loop drains the `noetl_events` WAL into the shared
+/// [`SharedWalIndex`]; the [`BuilderMode`] decides whether that index is
+/// observation-only (shadow) or the authoritative source the off-server drive
+/// reads (`offserver`).
+pub struct DrainConfig {
+    pub mode: BuilderMode,
     pub nats_url: String,
     pub nats_user: Option<String>,
     pub nats_password: Option<String>,
     pub stream: String,
+    /// Durable consumer name for the authoritative drain — makes the
+    /// state-builder a first-class system component whose backlog is observable
+    /// (KEDA/VMAlert), mirroring the materializer's durable consumer.  `None`
+    /// (shadow) → a fresh ephemeral DeliverAll consumer that cold-replays the
+    /// retained stream on each start.
+    pub durable: Option<String>,
     /// Bounded pull batch size + wait.
     pub batch: u32,
     pub timeout_ms: u64,
     pub idle_sleep: Duration,
 }
 
-impl ShadowConfig {
-    /// Build from the worker config + env, or `None` when the shadow is disabled.
+/// The durable consumer name the authoritative state-builder uses on the
+/// `noetl_events` stream — mirror of the materializer's `noetl_materializer`.
+/// Override with `NOETL_STATE_BUILDER_CONSUMER`.
+pub const STATE_BUILDER_CONSUMER: &str = "noetl_state_builder";
+
+impl DrainConfig {
+    /// Build from the worker config + env, or `None` when the builder is off
+    /// (mode `Off`).  Authoritative (`NOETL_STATE_BUILDER=offserver`) takes
+    /// precedence over shadow.
     pub fn from_env(nats_url: &str) -> Option<Self> {
-        if !shadow_enabled() {
+        let mode = builder_mode();
+        if mode == BuilderMode::Off {
             return None;
         }
         let (nats_url, nats_user, nats_password) = parse_nats_credentials(nats_url);
+        // Authoritative: a durable consumer so the backlog is observable and the
+        // cursor survives restarts (incremental tail-advance instead of a full
+        // cold replay each boot).  Shadow: ephemeral, cold-replay on each start.
+        let durable = if mode == BuilderMode::Authoritative {
+            Some(
+                std::env::var("NOETL_STATE_BUILDER_CONSUMER")
+                    .unwrap_or_else(|_| STATE_BUILDER_CONSUMER.to_string()),
+            )
+        } else {
+            None
+        };
         Some(Self {
+            mode,
             nats_url,
             nats_user,
             nats_password,
             stream: std::env::var("NOETL_STATE_BUILDER_STREAM")
                 .unwrap_or_else(|_| EVENT_STREAM.to_string()),
+            durable,
             batch: env_u32("NOETL_STATE_BUILDER_BATCH", 200).clamp(1, 1000),
             timeout_ms: env_u64("NOETL_STATE_BUILDER_TIMEOUT_MS", 2_000),
             idle_sleep: Duration::from_millis(env_u64("NOETL_STATE_BUILDER_IDLE_SLEEP_MS", 500)),
@@ -403,24 +544,29 @@ impl ShadowConfig {
     }
 }
 
-/// Spawn the shadow loop, returning the handle so the worker can abort it on
-/// shutdown.
-pub fn spawn_shadow(config: ShadowConfig) -> tokio::task::JoinHandle<()> {
+/// Spawn the drain loop over the shared index, returning the handle so the
+/// worker can abort it on shutdown.  The drain writes into `index`; under
+/// [`BuilderMode::Authoritative`] the command-dispatch path reads the same
+/// `index` to build the off-server drive state.
+pub fn spawn_drain(config: DrainConfig, index: SharedWalIndex) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_shadow_loop(config).await {
-            tracing::error!(error = %e, "state-builder shadow loop exited with error");
+        if let Err(e) = run_drain_loop(config, index).await {
+            tracing::error!(error = %e, "state-builder drain loop exited with error");
         }
     })
 }
 
-/// Connect → ephemeral DeliverAll/AckNone consumer → drain → index → advance.
+/// Connect → consumer (durable authoritative, or ephemeral DeliverAll/AckNone
+/// shadow) → drain → index → advance.
 ///
-/// A fresh **ephemeral** consumer with `DeliverPolicy::All` replays the whole
-/// retained stream into the in-memory index on each start (the cold-rebuild /
-/// crash-recovery model — RFC §7.3), and `AckPolicy::None` means the shadow never
-/// competes with the materializer's durable consumer for acks. Observation-only,
-/// so a missed tail is harmless and self-heals on the next event.
-async fn run_shadow_loop(config: ShadowConfig) -> Result<()> {
+/// The **shadow** consumer is ephemeral `DeliverPolicy::All` + `AckPolicy::None`:
+/// it replays the whole retained stream into the index on each start (the
+/// cold-rebuild / crash-recovery model — RFC §7.3) and never competes for acks.
+/// The **authoritative** consumer is durable (`AckPolicy::Explicit`,
+/// `DeliverPolicy::All` on first create) so its backlog is observable and the
+/// cursor survives restarts; it acks each drained batch.  Either way the index
+/// is the same — the chain walk + cache produce identical state.
+async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()> {
     let client = match (&config.nats_user, &config.nats_password) {
         (Some(u), Some(p)) => {
             ConnectOptions::with_user_and_password(u.clone(), p.clone())
@@ -436,26 +582,33 @@ async fn run_shadow_loop(config: ShadowConfig) -> Result<()> {
     let stream = js
         .get_stream(&config.stream)
         .await
-        .with_context(|| format!("state-builder shadow get_stream {}", config.stream))?;
+        .with_context(|| format!("state-builder get_stream {}", config.stream))?;
 
-    // Ephemeral, all-history, no-ack pull consumer (own consumer — never the
-    // materializer's durable one).
+    // Shadow: ephemeral, all-history, no-ack consumer (own consumer, never the
+    // materializer's).  Authoritative: durable, explicit-ack consumer so the
+    // backlog is observable + the cursor survives restarts.
+    let authoritative = config.mode == BuilderMode::Authoritative;
     let consumer = stream
         .create_consumer(PullConfig {
-            durable_name: None,
+            durable_name: config.durable.clone(),
             filter_subject: "noetl.events.>".to_string(),
             deliver_policy: DeliverPolicy::All,
-            ack_policy: AckPolicy::None,
+            ack_policy: if authoritative {
+                AckPolicy::Explicit
+            } else {
+                AckPolicy::None
+            },
             ..Default::default()
         })
         .await
-        .context("state-builder shadow create_consumer")?;
+        .context("state-builder create_consumer")?;
 
-    let mut index = WalEventIndex::new();
     tracing::info!(
         stream = %config.stream,
+        durable = ?config.durable,
+        mode = ?config.mode,
         batch = config.batch,
-        "off-server state-builder SHADOW started (WAL drain, observation-only, zero noetl.event scans)"
+        "off-server state-builder drain started (WAL drain, zero noetl.event scans)"
     );
 
     loop {
@@ -468,7 +621,7 @@ async fn run_shadow_loop(config: ShadowConfig) -> Result<()> {
         {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = %e, "state-builder shadow batch failed; backing off");
+                tracing::warn!(error = %e, "state-builder batch failed; backing off");
                 tokio::time::sleep(config.idle_sleep).await;
                 continue;
             }
@@ -477,35 +630,52 @@ async fn run_shadow_loop(config: ShadowConfig) -> Result<()> {
         let mut touched: Vec<i64> = Vec::new();
         let mut consumed = 0u64;
         let mut terminals: Vec<i64> = Vec::new();
-        while let Some(msg) = batch.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(error = %e, "state-builder shadow message error");
-                    continue;
-                }
-            };
-            consumed += 1;
-            let payload: serde_json::Value = match serde_json::from_slice(&msg.payload) {
-                Ok(v) => v,
-                Err(_) => {
-                    // Payload may be a JSON string holding JSON (mirror the
-                    // materializer's tolerance).
-                    match std::str::from_utf8(&msg.payload)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                    {
-                        Some(v) => v,
-                        None => continue,
+        // Apply the whole batch into the shared index under one lock, then drop
+        // it before the (shadow-only) advance pass — keeps the critical section
+        // the command-dispatch off-server-build path contends on short.
+        {
+            let mut idx = index.lock().await;
+            while let Some(msg) = batch.next().await {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "state-builder message error");
+                        continue;
+                    }
+                };
+                consumed += 1;
+                let payload: serde_json::Value = match serde_json::from_slice(&msg.payload) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Payload may be a JSON string holding JSON (mirror the
+                        // materializer's tolerance).
+                        match std::str::from_utf8(&msg.payload)
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        {
+                            Some(v) => v,
+                            None => {
+                                if authoritative {
+                                    let _ = msg.ack().await;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                };
+                if let Some((execution_id, _is_new, is_terminal)) = idx.apply(&payload) {
+                    if !touched.contains(&execution_id) {
+                        touched.push(execution_id);
+                    }
+                    if is_terminal {
+                        terminals.push(execution_id);
                     }
                 }
-            };
-            if let Some((execution_id, _is_new, is_terminal)) = index.apply(&payload) {
-                if !touched.contains(&execution_id) {
-                    touched.push(execution_id);
-                }
-                if is_terminal {
-                    terminals.push(execution_id);
+                // Authoritative durable consumer: ack after the event is indexed
+                // (at-least-once; re-apply on redelivery is idempotent — same
+                // event_id overwrites identical data).
+                if authoritative {
+                    let _ = msg.ack().await;
                 }
             }
         }
@@ -516,36 +686,47 @@ async fn run_shadow_loop(config: ShadowConfig) -> Result<()> {
         }
         crate::metrics::record_state_builder_wal_events(consumed);
 
-        // Advance each touched execution's cached spine — the cache mechanics
-        // under observation. Terminal executions advance once, then evict.
-        for eid in &touched {
-            if let Some(chain) = index.chain_mut(*eid) {
-                let outcome = chain.advance();
-                match outcome {
-                    AdvanceOutcome::CacheHit => crate::metrics::record_state_builder_build("cache_hit"),
-                    AdvanceOutcome::Incremental(_) => {
-                        crate::metrics::record_state_builder_build("incremental")
+        // Shadow: advance each touched execution's cached spine here — the cache
+        // mechanics under observation.  Authoritative: the command-dispatch
+        // off-server-build path ([`build_offserver_input`]) advances on demand
+        // when a drive command arrives, so the drain only INDEXES here (and
+        // evicts terminals) to keep the on-demand advance a cheap incremental.
+        if !authoritative {
+            let mut idx = index.lock().await;
+            for eid in &touched {
+                if let Some(chain) = idx.chain_mut(*eid) {
+                    let outcome = chain.advance();
+                    match outcome {
+                        AdvanceOutcome::CacheHit => {
+                            crate::metrics::record_state_builder_build("cache_hit")
+                        }
+                        AdvanceOutcome::Incremental(_) => {
+                            crate::metrics::record_state_builder_build("incremental")
+                        }
+                        AdvanceOutcome::ColdRebuild(hops) => {
+                            crate::metrics::record_state_builder_build("cold_rebuild");
+                            crate::metrics::record_state_builder_chain_hops(hops);
+                        }
+                        AdvanceOutcome::Incomplete => {
+                            crate::metrics::record_state_builder_build("incomplete")
+                        }
                     }
-                    AdvanceOutcome::ColdRebuild(hops) => {
-                        crate::metrics::record_state_builder_build("cold_rebuild");
-                        crate::metrics::record_state_builder_chain_hops(hops);
-                    }
-                    AdvanceOutcome::Incomplete => {
-                        crate::metrics::record_state_builder_build("incomplete")
-                    }
+                    tracing::debug!(
+                        execution_id = *eid,
+                        indexed = chain.len(),
+                        spine = ?chain.cached_len(),
+                        head = ?chain.head(),
+                        outcome = ?outcome,
+                        "state-builder shadow advanced execution (WAL chain walk, no noetl.event scan)"
+                    );
                 }
-                tracing::debug!(
-                    execution_id = *eid,
-                    indexed = chain.len(),
-                    spine = ?chain.cached_len(),
-                    head = ?chain.head(),
-                    outcome = ?outcome,
-                    "state-builder shadow advanced execution (WAL chain walk, no noetl.event scan)"
-                );
             }
         }
-        for eid in terminals {
-            index.evict(eid);
+        {
+            let mut idx = index.lock().await;
+            for eid in terminals {
+                idx.evict(eid);
+            }
         }
     }
 }
@@ -760,6 +941,66 @@ mod tests {
         assert!(idx.chain(100).is_none());
         // A payload with no event_id isn't chainable.
         assert!(idx.apply(&serde_json::json!({"execution_id": 1})).is_none());
+    }
+
+    #[test]
+    fn build_spine_returns_ordered_payloads_or_incomplete() {
+        // A complete chain → build_spine returns the raw payloads in event_id
+        // order (the OrchestrateInput.events the wasm `run` entry consumes).
+        let mut idx = WalEventIndex::new();
+        for e in linear_spine(4) {
+            idx.apply(&e);
+        }
+        let (outcome, spine) = idx.build_spine(42);
+        assert!(matches!(outcome, AdvanceOutcome::ColdRebuild(4)));
+        let spine = spine.expect("complete chain yields a spine");
+        let ids: Vec<i64> = spine.iter().map(|e| e["event_id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4], "spine in event_id order");
+        // Each payload is the raw WAL event (carries created_at + status), so it
+        // deserializes into the orchestrate-core Event the plug-in expects.
+        assert!(spine[0].get("created_at").is_some());
+
+        // An unknown execution → Incomplete + no spine (caller falls back).
+        let (o2, s2) = idx.build_spine(999);
+        assert!(matches!(o2, AdvanceOutcome::Incomplete));
+        assert!(s2.is_none());
+
+        // A non-genesis tail → Incomplete (the genesis guard), so the off-server
+        // drive falls back rather than building a partial state.
+        let mut idx2 = WalEventIndex::new();
+        idx2.apply(&ev(5, None, "command.completed"));
+        idx2.apply(&ev(6, Some(5), "command.issued"));
+        let (o3, s3) = idx2.build_spine(42);
+        assert!(matches!(o3, AdvanceOutcome::ColdRebuild(_) | AdvanceOutcome::Incomplete));
+        assert!(s3.is_none(), "non-genesis tail must not yield a spine");
+    }
+
+    #[tokio::test]
+    async fn build_offserver_input_assembles_run_input() {
+        // The off-server drive build assembles the exact OrchestrateInput shape
+        // the wasm `run` (from_events) entry decodes: { events, playbook,
+        // trigger_event_type }.
+        let index: SharedWalIndex =
+            std::sync::Arc::new(tokio::sync::Mutex::new(WalEventIndex::new()));
+        {
+            let mut idx = index.lock().await;
+            for e in linear_spine(3) {
+                idx.apply(&e);
+            }
+        }
+        let playbook = serde_json::json!({ "metadata": { "path": "t" } });
+        let bytes = build_offserver_input(&index, 42, &playbook, Some("command.completed"))
+            .await
+            .expect("complete chain builds input");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["trigger_event_type"], "command.completed");
+        assert_eq!(v["playbook"]["metadata"]["path"], "t");
+        let evs = v["events"].as_array().unwrap();
+        assert_eq!(evs.len(), 3, "all three spine events");
+        assert_eq!(evs[0]["event_id"], 1);
+
+        // An unknown execution → None (the caller falls back to run_state).
+        assert!(build_offserver_input(&index, 7, &playbook, None).await.is_none());
     }
 
     #[test]
