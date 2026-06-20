@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.37.0](https://github.com/noetl/worker/compare/v5.36.0...v5.37.0) (2026-06-20)
+
+### Features
+
+* **state-builder:** off-server WorkflowState builder kernel + WAL shadow loop (RFC [#115](https://github.com/noetl/worker/issues/115) Phase 4) ([e0f9441](https://github.com/noetl/worker/commit/e0f94410238e64183d843b17819f566a4c2d02f2)), closes [server#245](https://github.com/noetl/server/issues/245)
+
 ## [5.36.0](https://github.com/noetl/worker/compare/v5.35.0...v5.36.0) (2026-06-19)
 
 ### Features
