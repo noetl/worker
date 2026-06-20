@@ -190,6 +190,15 @@ impl Worker {
             }
         };
 
+        // Off-server state-builder SHADOW (noetl/ai-meta#115 Phase 4): when
+        // NOETL_STATE_BUILDER_SHADOW is set (system worker pool), drain the
+        // noetl_events WAL into a pool-side chain index and exercise the
+        // chain-walk + cache (hit / incremental / cold-rebuild) — observation
+        // only, zero noetl.event scans, no drive impact. Default off.
+        let state_builder_handle =
+            crate::state_builder::ShadowConfig::from_env(&self.config.nats_url)
+                .map(crate::state_builder::spawn_shadow);
+
         // Process commands
         let result = self.process_commands().await;
 
@@ -198,6 +207,9 @@ impl Worker {
         metrics_handle.abort();
         lag_handle.abort();
         if let Some(h) = materializer_handle {
+            h.abort();
+        }
+        if let Some(h) = state_builder_handle {
             h.abort();
         }
 

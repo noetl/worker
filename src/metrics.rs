@@ -125,6 +125,26 @@ pub struct WorkerMetrics {
     pub materializer_project_errors_total: IntCounter,
     /// One materializer drain→project→ack cycle latency.
     pub materializer_cycle_duration_seconds: Histogram,
+
+    // --- Off-server state builder (noetl/ai-meta#115 Phase 4) ----------------
+    /// Events the off-server state builder consumed from the `noetl_events`
+    /// **WAL** stream and indexed. Positive evidence the builder reads the WAL
+    /// (RFC tenet 5), not the materialized `noetl.event` table.
+    pub state_builder_wal_events_total: IntCounter,
+    /// `noetl.event` table scans the builder issued — the no-scan proof (RFC
+    /// tenet 3). The builder NEVER touches `noetl.event`, so this stays **0**
+    /// for the lifetime of the process; registering it makes the invariant
+    /// observable on `/metrics` rather than implicit.
+    pub state_builder_event_scans_total: IntCounter,
+    /// State-builds by outcome: `cache_hit` (head unchanged), `incremental`
+    /// (only the new tail walked), `cold_rebuild` (full walk from the head, e.g.
+    /// cache miss / restart), `incomplete` (a chain gap / non-genesis → the real
+    /// builder falls back to the server). The cache-effectiveness + correctness
+    /// surface for Phase 4.
+    pub state_builder_builds_total: IntCounterVec,
+    /// Chain-walk depth (events on the spine) per cold rebuild — the analogue of
+    /// the server's `noetl_state_build_chain_hops` (server#245), now off-server.
+    pub state_builder_chain_hops: Histogram,
 }
 
 impl WorkerMetrics {
@@ -487,6 +507,48 @@ impl WorkerMetrics {
             .register(Box::new(materializer_cycle_duration_seconds.clone()))
             .expect("register materializer_cycle_duration_seconds");
 
+        let state_builder_wal_events_total = IntCounter::new(
+            "noetl_worker_state_builder_wal_events_total",
+            "Events the off-server state builder consumed from the noetl_events WAL stream (RFC #115 Phase 4).",
+        )
+        .expect("state_builder_wal_events_total metric");
+        registry
+            .register(Box::new(state_builder_wal_events_total.clone()))
+            .expect("register state_builder_wal_events_total");
+
+        let state_builder_event_scans_total = IntCounter::new(
+            "noetl_worker_state_builder_event_scans_total",
+            "noetl.event scans the off-server state builder issued (RFC #115 tenet 3 no-scan proof; stays 0).",
+        )
+        .expect("state_builder_event_scans_total metric");
+        registry
+            .register(Box::new(state_builder_event_scans_total.clone()))
+            .expect("register state_builder_event_scans_total");
+
+        let state_builder_builds_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_builds_total",
+                "Off-server state builds by outcome (RFC #115 Phase 4).",
+            ),
+            &["outcome"],
+        )
+        .expect("state_builder_builds_total metric");
+        registry
+            .register(Box::new(state_builder_builds_total.clone()))
+            .expect("register state_builder_builds_total");
+
+        let state_builder_chain_hops = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_worker_state_builder_chain_hops",
+                "Chain-walk depth (spine length) per off-server cold rebuild (RFC #115 Phase 4).",
+            )
+            .buckets(vec![1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]),
+        )
+        .expect("state_builder_chain_hops metric");
+        registry
+            .register(Box::new(state_builder_chain_hops.clone()))
+            .expect("register state_builder_chain_hops");
+
         Self {
             registry,
             pulls_total,
@@ -518,6 +580,10 @@ impl WorkerMetrics {
             materializer_acked_total,
             materializer_project_errors_total,
             materializer_cycle_duration_seconds,
+            state_builder_wal_events_total,
+            state_builder_event_scans_total,
+            state_builder_builds_total,
+            state_builder_chain_hops,
         }
     }
 
@@ -760,6 +826,30 @@ pub fn record_materializer_cycle(
 /// observability surface.
 pub fn record_materializer_project_error() {
     WorkerMetrics::global().materializer_project_errors_total.inc();
+}
+
+/// Record `n` events consumed from the `noetl_events` WAL by the off-server
+/// state builder (noetl/ai-meta#115 Phase 4).
+pub fn record_state_builder_wal_events(n: u64) {
+    if n > 0 {
+        WorkerMetrics::global().state_builder_wal_events_total.inc_by(n);
+    }
+}
+
+/// Record one off-server state build outcome (`cache_hit` | `incremental` |
+/// `cold_rebuild` | `incomplete`).
+pub fn record_state_builder_build(outcome: &str) {
+    WorkerMetrics::global()
+        .state_builder_builds_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Record the chain-walk depth of one off-server cold rebuild.
+pub fn record_state_builder_chain_hops(hops: usize) {
+    WorkerMetrics::global()
+        .state_builder_chain_hops
+        .observe(hops as f64);
 }
 
 // Unused-warning suppression for fields that aren't read directly
