@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.40.2](https://github.com/noetl/worker/compare/v5.40.1...v5.40.2) (2026-06-20)
+
+### Bug Fixes
+
+* **state-builder:** rebuild WAL index from retained stream on boot ([#119](https://github.com/noetl/worker/issues/119)) ([#123](https://github.com/noetl/worker/issues/123)) ([b382ef7](https://github.com/noetl/worker/commit/b382ef74f121e9e6fe18d1218d2e9da66539fb8e)), closes [#115](https://github.com/noetl/worker/issues/115) [#116](https://github.com/noetl/worker/issues/116) [#117](https://github.com/noetl/worker/issues/117)
+
 ## [5.40.1](https://github.com/noetl/worker/compare/v5.40.0...v5.40.1) (2026-06-20)
 
 ### Bug Fixes
