@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.38.0](https://github.com/noetl/worker/compare/v5.37.0...v5.38.0) (2026-06-20)
+
+### Features
+
+* **state-builder:** off-server WAL drive cutover — authoritative build via wasm run/from_events (RFC [#115](https://github.com/noetl/worker/issues/115) Phase 4) ([d5acc6f](https://github.com/noetl/worker/commit/d5acc6f5ce1a4257dff2e390b86569e1df802511))
+
+### Bug Fixes
+
+* **state-builder:** staleness guard — serve the WAL build only after catching up to the server's dispatch head (RFC [#115](https://github.com/noetl/worker/issues/115) Phase 4) ([57214a9](https://github.com/noetl/worker/commit/57214a97f5ffa35b72ccb495f6f998f33d8f6e88))
+
 ## [5.37.0](https://github.com/noetl/worker/compare/v5.36.0...v5.37.0) (2026-06-20)
 
 ### Features
