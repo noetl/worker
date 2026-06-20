@@ -114,8 +114,12 @@ impl Worker {
         // Shared pool-side WAL event index (RFC #115 Phase 4).  Built here so
         // the executor and the drain loop share one index; the drain loop
         // (spawned in `run` when the builder is enabled) feeds it from the WAL.
-        let state_builder_index: crate::state_builder::SharedWalIndex =
-            Arc::new(Mutex::new(crate::state_builder::WalEventIndex::new()));
+        // The spine ordering (noetl/ai-meta#117) is resolved from env once: causal
+        // (`prev_event_id` chain) order by default, so fan-in survives an
+        // `event_id`-vs-chain inversion under high-concurrency fan-out.
+        let state_builder_index: crate::state_builder::SharedWalIndex = Arc::new(Mutex::new(
+            crate::state_builder::WalEventIndex::with_order(crate::state_builder::spine_order()),
+        ));
 
         // Create executor.  Under `NOETL_STATE_BUILDER=offserver` it builds the
         // orchestrate drive's state from `state_builder_index` (the WAL spine)
