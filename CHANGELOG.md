@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.40.0](https://github.com/noetl/worker/compare/v5.39.0...v5.40.0) (2026-06-20)
+
+### Features
+
+* **state-builder:** forward atomic-item-context flag onto the off-server drive input (RFC [#115](https://github.com/noetl/worker/issues/115) Phase 5) ([27047bf](https://github.com/noetl/worker/commit/27047bf1ad8569aacebe0faa268ac51576f7a7af)), closes [noetl/ai-meta#107](https://github.com/noetl/ai-meta/issues/107)
+
 ## [5.39.0](https://github.com/noetl/worker/compare/v5.38.0...v5.39.0) (2026-06-20)
 
 ### Features
