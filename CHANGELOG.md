@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.40.1](https://github.com/noetl/worker/compare/v5.40.0...v5.40.1) (2026-06-20)
+
+### Bug Fixes
+
+* **state-builder:** order off-server spine by prev_event_id chain, walk from real tip ([#117](https://github.com/noetl/worker/issues/117)) ([#122](https://github.com/noetl/worker/issues/122)) ([cbe749e](https://github.com/noetl/worker/commit/cbe749ed476707c88d3a490b982f01c410b6e067))
+
 ## [5.40.0](https://github.com/noetl/worker/compare/v5.39.0...v5.40.0) (2026-06-20)
 
 ### Features
