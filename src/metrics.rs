@@ -153,6 +153,15 @@ pub struct WorkerMetrics {
     /// authoritative so it used the server-built state.  The proof that the WAL
     /// build is authoritative is `served` dominating in steady state.
     pub state_builder_drive_builds_total: IntCounterVec,
+    /// Executions currently held in the pool-side WAL index — the index-coverage
+    /// gauge (noetl/ai-meta#119).  The #119 stall was an index starved to **0**
+    /// after a worker restart (the durable consumer cursor outran the rebuilt
+    /// in-memory index), so `build_spine_to(expected_head)` was permanently
+    /// `Incomplete` and off-server executions never completed.  The authoritative
+    /// drain now rebuilds the full index from the retained `noetl_events` WAL on
+    /// every boot; this gauge going **> 0** after a restart is the rehydration
+    /// proof.
+    pub state_builder_indexed_executions: IntGauge,
 }
 
 impl WorkerMetrics {
@@ -524,6 +533,15 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_wal_events_total.clone()))
             .expect("register state_builder_wal_events_total");
 
+        let state_builder_indexed_executions = IntGauge::new(
+            "noetl_worker_state_builder_indexed_executions",
+            "Executions currently held in the pool-side WAL index (noetl/ai-meta#119 rehydration proof; >0 after a restart means the index rebuilt from the retained WAL).",
+        )
+        .expect("state_builder_indexed_executions metric");
+        registry
+            .register(Box::new(state_builder_indexed_executions.clone()))
+            .expect("register state_builder_indexed_executions");
+
         let state_builder_event_scans_total = IntCounter::new(
             "noetl_worker_state_builder_event_scans_total",
             "noetl.event scans the off-server state builder issued (RFC #115 tenet 3 no-scan proof; stays 0).",
@@ -605,6 +623,7 @@ impl WorkerMetrics {
             state_builder_builds_total,
             state_builder_chain_hops,
             state_builder_drive_builds_total,
+            state_builder_indexed_executions,
         }
     }
 
@@ -855,6 +874,15 @@ pub fn record_state_builder_wal_events(n: u64) {
     if n > 0 {
         WorkerMetrics::global().state_builder_wal_events_total.inc_by(n);
     }
+}
+
+/// Set the count of executions currently held in the pool-side WAL index
+/// (noetl/ai-meta#119).  Surfaced each drain batch so a restart that repopulates
+/// the index from the retained WAL is observable (the bug was this stuck at 0).
+pub fn set_state_builder_indexed_executions(n: i64) {
+    WorkerMetrics::global()
+        .state_builder_indexed_executions
+        .set(n);
 }
 
 /// Record one off-server state build outcome (`cache_hit` | `incremental` |
