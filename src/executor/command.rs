@@ -150,6 +150,22 @@ pub struct CommandExecutor {
     /// is `&self`, so it lives here behind a `Mutex`.
     #[cfg(feature = "wasm-plugin")]
     wasm_dispatcher: tokio::sync::Mutex<crate::plugin::WasmDispatcher>,
+
+    /// Off-server state-builder mode (RFC #115 Phase 4 drive cutover).  When
+    /// [`BuilderMode::Authoritative`] (`NOETL_STATE_BUILDER=offserver`), a
+    /// `system/orchestrate` command marked `__offserver_build__` builds its drive
+    /// `WorkflowState` from [`Self::state_builder_index`] (the WAL spine, fed to
+    /// the wasm `run` from_events entry) instead of the server-built `run_state`
+    /// payload.  Default [`BuilderMode::Off`] → the server-built state is used,
+    /// exactly as today.
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    state_builder_mode: crate::state_builder::BuilderMode,
+
+    /// Shared pool-side WAL event index — the off-server drive's state source.
+    /// Fed by the drain loop ([`crate::state_builder::spawn_drain`]); read here
+    /// when the builder is authoritative.
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    state_builder_index: crate::state_builder::SharedWalIndex,
 }
 
 impl CommandExecutor {
@@ -162,12 +178,15 @@ impl CommandExecutor {
     /// `result_fetch.bearer_token: NOETL_FLIGHT_BEARER_TOKEN`
     /// resolve via `ctx.get_secret(alias)`.  See
     /// [`load_keychain_env_allowlist`] for the env-var contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: ControlPlaneClient,
         worker_id: String,
         server_url: String,
         snowflake: Arc<SnowflakeGen>,
         arrow_cache: Arc<ArrowIpcSharedMemoryCache>,
+        state_builder_mode: crate::state_builder::BuilderMode,
+        state_builder_index: crate::state_builder::SharedWalIndex,
     ) -> Self {
         let keychain_env = load_keychain_env_allowlist();
         if !keychain_env.is_empty() {
@@ -199,6 +218,8 @@ impl CommandExecutor {
             keychain_env,
             #[cfg(feature = "wasm-plugin")]
             wasm_dispatcher,
+            state_builder_mode,
+            state_builder_index,
         }
     }
 
@@ -1236,8 +1257,28 @@ impl CommandExecutor {
         command: &Command,
         client: &ControlPlaneClient,
     ) -> Result<noetl_tools::result::ToolResult, noetl_tools::error::ToolError> {
-        let (path, version, entry, input) = wasm_config_to_ref(&tool_config.config)
+        let (path, version, mut entry, mut input) = wasm_config_to_ref(&tool_config.config)
             .map_err(noetl_tools::error::ToolError::Configuration)?;
+
+        // Off-server drive build (RFC #115 Phase 4 drive cutover): when the server
+        // marks a `system/orchestrate` command `__offserver_build__`, build the
+        // drive's `WorkflowState` from the pool-side WAL spine (the wasm `run` /
+        // from_events entry) instead of the server-built `run_state` payload —
+        // state CONSTRUCTION runs here, off the server, with zero noetl.event
+        // reads.  An incomplete WAL chain (lag / cold) falls back to the
+        // server-built `state` carried on the same command, so progress +
+        // correctness never regress below the server-built path.
+        if path == "system/orchestrate" {
+            if let Some(args) = tool_config.config.get("args") {
+                if args.get("__offserver_build__").and_then(|v| v.as_bool()) == Some(true) {
+                    let (off_entry, off_input) =
+                        self.resolve_offserver_orchestrate_input(command.execution_id, args).await;
+                    entry = off_entry;
+                    input = off_input;
+                }
+            }
+        }
+
         let (output, report) = {
             let mut dispatcher = self.wasm_dispatcher.lock().await;
             dispatcher
@@ -1258,6 +1299,94 @@ impl CommandExecutor {
                 })?
         };
         Ok(plugin_outcome_to_tool_result(output, &report))
+    }
+
+    /// Resolve the wasm entry + input bytes for an `__offserver_build__`
+    /// `system/orchestrate` command (RFC #115 Phase 4 drive cutover).
+    ///
+    /// Authoritative builder → build the drive input from the pool-side WAL spine
+    /// ([`crate::state_builder::build_offserver_input`]) and invoke the `run`
+    /// (from_events) entry: state CONSTRUCTION runs here, off the server.  An
+    /// incomplete WAL chain (drain lag / cold cache) — after a short bounded
+    /// retry while the drain catches up — falls back to the **server-built**
+    /// `state` carried on the same command via the `run_state` entry, so the
+    /// drive never stalls and never builds a partial state.  A non-authoritative
+    /// worker always uses the server-built `run_state` (the `state` fallback).
+    ///
+    /// The `args` object carries `{ state, latest_ts, playbook, trigger_event_type }`
+    /// (the same `OrchestrateStateInput` shape the non-cutover drive sends) plus
+    /// the `__offserver_build__` + `execution_id` markers — `OrchestrateStateInput`
+    /// ignores the extra markers, so the args double as the `run_state` fallback
+    /// input verbatim.
+    async fn resolve_offserver_orchestrate_input(
+        &self,
+        execution_id: i64,
+        args: &serde_json::Value,
+    ) -> (String, Vec<u8>) {
+        use crate::state_builder::BuilderMode;
+
+        // The server-built fallback input is the args object as-is (the extra
+        // markers are ignored by OrchestrateStateInput's deserializer).
+        let fallback = || -> Vec<u8> {
+            serde_json::to_vec(args).unwrap_or_default()
+        };
+
+        if self.state_builder_mode != BuilderMode::Authoritative {
+            crate::metrics::record_state_builder_drive("fallback_disabled");
+            return ("run_state".to_string(), fallback());
+        }
+
+        let playbook = args.get("playbook").cloned().unwrap_or(serde_json::Value::Null);
+        let trigger_event_type = args.get("trigger_event_type").and_then(|v| v.as_str());
+        // The server's dispatch watermark — the WAL build serves only once the
+        // pool-side index has caught up to it (staleness guard), so the
+        // worker-built state is never staler than the server's view.
+        let expected_head = args.get("expected_head").and_then(|v| v.as_i64());
+
+        // Bounded retry: the trigger fired from the materialized WAL, so the
+        // event is already on the stream — the drain just needs to have pulled
+        // it. Re-check a few times before falling back.
+        let attempts = std::env::var("NOETL_STATE_BUILDER_DRIVE_RETRIES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(5)
+            .clamp(1, 50);
+        let sleep_ms = std::env::var("NOETL_STATE_BUILDER_DRIVE_RETRY_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(200)
+            .clamp(10, 5_000);
+        for attempt in 0..attempts {
+            if let Some(bytes) = crate::state_builder::build_offserver_input(
+                &self.state_builder_index,
+                execution_id,
+                &playbook,
+                trigger_event_type,
+                expected_head,
+            )
+            .await
+            {
+                crate::metrics::record_state_builder_drive("served");
+                tracing::debug!(
+                    execution_id,
+                    attempt,
+                    "off-server drive: built state from WAL spine (run/from_events), no noetl.event read"
+                );
+                return ("run".to_string(), bytes);
+            }
+            if attempt + 1 < attempts {
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            }
+        }
+
+        // WAL chain still incomplete after the retry window → use the
+        // server-built state. Conservative: the worst case equals today.
+        crate::metrics::record_state_builder_drive("fallback_incomplete");
+        tracing::info!(
+            execution_id,
+            "off-server drive: WAL chain incomplete after retries; falling back to server-built run_state"
+        );
+        ("run_state".to_string(), fallback())
     }
 }
 
@@ -2269,6 +2398,8 @@ mod tests {
             "http://localhost:8082".to_string(),
             snowflake,
             cache,
+            crate::state_builder::BuilderMode::Off,
+            std::sync::Arc::new(tokio::sync::Mutex::new(crate::state_builder::WalEventIndex::new())),
         );
 
         // Verify tools are registered
@@ -2837,6 +2968,8 @@ mod tests {
             base.to_string(),
             Arc::new(SnowflakeGen::with_node_and_epoch(1, 0)),
             test_cache("wkr-test-predispatch"),
+            crate::state_builder::BuilderMode::Off,
+            Arc::new(tokio::sync::Mutex::new(crate::state_builder::WalEventIndex::new())),
         )
     }
 
