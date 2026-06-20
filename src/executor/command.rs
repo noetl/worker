@@ -1338,6 +1338,10 @@ impl CommandExecutor {
 
         let playbook = args.get("playbook").cloned().unwrap_or(serde_json::Value::Null);
         let trigger_event_type = args.get("trigger_event_type").and_then(|v| v.as_str());
+        // The server's dispatch watermark — the WAL build serves only once the
+        // pool-side index has caught up to it (staleness guard), so the
+        // worker-built state is never staler than the server's view.
+        let expected_head = args.get("expected_head").and_then(|v| v.as_i64());
 
         // Bounded retry: the trigger fired from the materialized WAL, so the
         // event is already on the stream — the drain just needs to have pulled
@@ -1358,6 +1362,7 @@ impl CommandExecutor {
                 execution_id,
                 &playbook,
                 trigger_event_type,
+                expected_head,
             )
             .await
             {

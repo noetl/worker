@@ -428,11 +428,28 @@ pub async fn build_offserver_input(
     execution_id: i64,
     playbook: &serde_json::Value,
     trigger_event_type: Option<&str>,
+    expected_head: Option<i64>,
 ) -> Option<Vec<u8>> {
-    let (outcome, spine) = {
+    let (outcome, spine, head) = {
         let mut idx = index.lock().await;
-        idx.build_spine(execution_id)
+        let (outcome, spine) = idx.build_spine(execution_id);
+        let head = idx.chain(execution_id).and_then(|c| c.head());
+        (outcome, spine, head)
     };
+    // Staleness guard (RFC #115 Phase 4): the worker's WAL drain is an
+    // independent consumer that can lag the server's view.  A spine that is
+    // internally complete (genesis-rooted, no gaps) can still be STALE — missing
+    // the most recent events the server already saw (e.g. a fan-in barrier's
+    // just-issued reduce `command.issued`), which would make the drive RE-ISSUE
+    // it.  So serve only once the index has caught up to the server's dispatch
+    // watermark (`expected_head`); until then report incomplete so the bounded
+    // retry waits for the drain (or falls back to the server-built state).  This
+    // makes the WAL-built state never staler than the server-built one.
+    if let Some(expected) = expected_head {
+        if head.is_none_or(|h| h < expected) {
+            return None;
+        }
+    }
     // Record the cache outcome (the same labels the shadow loop records) so the
     // authoritative path's hit/incremental/cold distribution is observable.
     match outcome {
@@ -989,7 +1006,7 @@ mod tests {
             }
         }
         let playbook = serde_json::json!({ "metadata": { "path": "t" } });
-        let bytes = build_offserver_input(&index, 42, &playbook, Some("command.completed"))
+        let bytes = build_offserver_input(&index, 42, &playbook, Some("command.completed"), Some(3))
             .await
             .expect("complete chain builds input");
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -999,8 +1016,15 @@ mod tests {
         assert_eq!(evs.len(), 3, "all three spine events");
         assert_eq!(evs[0]["event_id"], 1);
 
+        // Staleness guard: an expected_head ahead of the index head → None (the
+        // drain hasn't caught up to the server's dispatch watermark yet).
+        assert!(
+            build_offserver_input(&index, 42, &playbook, None, Some(99)).await.is_none(),
+            "stale index (head < expected_head) must not serve"
+        );
+
         // An unknown execution → None (the caller falls back to run_state).
-        assert!(build_offserver_input(&index, 7, &playbook, None).await.is_none());
+        assert!(build_offserver_input(&index, 7, &playbook, None, None).await.is_none());
     }
 
     #[test]
