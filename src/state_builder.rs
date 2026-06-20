@@ -96,14 +96,57 @@ pub enum AdvanceOutcome {
     Incomplete,
 }
 
+/// How the off-server spine is ordered before it's handed to `from_events`
+/// (noetl/ai-meta#117).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpineOrder {
+    /// Causal order — walk the `prev_event_id` chain head→root, then reverse to
+    /// root→head.  The spine reflects the real causal linkage the Phase-2 chain
+    /// encodes, so `from_events` replays in true causal order even when the
+    /// `event_id`s are non-monotonic with the chain.  This is the default and the
+    /// fix for noetl/ai-meta#117: under high-concurrency fan-out two branch
+    /// completions can arrive at the owner reordered relative to their
+    /// producer-assigned `event_id`s, linking a higher-id event as the
+    /// predecessor of a lower-id one; an `event_id` sort then replays the inverted
+    /// pair out of causal order and the fan-in reduce barrier never fires.
+    #[default]
+    Causal,
+    /// Legacy `event_id`-ascending order (the pre-#117 behavior).  Assumes id
+    /// order == chain order; correct only when every event's id is monotonic
+    /// along the chain.  Kept as an instant revert
+    /// (`NOETL_OFFSERVER_SPINE_ORDER=event_id`) — identical to `Causal` for any
+    /// chain whose ids ARE monotonic (all linear / loop / sequential-fanout
+    /// chains), differs only on the inversion #117 fixes.
+    EventId,
+}
+
+/// Resolve the spine ordering from env.  `NOETL_OFFSERVER_SPINE_ORDER=event_id`
+/// → legacy `event_id` sort (the #117 revert); anything else (incl. unset) →
+/// causal order (the default, the #117 fix).  The fix only activates inside the
+/// `NOETL_STATE_BUILDER=offserver` path (the only place a spine is built off the
+/// server), so PROD — which runs the in-server drive — is untouched regardless.
+pub fn spine_order() -> SpineOrder {
+    if std::env::var("NOETL_OFFSERVER_SPINE_ORDER")
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("event_id")
+    {
+        SpineOrder::EventId
+    } else {
+        SpineOrder::Causal
+    }
+}
+
 /// The built spine cached for one execution, keyed by the immutable chain head.
 #[derive(Debug, Clone)]
 struct CachedSpine {
     /// The chain head this spine summarizes — the cache key. Immutable: a spine
     /// for a given head is valid forever (append-only chain).
     head_event_id: i64,
-    /// The event ids on the spine, ascending (`event_id` order — the order the
-    /// server event-scan applies, so `from_events` sees the identical sequence).
+    /// The event ids on the spine in the configured [`SpineOrder`] — causal
+    /// (root→head) by default, so `from_events` replays in true causal order
+    /// (noetl/ai-meta#117).  For monotonic chains this is identical to the
+    /// `event_id`-ascending order the server event-scan applies.
     ordered_ids: Vec<i64>,
 }
 
@@ -119,9 +162,20 @@ pub struct ExecutionChain {
     /// tip of the linear spine the server's `ChainHeads` watermark advances.
     head: Option<i64>,
     cache: Option<CachedSpine>,
+    /// How [`Self::chain_walk`] / [`Self::advance`] order the spine — injected by
+    /// the owning [`WalEventIndex`] (noetl/ai-meta#117).  Default `Causal`.
+    order: SpineOrder,
 }
 
 impl ExecutionChain {
+    /// A fresh chain that orders its spine per `order` (noetl/ai-meta#117).
+    fn with_order(order: SpineOrder) -> Self {
+        Self {
+            order,
+            ..Default::default()
+        }
+    }
+
     /// Index one WAL event. Idempotent: re-applying the same `event_id` (a
     /// JetStream redelivery) overwrites with identical data and never double-counts
     /// the head. Returns `true` if this event was new to the index.
@@ -162,18 +216,36 @@ impl ExecutionChain {
         self.events.is_empty()
     }
 
-    /// Walk the chain head→root by `prev_event_id`, returning the spine in
-    /// ascending `event_id` order — the same order the server event-scan applies
-    /// (`ORDER BY event_id ASC`). Returns `None` when the chain can't be trusted
-    /// complete: a hop points at an event not present in the index (WAL ordering /
-    /// gap), the walk didn't reach the genesis `playbook_started`, or it's empty.
-    /// This is the exact completeness contract the server chain-walk falls back
-    /// on (server#245); the off-server builder falls back to the server build the
-    /// same way.
+    /// Walk the chain head→root by `prev_event_id`, returning the spine in the
+    /// configured [`SpineOrder`] — causal (root→head) by default
+    /// (noetl/ai-meta#117), or `event_id`-ascending under the legacy revert.
+    /// Returns `None` when the chain can't be trusted complete: a hop points at an
+    /// event not present in the index (WAL ordering / gap), the walk didn't reach
+    /// the genesis `playbook_started`, or it's empty.  This is the exact
+    /// completeness contract the server chain-walk falls back on (server#245); the
+    /// off-server builder falls back to the server build the same way.
     pub fn chain_walk(&self) -> Option<Vec<i64>> {
-        let head = self.head?;
+        self.chain_walk_from(self.head?)
+    }
+
+    /// Walk the chain from an explicit `start` head→root by `prev_event_id`,
+    /// returning the spine in the configured [`SpineOrder`].  Same completeness
+    /// contract as [`Self::chain_walk`], but rooted at a caller-supplied tip
+    /// rather than the max-id head.
+    ///
+    /// This is the load-bearing distinction for noetl/ai-meta#117: the
+    /// authoritative off-server drive walks from `expected_head` — the server's
+    /// `ChainHeads` watermark, which is the **last-arrived** event (`link_batch`
+    /// advances the head to `event_ids.last()`, the real causal tip).  Under a
+    /// high-concurrency fan-out the last-arrived branch completion can carry a
+    /// LOWER producer-assigned `event_id` than its predecessor, so `max(event_id)`
+    /// is NOT the tip — a walk from the max-id head would start one branch up and
+    /// MISS the inverted tip entirely (the fan-in then never sees that branch's
+    /// completion and the reduce never fires).  Starting from `expected_head`
+    /// reaches every event on the chain regardless of id monotonicity.
+    fn chain_walk_from(&self, start: i64) -> Option<Vec<i64>> {
         let mut ordered: Vec<i64> = Vec::new();
-        let mut cursor = Some(head);
+        let mut cursor = Some(start);
         let mut reached_genesis = false;
         // Bound the walk so a corrupt cycle can't spin (real chains are at most a
         // few thousand events; mirror of the server builder's MAX_WALK guard).
@@ -194,52 +266,110 @@ impl ExecutionChain {
         if ordered.is_empty() || !reached_genesis {
             return None;
         }
-        ordered.sort_unstable();
+        match self.order {
+            // `ordered` was collected head→root by `prev_event_id`; reverse to
+            // root→head so `from_events` replays in true causal order even when
+            // the `event_id`s are non-monotonic with the chain (noetl/ai-meta#117).
+            SpineOrder::Causal => ordered.reverse(),
+            // Legacy revert: `event_id`-ascending (identical to the reverse above
+            // for any monotonic chain; wedges fan-in only on the #117 inversion).
+            SpineOrder::EventId => ordered.sort_unstable(),
+        }
         Some(ordered)
     }
 
     /// The ordered event spine as the raw `noetl_events` payloads — the verbatim
-    /// input a `from_events` build (server-side or wasm) consumes. `None` under
-    /// the same incompleteness conditions as [`Self::chain_walk`].
+    /// input a `from_events` build (server-side or wasm) consumes, walked from the
+    /// max-id head. `None` under the same incompleteness conditions as
+    /// [`Self::chain_walk`].  The authoritative drive instead serves
+    /// [`Self::cached_spine_events`] (the spine [`Self::advance_to`] just built
+    /// from `expected_head`) so the served order matches the cache.
     pub fn ordered_events(&self) -> Option<Vec<serde_json::Value>> {
         let ids = self.chain_walk()?;
         Some(ids.iter().map(|id| self.events[id].raw.clone()).collect())
     }
 
-    /// Advance the cached spine to the current head, doing the **minimum** work:
-    /// a no-op on an unchanged head, a **tail-only** walk when the head extended
-    /// (pointer-continuity verified against the cached head — no `COUNT(*)`), or a
-    /// full cold rebuild when there's no usable cache or the tail can't reach the
-    /// cached head. The advanced spine equals a full rebuild from the same head
-    /// (proven in the unit tests).
+    /// The raw `noetl_events` payloads for the currently-cached spine — the exact
+    /// artefact the last [`Self::advance`] / [`Self::advance_to`] built, in cache
+    /// order.  `None` when no spine is cached.  This is what the off-server drive
+    /// serves, so the served spine is the one whose ordering the cache encodes
+    /// (rooted at `expected_head` under #117), not a fresh max-id walk.
+    fn cached_spine_events(&self) -> Option<Vec<serde_json::Value>> {
+        let c = self.cache.as_ref()?;
+        Some(c.ordered_ids.iter().map(|id| self.events[id].raw.clone()).collect())
+    }
+
+    /// Advance the cached spine to the **max-id head** — the shadow/observation
+    /// path.  Delegates to [`Self::advance_to`]; see it for the cache mechanics.
+    /// For monotonic chains (every non-fan-out case) the max-id head IS the tip,
+    /// so this equals advancing to the real tip.
     pub fn advance(&mut self) -> AdvanceOutcome {
-        let Some(head) = self.head else {
+        match self.head {
+            Some(head) => self.advance_to(head),
+            None => AdvanceOutcome::Incomplete,
+        }
+    }
+
+    /// Advance the cached spine so its head is `target_head`, doing the
+    /// **minimum** work: a no-op on an unchanged cached head, a **tail-only** walk
+    /// when `target_head` extends the cached head along the chain (reachability
+    /// checked by walking `prev_event_id`, NOT by id comparison — ids are
+    /// non-monotonic under a #117 inversion), or a full cold rebuild otherwise.
+    /// The advanced spine equals a cold rebuild from the same `target_head`
+    /// (proven in the unit tests).
+    ///
+    /// `Incomplete` when `target_head` isn't indexed yet — this IS the staleness
+    /// guard for the off-server drive (the worker's WAL drain lags the server's
+    /// view, so serve only once the index has caught up to the server's dispatch
+    /// watermark `expected_head`), now expressed as "the tip must be present"
+    /// rather than the pre-#117 `max_id >= expected` check, which a fan-out id
+    /// inversion could satisfy without the real tip being indexed.
+    pub fn advance_to(&mut self, target_head: i64) -> AdvanceOutcome {
+        // The tip must be indexed before a spine can be built to it.
+        if !self.events.contains_key(&target_head) {
             return AdvanceOutcome::Incomplete;
-        };
-        // Cached head unchanged → hit.
+        }
+        // Cached head already at the target → hit.
         if let Some(c) = &self.cache {
-            if c.head_event_id == head {
+            if c.head_event_id == target_head {
                 return AdvanceOutcome::CacheHit;
             }
         }
-        // Try an incremental tail-advance from the cached head.
+        // Try an incremental tail-advance: walk target_head→cached_head along the
+        // chain.  Reachability (walk reaches the cached head) is the only test —
+        // an id comparison would be wrong under inversion.
         if let Some(c) = &self.cache {
-            if head > c.head_event_id {
-                if let Some(tail) = self.walk_tail_to(head, c.head_event_id) {
-                    let added = tail.len();
-                    let mut ordered = c.ordered_ids.clone();
-                    ordered.extend(tail);
-                    ordered.sort_unstable();
-                    self.cache = Some(CachedSpine { head_event_id: head, ordered_ids: ordered });
-                    return AdvanceOutcome::Incremental(added);
+            if let Some(mut tail) = self.walk_tail_to(target_head, c.head_event_id) {
+                let added = tail.len();
+                let mut ordered = c.ordered_ids.clone();
+                match self.order {
+                    // `walk_tail_to` collected target→down; reverse to causal
+                    // (cached_head+1 → target_head) and append to the causal cache
+                    // so the advanced spine equals a cold rebuild (#117).
+                    SpineOrder::Causal => {
+                        tail.reverse();
+                        ordered.extend(tail);
+                    }
+                    SpineOrder::EventId => {
+                        ordered.extend(tail);
+                        ordered.sort_unstable();
+                    }
                 }
+                self.cache = Some(CachedSpine {
+                    head_event_id: target_head,
+                    ordered_ids: ordered,
+                });
+                return AdvanceOutcome::Incremental(added);
             }
         }
-        // No cache / non-extending head / tail gap → cold rebuild.
-        match self.chain_walk() {
+        // No cache / tail can't reach the cached head → cold rebuild from the tip.
+        match self.chain_walk_from(target_head) {
             Some(ordered) => {
                 let len = ordered.len();
-                self.cache = Some(CachedSpine { head_event_id: head, ordered_ids: ordered });
+                self.cache = Some(CachedSpine {
+                    head_event_id: target_head,
+                    ordered_ids: ordered,
+                });
                 AdvanceOutcome::ColdRebuild(len)
             }
             None => AdvanceOutcome::Incomplete,
@@ -297,6 +427,9 @@ impl ExecutionChain {
 #[derive(Debug, Default)]
 pub struct WalEventIndex {
     chains: HashMap<i64, ExecutionChain>,
+    /// Spine ordering injected into every chain this index creates
+    /// (noetl/ai-meta#117).  Default `Causal`.
+    order: SpineOrder,
 }
 
 /// Event types that put an execution into a terminal state — the eviction signal
@@ -311,6 +444,15 @@ const TERMINAL_EVENT_TYPES: &[&str] = &[
 impl WalEventIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An index whose chains order their spine per `order` (noetl/ai-meta#117).
+    /// The worker resolves `order` from env ([`spine_order`]) at startup.
+    pub fn with_order(order: SpineOrder) -> Self {
+        Self {
+            order,
+            ..Default::default()
+        }
     }
 
     /// Index one WAL event payload (the `noetl_events` shape). Extracts the chain
@@ -328,7 +470,11 @@ impl WalEventIndex {
             .unwrap_or_default()
             .to_string();
         let is_terminal = TERMINAL_EVENT_TYPES.contains(&event_type.as_str());
-        let chain = self.chains.entry(execution_id).or_default();
+        let order = self.order;
+        let chain = self
+            .chains
+            .entry(execution_id)
+            .or_insert_with(|| ExecutionChain::with_order(order));
         let is_new = chain.apply(event_id, prev_event_id, event_type, payload.clone());
         Some((execution_id, is_new, is_terminal))
     }
@@ -366,10 +512,39 @@ impl WalEventIndex {
         match self.chains.get_mut(&execution_id) {
             Some(chain) => {
                 let outcome = chain.advance();
-                (outcome, chain.ordered_events())
+                let spine = match outcome {
+                    AdvanceOutcome::Incomplete => None,
+                    _ => chain.cached_spine_events(),
+                };
+                (outcome, spine)
             }
             // No chain indexed for this execution yet (the WAL drain hasn't seen
             // any of its events) — incomplete, fall back.
+            None => (AdvanceOutcome::Incomplete, None),
+        }
+    }
+
+    /// Like [`Self::build_spine`] but rooted at an explicit `target_head` — the
+    /// server's authoritative chain tip (`expected_head`) — so the served spine
+    /// reaches the real causal tip even when it carries a lower `event_id` than
+    /// its predecessor (the noetl/ai-meta#117 fan-out inversion).  This is the
+    /// path the authoritative off-server drive uses; the staleness guard is
+    /// intrinsic ([`ExecutionChain::advance_to`] returns `Incomplete` until the
+    /// tip is indexed).  Returns the spine in the cache's [`SpineOrder`].
+    pub fn build_spine_to(
+        &mut self,
+        execution_id: i64,
+        target_head: i64,
+    ) -> (AdvanceOutcome, Option<Vec<serde_json::Value>>) {
+        match self.chains.get_mut(&execution_id) {
+            Some(chain) => {
+                let outcome = chain.advance_to(target_head);
+                let spine = match outcome {
+                    AdvanceOutcome::Incomplete => None,
+                    _ => chain.cached_spine_events(),
+                };
+                (outcome, spine)
+            }
             None => (AdvanceOutcome::Incomplete, None),
         }
     }
@@ -442,11 +617,26 @@ pub async fn build_offserver_input(
     expected_head: Option<i64>,
     atomic_item_context: bool,
 ) -> Option<Vec<u8>> {
-    let (outcome, spine, head, resolved_trigger_type) = {
+    let (outcome, spine, resolved_trigger_type) = {
         let mut idx = index.lock().await;
-        let (outcome, spine) = idx.build_spine(execution_id);
+        // Build the spine rooted at the server's authoritative chain tip
+        // (`expected_head`, the `ChainHeads` watermark = the last-arrived event)
+        // when supplied — NOT the worker's max-id head.  Under a high-concurrency
+        // fan-out the last-arrived branch completion can carry a lower
+        // producer-assigned `event_id` than its predecessor, so the max-id head is
+        // NOT the causal tip and a max-id walk would miss the inverted branch's
+        // completion (the fan-in then never fires) — noetl/ai-meta#117.  Walking
+        // from `expected_head` reaches every event regardless of id monotonicity,
+        // and the staleness guard is intrinsic: `advance_to` reports `Incomplete`
+        // until the tip is indexed (the worker WAL drain lags the server), so the
+        // WAL-built state is never staler than the server's view.  When the server
+        // doesn't supply a watermark (legacy non-stateless path) fall back to the
+        // max-id head — the pre-#117 behavior for that path.
+        let (outcome, spine) = match expected_head {
+            Some(target) => idx.build_spine_to(execution_id, target),
+            None => idx.build_spine(execution_id),
+        };
         let chain = idx.chain(execution_id);
-        let head = chain.and_then(|c| c.head());
         // Stateless off-server drive (RFC #115 Phase 4 remainder): when the
         // server did NOT supply `trigger_event_type` (it no longer reads
         // `noetl.event` to classify the trigger), resolve it off the WAL index
@@ -456,22 +646,8 @@ pub async fn build_offserver_input(
             trigger_event_id
                 .and_then(|tid| chain.and_then(|c| c.event_type_of(tid)).map(|s| s.to_string()))
         });
-        (outcome, spine, head, resolved_trigger_type)
+        (outcome, spine, resolved_trigger_type)
     };
-    // Staleness guard (RFC #115 Phase 4): the worker's WAL drain is an
-    // independent consumer that can lag the server's view.  A spine that is
-    // internally complete (genesis-rooted, no gaps) can still be STALE — missing
-    // the most recent events the server already saw (e.g. a fan-in barrier's
-    // just-issued reduce `command.issued`), which would make the drive RE-ISSUE
-    // it.  So serve only once the index has caught up to the server's dispatch
-    // watermark (`expected_head`); until then report incomplete so the bounded
-    // retry waits for the drain (or falls back to the server-built state).  This
-    // makes the WAL-built state never staler than the server-built one.
-    if let Some(expected) = expected_head {
-        if head.is_none_or(|h| h < expected) {
-            return None;
-        }
-    }
     // Record the cache outcome (the same labels the shadow loop records) so the
     // authoritative path's hit/incremental/cold distribution is observable.
     match outcome {
@@ -865,8 +1041,9 @@ mod tests {
     #[test]
     fn chain_walk_matches_sorted_scan_order() {
         // Parity by construction (the server#245 proof, now off the WAL index): the
-        // chain walk collects head→root then sorts ascending; the result must equal
-        // the event-scan ORDER BY event_id ASC — i.e. the identical sequence
+        // chain walk collects head→root then reverses to causal (root→head) order
+        // (#117).  For a MONOTONIC chain causal order == event-scan ORDER BY
+        // event_id ASC, so the result must equal `1..=6` — the identical sequence
         // from_events sees. Apply in REVERSE (worst case for the walk) to prove the
         // index order doesn't matter.
         let spine = linear_spine(6);
@@ -992,8 +1169,9 @@ mod tests {
 
     #[test]
     fn build_spine_returns_ordered_payloads_or_incomplete() {
-        // A complete chain → build_spine returns the raw payloads in event_id
-        // order (the OrchestrateInput.events the wasm `run` entry consumes).
+        // A complete chain → build_spine returns the raw payloads in causal order
+        // (== event_id order for this monotonic chain) — the
+        // OrchestrateInput.events the wasm `run` entry consumes.
         let mut idx = WalEventIndex::new();
         for e in linear_spine(4) {
             idx.apply(&e);
@@ -1020,6 +1198,185 @@ mod tests {
         let (o3, s3) = idx2.build_spine(42);
         assert!(matches!(o3, AdvanceOutcome::ColdRebuild(_) | AdvanceOutcome::Incomplete));
         assert!(s3.is_none(), "non-genesis tail must not yield a spine");
+    }
+
+    /// A fan-out reduce chain carrying a noetl/ai-meta#117 id inversion:
+    /// causal order `1 → 2 → 3 → 100 → 50`, where the LAST-arrived branch
+    /// completion (`50`, enrich.completed) carries a LOWER producer-assigned
+    /// `event_id` than its predecessor (`100`, normalize.completed) — the two
+    /// branches' snowflakes come from different workers and arrive at the owner
+    /// reordered relative to their ids.  The real causal tip is `50` (the server's
+    /// `ChainHeads` watermark, `link_batch`-advanced to the last-arrived id), but
+    /// `max(event_id)` is `100`.
+    fn inverted_fanout_spine() -> Vec<serde_json::Value> {
+        vec![
+            ev(1, None, "playbook_started"),
+            ev(2, Some(1), "command.issued"),   // normalize dispatch
+            ev(3, Some(2), "command.issued"),   // enrich dispatch
+            ev(100, Some(3), "command.completed"), // normalize.completed (1st, high id)
+            ev(50, Some(100), "command.completed"), // enrich.completed (2nd, LOW id) — inversion
+        ]
+    }
+
+    #[test]
+    fn fanout_id_inversion_walks_from_tip_not_max_id() {
+        // The crux of #117: walking from the max-id head MISSES the inverted tip
+        // (50 is a child of 100, not on the 100→root path), so from_events never
+        // sees enrich.completed and the fan-in reduce never fires — the wedge.
+        let chain = chain_from(&inverted_fanout_spine());
+        let from_max = chain.chain_walk().expect("genesis-rooted");
+        assert_eq!(
+            from_max,
+            vec![1, 2, 3, 100],
+            "max-id walk drops the inverted tip 50"
+        );
+        assert!(
+            !from_max.contains(&50),
+            "enrich.completed (50) is invisible to the max-id walk — the wedge"
+        );
+        // Walking from the real tip (expected_head = 50) reaches every event in
+        // true causal order, enrich.completed LAST → both branches now visible.
+        let from_tip = chain.chain_walk_from(50).expect("genesis-rooted from tip");
+        assert_eq!(
+            from_tip,
+            vec![1, 2, 3, 100, 50],
+            "tip-rooted walk = full causal order, inverted tip included"
+        );
+    }
+
+    #[test]
+    fn build_spine_to_serves_inverted_tip_in_causal_order() {
+        // build_spine_to(expected_head) serves the full causal spine through the
+        // inversion; build_spine (max-id) drops the tip.
+        let mut idx_max = WalEventIndex::new();
+        for e in inverted_fanout_spine() {
+            idx_max.apply(&e);
+        }
+        let (_, sp_max) = idx_max.build_spine(42);
+        let ids_max: Vec<i64> = sp_max
+            .expect("genesis-rooted")
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids_max, vec![1, 2, 3, 100], "max-id build drops the tip");
+
+        let mut idx_tip = WalEventIndex::new();
+        for e in inverted_fanout_spine() {
+            idx_tip.apply(&e);
+        }
+        let (outcome, sp_tip) = idx_tip.build_spine_to(42, 50);
+        assert!(matches!(
+            outcome,
+            AdvanceOutcome::ColdRebuild(5) | AdvanceOutcome::Incremental(_)
+        ));
+        let ids_tip: Vec<i64> = sp_tip
+            .expect("tip-rooted spine")
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            ids_tip,
+            vec![1, 2, 3, 100, 50],
+            "tip-rooted build serves the full causal spine"
+        );
+    }
+
+    #[test]
+    fn advance_to_incomplete_until_tip_indexed() {
+        // The staleness guard is intrinsic to advance_to: when the server's
+        // watermark names a tip (50) the worker hasn't drained yet, the build is
+        // Incomplete (the drive waits / falls back), never serving a spine that's
+        // missing the tip.  Pre-#117 the `max_id >= expected` guard would have
+        // PASSED here (max_id 100 >= 50) and served a tip-less spine.
+        let mut idx = WalEventIndex::new();
+        idx.apply(&ev(1, None, "playbook_started"));
+        idx.apply(&ev(2, Some(1), "command.issued"));
+        idx.apply(&ev(3, Some(2), "command.issued"));
+        idx.apply(&ev(100, Some(3), "command.completed"));
+        let (outcome, spine) = idx.build_spine_to(42, 50);
+        assert!(matches!(outcome, AdvanceOutcome::Incomplete));
+        assert!(spine.is_none(), "tip 50 not drained yet → no spine");
+        // Once 50 arrives, the tip-rooted build serves the full causal spine.
+        idx.apply(&ev(50, Some(100), "command.completed"));
+        let (_, spine) = idx.build_spine_to(42, 50);
+        let ids: Vec<i64> = spine
+            .expect("tip now indexed")
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 100, 50]);
+    }
+
+    #[test]
+    fn legacy_event_id_order_revert_resorts_inverted_pair() {
+        // NOETL_OFFSERVER_SPINE_ORDER=event_id restores the pre-#117 sort: even
+        // walking from the real tip, it re-sorts the collected ids ascending, so
+        // the inverted pair (100, 50) is replayed as 50-before-100 — enrich before
+        // its predecessor normalize — the ordering that wedges fan-in.
+        let mut legacy = WalEventIndex::with_order(SpineOrder::EventId);
+        for e in inverted_fanout_spine() {
+            legacy.apply(&e);
+        }
+        let (_, sp) = legacy.build_spine_to(42, 50);
+        let ids: Vec<i64> = sp
+            .expect("genesis-rooted")
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 50, 100],
+            "legacy event_id sort replays the inverted pair out of causal order"
+        );
+        // The causal default preserves the chain order (the #117 fix).
+        let mut causal = WalEventIndex::with_order(SpineOrder::Causal);
+        for e in inverted_fanout_spine() {
+            causal.apply(&e);
+        }
+        let (_, sp2) = causal.build_spine_to(42, 50);
+        let ids2: Vec<i64> = sp2
+            .expect("genesis-rooted")
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids2, vec![1, 2, 3, 100, 50], "causal order preserves the chain");
+    }
+
+    #[test]
+    fn incremental_advance_to_equals_cold_rebuild_through_inversion() {
+        // The incremental-equals-cold-rebuild invariant (RFC §5.2) holds through a
+        // #117 inversion: advancing the cached spine from max-id (100) to the real
+        // tip (50) by a tail walk yields the same spine a cold rebuild from 50 does.
+        let mut incr = WalEventIndex::new();
+        for e in inverted_fanout_spine() {
+            incr.apply(&e);
+        }
+        // Seed the cache at the max-id head (100), then advance to the tip (50).
+        let _ = incr.build_spine(42); // cache keyed at 100 → [1,2,3,100]
+        let (outcome, sp_incr) = incr.build_spine_to(42, 50);
+        assert!(
+            matches!(outcome, AdvanceOutcome::Incremental(1)),
+            "tip 50 extends cached 100 by one tail hop"
+        );
+        let ids_incr: Vec<i64> = sp_incr
+            .unwrap()
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+
+        let mut cold = WalEventIndex::new();
+        for e in inverted_fanout_spine() {
+            cold.apply(&e);
+        }
+        let (cold_outcome, sp_cold) = cold.build_spine_to(42, 50);
+        assert!(matches!(cold_outcome, AdvanceOutcome::ColdRebuild(5)));
+        let ids_cold: Vec<i64> = sp_cold
+            .unwrap()
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids_incr, ids_cold, "incremental == cold rebuild through inversion");
+        assert_eq!(ids_incr, vec![1, 2, 3, 100, 50]);
     }
 
     #[tokio::test]
