@@ -440,6 +440,7 @@ pub async fn build_offserver_input(
     trigger_event_type: Option<&str>,
     trigger_event_id: Option<i64>,
     expected_head: Option<i64>,
+    atomic_item_context: bool,
 ) -> Option<Vec<u8>> {
     let (outcome, spine, head, resolved_trigger_type) = {
         let mut idx = index.lock().await;
@@ -490,6 +491,11 @@ pub async fn build_offserver_input(
         "events": events,
         "playbook": playbook,
         "trigger_event_type": trigger_type,
+        // RFC #115 Phase 5: forward the atomic-item-context flag onto the
+        // from_events `OrchestrateInput` so the off-server drive narrows each
+        // worker-bound command context to its minimal slice.  Default false
+        // (the server omits it) → full-context dispatch, unchanged.
+        "atomic_item_context": atomic_item_context,
     });
     serde_json::to_vec(&input).ok()
 }
@@ -1030,13 +1036,23 @@ mod tests {
             }
         }
         let playbook = serde_json::json!({ "metadata": { "path": "t" } });
-        let bytes =
-            build_offserver_input(&index, 42, &playbook, Some("command.completed"), None, Some(3))
-                .await
-                .expect("complete chain builds input");
+        let bytes = build_offserver_input(
+            &index,
+            42,
+            &playbook,
+            Some("command.completed"),
+            None,
+            Some(3),
+            true,
+        )
+        .await
+        .expect("complete chain builds input");
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["trigger_event_type"], "command.completed");
         assert_eq!(v["playbook"]["metadata"]["path"], "t");
+        // RFC #115 Phase 5: the atomic-item-context flag is forwarded onto the
+        // from_events drive input.
+        assert_eq!(v["atomic_item_context"], true);
         let evs = v["events"].as_array().unwrap();
         assert_eq!(evs.len(), 3, "all three spine events");
         assert_eq!(evs[0]["event_id"], 1);
@@ -1044,7 +1060,7 @@ mod tests {
         // Stateless edge (RFC #115 Phase 4 remainder): trigger_event_type=None +
         // a trigger_event_id resolves the type off the WAL index (event 3 is
         // command.completed in the linear spine).
-        let bytes2 = build_offserver_input(&index, 42, &playbook, None, Some(3), Some(3))
+        let bytes2 = build_offserver_input(&index, 42, &playbook, None, Some(3), Some(3), false)
             .await
             .expect("complete chain builds input (resolved trigger type)");
         let v2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
@@ -1053,7 +1069,7 @@ mod tests {
             "trigger type resolved off the WAL index from trigger_event_id"
         );
         // An unindexed trigger_event_id defaults to command.completed.
-        let bytes3 = build_offserver_input(&index, 42, &playbook, None, Some(999), Some(3))
+        let bytes3 = build_offserver_input(&index, 42, &playbook, None, Some(999), Some(3), false)
             .await
             .expect("complete chain builds input (default trigger type)");
         let v3: serde_json::Value = serde_json::from_slice(&bytes3).unwrap();
@@ -1062,12 +1078,12 @@ mod tests {
         // Staleness guard: an expected_head ahead of the index head → None (the
         // drain hasn't caught up to the server's dispatch watermark yet).
         assert!(
-            build_offserver_input(&index, 42, &playbook, None, None, Some(99)).await.is_none(),
+            build_offserver_input(&index, 42, &playbook, None, None, Some(99), false).await.is_none(),
             "stale index (head < expected_head) must not serve"
         );
 
         // An unknown execution → None (the caller falls back to run_state).
-        assert!(build_offserver_input(&index, 7, &playbook, None, None, None).await.is_none());
+        assert!(build_offserver_input(&index, 7, &playbook, None, None, None, false).await.is_none());
     }
 
     #[test]
