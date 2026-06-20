@@ -1271,10 +1271,34 @@ impl CommandExecutor {
         if path == "system/orchestrate" {
             if let Some(args) = tool_config.config.get("args") {
                 if args.get("__offserver_build__").and_then(|v| v.as_bool()) == Some(true) {
-                    let (off_entry, off_input) =
-                        self.resolve_offserver_orchestrate_input(command.execution_id, args).await;
-                    entry = off_entry;
-                    input = off_input;
+                    match self
+                        .resolve_offserver_orchestrate_input(command.execution_id, args)
+                        .await
+                    {
+                        OffserverDispatch::Wasm { entry: e, input: i } => {
+                            entry = e;
+                            input = i;
+                        }
+                        // Stateless off-server drive (RFC #115 Phase 4 remainder):
+                        // the WAL chain was incomplete after the bounded retry and
+                        // no server-built state rides the command, so return a
+                        // benign no-op result.  The server's `apply_worker_orchestration`
+                        // detects `__offserver_retry__`, clears the in-flight guard,
+                        // and the reconcile poller re-drives once the drain catches
+                        // up — no partial state is ever built, the execution never
+                        // wedges.
+                        OffserverDispatch::Noop => {
+                            crate::metrics::record_state_builder_drive("stateless_retry");
+                            tracing::info!(
+                                execution_id = command.execution_id,
+                                "off-server drive (stateless): WAL chain incomplete; \
+                                 returning no-op, server reconcile will re-drive"
+                            );
+                            return Ok(noetl_tools::result::ToolResult::success(
+                                serde_json::json!({ "__offserver_retry__": true }),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1322,22 +1346,42 @@ impl CommandExecutor {
         &self,
         execution_id: i64,
         args: &serde_json::Value,
-    ) -> (String, Vec<u8>) {
+    ) -> OffserverDispatch {
         use crate::state_builder::BuilderMode;
 
         // The server-built fallback input is the args object as-is (the extra
-        // markers are ignored by OrchestrateStateInput's deserializer).
-        let fallback = || -> Vec<u8> {
-            serde_json::to_vec(args).unwrap_or_default()
-        };
+        // markers are ignored by OrchestrateStateInput's deserializer).  Only
+        // usable when the server actually shipped a `state` — the stateless edge
+        // (RFC #115 Phase 4 remainder) ships none.
+        let fallback = || -> Vec<u8> { serde_json::to_vec(args).unwrap_or_default() };
+
+        // Stateless off-server drive: the server-built edge no longer rebuilds
+        // `WorkflowState`, so the command carries `__stateless__` + NO `state`
+        // fallback.  An incomplete WAL chain is then a no-op (the reconcile poller
+        // re-drives) rather than a fall-through to an absent server-built state.
+        let stateless = args.get("__stateless__").and_then(|v| v.as_bool()) == Some(true);
 
         if self.state_builder_mode != BuilderMode::Authoritative {
+            // A non-authoritative worker can't build off the WAL.  With a
+            // server-built state it runs `run_state`; under the stateless edge
+            // there is none, so it must no-op (the authoritative system pool is
+            // the one that drives offserver — this is a misroute / mixed-mode
+            // window).
+            if stateless {
+                return OffserverDispatch::Noop;
+            }
             crate::metrics::record_state_builder_drive("fallback_disabled");
-            return ("run_state".to_string(), fallback());
+            return OffserverDispatch::Wasm {
+                entry: "run_state".to_string(),
+                input: fallback(),
+            };
         }
 
         let playbook = args.get("playbook").cloned().unwrap_or(serde_json::Value::Null);
         let trigger_event_type = args.get("trigger_event_type").and_then(|v| v.as_str());
+        // The server supplies `trigger_event_id` on the stateless edge so the
+        // worker resolves `trigger_event_type` off its WAL index.
+        let trigger_event_id = args.get("trigger_event_id").and_then(|v| v.as_i64());
         // The server's dispatch watermark — the WAL build serves only once the
         // pool-side index has caught up to it (staleness guard), so the
         // worker-built state is never staler than the server's view.
@@ -1362,6 +1406,7 @@ impl CommandExecutor {
                 execution_id,
                 &playbook,
                 trigger_event_type,
+                trigger_event_id,
                 expected_head,
             )
             .await
@@ -1372,22 +1417,47 @@ impl CommandExecutor {
                     attempt,
                     "off-server drive: built state from WAL spine (run/from_events), no noetl.event read"
                 );
-                return ("run".to_string(), bytes);
+                return OffserverDispatch::Wasm {
+                    entry: "run".to_string(),
+                    input: bytes,
+                };
             }
             if attempt + 1 < attempts {
                 tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
             }
         }
 
-        // WAL chain still incomplete after the retry window → use the
-        // server-built state. Conservative: the worst case equals today.
+        // WAL chain still incomplete after the retry window.
+        if stateless {
+            // No server-built state to fall back to — a benign no-op; the server
+            // reconcile poller re-drives once the drain catches up.  Conservative:
+            // never builds a partial state, never wedges the execution.
+            crate::metrics::record_state_builder_drive("fallback_incomplete");
+            return OffserverDispatch::Noop;
+        }
+        // Legacy offserver path (server still ships a state): use it.
+        // Conservative: the worst case equals today.
         crate::metrics::record_state_builder_drive("fallback_incomplete");
         tracing::info!(
             execution_id,
             "off-server drive: WAL chain incomplete after retries; falling back to server-built run_state"
         );
-        ("run_state".to_string(), fallback())
+        OffserverDispatch::Wasm {
+            entry: "run_state".to_string(),
+            input: fallback(),
+        }
     }
+}
+
+/// How the worker should dispatch a `__offserver_build__` orchestrate command
+/// (RFC #115 Phase 4 drive cutover + remainder).
+enum OffserverDispatch {
+    /// Invoke the named wasm entry with these input bytes — `run` (from_events,
+    /// WAL-built state) or `run_state` (server-built fallback state).
+    Wasm { entry: String, input: Vec<u8> },
+    /// Stateless edge + incomplete WAL: return a benign no-op so the server
+    /// reconcile poller re-drives once the pool-side drain catches up.
+    Noop,
 }
 
 /// Parse a `tool_kind: "wasm"` config into the plug-in ref + entry + input bytes.
