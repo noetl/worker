@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.39.0](https://github.com/noetl/worker/compare/v5.38.0...v5.39.0) (2026-06-20)
+
+### Features
+
+* **state-builder:** stateless off-server drive — resolve trigger type off the WAL + no-op on incomplete chain (RFC [#115](https://github.com/noetl/worker/issues/115) Phase 4 remainder) ([#120](https://github.com/noetl/worker/issues/120)) ([3296d45](https://github.com/noetl/worker/commit/3296d4559f3f8bcbbb5d3088a1beb40e89c75fc2)), closes [noetl/ai-meta#107](https://github.com/noetl/ai-meta/issues/107)
+
 ## [5.38.0](https://github.com/noetl/worker/compare/v5.37.0...v5.38.0) (2026-06-20)
 
 ### Features
