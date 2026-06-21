@@ -139,7 +139,15 @@ wasmtime = { version = "27", optional = true }
 #   handles.  The CQRS materializer loop (`src/materializer.rs`) drives it
 #   to ack noetl_events batches only after events/project succeeds
 #   (noetl/ai-meta#103).
-noetl-tools = "3.13"
+# - v3.14: two task_sequence/http regressions surfaced by the batch
+#   pft_flow_test.  3.13.1 (tools#72, noetl/ai-meta#126): the `http` tool
+#   exposes the parsed response body under `data` again (Python-era
+#   contract) with `body` kept as a back-compat alias, so fixtures reading
+#   `output.data.data` resolve.  3.14.0 (tools#73, noetl/ai-meta#125): the
+#   `task_sequence` runner honours `do: jump`/`to:`, `do: break`, and
+#   `do: retry` (attempts/backoff + infinite-jump guard) instead of only
+#   `do: fail`.  Bumped from 3.13 to make the worker pick up both at runtime.
+noetl-tools = "3.14"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
