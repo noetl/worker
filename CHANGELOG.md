@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.40.3](https://github.com/noetl/worker/compare/v5.40.2...v5.40.3) (2026-06-21)
+
+### Bug Fixes
+
+* **deps:** bump noetl-tools 3.13 -> 3.14 (task_sequence control flow + http data-shape) ([#124](https://github.com/noetl/worker/issues/124)) ([87b85e8](https://github.com/noetl/worker/commit/87b85e883bd9a93cd0415f75a34d45896dc9493f)), closes [tools#72](https://github.com/noetl/tools/issues/72) [tools#73](https://github.com/noetl/tools/issues/73) [noetl/ai-meta#125](https://github.com/noetl/ai-meta/issues/125) [noetl/ai-meta#126](https://github.com/noetl/ai-meta/issues/126)
+
 ## [5.40.2](https://github.com/noetl/worker/compare/v5.40.1...v5.40.2) (2026-06-20)
 
 ### Bug Fixes
