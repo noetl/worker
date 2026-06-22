@@ -3097,6 +3097,7 @@ name = "noetl-worker"
 version = "5.41.0"
 dependencies = [
  "anyhow",
+ "arrow 53.4.1",
  "async-nats",
  "async-trait",
  "axum 0.8.9",

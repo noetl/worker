@@ -235,7 +235,7 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
             match classify_event(&row) {
                 Classification::Skip => tally.skipped += 1,
                 Classification::Eligible { legacy_ref, coords } => {
-                    write_shadow(&client, &config.cell, &row, &legacy_ref, &coords, &mut tally).await;
+                    write_shadow(&client, &config.cell, &legacy_ref, &coords, &mut tally).await;
                 }
             }
         }
@@ -284,7 +284,6 @@ struct CycleTally {
 async fn write_shadow(
     client: &ControlPlaneClient,
     cell: &CellSeed,
-    row: &serde_json::Value,
     legacy_ref: &str,
     coords: &ResultCoordinates,
     tally: &mut CycleTally,
@@ -310,7 +309,11 @@ async fn write_shadow(
     };
 
     let tier = decide_tier(&payload);
-    let date = event_date(row);
+    // The `date=` partition is derived from the execution_id snowflake, NOT the
+    // event timestamp — so the resolve-by-URN read path (#104 Phase C) can
+    // reconstruct the same §7 key from the logical URI's execution_id alone,
+    // with no carried date. Both sides call `snowflake::date_partition`.
+    let date = crate::snowflake::date_partition(coords.execution_id);
     let key = coords.physical_key(&cell.placement_for(coords), &date, tier.ext());
 
     match client.object_put(&key, tier.bytes, tier.media).await {
@@ -370,7 +373,7 @@ fn classify_event(row: &serde_json::Value) -> Classification {
     let coords = reference
         .get("uri")
         .and_then(|v| v.as_str())
-        .and_then(coords_from_uri);
+        .and_then(crate::result_locator::coords_from_uri);
     match (legacy_ref, coords) {
         (Some(r), Some(coords)) => Classification::Eligible {
             legacy_ref: r.to_string(),
@@ -395,46 +398,6 @@ fn find_result_ref(v: &serde_json::Value) -> Option<&serde_json::Map<String, ser
         serde_json::Value::Array(a) => a.iter().find_map(find_result_ref),
         _ => None,
     }
-}
-
-/// Parse the canonical `noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`
-/// URI into coordinates.
-///
-/// Transitional: a local inversion of `ResultCoordinates::logical_uri` so Phase
-/// B needs no `noetl-tools` release. The durable single source is
-/// `noetl_locator::ResultCoordinates::from_locator` (tools, #104 Phase B); a
-/// follow-up swaps this for it once the worker bumps `noetl-tools`. Kept in
-/// lockstep with that parser + the producer's `logical_uri`.
-fn coords_from_uri(uri: &str) -> Option<ResultCoordinates> {
-    let rest = uri.strip_prefix("noetl://")?;
-    let segs: Vec<&str> = rest.split('/').collect();
-    // tenant / project / "results" / eid / step… / frame / row / attempt
-    if segs.len() < 8 || segs[2] != "results" {
-        return None;
-    }
-    let tenant = segs[0];
-    let project = segs[1];
-    if tenant.is_empty() || project.is_empty() {
-        return None;
-    }
-    let n = segs.len();
-    let execution_id = segs[3].parse::<i64>().ok()?;
-    let frame = segs[n - 3].parse::<u64>().ok()?;
-    let row = segs[n - 2].parse::<u64>().ok()?;
-    let attempt = segs[n - 1].parse::<u32>().ok()?;
-    let step = segs[4..n - 3].join("/");
-    if step.is_empty() {
-        return None;
-    }
-    Some(ResultCoordinates::new(
-        Some(tenant),
-        Some(project),
-        execution_id,
-        step,
-        frame,
-        row,
-        attempt,
-    ))
 }
 
 enum TierKind {
@@ -503,18 +466,6 @@ fn decide_tier(payload: &serde_json::Value) -> Tier {
             media: JSON_MEDIA,
         },
     }
-}
-
-/// The `date=` partition for the §7 key — derived from the event's own
-/// timestamp (deterministic on replay, never wall-clock). Falls back to a fixed
-/// sentinel when absent so a key is still produced.
-fn event_date(row: &serde_json::Value) -> String {
-    row.get("timestamp")
-        .or_else(|| row.get("created_at"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.chars().take(10).collect::<String>())
-        .filter(|d| d.len() == 10)
-        .unwrap_or_else(|| "0000-00-00".to_string())
 }
 
 #[cfg(test)]
@@ -627,18 +578,7 @@ mod tests {
         assert_eq!(back, blob);
     }
 
-    #[test]
-    fn coords_from_uri_round_trips_and_rejects() {
-        let c = coords_from_uri("noetl://t_acme/p_gen/results/325/load_next/2/4/1").unwrap();
-        assert_eq!(c.tenant, "t_acme");
-        assert_eq!(c.project, "p_gen");
-        assert_eq!(c.logical_uri(), "noetl://t_acme/p_gen/results/325/load_next/2/4/1");
-        // Wrong kind / too short / non-numeric tail → None (never panics).
-        assert!(coords_from_uri("noetl://t/p/datasets/1/s/0/0/1").is_none());
-        assert!(coords_from_uri("noetl://t/p/results/1/s/0").is_none());
-        assert!(coords_from_uri("noetl://t/p/results/1/s/0/0/x").is_none());
-        assert!(coords_from_uri("https://nope").is_none());
-    }
+    use crate::result_locator::coords_from_uri;
 
     #[test]
     fn keep_every_attempt_distinct_keys() {
@@ -670,13 +610,14 @@ mod tests {
     }
 
     #[test]
-    fn event_date_from_timestamp_or_fallback() {
-        assert_eq!(event_date(&over_budget_row("noetl://t/p/results/1/s/0/0/1")), "2026-06-22");
-        assert_eq!(event_date(&serde_json::json!({})), "0000-00-00");
-        assert_eq!(
-            event_date(&serde_json::json!({ "created_at": "2026-01-02T00:00:00Z" })),
-            "2026-01-02"
-        );
+    fn date_partition_is_execution_id_derived_and_deterministic() {
+        // The §7 `date=` partition derives from the execution_id snowflake (not
+        // the event timestamp), so write + read reconstruct the SAME key.
+        let eid = 325i64;
+        let d1 = crate::snowflake::date_partition(eid);
+        let d2 = crate::snowflake::date_partition(eid);
+        assert_eq!(d1, d2, "pure function of the id");
+        assert_eq!(d1.len(), 10, "YYYY-MM-DD");
     }
 
     #[test]

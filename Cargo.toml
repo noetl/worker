@@ -190,6 +190,13 @@ noetl-executor = "0.5"
 # fallback chain.
 noetl-arrow-cache = "0.1"
 
+# Arrow — decode the Feather/IPC result tier back to JSON on the resolve-by-URN
+# read path (noetl/ai-meta#104 Phase C).  Already compiled transitively via
+# noetl-tools' `arrow_codec`; named directly here so the worker can manipulate
+# the `RecordBatch` that `decode_record_batches` returns.  Version tracks
+# noetl-tools' arrow 53.
+arrow = "53"
+
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 

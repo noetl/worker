@@ -142,6 +142,16 @@ pub struct WorkerMetrics {
     /// One result-materializer drain→classify→write→ack cycle latency.
     pub result_materializer_cycle_duration_seconds: Histogram,
 
+    // --- Resolve-by-URN read path (noetl/ai-meta#104 Phase C) ----------------
+    /// Resolve-by-URN attempts on the consume path, by outcome
+    /// (`resolved_feather` / `resolved_json` for a hit; `fallback_*` for a
+    /// fail-safe fall-through to the legacy `resolve_ref`). Flag-off it never
+    /// moves; flag-on its `resolved_*` delta is the proof the read path served
+    /// from the object-store tier instead of `noetl.result_store`.
+    pub result_resolve_total: IntCounterVec,
+    /// One resolve-by-URN attempt latency (registry + object fetch + decode).
+    pub result_resolve_duration_seconds: Histogram,
+
     // --- Off-server state builder (noetl/ai-meta#115 Phase 4) ----------------
     /// Events the off-server state builder consumed from the `noetl_events`
     /// **WAL** stream and indexed. Positive evidence the builder reads the WAL
@@ -588,6 +598,27 @@ impl WorkerMetrics {
             .register(Box::new(result_materializer_cycle_duration_seconds.clone()))
             .expect("register result_materializer_cycle_duration_seconds");
 
+        let result_resolve_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_result_resolve_total",
+                "Resolve-by-URN read-path attempts by outcome (noetl/ai-meta#104 Phase C).",
+            ),
+            &["outcome"],
+        )
+        .expect("result_resolve_total metric");
+        registry
+            .register(Box::new(result_resolve_total.clone()))
+            .expect("register result_resolve_total");
+
+        let result_resolve_duration_seconds = Histogram::with_opts(HistogramOpts::new(
+            "noetl_worker_result_resolve_duration_seconds",
+            "Latency of one resolve-by-URN attempt (registry + object fetch + decode).",
+        ))
+        .expect("result_resolve_duration_seconds metric");
+        registry
+            .register(Box::new(result_resolve_duration_seconds.clone()))
+            .expect("register result_resolve_duration_seconds");
+
         let state_builder_wal_events_total = IntCounter::new(
             "noetl_worker_state_builder_wal_events_total",
             "Events the off-server state builder consumed from the noetl_events WAL stream (RFC #115 Phase 4).",
@@ -687,6 +718,8 @@ impl WorkerMetrics {
             result_materializer_skipped_total,
             result_materializer_errors_total,
             result_materializer_cycle_duration_seconds,
+            result_resolve_total,
+            result_resolve_duration_seconds,
             state_builder_wal_events_total,
             state_builder_event_scans_total,
             state_builder_builds_total,
@@ -969,6 +1002,15 @@ pub fn record_result_materializer_cycle(
         m.result_materializer_errors_total.inc_by(errors);
     }
     m.result_materializer_cycle_duration_seconds.observe(duration_seconds);
+}
+
+/// Record one resolve-by-URN read-path attempt (noetl/ai-meta#104 Phase C).
+/// `outcome` is `resolved_feather` / `resolved_json` on a hit, or one of the
+/// `fallback_*` labels when the caller falls back to the legacy `resolve_ref`.
+pub fn record_result_resolve(outcome: &str, duration_seconds: f64) {
+    let m = WorkerMetrics::global();
+    m.result_resolve_total.with_label_values(&[outcome]).inc();
+    m.result_resolve_duration_seconds.observe(duration_seconds);
 }
 
 /// Record `n` events consumed from the `noetl_events` WAL by the off-server

@@ -1571,13 +1571,21 @@ fn stamp_logical_uri(
     reference.insert("uri".to_string(), serde_json::Value::String(uri));
 }
 
-/// Locate a result-reference URI on a step result (nested or top-level envelope).
-fn reference_uri(result: &serde_json::Value) -> Option<String> {
-    result
-        .pointer("/context/result/reference/ref")
+/// Locate a result-reference on a step result (nested or top-level envelope) and
+/// return `(legacy_ref, canonical_uri?)`: the legacy `reference.ref` (always —
+/// the authoritative fetch key) plus the canonical logical `reference.uri` when
+/// present (the resolve-by-URN key, #104 Phase C). `None` if there is no
+/// reference at all.
+fn reference_locators(result: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let reference = result
+        .pointer("/context/result/reference")
+        .or_else(|| result.pointer("/reference"))?;
+    let legacy = reference.get("ref").and_then(|v| v.as_str())?.to_string();
+    let canonical = reference
+        .get("uri")
         .and_then(|v| v.as_str())
-        .or_else(|| result.pointer("/reference/ref").and_then(|v| v.as_str()))
-        .map(str::to_string)
+        .map(str::to_string);
+    Some((legacy, canonical))
 }
 
 /// Splice resolved full `data` back into a step result where
@@ -1636,17 +1644,23 @@ async fn resolve_context_references(
     client: &ControlPlaneClient,
 ) {
     // `steps` carries the full step results (build_context inserts result.clone()).
-    let candidates: Vec<(String, String)> = match variables.get("steps") {
+    // Each candidate is (step_name, legacy_ref, canonical_uri?).
+    let candidates: Vec<(String, String, Option<String>)> = match variables.get("steps") {
         Some(serde_json::Value::Object(steps)) => steps
             .iter()
-            .filter_map(|(name, result)| reference_uri(result).map(|uri| (name.clone(), uri)))
+            .filter_map(|(name, result)| {
+                reference_locators(result).map(|(legacy, canonical)| (name.clone(), legacy, canonical))
+            })
             .collect(),
         _ => return,
     };
     if candidates.is_empty() {
         return;
     }
-    for (name, uri) in candidates {
+    // Resolve-by-URN read path (#104 Phase C) — only when the flag is on. Off →
+    // this is the byte-identical legacy `resolve_ref` path.
+    let resolve_by_urn = crate::result_resolver::enabled();
+    for (name, uri, canonical) in candidates {
         // The flat `<name>` binding is the bounded summary (+ `_ref`/`_store`).
         // Decide off it whether this command's template needs the bulk.
         let summary = variables.get(&name);
@@ -1654,7 +1668,24 @@ async fn resolve_context_references(
             tracing::debug!(step = %name, uri, "ref kept as summary (no bulk binding in template)");
             continue;
         }
-        match client.resolve_ref(&uri).await {
+        // Flag-on + a canonical URI present: try resolving the Feather/JSON tier
+        // from object store by URN. On any miss/error it returns None and we fall
+        // back fail-safe to the authoritative `resolve_ref` below — never a hard
+        // failure, never silent loss (OQ6).
+        let fetched: anyhow::Result<Option<serde_json::Value>> =
+            match (resolve_by_urn, canonical.as_deref()) {
+                (true, Some(canon)) => {
+                    match crate::result_resolver::resolve_by_urn(client, canon).await {
+                        Some(data) => {
+                            tracing::debug!(step = %name, uri = canon, "resolved over-budget result by URN (#104 Phase C)");
+                            Ok(Some(data))
+                        }
+                        None => client.resolve_ref(&uri).await,
+                    }
+                }
+                _ => client.resolve_ref(&uri).await,
+            };
+        match fetched {
             Ok(Some(data)) => {
                 // Preserve the locator accessors so a template that binds bulk
                 // AND `{{ step._ref }}` keeps both after the splice.
@@ -1943,6 +1974,32 @@ mod tests {
     use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
 
     #[test]
+    fn reference_locators_extracts_legacy_and_canonical() {
+        // Over-budget reference carrying BOTH the legacy ref and the canonical
+        // logical URI (the R02b stamp) → both surface for the Phase C read path.
+        let result = serde_json::json!({
+            "reference": {
+                "kind": "result_ref",
+                "ref": "noetl://execution/1/result/drain/9",
+                "uri": "noetl://default/default/results/1/drain/0/0/1"
+            }
+        });
+        let (legacy, canonical) = reference_locators(&result).unwrap();
+        assert_eq!(legacy, "noetl://execution/1/result/drain/9");
+        assert_eq!(
+            canonical.as_deref(),
+            Some("noetl://default/default/results/1/drain/0/0/1")
+        );
+        // Legacy-only reference (no canonical uri) → canonical is None (falls back).
+        let legacy_only = serde_json::json!({
+            "reference": { "kind": "result_ref", "ref": "noetl://execution/2/result/s/3" }
+        });
+        let (l, c) = reference_locators(&legacy_only).unwrap();
+        assert_eq!(l, "noetl://execution/2/result/s/3");
+        assert!(c.is_none());
+    }
+
+    #[test]
     fn context_reference_splice_reconstructs_inline() {
         // A nested step result holding `{reference}` + `extracted` (the
         // references-in-state shape) splices the resolved data where
@@ -1955,13 +2012,13 @@ mod tests {
             }}
         });
         assert_eq!(
-            reference_uri(&result).as_deref(),
+            reference_locators(&result).map(|(legacy, _)| legacy).as_deref(),
             Some("noetl://execution/1/result/drain/9")
         );
         let full = serde_json::json!({ "messages": [{"id": 1}, {"id": 2}], "count": 2 });
         splice_resolved(&mut result, full.clone());
         // The reference is gone; the full data sits where the orchestrator reads it.
-        assert!(reference_uri(&result).is_none());
+        assert!(reference_locators(&result).is_none());
         assert_eq!(
             result.pointer("/context/result/context/data"),
             Some(&full)
