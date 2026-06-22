@@ -158,7 +158,13 @@ wasmtime = { version = "27", optional = true }
 #   batch hot path has both more headroom AND less work per slot.
 #   Behavior-preserving (407 tools tests + 2 new equivalence pins); no
 #   worker code change.
-noetl-tools = "3.14.1"
+# - v3.14.2: postgres `pg_value_to_json` now serializes tz-naive
+#   `timestamp` (chrono::NaiveDateTime) plus date/time/uuid/numeric/bytea
+#   instead of returning `null` (tools#75, noetl/ai-meta#95).  Fixes the
+#   `auth0_login` postgres step returning `expires_at: null` for a plain
+#   `timestamp` column.  Tool-only fix (409 tools tests + clippy); no
+#   worker code change.
+noetl-tools = "3.14.2"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
