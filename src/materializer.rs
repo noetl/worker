@@ -384,7 +384,7 @@ async fn dispose(
 /// URL with the userinfo stripped (`async_nats::connect` ignores inline creds,
 /// so they must be passed explicitly). Env `NATS_USER`/`NATS_PASSWORD` take
 /// precedence (matching the worker's command-source convention).
-fn parse_nats_credentials(nats_url: &str) -> (String, Option<String>, Option<String>) {
+pub(crate) fn parse_nats_credentials(nats_url: &str) -> (String, Option<String>, Option<String>) {
     let env_user = std::env::var("NATS_USER").ok().filter(|s| !s.is_empty());
     let env_pass = std::env::var("NATS_PASSWORD").ok().filter(|s| !s.is_empty());
     if let (Some(u), Some(p)) = (&env_user, &env_pass) {
@@ -407,7 +407,7 @@ fn parse_nats_credentials(nats_url: &str) -> (String, Option<String>, Option<Str
 }
 
 /// Drop the `user:pass@` portion of a NATS URL.
-fn strip_userinfo(nats_url: &str) -> String {
+pub(crate) fn strip_userinfo(nats_url: &str) -> String {
     match url::Url::parse(nats_url) {
         Ok(mut u) if !u.username().is_empty() => {
             let _ = u.set_username("");
@@ -418,14 +418,14 @@ fn strip_userinfo(nats_url: &str) -> String {
     }
 }
 
-fn env_u32(key: &str, default: u32) -> u32 {
+pub(crate) fn env_u32(key: &str, default: u32) -> u32 {
     std::env::var(key)
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(default)
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
+pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())

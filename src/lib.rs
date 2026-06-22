@@ -13,6 +13,7 @@ pub mod config;
 pub mod events;
 pub mod executor;
 pub mod materializer;
+pub mod result_materializer;
 pub mod metrics;
 pub mod state_builder;
 pub mod metrics_server;
