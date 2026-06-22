@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.40.4](https://github.com/noetl/worker/compare/v5.40.3...v5.40.4) (2026-06-22)
+
+### Bug Fixes
+
+* **deps:** bump noetl-tools 3.14 -> 3.14.1 (task_sequence per-sub-task CPU opt) ([#127](https://github.com/noetl/worker/issues/127)) ([#125](https://github.com/noetl/worker/issues/125)) ([1a10a73](https://github.com/noetl/worker/commit/1a10a730d469a00a30c4ab9f2d782c365b2eb84e)), closes [tools#74](https://github.com/noetl/tools/issues/74)
+
 ## [5.40.3](https://github.com/noetl/worker/compare/v5.40.2...v5.40.3) (2026-06-21)
 
 ### Bug Fixes
