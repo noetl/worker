@@ -3043,9 +3043,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-tools"
-version = "3.14.1"
+version = "3.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd573aa7606cc93dce186a17faa041d9daf737daeae5f88289a65c11df6a55e"
+checksum = "d6abd6b9e2840ecd5f206cc1938de30e406422663286004827477d6db4ba67f4"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -3560,6 +3560,7 @@ dependencies = [
  "postgres-protocol",
  "serde_core",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
