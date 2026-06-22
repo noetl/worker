@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.41.0](https://github.com/noetl/worker/compare/v5.40.5...v5.41.0) (2026-06-22)
+
+### Features
+
+* **result-materializer:** shadow Feather result tier ([#104](https://github.com/noetl/worker/issues/104) Phase B) ([c1adb7f](https://github.com/noetl/worker/commit/c1adb7fe806f5541b0d877156280884aa344287a))
+
 ## [5.40.5](https://github.com/noetl/worker/compare/v5.40.4...v5.40.5) (2026-06-22)
 
 ### Bug Fixes
