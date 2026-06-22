@@ -147,7 +147,18 @@ wasmtime = { version = "27", optional = true }
 #   `task_sequence` runner honours `do: jump`/`to:`, `do: break`, and
 #   `do: retry` (attempts/backoff + infinite-jump guard) instead of only
 #   `do: fail`.  Bumped from 3.13 to make the worker pick up both at runtime.
-noetl-tools = "3.14"
+# - v3.14.1: behavior-preserving `task_sequence` per-sub-task CPU
+#   optimization (tools#74, noetl/ai-meta#127).  `TemplateEngine::render_value`
+#   builds the proxied minijinja context ONCE and threads it through the
+#   recursion (`render_value_with`/`render_with`); new
+#   `build_context_with_overlay` skips the redundant `to_template_context()`
+#   HashMap clone + per-block `ExecutionContext` clones in the set/policy
+#   paths.  Cuts per-sub-task context cost ~61.6% (2.6x) in an isolated
+#   micro-bench — pairs with the prod worker CPU-limit bump (1->2) so the
+#   batch hot path has both more headroom AND less work per slot.
+#   Behavior-preserving (407 tools tests + 2 new equivalence pins); no
+#   worker code change.
+noetl-tools = "3.14.1"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
