@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.40.5](https://github.com/noetl/worker/compare/v5.40.4...v5.40.5) (2026-06-22)
+
+### Bug Fixes
+
+* **deps:** bump noetl-tools 3.14.1 -> 3.14.2 (postgres temporal/identity serialization) ([#126](https://github.com/noetl/worker/issues/126)) ([60a849d](https://github.com/noetl/worker/commit/60a849df4cb3b559a5cc703017bef8733a270e4c)), closes [tools#75](https://github.com/noetl/tools/issues/75) [noetl/ai-meta#95](https://github.com/noetl/ai-meta/issues/95)
+
 ## [5.40.4](https://github.com/noetl/worker/compare/v5.40.3...v5.40.4) (2026-06-22)
 
 ### Bug Fixes
