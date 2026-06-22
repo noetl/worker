@@ -126,6 +126,22 @@ pub struct WorkerMetrics {
     /// One materializer drain→project→ack cycle latency.
     pub materializer_cycle_duration_seconds: Histogram,
 
+    // --- Shadow result materializer (noetl/ai-meta#104 Phase B) --------------
+    /// Events drained from `noetl_events` by the result materializer's separate
+    /// consumer.
+    pub result_materializer_drained_total: IntCounter,
+    /// Over-budget result references the result materializer wrote to object
+    /// store, by tier (`feather` for tabular, `json` for non-tabular).
+    pub result_materializer_writes_total: IntCounterVec,
+    /// Events the result materializer skipped (inline/small, un-addressable
+    /// reference, or payload not found) — the no-op surface.
+    pub result_materializer_skipped_total: IntCounter,
+    /// Shadow write/fetch failures — counted, never failing the event (the
+    /// batch is acked regardless; idempotent keys make redelivery safe).
+    pub result_materializer_errors_total: IntCounter,
+    /// One result-materializer drain→classify→write→ack cycle latency.
+    pub result_materializer_cycle_duration_seconds: Histogram,
+
     // --- Off-server state builder (noetl/ai-meta#115 Phase 4) ----------------
     /// Events the off-server state builder consumed from the `noetl_events`
     /// **WAL** stream and indexed. Positive evidence the builder reads the WAL
@@ -524,6 +540,54 @@ impl WorkerMetrics {
             .register(Box::new(materializer_cycle_duration_seconds.clone()))
             .expect("register materializer_cycle_duration_seconds");
 
+        let result_materializer_drained_total = IntCounter::new(
+            "noetl_worker_result_materializer_drained_total",
+            "Events drained from noetl_events by the shadow result materializer (noetl/ai-meta#104 Phase B).",
+        )
+        .expect("result_materializer_drained_total metric");
+        registry
+            .register(Box::new(result_materializer_drained_total.clone()))
+            .expect("register result_materializer_drained_total");
+
+        let result_materializer_writes_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_result_materializer_writes_total",
+                "Over-budget result references written to object store by the shadow result materializer, by tier.",
+            ),
+            &["tier"],
+        )
+        .expect("result_materializer_writes_total metric");
+        registry
+            .register(Box::new(result_materializer_writes_total.clone()))
+            .expect("register result_materializer_writes_total");
+
+        let result_materializer_skipped_total = IntCounter::new(
+            "noetl_worker_result_materializer_skipped_total",
+            "Events the shadow result materializer skipped (inline/un-addressable/payload-missing).",
+        )
+        .expect("result_materializer_skipped_total metric");
+        registry
+            .register(Box::new(result_materializer_skipped_total.clone()))
+            .expect("register result_materializer_skipped_total");
+
+        let result_materializer_errors_total = IntCounter::new(
+            "noetl_worker_result_materializer_errors_total",
+            "Shadow result-materializer fetch/write failures (counted, never failing the event).",
+        )
+        .expect("result_materializer_errors_total metric");
+        registry
+            .register(Box::new(result_materializer_errors_total.clone()))
+            .expect("register result_materializer_errors_total");
+
+        let result_materializer_cycle_duration_seconds = Histogram::with_opts(HistogramOpts::new(
+            "noetl_worker_result_materializer_cycle_duration_seconds",
+            "Latency of one shadow result-materializer drain→classify→write→ack cycle.",
+        ))
+        .expect("result_materializer_cycle_duration_seconds metric");
+        registry
+            .register(Box::new(result_materializer_cycle_duration_seconds.clone()))
+            .expect("register result_materializer_cycle_duration_seconds");
+
         let state_builder_wal_events_total = IntCounter::new(
             "noetl_worker_state_builder_wal_events_total",
             "Events the off-server state builder consumed from the noetl_events WAL stream (RFC #115 Phase 4).",
@@ -618,6 +682,11 @@ impl WorkerMetrics {
             materializer_acked_total,
             materializer_project_errors_total,
             materializer_cycle_duration_seconds,
+            result_materializer_drained_total,
+            result_materializer_writes_total,
+            result_materializer_skipped_total,
+            result_materializer_errors_total,
+            result_materializer_cycle_duration_seconds,
             state_builder_wal_events_total,
             state_builder_event_scans_total,
             state_builder_builds_total,
@@ -866,6 +935,40 @@ pub fn record_materializer_cycle(
 /// observability surface.
 pub fn record_materializer_project_error() {
     WorkerMetrics::global().materializer_project_errors_total.inc();
+}
+
+/// Record one shadow result-materializer cycle (noetl/ai-meta#104 Phase B).
+#[allow(clippy::too_many_arguments)]
+pub fn record_result_materializer_cycle(
+    drained: u64,
+    _eligible: u64,
+    feather: u64,
+    json: u64,
+    skipped: u64,
+    errors: u64,
+    duration_seconds: f64,
+) {
+    let m = WorkerMetrics::global();
+    if drained > 0 {
+        m.result_materializer_drained_total.inc_by(drained);
+    }
+    if feather > 0 {
+        m.result_materializer_writes_total
+            .with_label_values(&["feather"])
+            .inc_by(feather);
+    }
+    if json > 0 {
+        m.result_materializer_writes_total
+            .with_label_values(&["json"])
+            .inc_by(json);
+    }
+    if skipped > 0 {
+        m.result_materializer_skipped_total.inc_by(skipped);
+    }
+    if errors > 0 {
+        m.result_materializer_errors_total.inc_by(errors);
+    }
+    m.result_materializer_cycle_duration_seconds.observe(duration_seconds);
 }
 
 /// Record `n` events consumed from the `noetl_events` WAL by the off-server

@@ -212,6 +212,17 @@ impl Worker {
             }
         };
 
+        // Start the SHADOW result materializer (noetl/ai-meta#104 Phase B) when
+        // enabled (system worker pool only).  A SEPARATE noetl_events consumer
+        // (noetl_result_materializer) writes the over-budget Feather/JSON result
+        // tier to object store at the derived §7 key — isolated from the event
+        // materialize path so object-store latency never back-pressures the audit
+        // fold.  Shadow / non-authoritative; nothing reads it until Phase C.
+        // Default off.
+        let result_materializer_handle =
+            crate::result_materializer::ResultMaterializerConfig::from_env(&self.config)
+                .map(|cfg| crate::result_materializer::spawn(cfg, self.client.clone()));
+
         // Off-server state-builder drain (noetl/ai-meta#115 Phase 4): drain the
         // noetl_events WAL into the shared pool-side chain index (system worker
         // pool).  Under NOETL_STATE_BUILDER_SHADOW it's observation-only (exercises
@@ -231,6 +242,9 @@ impl Worker {
         metrics_handle.abort();
         lag_handle.abort();
         if let Some(h) = materializer_handle {
+            h.abort();
+        }
+        if let Some(h) = result_materializer_handle {
             h.abort();
         }
         if let Some(h) = state_builder_handle {
