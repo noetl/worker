@@ -63,6 +63,28 @@ pub fn mint_authoritative() -> bool {
     truthy_env("NOETL_RESULT_MINT_AUTHORITATIVE")
 }
 
+/// True when `NOETL_SIDE_EFFECT_BARRIER` is set to a truthy value — the Phase E
+/// side-effect durability barrier ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)).
+///
+/// When on, before the worker (re-)dispatches a **side-effecting** tool (per the
+/// tool-registry classifier `noetl_tools::registry::kind_is_side_effecting`) it
+/// checks whether the cycle's derived result URN already resolves to a durable
+/// result (via [`resolve_by_urn`], the Phase C read path). If it does — i.e. the
+/// cycle already ran to a durable completion on a prior drive — the worker
+/// **skips re-execution and adopts the recorded result**, so the external side
+/// effect (an HTTP `POST`, a DB write, a payment) fires exactly once across a
+/// crash-resume / re-drive. Non-side-effecting cycles are never blocked
+/// (idempotent recompute is fine), and a cycle whose result is **not** durable
+/// re-executes normally.
+///
+/// Default off → byte-identical to today (the dispatch path is unchanged; the
+/// barrier check is never reached). The barrier is **adopt-only**: it never skips
+/// a cycle whose result is absent, so flag-on can only ever turn a duplicate
+/// side effect into a single one, never drop work.
+pub fn side_effect_barrier() -> bool {
+    truthy_env("NOETL_SIDE_EFFECT_BARRIER")
+}
+
 fn truthy_env(key: &str) -> bool {
     matches!(
         std::env::var(key)
@@ -277,6 +299,20 @@ mod tests {
         std::env::set_var("NOETL_RESULT_MINT_AUTHORITATIVE", "false");
         assert!(!mint_authoritative());
         std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
+    }
+
+    #[test]
+    fn side_effect_barrier_defaults_off() {
+        // Phase E flag: default off → dispatch unchanged; truthy values arm it.
+        std::env::remove_var("NOETL_SIDE_EFFECT_BARRIER");
+        assert!(!side_effect_barrier());
+        for v in ["1", "true", "yes", "on", "TRUE"] {
+            std::env::set_var("NOETL_SIDE_EFFECT_BARRIER", v);
+            assert!(side_effect_barrier(), "value {v:?} should be truthy");
+        }
+        std::env::set_var("NOETL_SIDE_EFFECT_BARRIER", "false");
+        assert!(!side_effect_barrier());
+        std::env::remove_var("NOETL_SIDE_EFFECT_BARRIER");
     }
 
     #[test]

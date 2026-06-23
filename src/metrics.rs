@@ -162,6 +162,17 @@ pub struct WorkerMetrics {
     /// and `legacy_fallback` proves the reversible fallback path is intact.
     pub result_mint_authoritative_total: IntCounterVec,
 
+    /// Side-effect durability barrier outcomes by `outcome` + `tool` label
+    /// (noetl/ai-meta#104 Phase E).
+    ///
+    /// `outcome=skipped` — a side-effecting cycle whose durable result URN
+    /// already existed; re-execution was skipped and the recorded result
+    /// adopted (the side effect fired exactly once across the re-drive).
+    /// `outcome=executed` — a side-effecting cycle with no durable result yet;
+    /// dispatched normally. Flag-off it never moves; flag-on `skipped` is the
+    /// positive proof the barrier prevented a duplicate side effect.
+    pub side_effect_barrier_total: IntCounterVec,
+
     // --- Off-server state builder (noetl/ai-meta#115 Phase 4) ----------------
     /// Events the off-server state builder consumed from the `noetl_events`
     /// **WAL** stream and indexed. Positive evidence the builder reads the WAL
@@ -642,6 +653,19 @@ impl WorkerMetrics {
             .register(Box::new(result_mint_authoritative_total.clone()))
             .expect("register result_mint_authoritative_total");
 
+        let side_effect_barrier_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_side_effect_barrier_total",
+                "Side-effect durability barrier outcomes by outcome \
+                 (skipped | executed) + tool kind (noetl/ai-meta#104 Phase E).",
+            ),
+            &["outcome", "tool"],
+        )
+        .expect("side_effect_barrier_total metric");
+        registry
+            .register(Box::new(side_effect_barrier_total.clone()))
+            .expect("register side_effect_barrier_total");
+
         let state_builder_wal_events_total = IntCounter::new(
             "noetl_worker_state_builder_wal_events_total",
             "Events the off-server state builder consumed from the noetl_events WAL stream (RFC #115 Phase 4).",
@@ -743,6 +767,7 @@ impl WorkerMetrics {
             result_materializer_cycle_duration_seconds,
             result_resolve_total,
             result_mint_authoritative_total,
+            side_effect_barrier_total,
             result_resolve_duration_seconds,
             state_builder_wal_events_total,
             state_builder_event_scans_total,
@@ -1045,6 +1070,17 @@ pub fn record_result_mint_authoritative(path: &str) {
     WorkerMetrics::global()
         .result_mint_authoritative_total
         .with_label_values(&[path])
+        .inc();
+}
+
+/// Record one side-effect durability barrier decision (noetl/ai-meta#104 Phase E).
+/// `outcome` is `skipped` (a side-effecting cycle whose durable result already
+/// existed → re-execution skipped, recorded result adopted) or `executed` (no
+/// durable result yet → dispatched normally). `tool` is the tool kind.
+pub fn record_side_effect_barrier(outcome: &str, tool: &str) {
+    WorkerMetrics::global()
+        .side_effect_barrier_total
+        .with_label_values(&[outcome, tool])
         .inc();
 }
 
