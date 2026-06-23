@@ -1839,9 +1839,14 @@ fn path_satisfiable(summary: &serde_json::Value, path: &[String]) -> bool {
             Value::Object(o) => match o.get(seg) {
                 // Absent in the summary ⇒ absent in the full payload (summarise
                 // keeps every object key) ⇒ resolving can't help ⇒ satisfiable.
-                // Exception: a budget-`_truncated` object may have *dropped* keys
-                // the full payload still has — resolve to be safe.
-                None => return !o.contains_key("_truncated"),
+                // Exceptions — the summary may have *dropped* keys the full
+                // payload still has, so resolve to be safe:
+                //   - a budget-`_truncated` object, and
+                //   - a bare `_ref` stub (an externalized result whose real
+                //     payload lives in object store, not in this stub; #104
+                //     Phase C — without this an over-budget upstream is never
+                //     resolved on a bulk bind).
+                None => return !o.contains_key("_truncated") && !is_reference_stub(o),
                 Some(v) => cur = v,
             },
             Value::Array(a) => {
@@ -1862,6 +1867,35 @@ fn path_satisfiable(summary: &serde_json::Value, path: &[String]) -> bool {
     }
     // Whole bound value: satisfiable only if it carries no collapsed bulk.
     !contains_summary_bulk(cur)
+}
+
+/// True when `o` is a bare externalized-result **reference stub** — an object
+/// carrying only the injected locator accessors (`_ref` / `_store` / `_uri`,
+/// plus a `data` that is itself just a locator), NOT a key-preserving
+/// `summarise_value`.
+///
+/// `path_satisfiable`'s "absent key ⇒ absent in full payload" shortcut assumes
+/// the summary keeps every object key (summarise collapses only *bulk*). A bare
+/// `_ref` stub breaks that assumption: the real payload lives in object store,
+/// so a key absent from the stub may well exist in the full result. Navigating
+/// into such a stub must therefore resolve (same reasoning as the `_truncated`
+/// carve-out) rather than read off the stub. A genuine summary (e.g.
+/// `{columns, rows:[…], _ref}`) has non-locator keys and is NOT a stub, so its
+/// behavior is unchanged.
+fn is_reference_stub(o: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_locator =
+        o.contains_key("_ref") || o.contains_key("_store") || o.contains_key("_uri");
+    if !has_locator {
+        return false;
+    }
+    o.iter().all(|(k, v)| match k.as_str() {
+        "_ref" | "_store" | "_uri" => true,
+        "data" => v.as_object().is_some_and(|d| {
+            d.keys()
+                .all(|k| matches!(k.as_str(), "_ref" | "_store" | "_uri"))
+        }),
+        _ => false,
+    })
 }
 
 /// True if `v` contains anything the summary collapsed (an array — which keeps
@@ -2158,6 +2192,35 @@ mod tests {
     fn missing_summary_resolves_conservatively() {
         let tpl = r#"{"x":"{{ start.anything }}"}"#;
         assert!(step_needs_bulk_resolution(tpl, "start", None));
+    }
+
+    #[test]
+    fn bare_ref_stub_summary_forces_resolution() {
+        // #104 Phase C regression: an over-budget upstream externalized as a
+        // BARE `_ref` stub (only locator accessors; real payload in object
+        // store) must resolve on a bulk bind — its absent keys live in the full
+        // payload, not the stub. The consume step bound `{{ start.rows[..] }}`
+        // off `{_ref, data:{_ref}}` and the detector wrongly kept the stub, so
+        // resolve-by-URN (and the legacy fallback) never fired.
+        let stub = serde_json::json!({
+            "_ref": "noetl://execution/1/result/start/9",
+            "data": { "_ref": "noetl://execution/1/result/start/9" },
+        });
+        let tpl = r#"{"n":"{{ start.rows | length }}","deep":"{{ start.rows[1100][0] }}"}"#;
+        assert!(step_needs_bulk_resolution(tpl, "start", Some(&stub)));
+
+        // The predicate itself: a bare stub is one; a key-preserving summary isn't.
+        assert!(is_reference_stub(stub.as_object().unwrap()));
+        let real_summary = serde_json::json!({
+            "status": "success",
+            "data": { "rows": [{ "id": 0 }] },
+            "_ref": "noetl://x/y/z/1",
+        });
+        assert!(!is_reference_stub(real_summary.as_object().unwrap()));
+
+        // Locator/predicate access on a stub stays satisfiable (no over-resolve).
+        let pred = r#"{"has":"{{ start._ref is defined }}","r":"{{ start._ref }}"}"#;
+        assert!(!step_needs_bulk_resolution(pred, "start", Some(&stub)));
     }
 
     // --- #104 R02b: stamp the logical URI on over-budget references ---
