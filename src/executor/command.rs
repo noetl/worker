@@ -1588,6 +1588,42 @@ fn reference_locators(result: &serde_json::Value) -> Option<(String, Option<Stri
     Some((legacy, canonical))
 }
 
+/// Normalize a resolved payload to the **flattened single-tool shape** so the
+/// legacy `resolve_ref` fallback binds identically to resolve-by-URN and inline
+/// (#104 Phase C, OQ6 — B1).
+///
+/// `resolve_ref` returns the authoritative tool-result ENVELOPE
+/// `{data:{<tool>:<result>}, status, exit_code, stderr, stdout, duration_ms}`.
+/// For a **single-tool** step, inline execution and the resolve-by-URN tier both
+/// expose the one tool's result at step level (so `{{ start.rows }}` resolves,
+/// not `{{ start.<tool>.rows }}`). Mirror that: when the payload is a tool
+/// envelope (`status` + `data`) whose `data` holds exactly one tool's object
+/// result, the user-data IS that result.
+///
+/// Left **unchanged** for: a payload that is already the flat user-data (no
+/// `status` key — e.g. resolve-by-URN's `{columns, rows}`, so this is
+/// idempotent), and **multi-tool** envelopes (`data` with >1 key — the
+/// tool-keyed shape is preserved).
+fn flatten_single_tool_result(data: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let Value::Object(ref o) = data else {
+        return data;
+    };
+    // Only a tool-result envelope is a flatten candidate; a bare user-data
+    // payload (resolve-by-URN) has no `status` and passes through untouched.
+    if !o.contains_key("status") {
+        return data;
+    }
+    if let Some(Value::Object(d)) = o.get("data") {
+        if d.len() == 1 {
+            if let Some(inner @ Value::Object(_)) = d.values().next() {
+                return inner.clone();
+            }
+        }
+    }
+    data
+}
+
 /// Splice resolved full `data` back into a step result where
 /// `extract_user_data` reads it, dropping the `reference` block — reconstructing
 /// the inline shape the orchestrator kept out of the durable state.
@@ -1687,6 +1723,14 @@ async fn resolve_context_references(
             };
         match fetched {
             Ok(Some(data)) => {
+                // OQ6 shape parity (#104 Phase C, B1): the authoritative
+                // `resolve_ref` returns the full tool-result ENVELOPE
+                // `{data:{<tool>:<result>}, status, …}`, but inline binding and
+                // resolve-by-URN expose a single-tool step's result flattened to
+                // step level (`{{ start.rows }}`, not `{{ start.<tool>.rows }}`).
+                // Without this, the flag-off / fail-safe-fallback legacy path
+                // binds a divergent shape and breaks parity with the GCS path.
+                let data = flatten_single_tool_result(data);
                 // Preserve the locator accessors so a template that binds bulk
                 // AND `{{ step._ref }}` keeps both after the splice.
                 let mut flat = flat_with_data(&data);
@@ -2221,6 +2265,45 @@ mod tests {
         // Locator/predicate access on a stub stays satisfiable (no over-resolve).
         let pred = r#"{"has":"{{ start._ref is defined }}","r":"{{ start._ref }}"}"#;
         assert!(!step_needs_bulk_resolution(pred, "start", Some(&stub)));
+    }
+
+    #[test]
+    fn flatten_single_tool_result_unifies_resolve_shapes() {
+        // OQ6 (#104 Phase C, B1): legacy resolve_ref (tool envelope) and
+        // resolve-by-URN (flat rowset) must normalize to the SAME shape so the
+        // fail-safe fallback + flag-off legacy bind identically to inline.
+        use serde_json::json;
+        let canonical = json!({ "columns": ["id"], "rows": [[0], [1]] });
+
+        // Legacy resolve_ref: full single-tool envelope → flattens to the rowset.
+        let legacy = json!({
+            "data": { "generate_rows": { "columns": ["id"], "rows": [[0], [1]] } },
+            "status": "success", "exit_code": 0, "stderr": "", "stdout": "", "duration_ms": 1
+        });
+        assert_eq!(flatten_single_tool_result(legacy), canonical);
+
+        // resolve-by-URN: already the flat rowset (no `status`) → idempotent.
+        assert_eq!(
+            flatten_single_tool_result(json!({ "columns": ["id"], "rows": [[0], [1]] })),
+            canonical
+        );
+
+        // After flat_with_data both expose `{{ start.rows }}` at step level.
+        let flat = flat_with_data(&flatten_single_tool_result(json!({
+            "data": { "generate_rows": { "columns": ["id"], "rows": [[0], [1]] } },
+            "status": "success"
+        })));
+        assert!(flat.get("rows").is_some(), "rows lifted so {{ start.rows }} resolves");
+
+        // Multi-tool envelope is left unchanged (tool-keyed shape preserved).
+        let multi = json!({
+            "data": { "tool_a": { "x": 1 }, "tool_b": { "y": 2 } }, "status": "success"
+        });
+        assert_eq!(flatten_single_tool_result(multi.clone()), multi);
+
+        // A bare user-data payload (no `status`) passes through untouched.
+        let bare = json!({ "anything": 1 });
+        assert_eq!(flatten_single_tool_result(bare.clone()), bare);
     }
 
     // --- #104 R02b: stamp the logical URI on over-budget references ---
