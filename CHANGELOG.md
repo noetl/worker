@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.42.0](https://github.com/noetl/worker/compare/v5.41.0...v5.42.0) (2026-06-23)
+
+### Features
+
+* **result:** resolve-by-URN read path + refs-in-state bulk-bind fixes ([#104](https://github.com/noetl/worker/issues/104) Phase C) ([379bf31](https://github.com/noetl/worker/commit/379bf317c697c6b41c205567c167d5dcf8dc29e9)), closes [noetl/server#262](https://github.com/noetl/server/issues/262)
+
 ## [5.41.0](https://github.com/noetl/worker/compare/v5.40.5...v5.41.0) (2026-06-22)
 
 ### Features
