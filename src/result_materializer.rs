@@ -130,12 +130,24 @@ pub struct ResultMaterializerConfig {
     pub idle_sleep: Duration,
     pub error_backoff: Duration,
     pub cell: CellSeed,
+    /// Phase D minting flip (noetl/ai-meta#104 Phase D): when the tier is the
+    /// **authoritative** result store (not just a shadow copy). True when
+    /// `NOETL_RESULT_MINT_AUTHORITATIVE` is set; affects logging/observability
+    /// only — the write path (fetch → tier → object_put) is identical, since the
+    /// dual-write to `result_store` continues until the OQ5 retirement decision.
+    pub authoritative: bool,
 }
 
 impl ResultMaterializerConfig {
-    /// Build from worker config + env. `Ok(None)` when disabled (default).
+    /// Build from worker config + env. `None` when disabled.
+    ///
+    /// Spawns when **either** `NOETL_RESULT_MATERIALIZER_ENABLED` (Phase B
+    /// shadow) **or** `NOETL_RESULT_MINT_AUTHORITATIVE` (Phase D: the tier is the
+    /// authoritative store, so the materializer is the authoritative writer) is
+    /// set. Default off → not spawned (true no-op).
     pub fn from_env(worker: &WorkerConfig) -> Option<Self> {
-        if !enabled() {
+        let authoritative = crate::result_resolver::mint_authoritative();
+        if !enabled() && !authoritative {
             return None;
         }
         let (nats_url, nats_user, nats_password) = parse_nats_credentials(&worker.nats_url);
@@ -159,6 +171,7 @@ impl ResultMaterializerConfig {
                 DEFAULT_ERROR_BACKOFF_MS,
             )),
             cell: CellSeed::from_env(),
+            authoritative,
         })
     }
 
@@ -193,12 +206,21 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
     let source = build_source(&config.source_config()?, &ExecutionContext::default())
         .map_err(|e| anyhow!("result materializer build_source failed: {e}"))?;
 
+    // Phase D (#104): when the tier is authoritative the materializer is the
+    // authoritative writer; otherwise it is the Phase B shadow copy. The write
+    // path is identical either way (dual-write to `result_store` continues).
+    let mode = if config.authoritative {
+        "AUTHORITATIVE Feather tier; #104 Phase D"
+    } else {
+        "SHADOW Feather tier; #104 Phase B"
+    };
     tracing::info!(
         stream = %config.stream,
         consumer = %config.consumer,
         batch = config.batch,
         cell = %config.cell.cell,
-        "result materializer started (SHADOW Feather tier; #104 Phase B)"
+        authoritative = config.authoritative,
+        "result materializer started ({mode})"
     );
 
     // Deferred ack: we ack the batch ourselves after best-effort shadow writes.
@@ -646,10 +668,39 @@ mod tests {
             metrics_bind: "0.0.0.0:9090".into(),
         };
         // Disabled → no config built (true no-op: nothing spawned).
+        std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
         assert!(ResultMaterializerConfig::from_env(&cfg).is_none());
         std::env::set_var("NOETL_RESULT_MATERIALIZER_ENABLED", "true");
         assert!(enabled());
-        assert!(ResultMaterializerConfig::from_env(&cfg).is_some());
+        let built = ResultMaterializerConfig::from_env(&cfg).expect("enabled → built");
+        // Phase B shadow: enabled but not authoritative.
+        assert!(!built.authoritative);
         std::env::remove_var("NOETL_RESULT_MATERIALIZER_ENABLED");
+    }
+
+    #[test]
+    fn mint_authoritative_alone_spawns_authoritative_writer() {
+        // Phase D (#104): NOETL_RESULT_MINT_AUTHORITATIVE alone (without
+        // NOETL_RESULT_MATERIALIZER_ENABLED) spawns the materializer AS the
+        // authoritative tier writer.
+        std::env::remove_var("NOETL_RESULT_MATERIALIZER_ENABLED");
+        std::env::set_var("NOETL_RESULT_MINT_AUTHORITATIVE", "true");
+        let cfg = WorkerConfig {
+            worker_id: "w".into(),
+            pool_name: "p".into(),
+            server_url: "http://x".into(),
+            nats_url: "nats://h:4222".into(),
+            nats_stream: "s".into(),
+            nats_consumer: "c".into(),
+            nats_subject: "noetl.commands".into(),
+            nats_filter_subject: "noetl.commands".into(),
+            heartbeat_interval: std::time::Duration::from_secs(5),
+            max_concurrent_tasks: 1,
+            metrics_bind: "0.0.0.0:9090".into(),
+        };
+        let built = ResultMaterializerConfig::from_env(&cfg)
+            .expect("mint-authoritative → materializer built");
+        assert!(built.authoritative, "Phase D writer must be authoritative");
+        std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
     }
 }

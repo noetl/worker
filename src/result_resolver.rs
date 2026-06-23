@@ -35,8 +35,37 @@ use crate::result_locator::coords_from_uri;
 
 /// True when `NOETL_RESULT_URI_RESOLVE` is set to a truthy value.
 pub fn enabled() -> bool {
+    truthy_env("NOETL_RESULT_URI_RESOLVE")
+}
+
+/// True when `NOETL_RESULT_MINT_AUTHORITATIVE` is set to a truthy value — the
+/// Phase D "minting flip" ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)).
+///
+/// The flip makes the URN → Feather/GCS result tier the **authoritative** result
+/// store, with `noetl.result_store` demoted to the transitional **dual-write
+/// fallback** for reversibility. One flag turns the whole flip on:
+///
+/// - **Write side** (system pool): the result materializer is the authoritative
+///   tier writer — `mint_authoritative()` enables it even if
+///   `NOETL_RESULT_MATERIALIZER_ENABLED` is unset
+///   ([`crate::result_materializer`]).
+/// - **Read side** (consume): resolve-by-URN is the **primary** path —
+///   `mint_authoritative()` enables it even if `NOETL_RESULT_URI_RESOLVE` is
+///   unset ([`resolve_context_references`](crate::executor::command)). A tier
+///   miss / parse failure still falls back fail-safe to the dual-written
+///   `result_store` (rollback safety), recorded on
+///   `noetl_worker_result_mint_authoritative_total{path}`.
+///
+/// Default off → byte-identical to Phase A–C (a true no-op). The dual-write to
+/// `result_store` continues until the OQ5-gated retirement decision (NOT Phase
+/// D), so flag-off rolls back cleanly to `result_store`-authoritative.
+pub fn mint_authoritative() -> bool {
+    truthy_env("NOETL_RESULT_MINT_AUTHORITATIVE")
+}
+
+fn truthy_env(key: &str) -> bool {
     matches!(
-        std::env::var("NOETL_RESULT_URI_RESOLVE")
+        std::env::var(key)
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
@@ -234,6 +263,20 @@ mod tests {
         std::env::set_var("NOETL_RESULT_URI_RESOLVE", "true");
         assert!(enabled());
         std::env::remove_var("NOETL_RESULT_URI_RESOLVE");
+    }
+
+    #[test]
+    fn mint_authoritative_defaults_off() {
+        // Phase D flag: default off → byte-identical to A–C; truthy values flip it.
+        std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
+        assert!(!mint_authoritative());
+        for v in ["1", "true", "yes", "on", "TRUE"] {
+            std::env::set_var("NOETL_RESULT_MINT_AUTHORITATIVE", v);
+            assert!(mint_authoritative(), "value {v:?} should be truthy");
+        }
+        std::env::set_var("NOETL_RESULT_MINT_AUTHORITATIVE", "false");
+        assert!(!mint_authoritative());
+        std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
     }
 
     #[test]

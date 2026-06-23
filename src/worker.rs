@@ -212,13 +212,15 @@ impl Worker {
             }
         };
 
-        // Start the SHADOW result materializer (noetl/ai-meta#104 Phase B) when
+        // Start the result materializer (noetl/ai-meta#104 Phase B/D) when
         // enabled (system worker pool only).  A SEPARATE noetl_events consumer
         // (noetl_result_materializer) writes the over-budget Feather/JSON result
         // tier to object store at the derived §7 key — isolated from the event
         // materialize path so object-store latency never back-pressures the audit
-        // fold.  Shadow / non-authoritative; nothing reads it until Phase C.
-        // Default off.
+        // fold.  Under NOETL_RESULT_MATERIALIZER_ENABLED it is the Phase B shadow
+        // copy; under NOETL_RESULT_MINT_AUTHORITATIVE (Phase D) it is the
+        // authoritative tier writer (the consume path resolves from it, with the
+        // dual-written result_store as the reversible fallback).  Default off.
         let result_materializer_handle =
             crate::result_materializer::ResultMaterializerConfig::from_env(&self.config)
                 .map(|cfg| crate::result_materializer::spawn(cfg, self.client.clone()));
