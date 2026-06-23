@@ -1571,13 +1571,57 @@ fn stamp_logical_uri(
     reference.insert("uri".to_string(), serde_json::Value::String(uri));
 }
 
-/// Locate a result-reference URI on a step result (nested or top-level envelope).
-fn reference_uri(result: &serde_json::Value) -> Option<String> {
-    result
-        .pointer("/context/result/reference/ref")
+/// Locate a result-reference on a step result (nested or top-level envelope) and
+/// return `(legacy_ref, canonical_uri?)`: the legacy `reference.ref` (always —
+/// the authoritative fetch key) plus the canonical logical `reference.uri` when
+/// present (the resolve-by-URN key, #104 Phase C). `None` if there is no
+/// reference at all.
+fn reference_locators(result: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let reference = result
+        .pointer("/context/result/reference")
+        .or_else(|| result.pointer("/reference"))?;
+    let legacy = reference.get("ref").and_then(|v| v.as_str())?.to_string();
+    let canonical = reference
+        .get("uri")
         .and_then(|v| v.as_str())
-        .or_else(|| result.pointer("/reference/ref").and_then(|v| v.as_str()))
-        .map(str::to_string)
+        .map(str::to_string);
+    Some((legacy, canonical))
+}
+
+/// Normalize a resolved payload to the **flattened single-tool shape** so the
+/// legacy `resolve_ref` fallback binds identically to resolve-by-URN and inline
+/// (#104 Phase C, OQ6 — B1).
+///
+/// `resolve_ref` returns the authoritative tool-result ENVELOPE
+/// `{data:{<tool>:<result>}, status, exit_code, stderr, stdout, duration_ms}`.
+/// For a **single-tool** step, inline execution and the resolve-by-URN tier both
+/// expose the one tool's result at step level (so `{{ start.rows }}` resolves,
+/// not `{{ start.<tool>.rows }}`). Mirror that: when the payload is a tool
+/// envelope (`status` + `data`) whose `data` holds exactly one tool's object
+/// result, the user-data IS that result.
+///
+/// Left **unchanged** for: a payload that is already the flat user-data (no
+/// `status` key — e.g. resolve-by-URN's `{columns, rows}`, so this is
+/// idempotent), and **multi-tool** envelopes (`data` with >1 key — the
+/// tool-keyed shape is preserved).
+fn flatten_single_tool_result(data: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let Value::Object(ref o) = data else {
+        return data;
+    };
+    // Only a tool-result envelope is a flatten candidate; a bare user-data
+    // payload (resolve-by-URN) has no `status` and passes through untouched.
+    if !o.contains_key("status") {
+        return data;
+    }
+    if let Some(Value::Object(d)) = o.get("data") {
+        if d.len() == 1 {
+            if let Some(inner @ Value::Object(_)) = d.values().next() {
+                return inner.clone();
+            }
+        }
+    }
+    data
 }
 
 /// Splice resolved full `data` back into a step result where
@@ -1636,17 +1680,23 @@ async fn resolve_context_references(
     client: &ControlPlaneClient,
 ) {
     // `steps` carries the full step results (build_context inserts result.clone()).
-    let candidates: Vec<(String, String)> = match variables.get("steps") {
+    // Each candidate is (step_name, legacy_ref, canonical_uri?).
+    let candidates: Vec<(String, String, Option<String>)> = match variables.get("steps") {
         Some(serde_json::Value::Object(steps)) => steps
             .iter()
-            .filter_map(|(name, result)| reference_uri(result).map(|uri| (name.clone(), uri)))
+            .filter_map(|(name, result)| {
+                reference_locators(result).map(|(legacy, canonical)| (name.clone(), legacy, canonical))
+            })
             .collect(),
         _ => return,
     };
     if candidates.is_empty() {
         return;
     }
-    for (name, uri) in candidates {
+    // Resolve-by-URN read path (#104 Phase C) — only when the flag is on. Off →
+    // this is the byte-identical legacy `resolve_ref` path.
+    let resolve_by_urn = crate::result_resolver::enabled();
+    for (name, uri, canonical) in candidates {
         // The flat `<name>` binding is the bounded summary (+ `_ref`/`_store`).
         // Decide off it whether this command's template needs the bulk.
         let summary = variables.get(&name);
@@ -1654,8 +1704,33 @@ async fn resolve_context_references(
             tracing::debug!(step = %name, uri, "ref kept as summary (no bulk binding in template)");
             continue;
         }
-        match client.resolve_ref(&uri).await {
+        // Flag-on + a canonical URI present: try resolving the Feather/JSON tier
+        // from object store by URN. On any miss/error it returns None and we fall
+        // back fail-safe to the authoritative `resolve_ref` below — never a hard
+        // failure, never silent loss (OQ6).
+        let fetched: anyhow::Result<Option<serde_json::Value>> =
+            match (resolve_by_urn, canonical.as_deref()) {
+                (true, Some(canon)) => {
+                    match crate::result_resolver::resolve_by_urn(client, canon).await {
+                        Some(data) => {
+                            tracing::debug!(step = %name, uri = canon, "resolved over-budget result by URN (#104 Phase C)");
+                            Ok(Some(data))
+                        }
+                        None => client.resolve_ref(&uri).await,
+                    }
+                }
+                _ => client.resolve_ref(&uri).await,
+            };
+        match fetched {
             Ok(Some(data)) => {
+                // OQ6 shape parity (#104 Phase C, B1): the authoritative
+                // `resolve_ref` returns the full tool-result ENVELOPE
+                // `{data:{<tool>:<result>}, status, …}`, but inline binding and
+                // resolve-by-URN expose a single-tool step's result flattened to
+                // step level (`{{ start.rows }}`, not `{{ start.<tool>.rows }}`).
+                // Without this, the flag-off / fail-safe-fallback legacy path
+                // binds a divergent shape and breaks parity with the GCS path.
+                let data = flatten_single_tool_result(data);
                 // Preserve the locator accessors so a template that binds bulk
                 // AND `{{ step._ref }}` keeps both after the splice.
                 let mut flat = flat_with_data(&data);
@@ -1808,9 +1883,14 @@ fn path_satisfiable(summary: &serde_json::Value, path: &[String]) -> bool {
             Value::Object(o) => match o.get(seg) {
                 // Absent in the summary ⇒ absent in the full payload (summarise
                 // keeps every object key) ⇒ resolving can't help ⇒ satisfiable.
-                // Exception: a budget-`_truncated` object may have *dropped* keys
-                // the full payload still has — resolve to be safe.
-                None => return !o.contains_key("_truncated"),
+                // Exceptions — the summary may have *dropped* keys the full
+                // payload still has, so resolve to be safe:
+                //   - a budget-`_truncated` object, and
+                //   - a bare `_ref` stub (an externalized result whose real
+                //     payload lives in object store, not in this stub; #104
+                //     Phase C — without this an over-budget upstream is never
+                //     resolved on a bulk bind).
+                None => return !o.contains_key("_truncated") && !is_reference_stub(o),
                 Some(v) => cur = v,
             },
             Value::Array(a) => {
@@ -1831,6 +1911,35 @@ fn path_satisfiable(summary: &serde_json::Value, path: &[String]) -> bool {
     }
     // Whole bound value: satisfiable only if it carries no collapsed bulk.
     !contains_summary_bulk(cur)
+}
+
+/// True when `o` is a bare externalized-result **reference stub** — an object
+/// carrying only the injected locator accessors (`_ref` / `_store` / `_uri`,
+/// plus a `data` that is itself just a locator), NOT a key-preserving
+/// `summarise_value`.
+///
+/// `path_satisfiable`'s "absent key ⇒ absent in full payload" shortcut assumes
+/// the summary keeps every object key (summarise collapses only *bulk*). A bare
+/// `_ref` stub breaks that assumption: the real payload lives in object store,
+/// so a key absent from the stub may well exist in the full result. Navigating
+/// into such a stub must therefore resolve (same reasoning as the `_truncated`
+/// carve-out) rather than read off the stub. A genuine summary (e.g.
+/// `{columns, rows:[…], _ref}`) has non-locator keys and is NOT a stub, so its
+/// behavior is unchanged.
+fn is_reference_stub(o: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_locator =
+        o.contains_key("_ref") || o.contains_key("_store") || o.contains_key("_uri");
+    if !has_locator {
+        return false;
+    }
+    o.iter().all(|(k, v)| match k.as_str() {
+        "_ref" | "_store" | "_uri" => true,
+        "data" => v.as_object().is_some_and(|d| {
+            d.keys()
+                .all(|k| matches!(k.as_str(), "_ref" | "_store" | "_uri"))
+        }),
+        _ => false,
+    })
 }
 
 /// True if `v` contains anything the summary collapsed (an array — which keeps
@@ -1943,6 +2052,32 @@ mod tests {
     use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
 
     #[test]
+    fn reference_locators_extracts_legacy_and_canonical() {
+        // Over-budget reference carrying BOTH the legacy ref and the canonical
+        // logical URI (the R02b stamp) → both surface for the Phase C read path.
+        let result = serde_json::json!({
+            "reference": {
+                "kind": "result_ref",
+                "ref": "noetl://execution/1/result/drain/9",
+                "uri": "noetl://default/default/results/1/drain/0/0/1"
+            }
+        });
+        let (legacy, canonical) = reference_locators(&result).unwrap();
+        assert_eq!(legacy, "noetl://execution/1/result/drain/9");
+        assert_eq!(
+            canonical.as_deref(),
+            Some("noetl://default/default/results/1/drain/0/0/1")
+        );
+        // Legacy-only reference (no canonical uri) → canonical is None (falls back).
+        let legacy_only = serde_json::json!({
+            "reference": { "kind": "result_ref", "ref": "noetl://execution/2/result/s/3" }
+        });
+        let (l, c) = reference_locators(&legacy_only).unwrap();
+        assert_eq!(l, "noetl://execution/2/result/s/3");
+        assert!(c.is_none());
+    }
+
+    #[test]
     fn context_reference_splice_reconstructs_inline() {
         // A nested step result holding `{reference}` + `extracted` (the
         // references-in-state shape) splices the resolved data where
@@ -1955,13 +2090,13 @@ mod tests {
             }}
         });
         assert_eq!(
-            reference_uri(&result).as_deref(),
+            reference_locators(&result).map(|(legacy, _)| legacy).as_deref(),
             Some("noetl://execution/1/result/drain/9")
         );
         let full = serde_json::json!({ "messages": [{"id": 1}, {"id": 2}], "count": 2 });
         splice_resolved(&mut result, full.clone());
         // The reference is gone; the full data sits where the orchestrator reads it.
-        assert!(reference_uri(&result).is_none());
+        assert!(reference_locators(&result).is_none());
         assert_eq!(
             result.pointer("/context/result/context/data"),
             Some(&full)
@@ -2101,6 +2236,74 @@ mod tests {
     fn missing_summary_resolves_conservatively() {
         let tpl = r#"{"x":"{{ start.anything }}"}"#;
         assert!(step_needs_bulk_resolution(tpl, "start", None));
+    }
+
+    #[test]
+    fn bare_ref_stub_summary_forces_resolution() {
+        // #104 Phase C regression: an over-budget upstream externalized as a
+        // BARE `_ref` stub (only locator accessors; real payload in object
+        // store) must resolve on a bulk bind — its absent keys live in the full
+        // payload, not the stub. The consume step bound `{{ start.rows[..] }}`
+        // off `{_ref, data:{_ref}}` and the detector wrongly kept the stub, so
+        // resolve-by-URN (and the legacy fallback) never fired.
+        let stub = serde_json::json!({
+            "_ref": "noetl://execution/1/result/start/9",
+            "data": { "_ref": "noetl://execution/1/result/start/9" },
+        });
+        let tpl = r#"{"n":"{{ start.rows | length }}","deep":"{{ start.rows[1100][0] }}"}"#;
+        assert!(step_needs_bulk_resolution(tpl, "start", Some(&stub)));
+
+        // The predicate itself: a bare stub is one; a key-preserving summary isn't.
+        assert!(is_reference_stub(stub.as_object().unwrap()));
+        let real_summary = serde_json::json!({
+            "status": "success",
+            "data": { "rows": [{ "id": 0 }] },
+            "_ref": "noetl://x/y/z/1",
+        });
+        assert!(!is_reference_stub(real_summary.as_object().unwrap()));
+
+        // Locator/predicate access on a stub stays satisfiable (no over-resolve).
+        let pred = r#"{"has":"{{ start._ref is defined }}","r":"{{ start._ref }}"}"#;
+        assert!(!step_needs_bulk_resolution(pred, "start", Some(&stub)));
+    }
+
+    #[test]
+    fn flatten_single_tool_result_unifies_resolve_shapes() {
+        // OQ6 (#104 Phase C, B1): legacy resolve_ref (tool envelope) and
+        // resolve-by-URN (flat rowset) must normalize to the SAME shape so the
+        // fail-safe fallback + flag-off legacy bind identically to inline.
+        use serde_json::json;
+        let canonical = json!({ "columns": ["id"], "rows": [[0], [1]] });
+
+        // Legacy resolve_ref: full single-tool envelope → flattens to the rowset.
+        let legacy = json!({
+            "data": { "generate_rows": { "columns": ["id"], "rows": [[0], [1]] } },
+            "status": "success", "exit_code": 0, "stderr": "", "stdout": "", "duration_ms": 1
+        });
+        assert_eq!(flatten_single_tool_result(legacy), canonical);
+
+        // resolve-by-URN: already the flat rowset (no `status`) → idempotent.
+        assert_eq!(
+            flatten_single_tool_result(json!({ "columns": ["id"], "rows": [[0], [1]] })),
+            canonical
+        );
+
+        // After flat_with_data both expose `{{ start.rows }}` at step level.
+        let flat = flat_with_data(&flatten_single_tool_result(json!({
+            "data": { "generate_rows": { "columns": ["id"], "rows": [[0], [1]] } },
+            "status": "success"
+        })));
+        assert!(flat.get("rows").is_some(), "rows lifted so {{ start.rows }} resolves");
+
+        // Multi-tool envelope is left unchanged (tool-keyed shape preserved).
+        let multi = json!({
+            "data": { "tool_a": { "x": 1 }, "tool_b": { "y": 2 } }, "status": "success"
+        });
+        assert_eq!(flatten_single_tool_result(multi.clone()), multi);
+
+        // A bare user-data payload (no `status`) passes through untouched.
+        let bare = json!({ "anything": 1 });
+        assert_eq!(flatten_single_tool_result(bare.clone()), bare);
     }
 
     // --- #104 R02b: stamp the logical URI on over-budget references ---

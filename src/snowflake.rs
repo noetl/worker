@@ -50,6 +50,35 @@ fn default_epoch_ms() -> u64 {
         .unwrap_or(1_704_067_200_000)
 }
 
+/// The configured snowflake epoch (ms): `NOETL_SNOWFLAKE_EPOCH_MS` or the
+/// 2024-01-01 default. Mirrors [`SnowflakeGen::from_env_or_hint`] so a decoded
+/// timestamp uses the same origin the id was minted with.
+fn epoch_ms() -> u64 {
+    std::env::var("NOETL_SNOWFLAKE_EPOCH_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(default_epoch_ms)
+}
+
+/// The wall-clock ms a snowflake `id` encodes (epoch + the 41-bit timestamp
+/// field). The inverse of the `next_id` packing.
+pub fn timestamp_ms(id: i64) -> i64 {
+    let elapsed = ((id as u64) >> TIMESTAMP_SHIFT) & TIMESTAMP_MASK;
+    (epoch_ms() + elapsed) as i64
+}
+
+/// The `YYYY-MM-DD` UTC date partition a snowflake `id` falls in — the RFC #104
+/// §7 `date=` key segment, **derived from the id alone**. Both the result
+/// materializer (write) and the resolve-by-URN read path call this, so a key is
+/// reconstructable from the logical URI's `execution_id` without carrying the
+/// date. Replay-deterministic (a pure function of the id, never wall-clock).
+pub fn date_partition(id: i64) -> String {
+    Utc.timestamp_millis_opt(timestamp_ms(id))
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "0000-00-00".to_string())
+}
+
 /// Mutable state guarded by the generator's `Mutex`.
 #[derive(Debug)]
 struct State {

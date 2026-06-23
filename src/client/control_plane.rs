@@ -486,6 +486,53 @@ impl ControlPlaneClient {
         Ok(Some(value))
     }
 
+    /// Read an object back from the server-mediated object store
+    /// (`GET /api/internal/objects/{key}`) — the read half of the Phase B
+    /// `object_put`, used by the resolve-by-URN read path (#104 Phase C). Returns
+    /// `(bytes, content_type)` or `None` on 404 (so the resolver falls back
+    /// fail-safe). The slash/`=`-bearing §7 key rides as the catch-all path,
+    /// mirroring `object_put`.
+    pub async fn object_get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let response = self
+            .client
+            .get(format!("{}/api/internal/objects/{}", self.server_url, key))
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("object_get {key} failed: HTTP {} {}", status.as_u16(), body);
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = response.bytes().await?.to_vec();
+        Ok(Some((bytes, content_type)))
+    }
+
+    /// Fetch the server-served cell endpoint registry
+    /// (`GET /api/internal/cells`, #104 Phase C). Returns the raw JSON; the
+    /// resolve-by-URN path deserializes it into its own registry shape.
+    pub async fn cell_registry(&self) -> Result<serde_json::Value> {
+        let response = self
+            .client
+            .get(format!("{}/api/internal/cells", self.server_url))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("cell_registry fetch failed: HTTP {} {}", status.as_u16(), body);
+        }
+        Ok(response.json().await?)
+    }
+
     /// Resolve a keychain credential alias to its full record.
     ///
     /// Calls `GET /api/credentials/{alias}?include_data=true` on the
