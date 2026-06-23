@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.44.0](https://github.com/noetl/worker/compare/v5.43.0...v5.44.0) (2026-06-23)
+
+### Features
+
+* **barrier:** side-effect durability barrier, flag-gated ([#104](https://github.com/noetl/worker/issues/104) Phase E) ([#130](https://github.com/noetl/worker/issues/130)) ([c3ba8c7](https://github.com/noetl/worker/commit/c3ba8c78f416ee77f43c854161d389b2e54aee64)), closes [#125](https://github.com/noetl/worker/issues/125)
+
 ## [5.43.0](https://github.com/noetl/worker/compare/v5.42.0...v5.43.0) (2026-06-23)
 
 ### Features
