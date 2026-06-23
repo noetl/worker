@@ -136,6 +136,12 @@ pub struct ResultMaterializerConfig {
     /// only — the write path (fetch → tier → object_put) is identical, since the
     /// dual-write to `result_store` continues until the OQ5 retirement decision.
     pub authoritative: bool,
+    /// Phase F DR re-derive (noetl/ai-meta#104 Phase F): when set
+    /// (`NOETL_RESULT_TIER_DR`) the loop runs in **verify-and-repair** mode — for
+    /// each over-budget result it derives the object and rewrites it only when the
+    /// durable object is missing or byte-divergent (corrupt). A WAL event
+    /// re-delivery is then a targeted DR repair. Default off → normal write path.
+    pub dr_repair: bool,
 }
 
 impl ResultMaterializerConfig {
@@ -147,7 +153,11 @@ impl ResultMaterializerConfig {
     /// set. Default off → not spawned (true no-op).
     pub fn from_env(worker: &WorkerConfig) -> Option<Self> {
         let authoritative = crate::result_resolver::mint_authoritative();
-        if !enabled() && !authoritative {
+        let dr_repair = crate::result_resolver::result_tier_dr();
+        // Phase F: the DR re-derive runs on the same consume-loop, so the
+        // materializer must spawn when DR is requested even if the Phase B/D
+        // write flags are off (DR-only mode: verify-and-repair the existing tier).
+        if !enabled() && !authoritative && !dr_repair {
             return None;
         }
         let (nats_url, nats_user, nats_password) = parse_nats_credentials(&worker.nats_url);
@@ -172,6 +182,7 @@ impl ResultMaterializerConfig {
             )),
             cell: CellSeed::from_env(),
             authoritative,
+            dr_repair,
         })
     }
 
@@ -209,7 +220,9 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
     // Phase D (#104): when the tier is authoritative the materializer is the
     // authoritative writer; otherwise it is the Phase B shadow copy. The write
     // path is identical either way (dual-write to `result_store` continues).
-    let mode = if config.authoritative {
+    let mode = if config.dr_repair {
+        "DR verify-and-repair; #104 Phase F"
+    } else if config.authoritative {
         "AUTHORITATIVE Feather tier; #104 Phase D"
     } else {
         "SHADOW Feather tier; #104 Phase B"
@@ -220,6 +233,7 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
         batch = config.batch,
         cell = %config.cell.cell,
         authoritative = config.authoritative,
+        dr_repair = config.dr_repair,
         "result materializer started ({mode})"
     );
 
@@ -257,7 +271,14 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
             match classify_event(&row) {
                 Classification::Skip => tally.skipped += 1,
                 Classification::Eligible { legacy_ref, coords } => {
-                    write_shadow(&client, &config.cell, &legacy_ref, &coords, &mut tally).await;
+                    if config.dr_repair {
+                        // Phase F: verify-and-repair instead of an unconditional
+                        // write — rebuild only a missing/corrupt tier object.
+                        rederive_one(&client, &config.cell, &legacy_ref, &coords, &mut tally)
+                            .await;
+                    } else {
+                        write_shadow(&client, &config.cell, &legacy_ref, &coords, &mut tally).await;
+                    }
                 }
             }
         }
@@ -351,6 +372,122 @@ async fn write_shadow(
             tracing::warn!(execution_id = eid, object_key = %key, error = %e, "result materializer object_put failed (shadow)");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase F — DR re-derive (verify-and-repair)
+// ---------------------------------------------------------------------------
+
+/// The outcome of one DR verify-and-repair pass over an over-budget result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrOutcome {
+    /// The durable object existed and matched the re-derivation byte-for-byte.
+    Present,
+    /// The durable object was missing or byte-divergent (corrupt) and was
+    /// reconstructed from its source.
+    Rederived,
+    /// The authoritative payload source was absent — nothing to re-derive from.
+    SourceGone,
+    /// A fetch/encode/write failure.
+    Error,
+}
+
+impl DrOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            DrOutcome::Present => "present",
+            DrOutcome::Rederived => "rederived",
+            DrOutcome::SourceGone => "source_gone",
+            DrOutcome::Error => "error",
+        }
+    }
+}
+
+/// Pure verdict: given the durably-stored object bytes (`None` = missing) and the
+/// freshly re-derived bytes, is the durable object **healthy** (present and
+/// byte-identical)? Anything else (missing, or present-but-divergent/corrupt)
+/// needs a repair. Isolated so the "byte-identical means no rewrite, divergent
+/// means rewrite" decision is unit-testable without any I/O.
+fn dr_is_healthy(durable: Option<&[u8]>, fresh: &[u8]) -> bool {
+    matches!(durable, Some(b) if b == fresh)
+}
+
+/// DR core (noetl/ai-meta#104 Phase F): re-derive a single over-budget result's
+/// tier object from its authoritative source and repair it if the durable object
+/// is missing or corrupt.
+///
+/// The tier is **derivable** — the object bytes are the deterministic encode of
+/// the payload (`decide_tier`, byte-stable for a fixed input) and the key is
+/// computed from the logical URI — so the repair writes back exactly the bytes a
+/// fresh materialization would. It never alters the authoritative `result_store`
+/// source; it only ever (re)writes the derived object.
+async fn rederive_one(
+    client: &ControlPlaneClient,
+    cell: &CellSeed,
+    legacy_ref: &str,
+    coords: &ResultCoordinates,
+    tally: &mut CycleTally,
+) {
+    tally.eligible += 1;
+    let eid = coords.execution_id;
+
+    // 1. The byte source: the authoritative payload (read-only).
+    let payload = match client.resolve_ref(legacy_ref).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            // No source → cannot re-derive. Distinct from a benign shadow skip:
+            // under DR this means the object is unrecoverable from its source.
+            tracing::debug!(execution_id = eid, result_ref = legacy_ref, "DR: result source not found; cannot re-derive");
+            tally.eligible -= 1;
+            crate::metrics::record_result_tier_dr(DrOutcome::SourceGone.label());
+            return;
+        }
+        Err(e) => {
+            tally.errors += 1;
+            tracing::warn!(execution_id = eid, result_ref = legacy_ref, error = %e, "DR: result source fetch failed");
+            crate::metrics::record_result_tier_dr(DrOutcome::Error.label());
+            return;
+        }
+    };
+
+    // 2. Deterministically re-derive the object bytes + the §7 key.
+    let tier = decide_tier(&payload);
+    let date = crate::snowflake::date_partition(coords.execution_id);
+    let key = coords.physical_key(&cell.placement_for(coords), &date, tier.ext());
+
+    // 3. Verify the durable object against the re-derivation.
+    let durable = match client.object_get(&key).await {
+        Ok(opt) => opt,
+        Err(e) => {
+            tally.errors += 1;
+            tracing::warn!(execution_id = eid, object_key = %key, error = %e, "DR: durable object check failed");
+            crate::metrics::record_result_tier_dr(DrOutcome::Error.label());
+            return;
+        }
+    };
+
+    let outcome = if dr_is_healthy(durable.as_ref().map(|(b, _)| b.as_slice()), &tier.bytes) {
+        tracing::debug!(execution_id = eid, object_key = %key, "DR: durable object healthy; no repair");
+        DrOutcome::Present
+    } else {
+        // 4. Repair: rewrite the deterministic re-derivation.
+        match client.object_put(&key, tier.bytes, tier.media).await {
+            Ok(()) => {
+                match tier.kind {
+                    TierKind::Feather => tally.feather += 1,
+                    TierKind::Json => tally.json += 1,
+                }
+                tracing::info!(execution_id = eid, object_key = %key, tier = tier.kind.label(), "DR: re-derived missing/corrupt result object (#104 Phase F)");
+                DrOutcome::Rederived
+            }
+            Err(e) => {
+                tally.errors += 1;
+                tracing::warn!(execution_id = eid, object_key = %key, error = %e, "DR: re-derive object_put failed");
+                DrOutcome::Error
+            }
+        }
+    };
+    crate::metrics::record_result_tier_dr(outcome.label());
 }
 
 // ---------------------------------------------------------------------------
@@ -669,13 +806,60 @@ mod tests {
         };
         // Disabled → no config built (true no-op: nothing spawned).
         std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
+        std::env::remove_var("NOETL_RESULT_TIER_DR");
         assert!(ResultMaterializerConfig::from_env(&cfg).is_none());
         std::env::set_var("NOETL_RESULT_MATERIALIZER_ENABLED", "true");
         assert!(enabled());
         let built = ResultMaterializerConfig::from_env(&cfg).expect("enabled → built");
-        // Phase B shadow: enabled but not authoritative.
+        // Phase B shadow: enabled but not authoritative, not DR.
         assert!(!built.authoritative);
+        assert!(!built.dr_repair);
         std::env::remove_var("NOETL_RESULT_MATERIALIZER_ENABLED");
+
+        // Phase F: NOETL_RESULT_TIER_DR alone (no write flags) spawns the
+        // materializer in verify-and-repair mode.
+        std::env::set_var("NOETL_RESULT_TIER_DR", "true");
+        let dr = ResultMaterializerConfig::from_env(&cfg).expect("DR → materializer built");
+        assert!(dr.dr_repair, "DR flag must set verify-and-repair mode");
+        assert!(!dr.authoritative);
+        std::env::remove_var("NOETL_RESULT_TIER_DR");
+        // All flags off again → not spawned (true no-op).
+        assert!(ResultMaterializerConfig::from_env(&cfg).is_none());
+    }
+
+    // --- Phase F: DR re-derive ------------------------------------------------
+
+    #[test]
+    fn tier_encode_is_deterministic_byte_identical() {
+        // The DR byte-identical guarantee rests on a deterministic encode: the
+        // same payload encodes to the same bytes every time, so a repair writes
+        // back exactly what a fresh materialization would. Tabular (Feather) and
+        // non-tabular (JSON) both.
+        let tabular = serde_json::json!({ "columns": ["id"], "rows": [[1], [2], [3]] });
+        assert_eq!(
+            decide_tier(&tabular).bytes,
+            decide_tier(&tabular).bytes,
+            "Feather encode must be byte-identical across runs"
+        );
+        let blob = serde_json::json!({ "stdout": "hello", "nested": { "a": [1, 2, 3] } });
+        assert_eq!(
+            decide_tier(&blob).bytes,
+            decide_tier(&blob).bytes,
+            "JSON encode must be byte-identical across runs"
+        );
+    }
+
+    #[test]
+    fn dr_healthy_only_when_present_and_byte_identical() {
+        let fresh = b"\x01\x02\x03feather-bytes".as_slice();
+        // Present + identical → healthy (no repair).
+        assert!(dr_is_healthy(Some(fresh), fresh));
+        // Missing → not healthy (repair).
+        assert!(!dr_is_healthy(None, fresh));
+        // Present but divergent (corrupt) → not healthy (repair).
+        assert!(!dr_is_healthy(Some(b"corrupt".as_slice()), fresh));
+        // Present but truncated → not healthy (repair).
+        assert!(!dr_is_healthy(Some(b"\x01\x02\x03".as_slice()), fresh));
     }
 
     #[test]
