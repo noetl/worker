@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.45.0](https://github.com/noetl/worker/compare/v5.44.0...v5.45.0) (2026-06-23)
+
+### Features
+
+* **result:** DR re-derive verify-and-repair, byte-identical ([#104](https://github.com/noetl/worker/issues/104) Phase F) ([#131](https://github.com/noetl/worker/issues/131)) ([99cde36](https://github.com/noetl/worker/commit/99cde3632597164234199c609ef0eeb19023ac10))
+
 ## [5.44.0](https://github.com/noetl/worker/compare/v5.43.0...v5.44.0) (2026-06-23)
 
 ### Features
