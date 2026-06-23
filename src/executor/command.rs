@@ -514,23 +514,80 @@ impl CommandExecutor {
             "Executing tool"
         );
 
+        // noetl/ai-meta#104 Phase E — side-effect durability barrier.
+        //
+        // Before (re-)dispatching a SIDE-EFFECTING tool, check whether this
+        // cycle's derived result URN already resolves to a durable result — i.e.
+        // a prior drive already ran the cycle to completion. If it does, SKIP
+        // re-execution and adopt the recorded result, so the external side
+        // effect (an HTTP POST, a DB write, a payment, an email) fires exactly
+        // once across a crash-resume / re-drive. Non-side-effecting cycles are
+        // never blocked (idempotent recompute is fine); a side-effecting cycle
+        // whose result is NOT durable re-executes normally.
+        //
+        // Adopt-only safety: `resolve_by_urn` returns `Some` only on a durable
+        // tier hit, so the barrier can only ever turn a duplicate side effect
+        // into a single one — never skip a cycle whose result is absent.
+        //
+        // Flag-gated (`NOETL_SIDE_EFFECT_BARRIER`); default-off → the whole block
+        // is skipped (the cheap flag read short-circuits) and dispatch is
+        // byte-identical to today.
+        let barrier_adopted: Option<noetl_tools::result::ToolResult> =
+            if side_effect_barrier_should_check(
+                crate::result_resolver::side_effect_barrier(),
+                &tool_config,
+            ) {
+                let uri =
+                    cycle_logical_uri(command.execution_id, &command.step, &command.render_context);
+                match crate::result_resolver::resolve_by_urn(&dispatch_client, &uri).await {
+                    Some(payload) => {
+                        crate::metrics::record_side_effect_barrier("skipped", &command.tool_kind);
+                        tracing::info!(
+                            execution_id = command.execution_id,
+                            step = %command.step,
+                            tool = %command.tool_kind,
+                            uri = %uri,
+                            "side-effect barrier: durable result exists; skipping re-execution and adopting recorded result (#104 Phase E)"
+                        );
+                        Some(noetl_tools::result::ToolResult::success(payload))
+                    }
+                    None => {
+                        crate::metrics::record_side_effect_barrier("executed", &command.tool_kind);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // Execute the tool — route `tool_kind: "wasm"` to the plug-in host
         // (noetl/ai-meta#105), everything else to the tool registry. The wasm
         // branch only exists with the `wasm-plugin` feature, so the default
-        // build dispatches exactly as before.
-        #[cfg(feature = "wasm-plugin")]
-        let dispatch_outcome = if tool_config.kind == "wasm" {
-            self.dispatch_wasm(&tool_config, command, &dispatch_client).await
-        } else {
-            self.tool_registry
-                .execute_from_config(&tool_config, &ctx)
-                .await
+        // build dispatches exactly as before. When the Phase E barrier adopted a
+        // durable result above, the tool is NOT dispatched and that result is
+        // used directly.
+        let dispatch_outcome = match barrier_adopted {
+            Some(adopted) => Ok(adopted),
+            None => {
+                #[cfg(feature = "wasm-plugin")]
+                {
+                    if tool_config.kind == "wasm" {
+                        self.dispatch_wasm(&tool_config, command, &dispatch_client)
+                            .await
+                    } else {
+                        self.tool_registry
+                            .execute_from_config(&tool_config, &ctx)
+                            .await
+                    }
+                }
+                #[cfg(not(feature = "wasm-plugin"))]
+                {
+                    self.tool_registry
+                        .execute_from_config(&tool_config, &ctx)
+                        .await
+                }
+            }
         };
-        #[cfg(not(feature = "wasm-plugin"))]
-        let dispatch_outcome = self
-            .tool_registry
-            .execute_from_config(&tool_config, &ctx)
-            .await;
 
         let tool_result = match dispatch_outcome {
             Ok(result) => {
@@ -1544,6 +1601,77 @@ fn plugin_outcome_to_tool_result(
 /// overwrite the same key (the blueprint's default), keeping the name
 /// derivable. Only the durable `kind: "result_ref"` reference is stamped — a
 /// shm-only `arrow_ipc` hint (degraded path) and inline results are skipped.
+/// Whether the command the worker is about to dispatch is side-effecting
+/// ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) Phase E).
+///
+/// The orchestrator wraps a step's tool(s) in a `task_sequence` command, so the
+/// command's own kind is almost always `task_sequence` — classifying *that*
+/// would treat every step the same. Instead this looks **through** the wrapper:
+/// a `task_sequence` is side-effecting iff **any** of its sub-tasks is (so a
+/// step running only `noop` / `rhai` is correctly exempt), and a non-wrapped
+/// command is classified by its own kind. Sub-tasks whose kind can't be read
+/// fall back to side-effecting (conservative — over-classification is safe for
+/// the adopt-only barrier).
+fn command_is_side_effecting(tool_config: &ToolConfig) -> bool {
+    if tool_config.kind != "task_sequence" {
+        return noetl_tools::registry::kind_is_side_effecting(&tool_config.kind);
+    }
+    // `task_sequence`'s sub-tasks are carried under `config.tool_config` as an
+    // array of `{ <label>: { kind, ... } }` (the worker envelope shape).
+    match tool_config
+        .config
+        .get("tool_config")
+        .and_then(|v| v.as_array())
+    {
+        Some(subs) if !subs.is_empty() => subs.iter().any(|item| {
+            item.as_object()
+                .and_then(|o| o.values().next())
+                .and_then(|spec| spec.get("kind"))
+                .and_then(|k| k.as_str())
+                .map(noetl_tools::registry::kind_is_side_effecting)
+                .unwrap_or(true)
+        }),
+        // No inspectable sub-tasks → conservative.
+        _ => true,
+    }
+}
+
+/// Whether the Phase E side-effect barrier should consult the durable result
+/// tier before dispatching this cycle. It checks only when the barrier flag is
+/// on **and** the command is side-effecting (per [`command_is_side_effecting`],
+/// which looks through the `task_sequence` wrapper). A pure predicate — the
+/// durable-result lookup + adopt is the async step that follows. Flag-off and
+/// non-side-effecting cycles both short-circuit to `false`, leaving dispatch
+/// byte-identical to today.
+fn side_effect_barrier_should_check(enabled: bool, tool_config: &ToolConfig) -> bool {
+    enabled && command_is_side_effecting(tool_config)
+}
+
+/// Derive the stable logical URI for a cycle `(execution_id, step, frame, row,
+/// attempt)`. `frame` / `row` come from the dispatched command's cursor metadata
+/// (`__cursor_frame` / `__cursor_row` in `render_context`, defaulting to `0/0`
+/// for a non-cursor step). `attempt` is fixed to `1`: a crash-resume / re-drive
+/// of the *same* cycle derives the **identical** URI — which is exactly what lets
+/// the side-effect barrier ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+/// Phase E) recognise an already-durable result, and what lets the R02b stamp be
+/// idempotent across replays.
+fn cycle_logical_uri(
+    execution_id: i64,
+    step: &str,
+    render_context: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    let frame = render_context
+        .get("__cursor_frame")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let row = render_context
+        .get("__cursor_row")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    noetl_tools::locator::ResultCoordinates::new(None, None, execution_id, step, frame, row, 1)
+        .logical_uri()
+}
+
 fn stamp_logical_uri(
     result_obj: &mut serde_json::Value,
     execution_id: i64,
@@ -1556,18 +1684,7 @@ fn stamp_logical_uri(
     if reference.get("kind").and_then(|k| k.as_str()) != Some("result_ref") {
         return;
     }
-    let frame = render_context
-        .get("__cursor_frame")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let row = render_context
-        .get("__cursor_row")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let uri = noetl_tools::locator::ResultCoordinates::new(
-        None, None, execution_id, step, frame, row, 1,
-    )
-    .logical_uri();
+    let uri = cycle_logical_uri(execution_id, step, render_context);
     reference.insert("uri".to_string(), serde_json::Value::String(uri));
 }
 
@@ -2372,6 +2489,97 @@ mod tests {
         let mut inline = serde_json::json!({ "status": "COMPLETED", "context": { "data": {} } });
         stamp_logical_uri(&mut inline, 1, "s", &rc);
         assert!(inline.get("reference").is_none());
+    }
+
+    // --- noetl/ai-meta#104 Phase E: side-effect durability barrier ---
+
+    #[test]
+    fn cycle_logical_uri_matches_stamp_for_same_coordinate() {
+        // The barrier derives the cycle's URN with `cycle_logical_uri`; the R02b
+        // stamp writes it with `stamp_logical_uri`. They MUST agree for the same
+        // `(execution_id, step, frame, row)` — that identity is what lets a
+        // re-drive recognise the durable result a prior drive stamped.
+        let mut rc = std::collections::HashMap::new();
+        rc.insert("__cursor_frame".to_string(), serde_json::json!(2));
+        rc.insert("__cursor_row".to_string(), serde_json::json!(4));
+        let derived = cycle_logical_uri(325, "load_next_facility", &rc);
+
+        let mut obj = serde_json::json!({
+            "status": "COMPLETED",
+            "reference": { "kind": "result_ref" }
+        });
+        stamp_logical_uri(&mut obj, 325, "load_next_facility", &rc);
+        assert_eq!(serde_json::Value::String(derived), obj["reference"]["uri"]);
+    }
+
+    #[test]
+    fn cycle_logical_uri_is_attempt_one_and_stable_across_redrive() {
+        // attempt is fixed to 1 (the `.../1` suffix), so two drives of the SAME
+        // cycle derive the IDENTICAL URN — the barrier's correctness hinge.
+        let rc = std::collections::HashMap::new();
+        let first = cycle_logical_uri(7, "charge_card", &rc);
+        let second = cycle_logical_uri(7, "charge_card", &rc);
+        assert_eq!(first, second);
+        assert_eq!(first, "noetl://default/default/results/7/charge_card/0/0/1");
+    }
+
+    fn tc(kind: &str, config: serde_json::Value) -> ToolConfig {
+        ToolConfig {
+            kind: kind.to_string(),
+            config,
+            timeout: None,
+            retry: None,
+            auth: None,
+        }
+    }
+
+    /// A `task_sequence` ToolConfig wrapping sub-tasks of the given kinds.
+    fn task_seq(kinds: &[&str]) -> ToolConfig {
+        let subs: Vec<serde_json::Value> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| serde_json::json!({ format!("t{i}"): { "kind": k } }))
+            .collect();
+        tc("task_sequence", serde_json::json!({ "tool_config": subs }))
+    }
+
+    #[test]
+    fn barrier_gate_flag_off_never_checks() {
+        // Flag off → never consult the tier, regardless of side-effect class.
+        assert!(!side_effect_barrier_should_check(false, &tc("http", serde_json::json!({}))));
+        assert!(!side_effect_barrier_should_check(false, &task_seq(&["python"])));
+        assert!(!side_effect_barrier_should_check(false, &task_seq(&["noop"])));
+    }
+
+    #[test]
+    fn barrier_gate_only_side_effecting_when_on() {
+        // Flag on → check side-effecting commands, skip pure ones.
+        assert!(side_effect_barrier_should_check(true, &tc("http", serde_json::json!({}))));
+        assert!(side_effect_barrier_should_check(true, &tc("postgres", serde_json::json!({}))));
+        assert!(!side_effect_barrier_should_check(true, &tc("rhai", serde_json::json!({}))));
+        assert!(!side_effect_barrier_should_check(true, &tc("noop", serde_json::json!({}))));
+    }
+
+    #[test]
+    fn command_is_side_effecting_looks_through_task_sequence() {
+        // The orchestrator wraps every step's tool(s) in a task_sequence, so the
+        // gate must classify by the INNER tool kind, not the wrapper.
+        // A task_sequence whose only sub-task is pure → NOT side-effecting.
+        assert!(!command_is_side_effecting(&task_seq(&["noop"])));
+        assert!(!command_is_side_effecting(&task_seq(&["rhai"])));
+        assert!(!command_is_side_effecting(&task_seq(&["rhai", "noop"])));
+        // Any side-effecting sub-task makes the whole side-effecting.
+        assert!(command_is_side_effecting(&task_seq(&["python"])));
+        assert!(command_is_side_effecting(&task_seq(&["rhai", "http"])));
+        // An empty / uninspectable task_sequence is conservatively side-effecting.
+        assert!(command_is_side_effecting(&tc("task_sequence", serde_json::json!({}))));
+        assert!(command_is_side_effecting(&tc(
+            "task_sequence",
+            serde_json::json!({ "tool_config": [] })
+        )));
+        // A non-wrapped command is classified by its own kind.
+        assert!(command_is_side_effecting(&tc("postgres", serde_json::json!({}))));
+        assert!(!command_is_side_effecting(&tc("noop", serde_json::json!({}))));
     }
 
     // --- #105 routing: the wasm dispatch helpers ---
