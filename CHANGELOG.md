@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.46.0](https://github.com/noetl/worker/compare/v5.45.0...v5.46.0) (2026-06-23)
+
+### Features
+
+* **result:** producer-staged result tier, flag-gated ([#104](https://github.com/noetl/worker/issues/104) OQ5 Option A) ([#132](https://github.com/noetl/worker/issues/132)) ([0d9ca18](https://github.com/noetl/worker/commit/0d9ca1804c9b6def1132e18419bc03444da770b3))
+
 ## [5.45.0](https://github.com/noetl/worker/compare/v5.44.0...v5.45.0) (2026-06-23)
 
 ### Features
