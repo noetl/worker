@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.43.0](https://github.com/noetl/worker/compare/v5.42.0...v5.43.0) (2026-06-23)
+
+### Features
+
+* **result:** authoritative tier writer + tier-primary consume + rollback fallback ([#104](https://github.com/noetl/worker/issues/104) Phase D) ([419ad5f](https://github.com/noetl/worker/commit/419ad5f39c920f10de938759b8244ae2deb32038))
+
 ## [5.42.0](https://github.com/noetl/worker/compare/v5.41.0...v5.42.0) (2026-06-23)
 
 ### Features
