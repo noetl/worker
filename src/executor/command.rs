@@ -1695,7 +1695,14 @@ async fn resolve_context_references(
     }
     // Resolve-by-URN read path (#104 Phase C) — only when the flag is on. Off →
     // this is the byte-identical legacy `resolve_ref` path.
-    let resolve_by_urn = crate::result_resolver::enabled();
+    // Phase D minting flip (#104 Phase D): `NOETL_RESULT_MINT_AUTHORITATIVE`
+    // makes the URN tier the *authoritative* result store, so resolve-by-URN is
+    // the *primary* path even if `NOETL_RESULT_URI_RESOLVE` was not separately
+    // set. A tier miss still falls back fail-safe to the dual-written
+    // `result_store` (rollback safety); the path taken is recorded on
+    // `noetl_worker_result_mint_authoritative_total{path}`.
+    let mint_authoritative = crate::result_resolver::mint_authoritative();
+    let resolve_by_urn = crate::result_resolver::enabled() || mint_authoritative;
     for (name, uri, canonical) in candidates {
         // The flat `<name>` binding is the bounded summary (+ `_ref`/`_store`).
         // Decide off it whether this command's template needs the bulk.
@@ -1714,9 +1721,20 @@ async fn resolve_context_references(
                     match crate::result_resolver::resolve_by_urn(client, canon).await {
                         Some(data) => {
                             tracing::debug!(step = %name, uri = canon, "resolved over-budget result by URN (#104 Phase C)");
+                            // Phase D: the authoritative tier served this result.
+                            if mint_authoritative {
+                                crate::metrics::record_result_mint_authoritative("tier");
+                            }
                             Ok(Some(data))
                         }
-                        None => client.resolve_ref(&uri).await,
+                        None => {
+                            // Phase D: tier miss → fall back to the dual-written
+                            // `result_store` (reversible rollback path).
+                            if mint_authoritative {
+                                crate::metrics::record_result_mint_authoritative("legacy_fallback");
+                            }
+                            client.resolve_ref(&uri).await
+                        }
                     }
                 }
                 _ => client.resolve_ref(&uri).await,

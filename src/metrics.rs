@@ -151,6 +151,16 @@ pub struct WorkerMetrics {
     pub result_resolve_total: IntCounterVec,
     /// One resolve-by-URN attempt latency (registry + object fetch + decode).
     pub result_resolve_duration_seconds: Histogram,
+    /// Consume-side resolutions while the Phase D minting flip is on
+    /// (`NOETL_RESULT_MINT_AUTHORITATIVE`), by `path`
+    /// (noetl/ai-meta#104 Phase D):
+    /// - `tier` — the authoritative URN → Feather/GCS tier served the payload.
+    /// - `legacy_fallback` — the tier missed / could not be addressed, so the
+    ///   dual-written `noetl.result_store` served it (rollback safety).
+    ///
+    /// Flag-off it never moves; flag-on `tier` proves the tier is authoritative
+    /// and `legacy_fallback` proves the reversible fallback path is intact.
+    pub result_mint_authoritative_total: IntCounterVec,
 
     // --- Off-server state builder (noetl/ai-meta#115 Phase 4) ----------------
     /// Events the off-server state builder consumed from the `noetl_events`
@@ -619,6 +629,19 @@ impl WorkerMetrics {
             .register(Box::new(result_resolve_duration_seconds.clone()))
             .expect("register result_resolve_duration_seconds");
 
+        let result_mint_authoritative_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_result_mint_authoritative_total",
+                "Consume-side resolutions under the Phase D minting flip by path \
+                 (tier | legacy_fallback) (noetl/ai-meta#104 Phase D).",
+            ),
+            &["path"],
+        )
+        .expect("result_mint_authoritative_total metric");
+        registry
+            .register(Box::new(result_mint_authoritative_total.clone()))
+            .expect("register result_mint_authoritative_total");
+
         let state_builder_wal_events_total = IntCounter::new(
             "noetl_worker_state_builder_wal_events_total",
             "Events the off-server state builder consumed from the noetl_events WAL stream (RFC #115 Phase 4).",
@@ -719,6 +742,7 @@ impl WorkerMetrics {
             result_materializer_errors_total,
             result_materializer_cycle_duration_seconds,
             result_resolve_total,
+            result_mint_authoritative_total,
             result_resolve_duration_seconds,
             state_builder_wal_events_total,
             state_builder_event_scans_total,
@@ -1011,6 +1035,17 @@ pub fn record_result_resolve(outcome: &str, duration_seconds: f64) {
     let m = WorkerMetrics::global();
     m.result_resolve_total.with_label_values(&[outcome]).inc();
     m.result_resolve_duration_seconds.observe(duration_seconds);
+}
+
+/// Record one consume-side resolution under the Phase D minting flip
+/// (noetl/ai-meta#104 Phase D). `path` is `tier` (the authoritative tier served)
+/// or `legacy_fallback` (the dual-written `result_store` served — rollback
+/// safety).
+pub fn record_result_mint_authoritative(path: &str) {
+    WorkerMetrics::global()
+        .result_mint_authoritative_total
+        .with_label_values(&[path])
+        .inc();
 }
 
 /// Record `n` events consumed from the `noetl_events` WAL by the off-server
