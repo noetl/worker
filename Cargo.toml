@@ -164,7 +164,12 @@ wasmtime = { version = "27", optional = true }
 #   `auth0_login` postgres step returning `expires_at: null` for a plain
 #   `timestamp` column.  Tool-only fix (409 tools tests + clippy); no
 #   worker code change.
-noetl-tools = "3.14.2"
+# - v3.17.0: `registry::kind_is_side_effecting` — the per-kind
+#   side-effect classifier the Phase E durability barrier consumes
+#   (tools#78, noetl/ai-meta#104).  Conservative default `true`; only
+#   `noop` / `rhai` are `false`.  Required by `command_is_side_effecting`
+#   in src/executor/command.rs.
+noetl-tools = "3.17"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
