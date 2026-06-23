@@ -85,6 +85,27 @@ pub fn side_effect_barrier() -> bool {
     truthy_env("NOETL_SIDE_EFFECT_BARRIER")
 }
 
+/// True when `NOETL_RESULT_TIER_DR` is set to a truthy value — the Phase F
+/// disaster-recovery re-derive ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)).
+///
+/// The result tier is **derivable** from the WAL: a result's bytes are the
+/// deterministic encode of the authoritative payload (the `result_store` byte
+/// source today), and its location is computed from the logical URI. So a missing
+/// or corrupted tier object can be rebuilt from its source by re-running the
+/// materialization for that URN. When this flag is on, the result materializer
+/// runs in **verify-and-repair** mode: for each over-budget result it derives the
+/// object, compares it against what is durable, and rewrites it only when the
+/// durable object is **missing or byte-divergent** (corrupt). A re-delivery of the
+/// WAL event is therefore a targeted DR repair.
+///
+/// Default off → byte-identical to Phase B/D (the materializer's normal write
+/// path is used; this verify-and-repair branch is never reached). Adopt-safe: the
+/// repair only ever rewrites an object to its deterministic re-derivation, never
+/// alters the authoritative `result_store` source.
+pub fn result_tier_dr() -> bool {
+    truthy_env("NOETL_RESULT_TIER_DR")
+}
+
 fn truthy_env(key: &str) -> bool {
     matches!(
         std::env::var(key)

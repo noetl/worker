@@ -173,6 +173,21 @@ pub struct WorkerMetrics {
     /// positive proof the barrier prevented a duplicate side effect.
     pub side_effect_barrier_total: IntCounterVec,
 
+    /// Result-tier DR re-derive outcomes by `outcome` (noetl/ai-meta#104 Phase
+    /// F), recorded by the materializer's verify-and-repair mode
+    /// (`NOETL_RESULT_TIER_DR`):
+    /// - `present` — the durable object existed and was byte-identical to the
+    ///   re-derivation; no rewrite needed.
+    /// - `rederived` — the object was missing or byte-divergent (corrupt) and was
+    ///   reconstructed from its source.
+    /// - `source_gone` — the authoritative payload source was absent, so the
+    ///   object could not be re-derived.
+    /// - `error` — a fetch/encode/write failure.
+    ///
+    /// Flag-off it never moves; flag-on `rederived` is the positive proof a
+    /// missing/corrupt tier object was rebuilt from the WAL-derivable source.
+    pub result_tier_dr_total: IntCounterVec,
+
     // --- Off-server state builder (noetl/ai-meta#115 Phase 4) ----------------
     /// Events the off-server state builder consumed from the `noetl_events`
     /// **WAL** stream and indexed. Positive evidence the builder reads the WAL
@@ -666,6 +681,19 @@ impl WorkerMetrics {
             .register(Box::new(side_effect_barrier_total.clone()))
             .expect("register side_effect_barrier_total");
 
+        let result_tier_dr_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_result_tier_dr_total",
+                "Result-tier DR re-derive outcomes by outcome \
+                 (present | rederived | source_gone | error) (noetl/ai-meta#104 Phase F).",
+            ),
+            &["outcome"],
+        )
+        .expect("result_tier_dr_total metric");
+        registry
+            .register(Box::new(result_tier_dr_total.clone()))
+            .expect("register result_tier_dr_total");
+
         let state_builder_wal_events_total = IntCounter::new(
             "noetl_worker_state_builder_wal_events_total",
             "Events the off-server state builder consumed from the noetl_events WAL stream (RFC #115 Phase 4).",
@@ -768,6 +796,7 @@ impl WorkerMetrics {
             result_resolve_total,
             result_mint_authoritative_total,
             side_effect_barrier_total,
+            result_tier_dr_total,
             result_resolve_duration_seconds,
             state_builder_wal_events_total,
             state_builder_event_scans_total,
@@ -1081,6 +1110,17 @@ pub fn record_side_effect_barrier(outcome: &str, tool: &str) {
     WorkerMetrics::global()
         .side_effect_barrier_total
         .with_label_values(&[outcome, tool])
+        .inc();
+}
+
+/// Record one result-tier DR re-derive outcome (noetl/ai-meta#104 Phase F).
+/// `outcome` is `present` (durable object existed + byte-identical), `rederived`
+/// (missing/corrupt → rebuilt from source), `source_gone` (no source to rebuild
+/// from), or `error`.
+pub fn record_result_tier_dr(outcome: &str) {
+    WorkerMetrics::global()
+        .result_tier_dr_total
+        .with_label_values(&[outcome])
         .inc();
 }
 
