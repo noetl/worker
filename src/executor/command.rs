@@ -626,6 +626,7 @@ impl CommandExecutor {
                     &result.status.to_string(),
                     command.execution_id,
                     &command.step,
+                    &command.render_context,
                     self.arrow_cache.as_ref(),
                     &dispatch_client,
                 )
@@ -1073,6 +1074,7 @@ async fn build_call_done_result(
     status: &str,
     execution_id: i64,
     step: &str,
+    render_context: &std::collections::HashMap<String, serde_json::Value>,
     arrow_cache: &ArrowIpcSharedMemoryCache,
     client: &ControlPlaneClient,
 ) -> Result<serde_json::Value, serde_json::Error> {
@@ -1183,6 +1185,19 @@ async fn build_call_done_result(
             // `when:`/`set:`/cursor fan-out off the reference without resolving
             // the full payload (which stays in the store).
             reference["extracted"] = build_extracted(context);
+            // noetl/ai-meta#104 OQ5 Option A — producer-staged result tier.
+            // The durable PUT succeeded, so this over-budget result carries a
+            // canonical logical URI (stamped by `stamp_logical_uri` on the same
+            // coordinates `cycle_logical_uri` derives here). When producer-staging
+            // is enabled, stage the tier object NOW, at emit time, directly to the
+            // object store — so the materializer never has to read `result_store`
+            // to populate the tier (the prerequisite to retiring `result_store`).
+            // Best-effort: the dual-write above is authoritative, so a staging
+            // miss is invisible to the execution. Default-off → never called.
+            if crate::result_producer_stage::enabled() {
+                let canonical_uri = cycle_logical_uri(execution_id, step, render_context);
+                crate::result_producer_stage::stage(client, &canonical_uri, context).await;
+            }
             if let Ok(mut hint) = shm_result {
                 hint.media_type = shm_payload.media_type.clone();
                 // Stamp the hint as the `ipc` field on the
@@ -2930,7 +2945,7 @@ mod tests {
             "duration_ms": 12,
         });
         let result =
-            build_call_done_result(&context, "COMPLETED", 42, "greet", cache.as_ref(), &client)
+            build_call_done_result(&context, "COMPLETED", 42, "greet", &std::collections::HashMap::new(), cache.as_ref(), &client)
                 .await
                 .unwrap();
         assert_eq!(result["status"], "COMPLETED");
@@ -2973,6 +2988,7 @@ mod tests {
             "COMPLETED",
             12345,
             "big_step",
+            &std::collections::HashMap::new(),
             cache.as_ref(),
             &client,
         )
@@ -3052,6 +3068,7 @@ mod tests {
             "COMPLETED",
             7,
             "auth_step",
+            &std::collections::HashMap::new(),
             cache.as_ref(),
             &client,
         )
@@ -3124,6 +3141,7 @@ mod tests {
             "COMPLETED",
             7,
             "leaky_select",
+            &std::collections::HashMap::new(),
             cache.as_ref(),
             &client,
         )
@@ -3197,6 +3215,7 @@ mod tests {
             "COMPLETED",
             999,
             "tabular_step",
+            &std::collections::HashMap::new(),
             cache.as_ref(),
             &client,
         )
@@ -3272,6 +3291,7 @@ mod tests {
             "COMPLETED",
             42,
             "no_ipc_step",
+            &std::collections::HashMap::new(),
             cache.as_ref(),
             &client,
         )
@@ -3312,6 +3332,7 @@ mod tests {
             "COMPLETED",
             42,
             "shm_only_step",
+            &std::collections::HashMap::new(),
             cache.as_ref(),
             &client,
         )
@@ -3344,6 +3365,7 @@ mod tests {
             "COMPLETED",
             42,
             "drop_step",
+            &std::collections::HashMap::new(),
             cache.as_ref(),
             &client,
         )
@@ -3398,7 +3420,7 @@ mod tests {
         // smaller and a result larger than the threshold.
         let small = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES - 100) });
         let small_result =
-            build_call_done_result(&small, "COMPLETED", 1, "s", cache.as_ref(), &client)
+            build_call_done_result(&small, "COMPLETED", 1, "s", &std::collections::HashMap::new(), cache.as_ref(), &client)
                 .await
                 .unwrap();
         assert!(small_result.get("context").is_some());
@@ -3406,7 +3428,7 @@ mod tests {
 
         let large = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES + 100) });
         let large_result =
-            build_call_done_result(&large, "COMPLETED", 1, "l", cache.as_ref(), &client)
+            build_call_done_result(&large, "COMPLETED", 1, "l", &std::collections::HashMap::new(), cache.as_ref(), &client)
                 .await
                 .unwrap();
         assert!(large_result.get("context").is_none());

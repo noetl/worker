@@ -173,6 +173,23 @@ async fn registry(client: &ControlPlaneClient) -> Option<&'static CellRegistry> 
         .ok()
 }
 
+/// Resolve a result's cell placement from the server-served registry — the
+/// **write-side** entry point shared with the producer-staging path
+/// ([`crate::result_producer_stage`], #104 OQ5 Option A).
+///
+/// Deriving placement from the same `GET /api/internal/cells` registry the
+/// read path uses is what makes a producer-staged object land at exactly the
+/// §7 key [`resolve_by_urn`] later looks up — no env-var cell seed on the
+/// producing worker, no key drift between write and read. `None` on a registry
+/// miss (the caller then declines to stage rather than guessing a key).
+pub async fn placement_for(
+    client: &ControlPlaneClient,
+    coords: &ResultCoordinates,
+) -> Option<CellPlacement> {
+    let reg = registry(client).await?;
+    reg.placement_for(coords)
+}
+
 // ---------------------------------------------------------------------------
 // Resolve
 // ---------------------------------------------------------------------------

@@ -188,6 +188,24 @@ pub struct WorkerMetrics {
     /// missing/corrupt tier object was rebuilt from the WAL-derivable source.
     pub result_tier_dr_total: IntCounterVec,
 
+    /// Producer-staged result tier outcomes by `outcome` (noetl/ai-meta#104 OQ5
+    /// Option A), gated on `NOETL_RESULT_PRODUCER_STAGE`:
+    /// - `staged_feather` / `staged_json` — the producing worker wrote the tier
+    ///   object at emit time (the write that decouples the tier from
+    ///   `result_store`, the prerequisite to retiring it).
+    /// - `skip_parse_uri` — no canonical URI on the reference (cannot key).
+    /// - `skip_registry` — the cell registry was unavailable (declined to guess
+    ///   a key; the materializer still covers the tier).
+    /// - `error` — an `object_put` failure (best-effort; the materializer covers it).
+    /// - `materializer_skip_exists` — the materializer found a producer-staged
+    ///   object already present and skipped its `result_store` fetch (the OQ5
+    ///   "no result_store read" proof).
+    ///
+    /// Flag-off it never moves; flag-on `staged_*` + `materializer_skip_exists`
+    /// together prove the producer populates the tier and the materializer needs
+    /// no `result_store` read for it.
+    pub result_producer_stage_total: IntCounterVec,
+
     // --- Off-server state builder (noetl/ai-meta#115 Phase 4) ----------------
     /// Events the off-server state builder consumed from the `noetl_events`
     /// **WAL** stream and indexed. Positive evidence the builder reads the WAL
@@ -694,6 +712,20 @@ impl WorkerMetrics {
             .register(Box::new(result_tier_dr_total.clone()))
             .expect("register result_tier_dr_total");
 
+        let result_producer_stage_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_result_producer_stage_total",
+                "Producer-staged result tier outcomes by outcome \
+                 (staged_feather | staged_json | skip_parse_uri | skip_registry | \
+                 error | materializer_skip_exists) (noetl/ai-meta#104 OQ5 Option A).",
+            ),
+            &["outcome"],
+        )
+        .expect("result_producer_stage_total metric");
+        registry
+            .register(Box::new(result_producer_stage_total.clone()))
+            .expect("register result_producer_stage_total");
+
         let state_builder_wal_events_total = IntCounter::new(
             "noetl_worker_state_builder_wal_events_total",
             "Events the off-server state builder consumed from the noetl_events WAL stream (RFC #115 Phase 4).",
@@ -797,6 +829,7 @@ impl WorkerMetrics {
             result_mint_authoritative_total,
             side_effect_barrier_total,
             result_tier_dr_total,
+            result_producer_stage_total,
             result_resolve_duration_seconds,
             state_builder_wal_events_total,
             state_builder_event_scans_total,
@@ -1120,6 +1153,18 @@ pub fn record_side_effect_barrier(outcome: &str, tool: &str) {
 pub fn record_result_tier_dr(outcome: &str) {
     WorkerMetrics::global()
         .result_tier_dr_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Record one producer-staged result tier outcome (noetl/ai-meta#104 OQ5 Option
+/// A). `outcome` is `staged_feather` / `staged_json` (the producer wrote the tier
+/// at emit time), `skip_parse_uri` / `skip_registry` / `error` (best-effort
+/// declines), or `materializer_skip_exists` (the materializer found the
+/// producer-staged object and skipped its `result_store` fetch).
+pub fn record_result_producer_stage(outcome: &str) {
+    WorkerMetrics::global()
+        .result_producer_stage_total
         .with_label_values(&[outcome])
         .inc();
 }

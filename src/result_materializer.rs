@@ -65,10 +65,9 @@ const DEFAULT_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_IDLE_SLEEP_MS: u64 = 500;
 const DEFAULT_ERROR_BACKOFF_MS: u64 = 2_000;
 
-/// Media type stamped on a Feather (Arrow IPC) object.
-const FEATHER_MEDIA: &str = "application/vnd.apache.arrow.feather";
-/// Media type stamped on a JSON fallback object.
-const JSON_MEDIA: &str = "application/json";
+// The result-tier encoding (`decide_tier` → Feather/JSON) is shared with the
+// producer-staging path (#104 OQ5 Option A) so the two are byte-identical.
+use crate::result_locator::{decide_tier, TierKind};
 
 /// True when `NOETL_RESULT_MATERIALIZER_ENABLED` is set to a truthy value.
 pub fn enabled() -> bool {
@@ -237,6 +236,11 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
         "result materializer started ({mode})"
     );
 
+    // #104 OQ5 Option A: read the producer-staging flag once — when on, the
+    // write path skips a `result_store` fetch for any result already staged to
+    // the tier by its producer (skip-on-exists in `write_shadow`).
+    let producer_stage = crate::result_producer_stage::enabled();
+
     // Deferred ack: we ack the batch ourselves after best-effort shadow writes.
     let opts = PollOptions::new(Some(config.batch), Some(config.timeout_ms), AckMode::Defer);
 
@@ -277,7 +281,7 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
                         rederive_one(&client, &config.cell, &legacy_ref, &coords, &mut tally)
                             .await;
                     } else {
-                        write_shadow(&client, &config.cell, &legacy_ref, &coords, &mut tally).await;
+                        write_shadow(&client, &config.cell, producer_stage, &legacy_ref, &coords, &mut tally).await;
                     }
                 }
             }
@@ -327,12 +331,45 @@ struct CycleTally {
 async fn write_shadow(
     client: &ControlPlaneClient,
     cell: &CellSeed,
+    producer_stage: bool,
     legacy_ref: &str,
     coords: &ResultCoordinates,
     tally: &mut CycleTally,
 ) {
     tally.eligible += 1;
     let eid = coords.execution_id;
+
+    // #104 OQ5 Option A — skip-on-exists. When producer-staging is enabled the
+    // producing worker stages the tier object at emit time, so the materializer
+    // does NOT need to read `result_store` to (re)write it. Probe the §7 key
+    // (both tier extensions, exactly like the resolve-by-URN read path) and skip
+    // the `result_store` fetch entirely when the object already exists. The key
+    // is content-addressed and `decide_tier` is deterministic, so an existing
+    // object is byte-identical to what we'd write — re-writing it is wasted I/O
+    // and, more importantly, the avoided `resolve_ref` is the prerequisite that
+    // lets `result_store` be retired. Gated on the same flag so default-off is a
+    // true no-op (byte-identical to Phase B/D behaviour).
+    if producer_stage {
+        let date = crate::snowflake::date_partition(coords.execution_id);
+        let placement = cell.placement_for(coords);
+        let staged = matches!(
+            client.object_get(&coords.physical_key(&placement, &date, "feather")).await,
+            Ok(Some(_))
+        ) || matches!(
+            client.object_get(&coords.physical_key(&placement, &date, "json")).await,
+            Ok(Some(_))
+        );
+        if staged {
+            tally.skipped += 1;
+            tally.eligible -= 1;
+            crate::metrics::record_result_producer_stage("materializer_skip_exists");
+            tracing::debug!(
+                execution_id = eid,
+                "result object already producer-staged; materializer skip (no result_store read)"
+            );
+            return;
+        }
+    }
 
     // Fetch the authoritative payload (read-only — never alters it).
     let payload = match client.resolve_ref(legacy_ref).await {
@@ -559,74 +596,6 @@ fn find_result_ref(v: &serde_json::Value) -> Option<&serde_json::Map<String, ser
     }
 }
 
-enum TierKind {
-    Feather,
-    Json,
-}
-
-impl TierKind {
-    fn label(&self) -> &'static str {
-        match self {
-            TierKind::Feather => "feather",
-            TierKind::Json => "json",
-        }
-    }
-}
-
-/// The chosen result tier: encoded bytes + how to store them.
-struct Tier {
-    kind: TierKind,
-    bytes: Vec<u8>,
-    media: &'static str,
-}
-
-impl Tier {
-    fn ext(&self) -> &'static str {
-        match self.kind {
-            TierKind::Feather => "feather",
-            TierKind::Json => "json",
-        }
-    }
-}
-
-/// Decide the over-budget tier (OQ3 decided: non-tabular → JSON).
-///
-/// A tool rowset (DuckDB / Postgres / Snowflake) is the tabular case the Feather
-/// tier exists for, but the stored result envelope nests it: the worker stores
-/// `result_context = {data: {<tool>: <output>}, status, stdout, …}`. So we look
-/// for a tabular rowset in two places, in order:
-///
-///  1. the payload **itself** is a top-level `{rows…}` / `{data:{rows…}}` rowset
-///     (`try_encode_tabular_json`) — the shape a colocated shm consumer sees;
-///  2. otherwise, a value under the conventional `data.<tool>` envelope is a
-///     rowset — the realistic shape an over-budget DuckDB/Postgres result takes.
-///
-/// The first match encodes Arrow **Feather** (the rowset only); anything else
-/// falls back to **JSON** of the whole payload. Encoding the rowset (not the
-/// envelope) is intentional: the Feather tier holds the columnar payload, and
-/// the bounded `extracted` block (carried inline) already covers guard/fan-out.
-fn decide_tier(payload: &serde_json::Value) -> Tier {
-    let encode = noetl_tools::arrow_codec::try_encode_tabular_json;
-    let tabular = encode(payload).or_else(|| {
-        payload
-            .get("data")
-            .and_then(|d| d.as_object())
-            .and_then(|m| m.values().find_map(encode))
-    });
-    match tabular {
-        Some(enc) => Tier {
-            kind: TierKind::Feather,
-            bytes: enc.bytes,
-            media: FEATHER_MEDIA,
-        },
-        None => Tier {
-            kind: TierKind::Json,
-            bytes: serde_json::to_vec(payload).unwrap_or_default(),
-            media: JSON_MEDIA,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,56 +654,6 @@ mod tests {
             "result": { "reference": { "kind": "result_ref", "ref": "noetl://execution/1/result/s/2" } }
         });
         assert_eq!(classify_event(&row), Classification::Skip);
-    }
-
-    #[test]
-    fn decide_tier_tabular_is_feather() {
-        // Canonical {columns, rows} → Arrow Feather.
-        let tabular = serde_json::json!({
-            "columns": ["id", "name"],
-            "rows": [[1, "a"], [2, "b"]]
-        });
-        let tier = decide_tier(&tabular);
-        assert!(matches!(tier.kind, TierKind::Feather));
-        assert_eq!(tier.media, FEATHER_MEDIA);
-        assert_eq!(tier.ext(), "feather");
-        assert!(!tier.bytes.is_empty());
-    }
-
-    #[test]
-    fn decide_tier_rowset_under_data_envelope_is_feather() {
-        // The realistic over-budget tool result: the worker stores
-        // `{data: {<tool>: {columns, rows}}, status, stdout, …}`. The rowset is
-        // nested under the conventional `data.<tool>` envelope — the materializer
-        // still tiers it as Feather (encoding the rowset).
-        let envelope = serde_json::json!({
-            "status": "ok",
-            "stdout": "",
-            "exit_code": 0,
-            "data": {
-                "run_query": {
-                    "columns": ["id", "name"],
-                    "rows": [[1, "a"], [2, "b"], [3, "c"]]
-                }
-            }
-        });
-        let tier = decide_tier(&envelope);
-        assert!(matches!(tier.kind, TierKind::Feather), "data.<tool> rowset should tier as Feather");
-        assert_eq!(tier.media, FEATHER_MEDIA);
-        assert!(!tier.bytes.is_empty());
-    }
-
-    #[test]
-    fn decide_tier_non_tabular_is_json() {
-        // Opaque shape (HTTP JSON / shell stdout) → JSON fallback (OQ3).
-        let blob = serde_json::json!({ "stdout": "hello", "code": 0, "nested": { "a": [1, 2, 3] } });
-        let tier = decide_tier(&blob);
-        assert!(matches!(tier.kind, TierKind::Json));
-        assert_eq!(tier.media, JSON_MEDIA);
-        assert_eq!(tier.ext(), "json");
-        // Round-trips back to the same JSON.
-        let back: serde_json::Value = serde_json::from_slice(&tier.bytes).unwrap();
-        assert_eq!(back, blob);
     }
 
     use crate::result_locator::coords_from_uri;
@@ -830,26 +749,6 @@ mod tests {
     // --- Phase F: DR re-derive ------------------------------------------------
 
     #[test]
-    fn tier_encode_is_deterministic_byte_identical() {
-        // The DR byte-identical guarantee rests on a deterministic encode: the
-        // same payload encodes to the same bytes every time, so a repair writes
-        // back exactly what a fresh materialization would. Tabular (Feather) and
-        // non-tabular (JSON) both.
-        let tabular = serde_json::json!({ "columns": ["id"], "rows": [[1], [2], [3]] });
-        assert_eq!(
-            decide_tier(&tabular).bytes,
-            decide_tier(&tabular).bytes,
-            "Feather encode must be byte-identical across runs"
-        );
-        let blob = serde_json::json!({ "stdout": "hello", "nested": { "a": [1, 2, 3] } });
-        assert_eq!(
-            decide_tier(&blob).bytes,
-            decide_tier(&blob).bytes,
-            "JSON encode must be byte-identical across runs"
-        );
-    }
-
-    #[test]
     fn dr_healthy_only_when_present_and_byte_identical() {
         let fresh = b"\x01\x02\x03feather-bytes".as_slice();
         // Present + identical → healthy (no repair).
@@ -886,5 +785,104 @@ mod tests {
             .expect("mint-authoritative → materializer built");
         assert!(built.authoritative, "Phase D writer must be authoritative");
         std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
+    }
+
+    // --- #104 OQ5 Option A: materializer skip-on-exists -----------------------
+
+    use axum::{body::Bytes, routing::get, Json, Router};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    fn test_cell() -> CellSeed {
+        CellSeed { env: "dev".into(), region: "local".into(), cell: "local-0".into(), shard_count: 256 }
+    }
+
+    /// When producer-staging is on and the tier object already exists (the
+    /// producer staged it at emit time), `write_shadow` SKIPS the `result_store`
+    /// fetch entirely — the OQ5 "materializer needs no result_store read" proof.
+    #[tokio::test]
+    async fn write_shadow_skips_result_store_when_object_already_staged() {
+        let resolve_hit = Arc::new(AtomicBool::new(false));
+        let rh = Arc::clone(&resolve_hit);
+
+        // object_get → 200 (object EXISTS); resolve → tripwire (must NOT be hit).
+        let app = Router::new()
+            .route(
+                "/api/internal/objects/{*key}",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, crate::result_locator::FEATHER_MEDIA)],
+                        vec![1u8, 2, 3],
+                    )
+                }),
+            )
+            .route(
+                "/api/result/resolve",
+                get(move || {
+                    let rh = Arc::clone(&rh);
+                    async move {
+                        rh.store(true, Ordering::SeqCst);
+                        Json(serde_json::json!({}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = ControlPlaneClient::new(&base);
+        let coords = coords_from_uri("noetl://t/p/results/325/load/2/4/1").unwrap();
+        let mut tally = CycleTally::default();
+        write_shadow(&client, &test_cell(), true, "noetl://execution/325/result/s/9001", &coords, &mut tally).await;
+
+        assert_eq!(tally.skipped, 1, "already-staged object → skipped");
+        assert_eq!(tally.eligible, 0, "skip decrements the eligible count");
+        assert_eq!(tally.feather, 0, "no rewrite");
+        assert_eq!(tally.json, 0);
+        assert!(!resolve_hit.load(Ordering::SeqCst), "must NOT read result_store for a producer-staged object");
+    }
+
+    /// Producer-staging on but the object is ABSENT (producer didn't stage, or it
+    /// was GC'd): `write_shadow` falls through to the normal `result_store` fetch
+    /// + write — the materializer remains the safety net.
+    #[tokio::test]
+    async fn write_shadow_falls_through_when_object_absent() {
+        let resolve_hit = Arc::new(AtomicBool::new(false));
+        let put_hit = Arc::new(AtomicBool::new(false));
+        let rh = Arc::clone(&resolve_hit);
+        let ph = Arc::clone(&put_hit);
+
+        let app = Router::new()
+            // object_get → 404 (NOT staged) for both feather + json probes.
+            .route("/api/internal/objects/{*key}", get(|| async { axum::http::StatusCode::NOT_FOUND })
+                .put(move |_: Bytes| {
+                    let ph = Arc::clone(&ph);
+                    async move { ph.store(true, Ordering::SeqCst); axum::http::StatusCode::OK }
+                }))
+            // resolve → the authoritative payload (tabular → Feather).
+            .route(
+                "/api/result/resolve",
+                get(move || {
+                    let rh = Arc::clone(&rh);
+                    async move {
+                        rh.store(true, Ordering::SeqCst);
+                        Json(serde_json::json!({ "columns": ["id"], "rows": [[1], [2]] }))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = ControlPlaneClient::new(&base);
+        let coords = coords_from_uri("noetl://t/p/results/325/load/2/4/1").unwrap();
+        let mut tally = CycleTally::default();
+        write_shadow(&client, &test_cell(), true, "noetl://execution/325/result/s/9001", &coords, &mut tally).await;
+
+        assert!(resolve_hit.load(Ordering::SeqCst), "absent object → materializer fetches result_store (safety net)");
+        assert!(put_hit.load(Ordering::SeqCst), "absent object → materializer writes the tier");
+        assert_eq!(tally.feather, 1, "wrote the Feather tier");
     }
 }

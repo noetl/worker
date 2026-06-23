@@ -15,6 +15,7 @@ pub mod executor;
 pub mod materializer;
 pub mod result_locator;
 pub mod result_materializer;
+pub mod result_producer_stage;
 pub mod result_resolver;
 pub mod metrics;
 pub mod state_builder;
