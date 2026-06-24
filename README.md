@@ -50,6 +50,11 @@ Worker executable that consumes command events and executes tools.
 NATS consumer lag is a planned follow-up — requires a periodic
 poll against the JetStream consumer info API.
 
+Under `NOETL_STATE_BUILDER=offserver` the drive is event-signalled
+and releases the WAL index lock per applied message, so per-hop
+transition latency stays sub-second instead of stalling on the
+idle-stream WAL drain (see noetl/ai-meta#130).
+
 ## Release Checklist
 
 1. Ensure `noetl-tools` + `noetl-executor` target versions are
