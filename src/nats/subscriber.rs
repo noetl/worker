@@ -1,11 +1,25 @@
 //! NATS JetStream subscriber for command notifications.
 
 use anyhow::Result;
-use async_nats::jetstream::{self, consumer::pull::Config as ConsumerConfig, Context};
+use async_nats::jetstream::{
+    self, consumer::pull::Config as ConsumerConfig, consumer::Consumer, Context,
+};
 use async_nats::ConnectOptions;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::sync::Mutex;
 use url::Url;
+
+/// The durable pull consumer this subscriber drains command notifications
+/// from. `Consumer` is an `Arc`-backed handle — cloning it does not re-hit
+/// the server, so the cached handle is cheap to share across `receive` calls.
+type PullConsumer = Consumer<ConsumerConfig>;
+
+/// Default server-blocking claim wait. A published command is delivered the
+/// instant it lands; this only bounds how long an idle worker blocks before
+/// looping. Overridable via `NOETL_NATS_CLAIM_EXPIRES_MS`.
+const DEFAULT_CLAIM_EXPIRES_MS: u64 = 2_000;
 
 /// Command notification received from NATS.
 ///
@@ -90,6 +104,24 @@ pub struct NatsSubscriber {
 
     /// Subject to subscribe to.
     subject: String,
+
+    /// Cached durable pull-consumer handle (noetl/ai-meta#130). Before this,
+    /// every `receive()` re-ran `get_stream` + `get_consumer` (two NATS
+    /// round-trips) to rebuild the handle on each command-claim hop. The
+    /// handle is resolved once and reused; reset to `None` on any fetch error
+    /// so a server restart / consumer recreation self-heals on the next claim.
+    consumer_handle: Mutex<Option<PullConsumer>>,
+
+    /// When true (default), `receive()` issues a server-blocking bounded pull
+    /// (`batch().expires(claim_expires)`) that returns the instant a command
+    /// is published — instead of the legacy NO-WAIT `fetch()` that returns
+    /// empty immediately and forces the caller to sleep and re-poll, adding up
+    /// to one poll-interval (~100ms) of latency to every claim hop. Set
+    /// `NOETL_NATS_BLOCKING_CLAIM=0` (or `false`) to restore the legacy path.
+    blocking_claim: bool,
+
+    /// How long a blocking claim waits before returning empty when idle.
+    claim_expires: Duration,
 }
 
 impl NatsSubscriber {
@@ -157,18 +189,64 @@ impl NatsSubscriber {
             }
         }
 
+        // noetl/ai-meta#130: default to the server-blocking claim path so a
+        // published command is delivered in ms; opt out to the legacy no-wait
+        // fetch + caller-side poll-sleep with NOETL_NATS_BLOCKING_CLAIM=0.
+        let blocking_claim = !matches!(
+            std::env::var("NOETL_NATS_BLOCKING_CLAIM")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        );
+        let claim_expires = Duration::from_millis(
+            std::env::var("NOETL_NATS_CLAIM_EXPIRES_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .unwrap_or(DEFAULT_CLAIM_EXPIRES_MS),
+        );
+        tracing::info!(
+            blocking_claim,
+            claim_expires_ms = claim_expires.as_millis() as u64,
+            "NATS command-claim mode"
+        );
+
         Ok(Self {
             js,
             stream: stream.to_string(),
             consumer: consumer.to_string(),
             subject: filter_subject.to_string(),
+            consumer_handle: Mutex::new(None),
+            blocking_claim,
+            claim_expires,
         })
     }
 
+    /// Return the durable pull-consumer handle, resolving it once and reusing
+    /// the cached clone thereafter (noetl/ai-meta#130).
+    ///
+    /// The handle is cloned out of the cache before the lock is released, so a
+    /// blocking drain on it never holds the cache lock.
+    async fn cached_consumer(&self) -> Result<PullConsumer> {
+        let mut guard = self.consumer_handle.lock().await;
+        if let Some(consumer) = guard.as_ref() {
+            return Ok(consumer.clone());
+        }
+        let consumer = self.ensure_consumer().await?;
+        *guard = Some(consumer.clone());
+        Ok(consumer)
+    }
+
+    /// Drop the cached consumer handle so the next claim re-resolves it. Called
+    /// after a fetch error — a stale handle (server restart, consumer
+    /// recreated) must not be reused or every subsequent claim fails.
+    async fn invalidate_consumer(&self) {
+        *self.consumer_handle.lock().await = None;
+    }
+
     /// Create or get the durable consumer.
-    async fn ensure_consumer(
-        &self,
-    ) -> Result<jetstream::consumer::Consumer<jetstream::consumer::pull::Config>> {
+    async fn ensure_consumer(&self) -> Result<PullConsumer> {
         let stream = self.js.get_stream(&self.stream).await?;
 
         let consumer_config = ConsumerConfig {
@@ -190,22 +268,50 @@ impl NatsSubscriber {
 
     /// Receive the next command notification.
     ///
-    /// This blocks until a message is available or the operation times out.
+    /// In the default blocking-claim mode this issues a server-blocking
+    /// bounded pull that returns the instant a command is published (or empty
+    /// after `claim_expires` when idle). In legacy mode it issues a no-wait
+    /// fetch that returns empty immediately, leaving the caller to poll-sleep.
+    /// Either way it claims at most one message so the worker's per-message
+    /// dispatch + ack flow is unchanged.
     pub async fn receive(
         &self,
     ) -> Result<Option<(CommandNotification, async_nats::jetstream::Message)>> {
-        let consumer = self.ensure_consumer().await?;
+        let consumer = self.cached_consumer().await?;
 
-        // Fetch one message with a timeout
-        let mut messages = consumer.fetch().max_messages(1).messages().await?;
+        // Server-blocking bounded pull (`batch`) vs legacy no-wait `fetch`.
+        let fetched = if self.blocking_claim {
+            consumer
+                .batch()
+                .max_messages(1)
+                .expires(self.claim_expires)
+                .messages()
+                .await
+        } else {
+            consumer.fetch().max_messages(1).messages().await
+        };
 
-        if let Some(msg) = messages.next().await {
-            let msg = msg.map_err(|e| anyhow::anyhow!("Failed to receive message: {}", e))?;
-            let notification: CommandNotification = serde_json::from_slice(&msg.payload)?;
-            return Ok(Some((notification, msg)));
+        let mut messages = match fetched {
+            Ok(m) => m,
+            Err(e) => {
+                // The cached consumer handle may be stale (server restart /
+                // consumer recreated). Drop it so the next claim re-resolves.
+                self.invalidate_consumer().await;
+                return Err(anyhow::anyhow!("Failed to pull command: {}", e));
+            }
+        };
+
+        match messages.next().await {
+            Some(Ok(msg)) => {
+                let notification: CommandNotification = serde_json::from_slice(&msg.payload)?;
+                Ok(Some((notification, msg)))
+            }
+            Some(Err(e)) => {
+                self.invalidate_consumer().await;
+                Err(anyhow::anyhow!("Failed to receive message: {}", e))
+            }
+            None => Ok(None),
         }
-
-        Ok(None)
     }
 
     /// Acknowledge a message.
@@ -493,5 +599,79 @@ mod tests {
         });
         let err = serde_json::from_value::<CommandNotification>(wire).unwrap_err();
         assert!(err.to_string().contains("string or"), "got: {}", err);
+    }
+
+    /// Live-server proof (noetl/ai-meta#130) that the default blocking-claim
+    /// path delivers a command shortly after it is published — not after a
+    /// fixed poll interval — AND that the consumer handle is cached across the
+    /// claim (no per-receive `get_stream` + `get_consumer` rebuild).
+    ///
+    /// Set `NOETL_TEST_NATS_URL=nats://localhost:4222` to run.
+    #[tokio::test]
+    async fn blocking_claim_delivers_published_command_promptly() {
+        let url = match std::env::var("NOETL_TEST_NATS_URL") {
+            Ok(u) => u,
+            Err(_) => return, // skip without a live NATS
+        };
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let stream = format!("claim_test_{suffix}");
+        let subject = format!("noetl.commands.claim_{suffix}");
+        let consumer = format!("claim_c_{suffix}");
+
+        // Blocking mode is the default; be explicit so the test is robust to a
+        // leaked opt-out env var from another test in the same process.
+        std::env::set_var("NOETL_NATS_BLOCKING_CLAIM", "1");
+
+        let sub = NatsSubscriber::connect(&url, &stream, &consumer, &subject, &subject)
+            .await
+            .expect("connect subscriber");
+
+        // Publish a command notification ~50ms after we start blocking, so the
+        // claim is genuinely waiting when it lands.
+        let pub_url = url.clone();
+        let pub_subject = subject.clone();
+        let publisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let client = async_nats::connect(&pub_url).await.unwrap();
+            let js = jetstream::new(client);
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "execution_id": 1i64,
+                "event_id": 2i64,
+                "command_id": 3i64,
+                "step": "s",
+                "server_url": "http://localhost:8082",
+            }))
+            .unwrap();
+            js.publish(pub_subject, payload.into())
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        });
+
+        let start = std::time::Instant::now();
+        let got = sub.receive().await.expect("receive");
+        let elapsed = start.elapsed();
+        publisher.await.unwrap();
+
+        let (notification, msg) = got.expect("blocking claim should deliver the command");
+        assert_eq!(notification.command_id, "3");
+        msg.ack().await.expect("ack");
+
+        // Returned promptly after the ~50ms publish, not after a long poll.
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "claim took {elapsed:?}; blocking pull should return shortly after publish"
+        );
+        // Handle cached for reuse on the next claim hop.
+        assert!(
+            sub.consumer_handle.lock().await.is_some(),
+            "consumer handle must be cached after a claim"
+        );
+
+        // Cleanup.
+        let client = async_nats::connect(&url).await.unwrap();
+        let _ = jetstream::new(client).delete_stream(&stream).await;
     }
 }
