@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
@@ -333,10 +334,17 @@ impl WasmPluginHost {
         if self.cache.contains_key(key) {
             return Ok(());
         }
+        // Cranelift JIT compile — the dominant one-time cold-start cost
+        // (noetl/ai-meta#130): a ~1.6MB module compiles in fractions of a
+        // second on a fast host, multiples of that on a constrained worker
+        // node.  Boot-warmup pays it once at startup so the first real dispatch
+        // is a cache hit.
+        let t = Instant::now();
         let module = Module::new(&self.engine, source).map_err(|e| PluginError::Compile {
             path: key.path.clone(),
             source: e,
         })?;
+        crate::metrics::record_plugin_load("compile", t.elapsed().as_secs_f64());
         self.cache.insert(key.clone(), module);
         self.compiles += 1;
         Ok(())
@@ -384,7 +392,13 @@ impl WasmPluginHost {
         version: u32,
         source: &dyn PluginSource,
     ) -> Result<PluginKey, PluginError> {
+        // Fetch the module bytes from the catalog source.  Timed for the
+        // cold-start attribution (noetl/ai-meta#130) — this HTTP GET runs on
+        // every dispatch (the digest is resolved from the body), but it is the
+        // small part of the cold cost; the `compile` phase dominates.
+        let t = Instant::now();
         let (digest, bytes) = source.resolve(path, version).await?;
+        crate::metrics::record_plugin_load("fetch", t.elapsed().as_secs_f64());
         let key = PluginKey::new(path, version, digest);
         if !self.cache.contains_key(&key) {
             self.load(&key, bytes)?;
@@ -810,6 +824,28 @@ impl WasmDispatcher {
     /// registry at `server_url` (the production source).
     pub fn http(server_url: impl Into<String>) -> Result<Self, PluginError> {
         Self::new(Box::new(HttpPluginSource::new(server_url)))
+    }
+
+    /// Warm the module cache for `(path, version)` — fetch + Cranelift-compile
+    /// the module so the first real dispatch is a cache hit (noetl/ai-meta#130
+    /// cold-start).  Called once at worker boot for `system/orchestrate@1` (the
+    /// off-server drive module).  The compile here is the same one the first
+    /// dispatch would otherwise pay on the critical path; moving it to startup —
+    /// behind the readiness gate — makes the first orchestration hop warm.
+    pub async fn warm(&mut self, path: &str, version: u32) -> Result<(), PluginError> {
+        self.host
+            .ensure_loaded_by_ref(path, version, self.source.as_ref())
+            .await
+            .map(|_| ())
+    }
+
+    /// True once `(path, version)` is compiled + cached at any digest — the
+    /// warmup observability hook.
+    pub fn is_warm(&self, path: &str, version: u32) -> bool {
+        self.host
+            .cache
+            .keys()
+            .any(|k| k.path == path && k.version == version)
     }
 
     /// Ensure the plug-in for `key` is loaded (fetching from the catalog source
@@ -1638,6 +1674,37 @@ mod tests {
         // Each run records exactly one capability intent (no leakage between
         // runs — fresh store + fresh buffer per invocation).
         assert_eq!(second.intents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_compiles_into_cache_so_dispatch_is_a_hit() {
+        // Boot warmup (noetl/ai-meta#130): `warm(path, version)` fetches +
+        // compiles the module up front; the subsequent dispatch reuses the
+        // cached module instead of paying the cold compile.
+        const WASM: &[u8] = include_bytes!("../tests/fixtures/reference_materializer.wasm");
+        let key = PluginKey::new("system/orchestrate", 1, "sha-orch");
+        let mut src = MapPluginSource::default();
+        src.insert(key.clone(), WASM.to_vec());
+        let mut dispatcher = WasmDispatcher::new(Box::new(src)).unwrap();
+
+        // Cold before warm.
+        assert!(!dispatcher.is_warm("system/orchestrate", 1));
+        dispatcher.warm("system/orchestrate", 1).await.unwrap();
+        // Warm: the module is compiled + cached at its resolved digest.
+        assert!(dispatcher.is_warm("system/orchestrate", 1));
+        // A dispatch after warm still works (cache hit — same digest).
+        let out = dispatcher.run(&key, b"x").await.unwrap();
+        assert_eq!(out.intents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_missing_module_is_an_error_not_a_panic() {
+        // The warm of a module the source can't resolve returns an error the
+        // caller treats as non-fatal (the first real dispatch lazy-loads).
+        let src = MapPluginSource::default();
+        let mut dispatcher = WasmDispatcher::new(Box::new(src)).unwrap();
+        assert!(dispatcher.warm("system/orchestrate", 1).await.is_err());
+        assert!(!dispatcher.is_warm("system/orchestrate", 1));
     }
 
     #[test]

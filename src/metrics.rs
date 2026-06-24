@@ -247,6 +247,26 @@ pub struct WorkerMetrics {
     /// every boot; this gauge going **> 0** after a restart is the rehydration
     /// proof.
     pub state_builder_indexed_executions: IntGauge,
+    /// Per-phase latency of loading a wasm plug-in module
+    /// (noetl/ai-meta#130 cold-start): `fetch` — the HTTP GET of the module
+    /// bytes from the server catalog; `compile` — the Cranelift JIT compile
+    /// (`Module::new`).  The compile dominates the first-hop cold-start
+    /// (~1.6MB `system/orchestrate` module → ~0.2s on a fast host, multiples of
+    /// that on a constrained worker node); boot-time warmup moves it off the
+    /// first real drive.
+    pub plugin_load_seconds: HistogramVec,
+    /// Boot-time plug-in warmup outcome (noetl/ai-meta#130): `warmed` — the
+    /// module compiled + cached during startup so the first dispatch is a cache
+    /// hit; `skipped` — warmup disabled or feature off; `error` — the warm
+    /// fetch/compile failed (non-fatal; the first real dispatch falls back to
+    /// the lazy load path).  `duration_seconds` on the warmup span is the total
+    /// boot-warm cost the readiness gate hides.
+    pub plugin_warm_total: IntCounterVec,
+    /// Worker readiness (noetl/ai-meta#130): `1` once boot warmup completed and
+    /// the pull loop is eligible to claim, `0` during startup.  The `/readyz`
+    /// probe reads this so Kubernetes only routes / completes a rollout once the
+    /// worker is warm.
+    pub worker_ready: IntGauge,
 }
 
 impl WorkerMetrics {
@@ -806,6 +826,42 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_drive_wait_total.clone()))
             .expect("register state_builder_drive_wait_total");
 
+        let plugin_load_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_worker_plugin_load_seconds",
+                "Per-phase latency of loading a wasm plug-in module (fetch vs Cranelift compile); noetl/ai-meta#130 cold-start attribution.",
+            )
+            .buckets(vec![
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.0, 5.0,
+            ]),
+            &["phase"],
+        )
+        .expect("plugin_load_seconds metric");
+        registry
+            .register(Box::new(plugin_load_seconds.clone()))
+            .expect("register plugin_load_seconds");
+
+        let plugin_warm_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_plugin_warm_total",
+                "Boot-time plug-in warmup outcome — warmed / skipped / error; noetl/ai-meta#130.",
+            ),
+            &["outcome"],
+        )
+        .expect("plugin_warm_total metric");
+        registry
+            .register(Box::new(plugin_warm_total.clone()))
+            .expect("register plugin_warm_total");
+
+        let worker_ready = IntGauge::new(
+            "noetl_worker_ready",
+            "Worker readiness — 1 once boot warmup completed; the /readyz probe reads this (noetl/ai-meta#130).",
+        )
+        .expect("worker_ready metric");
+        registry
+            .register(Box::new(worker_ready.clone()))
+            .expect("register worker_ready");
+
         Self {
             registry,
             pulls_total,
@@ -855,6 +911,9 @@ impl WorkerMetrics {
             state_builder_drive_builds_total,
             state_builder_drive_wait_total,
             state_builder_indexed_executions,
+            plugin_load_seconds,
+            plugin_warm_total,
+            worker_ready,
         }
     }
 
@@ -1238,6 +1297,40 @@ pub fn record_state_builder_drive_wait(outcome: &str) {
         .state_builder_drive_wait_total
         .with_label_values(&[outcome])
         .inc();
+}
+
+/// Record one wasm plug-in load phase latency (`fetch` — HTTP GET of the module
+/// bytes; `compile` — Cranelift `Module::new`).  noetl/ai-meta#130 cold-start
+/// attribution: the `compile` phase on the first dispatch is the one-time cost
+/// boot-warmup removes.
+pub fn record_plugin_load(phase: &str, duration_seconds: f64) {
+    WorkerMetrics::global()
+        .plugin_load_seconds
+        .with_label_values(&[phase])
+        .observe(duration_seconds);
+}
+
+/// Record the boot-time plug-in warmup outcome (`warmed` | `skipped` | `error`).
+/// noetl/ai-meta#130.
+pub fn record_plugin_warm(outcome: &str) {
+    WorkerMetrics::global()
+        .plugin_warm_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Set the worker-readiness gauge (`true` once boot warmup completed).  The
+/// `/readyz` probe reads this so Kubernetes only marks the pod Ready once warm.
+/// noetl/ai-meta#130.
+pub fn set_worker_ready(ready: bool) {
+    WorkerMetrics::global()
+        .worker_ready
+        .set(if ready { 1 } else { 0 });
+}
+
+/// Read the worker-readiness gauge — the `/readyz` handler's source of truth.
+pub fn worker_ready() -> bool {
+    WorkerMetrics::global().worker_ready.get() == 1
 }
 
 // Unused-warning suppression for fields that aren't read directly
