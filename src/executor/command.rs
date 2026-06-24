@@ -1466,20 +1466,42 @@ impl CommandExecutor {
         // worker-built state is never staler than the server's view.
         let expected_head = args.get("expected_head").and_then(|v| v.as_i64());
 
-        // Bounded retry: the trigger fired from the materialized WAL, so the
-        // event is already on the stream — the drain just needs to have pulled
-        // it. Re-check a few times before falling back.
+        // Bounded, event-signalled wait (noetl/ai-meta#130).  The trigger fired
+        // from the server's in-memory chain head, so the event the build needs is
+        // already on the `noetl_events` WAL — the pool-side drain just has to have
+        // pulled + indexed it.  Rather than poll on a fixed 200ms grid (and, on a
+        // miss after the window, hand off to the 8s reconcile poller — the source
+        // of the ~1.8s/hop tail), park on the drain's append signal: the loop
+        // wakes the instant the drain indexes a batch and re-checks the chain, so
+        // a complete chain advances in ~drain-apply latency (single-digit ms)
+        // instead of a poll tick.  `attempts × retry_ms` becomes a total *budget*
+        // (default 5 × 200ms = 1000ms); `retry_ms` is the per-wait cap so we still
+        // re-check even if a wake is missed (belt-and-suspenders — the index under
+        // the lock is the source of truth, the signal only changes *when* we look).
         let attempts = std::env::var("NOETL_STATE_BUILDER_DRIVE_RETRIES")
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(5)
             .clamp(1, 50);
-        let sleep_ms = std::env::var("NOETL_STATE_BUILDER_DRIVE_RETRY_MS")
+        let retry_ms = std::env::var("NOETL_STATE_BUILDER_DRIVE_RETRY_MS")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(200)
             .clamp(10, 5_000);
-        for attempt in 0..attempts {
+        let budget = std::time::Duration::from_millis(retry_ms.saturating_mul(attempts as u64));
+        let per_wait = std::time::Duration::from_millis(retry_ms);
+        let deadline = std::time::Instant::now() + budget;
+        let appended = self.state_builder_index.appended();
+        let mut wakes = 0u32;
+        loop {
+            // Register interest on the append signal BEFORE building, so an apply
+            // landing between the build check and the await below can't be lost
+            // (the enable-before-check pattern — `notify_waiters` only wakes
+            // already-registered futures).
+            let notified = appended.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(bytes) = crate::state_builder::build_offserver_input(
                 &self.state_builder_index,
                 execution_id,
@@ -1494,7 +1516,7 @@ impl CommandExecutor {
                 crate::metrics::record_state_builder_drive("served");
                 tracing::debug!(
                     execution_id,
-                    attempt,
+                    wakes,
                     "off-server drive: built state from WAL spine (run/from_events), no noetl.event read"
                 );
                 return OffserverDispatch::Wasm {
@@ -1502,8 +1524,19 @@ impl CommandExecutor {
                     input: bytes,
                 };
             }
-            if attempt + 1 < attempts {
-                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = per_wait.min(deadline - now);
+            // Wake on the next drain apply, or fall through on the per-wait cap.
+            match tokio::time::timeout(wait, notified).await {
+                Ok(()) => {
+                    wakes += 1;
+                    crate::metrics::record_state_builder_drive_wait("woken");
+                }
+                Err(_) => crate::metrics::record_state_builder_drive_wait("timeout"),
             }
         }
 
@@ -2921,7 +2954,7 @@ mod tests {
             snowflake,
             cache,
             crate::state_builder::BuilderMode::Off,
-            std::sync::Arc::new(tokio::sync::Mutex::new(crate::state_builder::WalEventIndex::new())),
+            crate::state_builder::SharedWalIndex::new(crate::state_builder::WalEventIndex::new()),
         );
 
         // Verify tools are registered
@@ -3498,7 +3531,7 @@ mod tests {
             Arc::new(SnowflakeGen::with_node_and_epoch(1, 0)),
             test_cache("wkr-test-predispatch"),
             crate::state_builder::BuilderMode::Off,
-            Arc::new(tokio::sync::Mutex::new(crate::state_builder::WalEventIndex::new())),
+            crate::state_builder::SharedWalIndex::new(crate::state_builder::WalEventIndex::new()),
         )
     }
 
