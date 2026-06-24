@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.46.1](https://github.com/noetl/worker/compare/v5.46.0...v5.46.1) (2026-06-24)
+
+### Bug Fixes
+
+* **offserver:** event-signalled drive + release index lock per WAL apply ([#133](https://github.com/noetl/worker/issues/133)) ([402b26e](https://github.com/noetl/worker/commit/402b26e8c87210e56f28044073ff0b5cc7c62603)), closes [noetl/ai-meta#130](https://github.com/noetl/ai-meta/issues/130) [#115](https://github.com/noetl/worker/issues/115) [#103](https://github.com/noetl/worker/issues/103) [noetl/ai-meta#130](https://github.com/noetl/ai-meta/issues/130)
+
 ## [5.46.0](https://github.com/noetl/worker/compare/v5.45.0...v5.46.0) (2026-06-23)
 
 ### Features
