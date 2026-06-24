@@ -233,6 +233,11 @@ pub struct WorkerMetrics {
     /// authoritative so it used the server-built state.  The proof that the WAL
     /// build is authoritative is `served` dominating in steady state.
     pub state_builder_drive_builds_total: IntCounterVec,
+    /// Off-server DRIVE build-retry waits by outcome — `woken` (the drain's
+    /// append signal fired, noetl/ai-meta#130) vs `timeout` (the per-wait cap
+    /// elapsed).  A healthy event-signalled drive shows `woken` dominating with a
+    /// low absolute count (one or two wakes per hop), not a fixed-grid poll.
+    pub state_builder_drive_wait_total: IntCounterVec,
     /// Executions currently held in the pool-side WAL index — the index-coverage
     /// gauge (noetl/ai-meta#119).  The #119 stall was an index starved to **0**
     /// after a worker restart (the durable consumer cursor outran the rebuilt
@@ -789,6 +794,18 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_drive_builds_total.clone()))
             .expect("register state_builder_drive_builds_total");
 
+        let state_builder_drive_wait_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_drive_wait_total",
+                "Off-server DRIVE build-retry waits by outcome — woken (drain append signal) vs timeout (per-wait cap); noetl/ai-meta#130 event-signalled drive.",
+            ),
+            &["outcome"],
+        )
+        .expect("state_builder_drive_wait_total metric");
+        registry
+            .register(Box::new(state_builder_drive_wait_total.clone()))
+            .expect("register state_builder_drive_wait_total");
+
         Self {
             registry,
             pulls_total,
@@ -836,6 +853,7 @@ impl WorkerMetrics {
             state_builder_builds_total,
             state_builder_chain_hops,
             state_builder_drive_builds_total,
+            state_builder_drive_wait_total,
             state_builder_indexed_executions,
         }
     }
@@ -1207,6 +1225,17 @@ pub fn record_state_builder_chain_hops(hops: usize) {
 pub fn record_state_builder_drive(outcome: &str) {
     WorkerMetrics::global()
         .state_builder_drive_builds_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Record one off-server DRIVE build-retry wait by outcome (`woken` when the
+/// drain's append signal fired, `timeout` when the per-wait cap elapsed).
+/// noetl/ai-meta#130 — proof the event-signalled drive wakes on WAL appends
+/// rather than polling a fixed grid.
+pub fn record_state_builder_drive_wait(outcome: &str) {
+    WorkerMetrics::global()
+        .state_builder_drive_wait_total
         .with_label_values(&[outcome])
         .inc();
 }

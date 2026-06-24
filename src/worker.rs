@@ -117,9 +117,10 @@ impl Worker {
         // The spine ordering (noetl/ai-meta#117) is resolved from env once: causal
         // (`prev_event_id` chain) order by default, so fan-in survives an
         // `event_id`-vs-chain inversion under high-concurrency fan-out.
-        let state_builder_index: crate::state_builder::SharedWalIndex = Arc::new(Mutex::new(
-            crate::state_builder::WalEventIndex::with_order(crate::state_builder::spine_order()),
-        ));
+        let state_builder_index: crate::state_builder::SharedWalIndex =
+            crate::state_builder::SharedWalIndex::new(
+                crate::state_builder::WalEventIndex::with_order(crate::state_builder::spine_order()),
+            );
 
         // Create executor.  Under `NOETL_STATE_BUILDER=offserver` it builds the
         // orchestrate drive's state from `state_builder_index` (the WAL spine)

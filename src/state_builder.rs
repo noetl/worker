@@ -565,7 +565,52 @@ impl WalEventIndex {
 /// command-dispatch off-server-build path.  A `tokio::Mutex` because both sides
 /// are async tasks in the same worker process; critical sections are short
 /// (a per-batch apply, or a single chain advance + spine read).
-pub type SharedWalIndex = std::sync::Arc<tokio::sync::Mutex<WalEventIndex>>;
+///
+/// Alongside the index it carries an [`appended`](SharedWalIndex::appended)
+/// [`Notify`](tokio::sync::Notify) the drain pulses every time it applies a
+/// non-empty batch (noetl/ai-meta#130).  The off-server drive's build-retry loop
+/// parks on that signal instead of polling on a fixed `idle_sleep` grid, so a
+/// hop advances the instant the drain indexes the event it needs rather than
+/// waiting for the next poll tick / the 8s reconcile poller.  The signal is a
+/// liveness hint only — the index under the mutex is the source of truth; a
+/// spurious or missed pulse only changes *when* the loop re-checks, never *what*
+/// it builds.
+#[derive(Clone)]
+pub struct SharedWalIndex {
+    inner: std::sync::Arc<tokio::sync::Mutex<WalEventIndex>>,
+    appended: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl SharedWalIndex {
+    /// Wrap a fresh [`WalEventIndex`] with its append signal.
+    pub fn new(index: WalEventIndex) -> Self {
+        Self {
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(index)),
+            appended: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Lock the underlying index.  Named `lock` so existing
+    /// `index.lock().await` call sites are unchanged.
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, WalEventIndex> {
+        self.inner.lock().await
+    }
+
+    /// A handle to the append signal the drain pulses after each non-empty
+    /// apply.  Callers register interest with [`Notify::notified`] *before*
+    /// checking the index (the enable-before-check pattern) so an append landing
+    /// between the check and the await can't be lost.
+    pub fn appended(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.appended.clone()
+    }
+
+    /// Wake every waiter parked on the append signal.  Called by the drain loop
+    /// after it applies a batch that touched at least one execution.  Cheap and
+    /// lock-free; a no-op when nobody is waiting.
+    pub fn notify_appended(&self) {
+        self.appended.notify_waiters();
+    }
+}
 
 /// Where the worker's state builder operates — resolved from env at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,7 +842,16 @@ impl DrainConfig {
             durable,
             batch: env_u32("NOETL_STATE_BUILDER_BATCH", 200).clamp(1, 1000),
             timeout_ms: env_u64("NOETL_STATE_BUILDER_TIMEOUT_MS", 2_000),
-            idle_sleep: Duration::from_millis(env_u64("NOETL_STATE_BUILDER_IDLE_SLEEP_MS", 500)),
+            // noetl/ai-meta#130: the post-empty backoff was 500ms — on an idle
+            // cluster a freshly-published event could sit up to that long between
+            // an empty long-poll returning and the next `batch()` starting, which
+            // (stacked on the old fixed-grid drive retry) was a chunk of the
+            // ~1.8s/hop off-server latency.  The `expires`-bounded long-poll below
+            // already blocks efficiently while waiting for messages, so this is a
+            // tiny re-poll gap, not a busy-loop guard; drop it to 25ms so the drain
+            // re-arms its long-poll near-immediately and the append signal fires
+            // within milliseconds of an event landing.  Still env-overridable.
+            idle_sleep: Duration::from_millis(env_u64("NOETL_STATE_BUILDER_IDLE_SLEEP_MS", 25)),
         })
     }
 }
@@ -905,54 +959,69 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         let mut touched: Vec<i64> = Vec::new();
         let mut consumed = 0u64;
         let mut terminals: Vec<i64> = Vec::new();
-        // Apply the whole batch into the shared index under one lock, then drop
-        // it before the (shadow-only) advance pass — keeps the critical section
-        // the command-dispatch off-server-build path contends on short.
-        {
-            let mut idx = index.lock().await;
-            while let Some(msg) = batch.next().await {
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "state-builder message error");
-                        continue;
-                    }
-                };
-                consumed += 1;
-                let payload: serde_json::Value = match serde_json::from_slice(&msg.payload) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        // Payload may be a JSON string holding JSON (mirror the
-                        // materializer's tolerance).
-                        match std::str::from_utf8(&msg.payload)
-                            .ok()
-                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                        {
-                            Some(v) => v,
-                            None => {
-                                if durable {
-                                    let _ = msg.ack().await;
-                                }
-                                continue;
+        // noetl/ai-meta#130: apply each message under its OWN short lock and
+        // release between messages — do NOT hold the index lock across
+        // `batch.next().await`.  The pull is `.expires(timeout_ms)`-bounded, so on
+        // an idle stream `batch.next()` blocks for the full expiry (default 2s)
+        // waiting for the next message after the last one arrives; holding the
+        // lock across that wait pinned the index for ~2s per cycle and stalled the
+        // off-server drive's `build_offserver_input` (which blocks on the same
+        // lock) — the ~1.8–2.3s/hop in #130.  Parsing happens lock-free; the
+        // critical section is now a single `idx.apply`.  Each applied event pulses
+        // the append signal immediately, so the drive's build-retry loop wakes the
+        // instant the event it needs is indexed.
+        while let Some(msg) = batch.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "state-builder message error");
+                    continue;
+                }
+            };
+            consumed += 1;
+            let payload: serde_json::Value = match serde_json::from_slice(&msg.payload) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Payload may be a JSON string holding JSON (mirror the
+                    // materializer's tolerance).
+                    match std::str::from_utf8(&msg.payload)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    {
+                        Some(v) => v,
+                        None => {
+                            if durable {
+                                let _ = msg.ack().await;
                             }
+                            continue;
                         }
                     }
-                };
-                if let Some((execution_id, _is_new, is_terminal)) = idx.apply(&payload) {
-                    if !touched.contains(&execution_id) {
-                        touched.push(execution_id);
-                    }
-                    if is_terminal {
-                        terminals.push(execution_id);
-                    }
                 }
-                // Durable consumer: ack after the event is indexed (at-least-once;
-                // re-apply on redelivery is idempotent — same event_id overwrites
-                // identical data).  The ephemeral DeliverAll consumer (the #119
-                // default) has no cursor to advance and never acks.
-                if durable {
-                    let _ = msg.ack().await;
+            };
+            // Short critical section: just the apply, then drop the lock so the
+            // off-server build path can read the index while we await the next
+            // message.
+            let applied = {
+                let mut idx = index.lock().await;
+                idx.apply(&payload)
+            };
+            if let Some((execution_id, _is_new, is_terminal)) = applied {
+                if !touched.contains(&execution_id) {
+                    touched.push(execution_id);
                 }
+                if is_terminal {
+                    terminals.push(execution_id);
+                }
+                // Wake any drive build-retry loop waiting on this execution the
+                // instant the event is indexed — not after the whole batch drains.
+                index.notify_appended();
+            }
+            // Durable consumer: ack after the event is indexed (at-least-once;
+            // re-apply on redelivery is idempotent — same event_id overwrites
+            // identical data).  The ephemeral DeliverAll consumer (the #119
+            // default) has no cursor to advance and never acks.
+            if durable {
+                let _ = msg.ack().await;
             }
         }
 
@@ -1502,8 +1571,7 @@ mod tests {
         // The off-server drive build assembles the exact OrchestrateInput shape
         // the wasm `run` (from_events) entry decodes: { events, playbook,
         // trigger_event_type }.
-        let index: SharedWalIndex =
-            std::sync::Arc::new(tokio::sync::Mutex::new(WalEventIndex::new()));
+        let index: SharedWalIndex = SharedWalIndex::new(WalEventIndex::new());
         {
             let mut idx = index.lock().await;
             for e in linear_spine(3) {
@@ -1559,6 +1627,122 @@ mod tests {
 
         // An unknown execution → None (the caller falls back to run_state).
         assert!(build_offserver_input(&index, 7, &playbook, None, None, None, false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn append_signal_wakes_registered_waiter() {
+        // noetl/ai-meta#130: the drain's append signal must wake a waiter that
+        // registered interest (enable-before-check) — the primitive the
+        // off-server drive's build-retry loop parks on instead of fixed polling.
+        let index = SharedWalIndex::new(WalEventIndex::new());
+        let appended = index.appended();
+        let notified = appended.notified();
+        tokio::pin!(notified);
+        // Register BEFORE the (would-be) build check.
+        notified.as_mut().enable();
+        // A pulse from the drain side wakes the registered waiter promptly.
+        index.notify_appended();
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("notify_appended must wake a registered waiter");
+    }
+
+    #[tokio::test]
+    async fn reader_is_not_starved_while_index_is_being_fed() {
+        // noetl/ai-meta#130 regression guard: the off-server build path must be
+        // able to acquire the index lock promptly even while the drain is feeding
+        // events.  The old drain held the lock across the whole `batch.next()`
+        // wait (~2s on an idle stream); this proves a reader interleaves with a
+        // feeder that applies + releases per event.  If a regression reintroduces
+        // a long-held lock on the feeder side, the reader's `lock()` below would
+        // block past the generous timeout and the test fails.
+        let index = SharedWalIndex::new(WalEventIndex::new());
+        let feeder = index.clone();
+        let spine = linear_spine(3);
+        let feed = tokio::spawn(async move {
+            for e in &spine {
+                {
+                    let mut idx = feeder.lock().await; // short critical section
+                    idx.apply(e);
+                }
+                feeder.notify_appended();
+                // Simulate the idle gap between WAL messages WITHOUT holding the
+                // lock (the fixed behaviour); the reader must win the lock here.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        });
+        // While the feeder is mid-stream, the reader acquires the lock repeatedly
+        // with a tight timeout — proving it is never pinned out for ~2s.
+        for _ in 0..5 {
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                let _g = index.lock().await;
+            })
+            .await
+            .expect("reader must acquire the index lock without being starved");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        feed.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_build_wakes_on_append_signal() {
+        // End-to-end at the state-builder layer: a waiter mirroring the
+        // off-server drive's build-retry loop (enable → build → park on the
+        // append signal) advances the instant the drain indexes the events it
+        // needs, NOT on a fixed poll grid.  Staged applies + pulses prove the
+        // loop re-checks on each append and only serves once the chain reaches
+        // `expected_head` (the staleness guard stays intact).
+        let index = SharedWalIndex::new(WalEventIndex::new());
+        let playbook = serde_json::json!({ "metadata": { "path": "t" } });
+        let spine = linear_spine(3); // events 1,2,3 for execution 42
+
+        let waiter_index = index.clone();
+        let waiter_playbook = playbook.clone();
+        let waiter = tokio::spawn(async move {
+            let appended = waiter_index.appended();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let notified = appended.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(bytes) = build_offserver_input(
+                    &waiter_index,
+                    42,
+                    &waiter_playbook,
+                    Some("command.completed"),
+                    None,
+                    Some(3),
+                    false,
+                )
+                .await
+                {
+                    return bytes;
+                }
+                assert!(std::time::Instant::now() < deadline, "waiter timed out");
+                // Park on the next drain append (cap well above the staging gap).
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), notified).await;
+            }
+        });
+
+        // Stage the spine one event at a time, pulsing after each — the waiter
+        // wakes on each pulse, finds the chain still short of expected_head=3, and
+        // re-parks, until the final event lets the build serve.
+        for e in &spine {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            {
+                let mut idx = index.lock().await;
+                idx.apply(e);
+            }
+            index.notify_appended();
+        }
+
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter resolves before the timeout")
+            .expect("waiter task did not panic");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["events"].as_array().unwrap().len(), 3, "served the full spine");
+        assert_eq!(v["trigger_event_type"], "command.completed");
     }
 
     #[test]
