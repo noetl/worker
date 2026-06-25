@@ -169,7 +169,18 @@ wasmtime = { version = "27", optional = true }
 #   (tools#78, noetl/ai-meta#104).  Conservative default `true`; only
 #   `noop` / `rhai` are `false`.  Required by `command_is_side_effecting`
 #   in src/executor/command.rs.
-noetl-tools = "3.17"
+# - v3.18.0: the `playbook` tool's opt-in `return_result: true` mode
+#   (tools#80, noetl/ai-meta#136).  In blocking mode the tool now resolves
+#   and returns the CHILD execution's real result payload (what a sibling
+#   step reads as `{{ step }}`) instead of `{status, execution_id}`, so
+#   MCP-composition playbooks (the travel itinerary-planner dispatching
+#   `mcp/google-places|duffel|amadeus|firestore`) see real sub-playbook
+#   output rather than synthetic placeholders.  Opt-in (`return_result`)
+#   so the 100+ existing `kind: playbook` callers keep their async /
+#   `return_step` semantics; env kill-switch
+#   `NOETL_PLAYBOOK_AWAIT_CHILD_RESULT` (default true) reverts the new
+#   path without a redeploy.  No worker code change — runtime adoption only.
+noetl-tools = "3.18"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
