@@ -180,7 +180,15 @@ wasmtime = { version = "27", optional = true }
 #   `return_step` semantics; env kill-switch
 #   `NOETL_PLAYBOOK_AWAIT_CHILD_RESULT` (default true) reverts the new
 #   path without a redeploy.  No worker code change — runtime adoption only.
-noetl-tools = "3.18"
+#
+# 3.18.1 (#136 payload fix): `build_payload` no longer lets the worker's
+#   auto-injected empty `args: {}` shadow an explicit `payload:` on a
+#   `kind: playbook` step.  Precedence is non-empty `args` -> `payload` ->
+#   `args` as-is -> `{}`, so an MCP-composition step like
+#   `mcp/google-places.search_text` forwards its `method`/`tool`/`arguments`
+#   to the child instead of running the child's default `tools/list`.
+#   Runtime adoption only — no worker code change.
+noetl-tools = "3.18.1"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
