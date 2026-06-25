@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.46.2](https://github.com/noetl/worker/compare/v5.46.1...v5.46.2) (2026-06-25)
+
+### Bug Fixes
+
+* **deps:** bump noetl-tools 3.17 -> 3.18 (playbook return_result, [#136](https://github.com/noetl/worker/issues/136)) ([#137](https://github.com/noetl/worker/issues/137)) ([934fb61](https://github.com/noetl/worker/commit/934fb6109b66e552907195ca356f682aaa1a3d0e)), closes [tools#80](https://github.com/noetl/tools/issues/80)
+
 ## [5.46.1](https://github.com/noetl/worker/compare/v5.46.0...v5.46.1) (2026-06-24)
 
 ### Bug Fixes
