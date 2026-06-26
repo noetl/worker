@@ -1,6 +1,6 @@
 [package]
 name = "noetl-worker"
-version = "5.46.3"
+version = "5.47.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"
@@ -188,7 +188,7 @@ wasmtime = { version = "27", optional = true }
 #   `mcp/google-places.search_text` forwards its `method`/`tool`/`arguments`
 #   to the child instead of running the child's default `tools/list`.
 #   Runtime adoption only — no worker code change.
-noetl-tools = "3.18.1"
+noetl-tools = "3.19"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:

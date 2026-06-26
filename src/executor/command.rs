@@ -680,6 +680,36 @@ impl CommandExecutor {
                         "skipping call.done emit per pending_callback marker (await async callback)"
                     );
                     crate::metrics::record_call_done_skipped_pending_callback(&tool_config.kind);
+
+                    // noetl/ai-meta#145 G2 — poll-based completion fallback.
+                    // Off by default (the durable path is the external
+                    // noetl-k8s-watcher).  When ON, this worker resolves its
+                    // OWN container Jobs: spawn a detached poller (the slot
+                    // is already freed by returning from this handler) that
+                    // watches the Job to terminal and emits the resume
+                    // call.done itself.  See
+                    // docs/rfc/g1-g2-container-job-async.md §2.  Mutually
+                    // exclusive with the watcher — running both double-emits.
+                    if container_completion_poll_enabled() {
+                        match extract_job_handle(&result) {
+                            Some((namespace, job_name)) => {
+                                self.spawn_container_poll(
+                                    &dispatch_client,
+                                    command,
+                                    ctx.call_index,
+                                    namespace,
+                                    job_name,
+                                );
+                            }
+                            None => {
+                                tracing::warn!(
+                                    execution_id = command.execution_id,
+                                    step = %command.step,
+                                    "container poll fallback enabled but result carried no job handle; cannot poll — falling back to watcher path",
+                                );
+                            }
+                        }
+                    }
                 } else {
                     self.emit_event_via(
                         &dispatch_client,
@@ -896,6 +926,132 @@ impl CommandExecutor {
         result
     }
 
+    /// noetl/ai-meta#145 G2 — spawn the detached container poll fallback.
+    ///
+    /// The dispatch slot is freed the moment this handler returns; the
+    /// spawned task is independent of the pull loop.  It watches the
+    /// dispatched K8s Job to its terminal state via the tools-crate
+    /// `poll_job_to_terminal` helper, then emits the resume `call.done`
+    /// itself through the worker's normal `/api/events` path — no
+    /// internal token, no server change.  Only cheap clones cross into
+    /// the task (`ControlPlaneClient` is `Arc`-backed; `SnowflakeGen` is
+    /// already `Arc`).
+    fn spawn_container_poll(
+        &self,
+        client: &ControlPlaneClient,
+        command: &Command,
+        call_index: usize,
+        namespace: String,
+        job_name: String,
+    ) {
+        use tracing::Instrument;
+
+        let client = client.clone();
+        let snowflake = self.snowflake.clone();
+        let worker_id = self.worker_id.clone();
+        let execution_id = command.execution_id;
+        let step = command.step.clone();
+        let command_id = command.command_id.clone();
+        let attempts = command.attempts;
+        let opts = container_poll_options();
+
+        crate::metrics::record_container_poll_started(&namespace);
+        let span = tracing::info_span!(
+            "container.poll",
+            execution_id,
+            step = %step,
+            job_name = %job_name,
+            namespace = %namespace,
+        );
+
+        tokio::spawn(
+            async move {
+                let started = std::time::Instant::now();
+                let outcome =
+                    noetl_tools::tools::poll_job_to_terminal(&namespace, &job_name, opts).await;
+                let elapsed = started.elapsed().as_secs_f64();
+
+                // Map the poll outcome → a call.done envelope.  An
+                // infrastructure error polling the Job becomes a FAILED
+                // resume (the execution must not hang forever) tagged
+                // `error` so it's distinguishable on the dashboard.
+                let (status_label, terminal_context, metric_state) = match outcome {
+                    Ok(o) => {
+                        let status = if o.is_success() { "COMPLETED" } else { "FAILED" };
+                        let state = o.state.clone();
+                        let ctx = serde_json::json!({
+                            "terminal_state": o.state,
+                            "job_name": job_name,
+                            "namespace": namespace,
+                            "reason": o.reason,
+                            "completed_at": o.completed_at,
+                            "via": "poll",
+                        });
+                        (status, ctx, state)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            execution_id,
+                            step = %step,
+                            job_name = %job_name,
+                            error = %e,
+                            "container poll failed; emitting FAILED resume so the execution does not hang",
+                        );
+                        let ctx = serde_json::json!({
+                            "terminal_state": "error",
+                            "job_name": job_name,
+                            "namespace": namespace,
+                            "reason": e.to_string(),
+                            "via": "poll",
+                        });
+                        ("FAILED", ctx, "error".to_string())
+                    }
+                };
+
+                let event = ExecutorEvent {
+                    execution_id,
+                    event_type: "call.done".to_string(),
+                    step: step.clone(),
+                    status: status_label.to_string(),
+                    created_at: chrono::Utc::now(),
+                    context: serde_json::json!({
+                        "command_id": command_id,
+                        "call_index": call_index,
+                        "result": {
+                            "status": status_label,
+                            "context": terminal_context,
+                        },
+                    }),
+                    event_id: Some(snowflake.next_id()),
+                    worker_id: Some(worker_id),
+                    meta: Some(serde_json::json!({
+                        "attempts": attempts,
+                        "node_type": "container",
+                        "via": "poll",
+                    })),
+                };
+
+                if let Err(e) = client.emit_event_with_retry(event, 3).await {
+                    tracing::error!(
+                        execution_id,
+                        step = %step,
+                        error = %e,
+                        "container poll: failed to emit resume call.done after retries",
+                    );
+                } else {
+                    tracing::info!(
+                        execution_id,
+                        step = %step,
+                        state = %metric_state,
+                        "container poll: emitted resume call.done",
+                    );
+                }
+                crate::metrics::record_container_poll_terminal(&metric_state, elapsed);
+            }
+            .instrument(span),
+        );
+    }
+
     /// Handle a failure that happens BEFORE the tool-dispatch match
     /// (credential-alias resolution, tool-config deserialization).
     ///
@@ -1011,6 +1167,57 @@ fn inline_budget_bytes() -> usize {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(INLINE_CONTEXT_MAX_BYTES)
     })
+}
+
+/// noetl/ai-meta#145 G2 — whether this worker resolves its own
+/// container Jobs via the poll fallback.  Off by default: the durable
+/// completion path is the external `noetl-k8s-watcher`.  Turning this on
+/// is a statement that the watcher is NOT also running against this
+/// worker's Jobs (the two paths double-emit the resume `call.done`).
+fn container_completion_poll_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("NOETL_CONTAINER_COMPLETION_POLL")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Poll cadence + deadline for the container poll fallback, overridable
+/// from env.  Defaults: 5s→30s backoff, 24 h max_wait backstop.
+fn container_poll_options() -> noetl_tools::tools::PollOptions {
+    use std::time::Duration;
+    let secs = |name: &str, default: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    };
+    noetl_tools::tools::PollOptions {
+        interval: Duration::from_secs(secs("NOETL_CONTAINER_POLL_INTERVAL_SECS", 5)),
+        max_interval: Duration::from_secs(secs("NOETL_CONTAINER_POLL_MAX_INTERVAL_SECS", 30)),
+        max_wait: Duration::from_secs(secs("NOETL_CONTAINER_POLL_MAX_WAIT_SECS", 24 * 60 * 60)),
+    }
+}
+
+/// Extract `(namespace, job_name)` from a container tool's
+/// `ToolResult.data` (`{ "job_name": ..., "namespace": ... }`).  Returns
+/// `None` if either field is missing/empty — the caller logs + skips the
+/// poll (the watcher path can still resolve the Job).
+fn extract_job_handle(result: &noetl_tools::result::ToolResult) -> Option<(String, String)> {
+    let data = result.data.as_ref()?;
+    let job_name = data.get("job_name")?.as_str()?.to_string();
+    let namespace = data.get("namespace")?.as_str()?.to_string();
+    if job_name.is_empty() || namespace.is_empty() {
+        return None;
+    }
+    Some((namespace, job_name))
 }
 
 /// Encoding choice for the over-budget shm cache write.  R-2.2:
@@ -3620,5 +3827,53 @@ mod tests {
             "retryable pre-dispatch failure must emit no events, got: {events:?}"
         );
         handle.abort();
+    }
+
+    // --- noetl/ai-meta#145 G2 — container poll fallback helpers ---
+
+    #[test]
+    fn extract_job_handle_reads_container_data() {
+        let mut r = noetl_tools::result::ToolResult::success(serde_json::json!({
+            "job_name": "noetl-container-train-42-abcde",
+            "namespace": "noetl",
+            "job_uid": "uid-1",
+        }));
+        r.pending_callback = Some(true);
+        let (ns, name) = extract_job_handle(&r).expect("handle present");
+        assert_eq!(ns, "noetl");
+        assert_eq!(name, "noetl-container-train-42-abcde");
+    }
+
+    #[test]
+    fn extract_job_handle_none_when_fields_missing_or_empty() {
+        // No data at all.
+        let mut r = noetl_tools::result::ToolResult::success(serde_json::json!({}));
+        r.pending_callback = Some(true);
+        assert!(extract_job_handle(&r).is_none());
+
+        // Empty strings are rejected (would build an unusable kube query).
+        let r2 = noetl_tools::result::ToolResult::success(serde_json::json!({
+            "job_name": "",
+            "namespace": "noetl",
+        }));
+        assert!(extract_job_handle(&r2).is_none());
+    }
+
+    #[test]
+    fn container_poll_options_reads_env_overrides() {
+        // Defaults when unset.
+        std::env::remove_var("NOETL_CONTAINER_POLL_INTERVAL_SECS");
+        std::env::remove_var("NOETL_CONTAINER_POLL_MAX_WAIT_SECS");
+        let o = container_poll_options();
+        assert_eq!(o.interval.as_secs(), 5);
+        assert_eq!(o.max_wait.as_secs(), 24 * 60 * 60);
+
+        std::env::set_var("NOETL_CONTAINER_POLL_INTERVAL_SECS", "2");
+        std::env::set_var("NOETL_CONTAINER_POLL_MAX_WAIT_SECS", "120");
+        let o2 = container_poll_options();
+        assert_eq!(o2.interval.as_secs(), 2);
+        assert_eq!(o2.max_wait.as_secs(), 120);
+        std::env::remove_var("NOETL_CONTAINER_POLL_INTERVAL_SECS");
+        std::env::remove_var("NOETL_CONTAINER_POLL_MAX_WAIT_SECS");
     }
 }

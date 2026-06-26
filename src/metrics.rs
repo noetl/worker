@@ -82,6 +82,15 @@ pub struct WorkerMetrics {
     pub result_store_put_bytes_total: IntCounter,
     pub result_store_put_errors_total: IntCounter,
     pub call_done_skipped_pending_callback_total: IntCounterVec,
+    /// noetl/ai-meta#145 G2 — container poll fallback.  Pollers started,
+    /// by namespace.
+    pub container_poll_started_total: IntCounterVec,
+    /// Container poll fallback terminal outcomes, by resolved state
+    /// (`succeeded` / `failed` / `poll_timeout` / `error`).
+    pub container_poll_terminal_total: IntCounterVec,
+    /// Wall-clock a container poll fallback spent watching a Job to its
+    /// terminal state.
+    pub container_poll_duration_seconds: Histogram,
     /// Messages received by the continuous subscription runtime, by source.
     pub subscription_messages_received_total: IntCounterVec,
     /// Per-message executions the runtime dispatched, by source + outcome
@@ -432,6 +441,52 @@ impl WorkerMetrics {
         registry
             .register(Box::new(call_done_skipped_pending_callback_total.clone()))
             .expect("register call_done_skipped_pending_callback_total");
+
+        // noetl/ai-meta#145 G2 — container poll fallback observability.
+        // The poller runs in a detached task (the dispatch slot is already
+        // freed), so these are the only signal an operator has that a
+        // long-running Job is being watched + how it resolved.  Pair
+        // `container_poll_terminal_total{state}` with the server-side
+        // `noetl_container_callback_total` to confirm exactly one of the
+        // two completion paths fired per Job (poll vs watcher).
+        let container_poll_started_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_container_poll_started_total",
+                "Container poll-fallback watchers started, by namespace.",
+            ),
+            &["namespace"],
+        )
+        .expect("container_poll_started_total metric");
+        registry
+            .register(Box::new(container_poll_started_total.clone()))
+            .expect("register container_poll_started_total");
+
+        let container_poll_terminal_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_container_poll_terminal_total",
+                "Container poll-fallback terminal outcomes, by resolved state (succeeded/failed/poll_timeout/error).",
+            ),
+            &["state"],
+        )
+        .expect("container_poll_terminal_total metric");
+        registry
+            .register(Box::new(container_poll_terminal_total.clone()))
+            .expect("register container_poll_terminal_total");
+
+        let container_poll_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_worker_container_poll_duration_seconds",
+                "Wall-clock a container poll fallback spent watching a Job to terminal state.",
+            )
+            // Jobs run seconds → hours; buckets span that range.
+            .buckets(vec![
+                1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0, 21600.0,
+            ]),
+        )
+        .expect("container_poll_duration_seconds metric");
+        registry
+            .register(Box::new(container_poll_duration_seconds.clone()))
+            .expect("register container_poll_duration_seconds");
 
         let subscription_messages_received_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -821,6 +876,9 @@ impl WorkerMetrics {
             result_store_put_bytes_total,
             result_store_put_errors_total,
             call_done_skipped_pending_callback_total,
+            container_poll_started_total,
+            container_poll_terminal_total,
+            container_poll_duration_seconds,
             subscription_messages_received_total,
             subscription_executions_total,
             subscription_spooled_total,
@@ -1062,6 +1120,25 @@ pub fn record_call_done_skipped_pending_callback(tool_kind: &str) {
         .call_done_skipped_pending_callback_total
         .with_label_values(&[tool_kind])
         .inc();
+}
+
+/// noetl/ai-meta#145 G2 — record that a container poll-fallback watcher
+/// started for a Job in `namespace`.
+pub fn record_container_poll_started(namespace: &str) {
+    WorkerMetrics::global()
+        .container_poll_started_total
+        .with_label_values(&[namespace])
+        .inc();
+}
+
+/// Record a container poll-fallback terminal outcome (`succeeded` /
+/// `failed` / `poll_timeout` / `error`) plus the watch duration.
+pub fn record_container_poll_terminal(state: &str, duration_secs: f64) {
+    let m = WorkerMetrics::global();
+    m.container_poll_terminal_total
+        .with_label_values(&[state])
+        .inc();
+    m.container_poll_duration_seconds.observe(duration_secs);
 }
 
 /// Record one materializer drain→project→ack cycle (noetl/ai-meta#103).
