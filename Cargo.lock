@@ -84,9 +84,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "ar_archive_writer"
@@ -3049,9 +3049,9 @@ checksum = "fcdc9657471e917de19608a327a65eafb0d4bef5df5271c991c85982a5ccdf07"
 
 [[package]]
 name = "noetl-tools"
-version = "3.18.1"
+version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9a9252eedf5f07b41a71281e9d76ae41ed6f7aa61961079687f1890203eb8e4"
+checksum = "42dd1edc957bfcb0a0a1fe0ab7a3e9d2c2bfc5d2c619fdab2cab9b5c01b5918a"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "noetl-worker"
-version = "5.46.3"
+version = "5.47.0"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",

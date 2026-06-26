@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.47.0](https://github.com/noetl/worker/compare/v5.46.3...v5.47.0) (2026-06-26)
+
+### Features
+
+* **container:** G2 poll-based completion fallback for long-running Jobs (SLM platform [#145](https://github.com/noetl/worker/issues/145)) ([#139](https://github.com/noetl/worker/issues/139)) ([66bf007](https://github.com/noetl/worker/commit/66bf007195b25e4b7fd0a3e810e652c89a2b2485))
+
 ## [5.46.3](https://github.com/noetl/worker/compare/v5.46.2...v5.46.3) (2026-06-25)
 
 ### Bug Fixes
