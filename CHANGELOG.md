@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.47.1](https://github.com/noetl/worker/compare/v5.47.0...v5.47.1) (2026-06-27)
+
+### Performance Improvements
+
+* **coldstart:** readiness-gated boot warmup of orchestrate drive plug-in ([#136](https://github.com/noetl/worker/issues/136)) ([fb67483](https://github.com/noetl/worker/commit/fb67483603451034b02d6ca3e1b272bd3942a30d)), closes [noetl/ai-meta#130](https://github.com/noetl/ai-meta/issues/130)
+* **nats:** blocking command claim + cached consumer handle ([#135](https://github.com/noetl/worker/issues/135)) ([4450406](https://github.com/noetl/worker/commit/44504060b06d4b6a186a976d41a58b5731e7fc12)), closes [noetl/ai-meta#130](https://github.com/noetl/ai-meta/issues/130)
+
 ## [5.47.0](https://github.com/noetl/worker/compare/v5.46.3...v5.47.0) (2026-06-26)
 
 ### Features
