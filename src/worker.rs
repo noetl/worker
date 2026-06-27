@@ -237,6 +237,27 @@ impl Worker {
             crate::state_builder::DrainConfig::from_env(&self.config.nats_url)
                 .map(|cfg| crate::state_builder::spawn_drain(cfg, self.state_builder_index.clone()));
 
+        // Boot warmup of the off-server orchestrate drive plug-in
+        // (noetl/ai-meta#130 cold-start).  The first orchestrate hop otherwise
+        // pays a one-time Cranelift compile of the ~1.6MB `system/orchestrate`
+        // module on the critical path (~2.7s observed on a constrained kind
+        // node).  Compile it once here — overlapping the state-builder drain
+        // rehydrate above — so the first real drive is a cache hit.  Gated to
+        // the drive pool (system pool) by default; NOETL_WARM_ORCHESTRATE_PLUGIN
+        // forces on/off.  The warmup completes BEFORE process_commands starts
+        // claiming, so the first claimed orchestrate command finds a warm cache
+        // even independent of the /readyz gate.
+        if warm_orchestrate_enabled() {
+            self.executor.warm_orchestrate_plugin().await;
+        } else {
+            crate::metrics::record_plugin_warm("skipped");
+        }
+        // Mark ready regardless of warm outcome — the worker is functional even
+        // cold; the readiness gate exists to hide the warm latency from a
+        // rollout, not to fail-closed when a warm misses (e.g. server briefly
+        // unreachable at boot).
+        crate::metrics::set_worker_ready(true);
+
         // Process commands
         let result = self.process_commands().await;
 
@@ -499,6 +520,27 @@ impl Worker {
     }
 }
 
+/// Whether this worker should boot-warm the orchestrate drive plug-in
+/// (noetl/ai-meta#130).  `NOETL_WARM_ORCHESTRATE_PLUGIN` forces the decision
+/// (`1`/`true`/`yes`/`on` vs `0`/`false`/`no`/`off`); unset, it defaults to the
+/// pool that actually drives orchestrate — the system pool, identified by
+/// running the off-server state-builder drain (`NOETL_STATE_BUILDER` set) or the
+/// CQRS materializer (`NOETL_MATERIALIZER_ENABLED`).  A leaf pool that only runs
+/// tools never receives `system/orchestrate`, so warming there would waste
+/// startup time + memory.
+fn warm_orchestrate_enabled() -> bool {
+    match std::env::var("NOETL_WARM_ORCHESTRATE_PLUGIN") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => {
+            crate::state_builder::builder_mode() != crate::state_builder::BuilderMode::Off
+                || crate::materializer::enabled()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +550,15 @@ mod tests {
         let config = WorkerConfig::default();
         assert!(!config.worker_id.is_empty());
         assert_eq!(config.pool_name, "default");
+    }
+
+    #[test]
+    fn warm_orchestrate_env_override_wins() {
+        // Explicit override is honored regardless of pool role.
+        std::env::set_var("NOETL_WARM_ORCHESTRATE_PLUGIN", "1");
+        assert!(warm_orchestrate_enabled());
+        std::env::set_var("NOETL_WARM_ORCHESTRATE_PLUGIN", "off");
+        assert!(!warm_orchestrate_enabled());
+        std::env::remove_var("NOETL_WARM_ORCHESTRATE_PLUGIN");
     }
 }

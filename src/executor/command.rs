@@ -33,6 +33,16 @@ use crate::client::{ControlPlaneClient, ExecutorEvent};
 use crate::executor::case_evaluator::{CaseAction, CaseEvaluator};
 use crate::snowflake::SnowflakeGen;
 
+/// Catalog path + seed version of the off-server drive plug-in the server
+/// dispatches for every `system/orchestrate` command (`"plugin": { "path":
+/// "system/orchestrate", "version": 1 }` in the server's
+/// `dispatch_orchestrate_command`).  Used by the boot warmup (noetl/ai-meta#130)
+/// to pre-compile the module so the first drive hop is a cache hit.
+#[cfg(feature = "wasm-plugin")]
+pub(crate) const ORCHESTRATE_PLUGIN_PATH: &str = "system/orchestrate";
+#[cfg(feature = "wasm-plugin")]
+pub(crate) const ORCHESTRATE_PLUGIN_VERSION: u32 = 1;
+
 /// Env var carrying the comma-separated list of worker-pod env var
 /// names to lift into `ExecutionContext.secrets` at startup
 /// (noetl/ai-meta#34).  Operators populate the underlying env vars
@@ -221,6 +231,52 @@ impl CommandExecutor {
             state_builder_mode,
             state_builder_index,
         }
+    }
+
+    /// Boot-time warmup of the off-server orchestrate drive plug-in
+    /// (noetl/ai-meta#130 cold-start).  Fetches + Cranelift-compiles
+    /// `system/orchestrate@1` into the dispatcher's module cache so the first
+    /// real drive hop is a cache hit instead of paying the one-time compile on
+    /// the critical path.  Returns `true` on a successful warm, `false` when the
+    /// warm failed (non-fatal — the first dispatch falls back to the lazy load).
+    /// With the `wasm-plugin` feature off this is a no-op that returns `false`.
+    #[cfg(feature = "wasm-plugin")]
+    pub async fn warm_orchestrate_plugin(&self) -> bool {
+        let t = std::time::Instant::now();
+        let mut dispatcher = self.wasm_dispatcher.lock().await;
+        match dispatcher
+            .warm(ORCHESTRATE_PLUGIN_PATH, ORCHESTRATE_PLUGIN_VERSION)
+            .await
+        {
+            Ok(()) => {
+                crate::metrics::record_plugin_warm("warmed");
+                tracing::info!(
+                    plugin = ORCHESTRATE_PLUGIN_PATH,
+                    version = ORCHESTRATE_PLUGIN_VERSION,
+                    elapsed_ms = t.elapsed().as_millis() as u64,
+                    "boot warmup: orchestrate drive plug-in compiled + cached"
+                );
+                true
+            }
+            Err(e) => {
+                crate::metrics::record_plugin_warm("error");
+                // Non-fatal: the server may not have seeded the module yet, or
+                // be briefly unreachable at boot.  The first real dispatch will
+                // lazily load it (paying the cold compile then).
+                tracing::warn!(
+                    plugin = ORCHESTRATE_PLUGIN_PATH,
+                    error = %e,
+                    "boot warmup: orchestrate plug-in warm failed (non-fatal; first dispatch will lazy-load)"
+                );
+                false
+            }
+        }
+    }
+
+    /// No-op warmup when the `wasm-plugin` feature is disabled.
+    #[cfg(not(feature = "wasm-plugin"))]
+    pub async fn warm_orchestrate_plugin(&self) -> bool {
+        false
     }
 
     /// Execute a command.

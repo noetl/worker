@@ -41,14 +41,15 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
 
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
-        .route("/healthz", get(healthz_handler));
+        .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
 
     tracing::info!(
         bind = %actual_addr,
-        "Metrics HTTP server listening at http://{actual_addr}/metrics + /healthz"
+        "Metrics HTTP server listening at http://{actual_addr}/metrics + /healthz + /readyz"
     );
 
     let handle = tokio::spawn(async move {
@@ -80,6 +81,20 @@ async fn metrics_handler() -> impl IntoResponse {
 /// modes the heartbeat already covers.
 async fn healthz_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// `GET /readyz` — readiness check (noetl/ai-meta#130 cold-start).  Returns 200
+/// once boot warmup has completed (the orchestrate drive plug-in is compiled +
+/// cached on the drive pool); 503 while still warming.  Kubernetes routes /
+/// completes a rollout only on 200, so the one-time warm latency is hidden from
+/// the first real request.  Liveness (`/healthz`) stays 200 throughout so a slow
+/// warm never trips a restart.
+async fn readyz_handler() -> impl IntoResponse {
+    if crate::metrics::worker_ready() {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "warming")
+    }
 }
 
 #[cfg(test)]
