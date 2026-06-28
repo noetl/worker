@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.47.3](https://github.com/noetl/worker/compare/v5.47.2...v5.47.3) (2026-06-28)
+
+### Bug Fixes
+
+* **executor:** never offload the __orchestrate__ control-plane drive result ([#141](https://github.com/noetl/worker/issues/141)) ([f8f4d12](https://github.com/noetl/worker/commit/f8f4d12cb449cfcd52c35b4361c364413aa01c58)), closes [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) [noetl/ai-meta#113](https://github.com/noetl/ai-meta/issues/113) [noetl/ai-meta#154](https://github.com/noetl/ai-meta/issues/154) [noetl/ai-meta#155](https://github.com/noetl/ai-meta/issues/155) [noetl/ai-meta#154](https://github.com/noetl/ai-meta/issues/154) [noetl/ai-meta#155](https://github.com/noetl/ai-meta/issues/155)
+
 ## [5.47.2](https://github.com/noetl/worker/compare/v5.47.1...v5.47.2) (2026-06-28)
 
 ### Bug Fixes
