@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.47.2](https://github.com/noetl/worker/compare/v5.47.1...v5.47.2) (2026-06-28)
+
+### Bug Fixes
+
+* **nats:** reuse NATS connection in drain loops — bump noetl-tools 3.19.0->3.19.1 ([#140](https://github.com/noetl/worker/issues/140)) ([9702469](https://github.com/noetl/worker/commit/9702469338b1d1a9dd8dd418361fda2fd25305d6)), closes [tools#79](https://github.com/noetl/tools/issues/79)
+
 ## [5.47.1](https://github.com/noetl/worker/compare/v5.47.0...v5.47.1) (2026-06-27)
 
 ### Performance Improvements
