@@ -1209,6 +1209,12 @@ impl CommandExecutor {
 /// so operators see a WARN log instead of a silent drop).
 const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
 
+/// The synthetic step name the server assigns to the control-plane drive
+/// command (`system/orchestrate` wasm dispatch).  Results emitted under this
+/// step are decoded synchronously by the server to advance the drive, so they
+/// are exempt from the inline-budget offload — see `build_call_done_result`.
+const ORCHESTRATE_STEP_NAME: &str = "__orchestrate__";
+
 /// The effective inline budget, read once from `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`
 /// (default [`INLINE_CONTEXT_MAX_BYTES`] = 100KB).  Lets ops tune when a tool
 /// result spills to the durable store + a reference — the lever for
@@ -1359,7 +1365,26 @@ async fn build_call_done_result(
     let context = &context;
 
     let serialised = serde_json::to_string(context)?;
-    if serialised.len() <= inline_budget_bytes() {
+    // The control-plane drive result (`__orchestrate__`) MUST ride inline so the
+    // server's `apply_worker_orchestration` can synchronously decode its
+    // `output_b64` and advance the drive.  Offloading it to the durable result
+    // store is unsafe: under `NOETL_RESULT_STORE_DUAL_WRITE=false`
+    // (noetl/ai-meta#104 OQ5 — the dual-write retirement) the server's
+    // `PUT /api/result/{id}` mints a `noetl://` ref WITHOUT writing the
+    // `noetl.result_store` row, so the server's offloaded-drive resolution
+    // (events.rs `apply_worker_orchestration`, the noetl/ai-meta#113 fallback)
+    // gets "ref not found in store" → fails to decode → `commands=0` → the
+    // reconcile poller re-publishes `__orchestrate__` forever and the execution
+    // wedges in RUNNING with no terminal event (the noetl/ai-meta#154
+    // ref-not-found re-drive loop).  A render-hop drive result exceeds the 100KB
+    // inline budget once the accumulated context carries a provider envelope —
+    // the Muno "what hotels are in Paris?" turn drives a ~138KB orchestrate
+    // result and wedges, while the smaller google-places turn (~under budget)
+    // stays inline and completes (noetl/ai-meta#155).  Keep the orchestrate
+    // result inline regardless of size so the drive never depends on a separate
+    // store round-trip.  (Complements the noetl/ai-meta#154 Leg A server fix,
+    // which fails such a run loudly if a ref is ever still unresolvable.)
+    if step == ORCHESTRATE_STEP_NAME || serialised.len() <= inline_budget_bytes() {
         return Ok(serde_json::json!({ "status": status, "context": context }));
     }
 
@@ -3327,6 +3352,45 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    /// Branch 0 — the control-plane drive result (`__orchestrate__`) rides the
+    /// inline `result.context` path EVEN when it exceeds the inline budget, so
+    /// the server can decode `output_b64` synchronously and advance the drive.
+    /// Without this exemption a large drive result (e.g. the Muno hotels turn's
+    /// ~138KB orchestrate result) offloads to a ref the server can't resolve
+    /// under `NOETL_RESULT_STORE_DUAL_WRITE=false` → `commands=0` → the
+    /// noetl/ai-meta#154 re-drive wedge.  The client points at an unreachable
+    /// URL: the inline path must NOT attempt any durable PUT.
+    #[tokio::test]
+    async fn build_call_done_result_inlines_oversize_orchestrate_result() {
+        let cache = test_cache("wkr-test-orchestrate-inline");
+        let client = ControlPlaneClient::new("http://127.0.0.1:1");
+
+        let big_string: String = "x".repeat(INLINE_CONTEXT_MAX_BYTES + 4096);
+        let context = serde_json::json!({ "output_b64": "ZHJpdmU=", "filler": big_string });
+        let result = build_call_done_result(
+            &context,
+            "COMPLETED",
+            12345,
+            ORCHESTRATE_STEP_NAME,
+            &std::collections::HashMap::new(),
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
+
+        // Inline path: the orchestrate result rides `result.context`, NOT a
+        // `reference` block, despite being over budget.
+        assert_eq!(result["status"], "COMPLETED");
+        assert!(
+            result.get("reference").is_none(),
+            "orchestrate result must NOT be offloaded to a reference"
+        );
+        assert_eq!(result["context"]["output_b64"], "ZHJpdmU=");
+        // Nothing was staged to the shm cache (the over-budget path was skipped).
+        assert_eq!(cache.used_bytes(), 0);
     }
 
     /// Credential scrub: a tool result containing a `password` /
