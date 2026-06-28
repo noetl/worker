@@ -188,7 +188,17 @@ wasmtime = { version = "27", optional = true }
 #   `mcp/google-places.search_text` forwards its `method`/`tool`/`arguments`
 #   to the child instead of running the child's default `tools/list`.
 #   Runtime adoption only — no worker code change.
-noetl-tools = "3.19"
+#
+# 3.19.1 (#79 / ai-meta FIX A): `NatsSource` caches its NATS connection +
+#   resolved pull-consumer across poll/ack instead of connecting, resolving,
+#   draining and DROPPING the connection on every call.  The CQRS event
+#   materializer + result materializer drain loops (system worker pool) poll
+#   this source on a ~2.5s idle cadence (and far faster under load), so the
+#   pre-3.19.1 source reconnected to NATS every cycle — the system-pool
+#   "reconnect 50-116x/sec" storm.  3.19.1 makes the drain hold ONE long-lived
+#   connection, matching the state-builder drain.  Runtime adoption only —
+#   no worker code change.
+noetl-tools = "3.19.1"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
