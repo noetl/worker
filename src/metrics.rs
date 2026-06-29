@@ -247,6 +247,14 @@ pub struct WorkerMetrics {
     /// elapsed).  A healthy event-signalled drive shows `woken` dominating with a
     /// low absolute count (one or two wakes per hop), not a fixed-grid poll.
     pub state_builder_drive_wait_total: IntCounterVec,
+    /// Off-server drive **tail-attach** accounting (noetl/ai-meta#156).  `kind`
+    /// = `attached` (events the server shipped on the dispatch so the worker can
+    /// advance its WAL index drain-independently) vs `applied_new` (of those, the
+    /// ones new to the pool-side index — the rest were already drained, an
+    /// idempotent overwrite).  A healthy accelerated hop shows `attached` small
+    /// (O(few events)) and `applied_new` ≥ 1 (the new tail the build needed),
+    /// confirming the per-hop cost is O(tail), not O(global-stream).
+    pub state_builder_tail_total: IntCounterVec,
     /// Executions currently held in the pool-side WAL index — the index-coverage
     /// gauge (noetl/ai-meta#119).  The #119 stall was an index starved to **0**
     /// after a worker restart (the durable consumer cursor outran the rebuilt
@@ -881,6 +889,18 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_drive_wait_total.clone()))
             .expect("register state_builder_drive_wait_total");
 
+        let state_builder_tail_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_tail_total",
+                "Off-server drive tail-attach events by kind — attached (shipped on dispatch) vs applied_new (new to the pool-side WAL index); noetl/ai-meta#156.",
+            ),
+            &["kind"],
+        )
+        .expect("state_builder_tail_total metric");
+        registry
+            .register(Box::new(state_builder_tail_total.clone()))
+            .expect("register state_builder_tail_total");
+
         let plugin_load_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "noetl_worker_plugin_load_seconds",
@@ -968,6 +988,7 @@ impl WorkerMetrics {
             state_builder_chain_hops,
             state_builder_drive_builds_total,
             state_builder_drive_wait_total,
+            state_builder_tail_total,
             state_builder_indexed_executions,
             plugin_load_seconds,
             plugin_warm_total,
@@ -1374,6 +1395,25 @@ pub fn record_state_builder_drive_wait(outcome: &str) {
         .state_builder_drive_wait_total
         .with_label_values(&[outcome])
         .inc();
+}
+
+/// Record one off-server drive tail-attach (noetl/ai-meta#156): `attached` events
+/// the server shipped on the dispatch and `applied_new` of those that were new to
+/// the pool-side WAL index (the rest were already drained — an idempotent
+/// overwrite).  A no-op when `attached == 0`.
+pub fn record_offserver_tail_applied(attached: usize, applied_new: usize) {
+    if attached == 0 {
+        return;
+    }
+    let m = WorkerMetrics::global();
+    m.state_builder_tail_total
+        .with_label_values(&["attached"])
+        .inc_by(attached as u64);
+    if applied_new > 0 {
+        m.state_builder_tail_total
+            .with_label_values(&["applied_new"])
+            .inc_by(applied_new as u64);
+    }
 }
 
 /// Record one wasm plug-in load phase latency (`fetch` — HTTP GET of the module

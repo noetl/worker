@@ -1754,6 +1754,45 @@ impl CommandExecutor {
         // worker-built state is never staler than the server's view.
         let expected_head = args.get("expected_head").and_then(|v| v.as_i64());
 
+        // noetl/ai-meta#156: the off-server drive's per-hop cost is today coupled
+        // to GLOBAL `noetl_events` WAL volume, not this execution's work — the
+        // build serves only once the pool-side drain (one ephemeral DeliverAll
+        // consumer racing the whole stream under one mutex) has independently
+        // pulled + indexed `expected_head`.  Under load that drain lags past the
+        // retry budget below and the hop drops to the server's 8s reconcile tick.
+        //
+        // The server is the producer of these events and now ships the new tail on
+        // the dispatch (`tail_events`, the same `noetl_events` payloads it
+        // published).  Apply them to the pool-side WAL index BEFORE the build loop
+        // so a warm-index hop completes its chain to `expected_head` on the first
+        // build attempt — drain-independent.  This is purely additive: applying a
+        // payload the drain would also apply is idempotent (`apply` overwrites by
+        // `event_id`), and a tail that's insufficient to reach genesis (cold index
+        // after a restart) simply leaves the build `Incomplete` → the existing
+        // retry/drain/reconcile fallback below runs exactly as today.
+        if let Some(tail) = args.get("tail_events").and_then(|v| v.as_array()) {
+            if !tail.is_empty() {
+                let mut applied = 0usize;
+                {
+                    let mut idx = self.state_builder_index.lock().await;
+                    for ev in tail {
+                        if let Some((_eid, is_new, _term)) = idx.apply(ev) {
+                            if is_new {
+                                applied += 1;
+                            }
+                        }
+                    }
+                }
+                crate::metrics::record_offserver_tail_applied(tail.len(), applied);
+                tracing::debug!(
+                    execution_id,
+                    attached = tail.len(),
+                    applied,
+                    "off-server drive: applied server-attached event tail to WAL index (noetl/ai-meta#156)"
+                );
+            }
+        }
+
         // Bounded, event-signalled wait (noetl/ai-meta#130).  The trigger fired
         // from the server's in-memory chain head, so the event the build needs is
         // already on the `noetl_events` WAL — the pool-side drain just has to have
