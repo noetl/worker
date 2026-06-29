@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.48.0](https://github.com/noetl/worker/compare/v5.47.3...v5.48.0) (2026-06-29)
+
+### Features
+
+* **executor:** apply server-attached event tail to off-server drive ([#156](https://github.com/noetl/worker/issues/156)) ([#142](https://github.com/noetl/worker/issues/142)) ([614fb8e](https://github.com/noetl/worker/commit/614fb8eaa665631dc09b3ce47f3e8f35b02dc132))
+
 ## [5.47.3](https://github.com/noetl/worker/compare/v5.47.2...v5.47.3) (2026-06-28)
 
 ### Bug Fixes
