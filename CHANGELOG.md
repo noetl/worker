@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.50.1](https://github.com/noetl/worker/compare/v5.50.0...v5.50.1) (2026-06-30)
+
+### Bug Fixes
+
+* **state_materializer:** throttle open-shard rewrites per execution ([#166](https://github.com/noetl/worker/issues/166) Phase 2) ([d7fc79d](https://github.com/noetl/worker/commit/d7fc79dc959dfe8ab612ff52f341c1d3300f04ac))
+
 ## [5.50.0](https://github.com/noetl/worker/compare/v5.49.0...v5.50.0) (2026-06-30)
 
 ### Features
