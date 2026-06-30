@@ -326,6 +326,28 @@ pub struct WorkerMetrics {
     /// A rising `drain_dead` rate is the self-heal firing — the worker recovering
     /// from a NATS bounce on its own instead of wedging until a manual restart.
     pub state_builder_consumer_recreate_total: IntCounterVec,
+
+    // --- State materializer (noetl/ai-meta#166 Phase 2 — shadow state-shard tier) ---
+    /// Events drained from `noetl_events` by the shadow state materializer.
+    pub state_materializer_drained_total: IntCounter,
+    /// Slim-chain rows projected (events accepted into an open shard).
+    pub state_materializer_rows_total: IntCounter,
+    /// State shards written to object store, partitioned by `seal`
+    /// (`open` / `sealed`).
+    pub state_materializer_shards_written_total: IntCounterVec,
+    /// Total bytes of Feather state-shard objects written.
+    pub state_materializer_shard_bytes_total: IntCounter,
+    /// Shadow state-materializer encode/write failures (counted, never failing
+    /// the event — the shard tier never wedges its own consumer).
+    pub state_materializer_errors_total: IntCounter,
+    /// Open shards evicted before sealing, partitioned by `reason`
+    /// (`idle` / `max_open`) — the abandoned-execution backstop.
+    pub state_materializer_evicted_total: IntCounterVec,
+    /// Resident open (un-sealed) shards — the writer's working-set gauge; the
+    /// signal that it stays `O(live executions)`, not `O(history)`.
+    pub state_materializer_open_shards: IntGauge,
+    /// Latency of one state-materializer drain→project→write→ack cycle.
+    pub state_materializer_cycle_duration_seconds: Histogram,
 }
 
 impl WorkerMetrics {
@@ -1046,6 +1068,85 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_consumer_recreate_total.clone()))
             .expect("register state_builder_consumer_recreate_total");
 
+        // --- State materializer (noetl/ai-meta#166 Phase 2) ---
+        let state_materializer_drained_total = IntCounter::new(
+            "noetl_worker_state_materializer_drained_total",
+            "Events drained from noetl_events by the shadow state materializer (noetl/ai-meta#166 Phase 2).",
+        )
+        .expect("state_materializer_drained_total metric");
+        registry
+            .register(Box::new(state_materializer_drained_total.clone()))
+            .expect("register state_materializer_drained_total");
+
+        let state_materializer_rows_total = IntCounter::new(
+            "noetl_worker_state_materializer_rows_total",
+            "Slim-chain rows projected into open state shards by the shadow state materializer.",
+        )
+        .expect("state_materializer_rows_total metric");
+        registry
+            .register(Box::new(state_materializer_rows_total.clone()))
+            .expect("register state_materializer_rows_total");
+
+        let state_materializer_shards_written_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_materializer_shards_written_total",
+                "Feather state shards written to object store by the shadow state materializer, by seal state (open/sealed).",
+            ),
+            &["seal"],
+        )
+        .expect("state_materializer_shards_written_total metric");
+        registry
+            .register(Box::new(state_materializer_shards_written_total.clone()))
+            .expect("register state_materializer_shards_written_total");
+
+        let state_materializer_shard_bytes_total = IntCounter::new(
+            "noetl_worker_state_materializer_shard_bytes_total",
+            "Total bytes of Feather state-shard objects written by the shadow state materializer.",
+        )
+        .expect("state_materializer_shard_bytes_total metric");
+        registry
+            .register(Box::new(state_materializer_shard_bytes_total.clone()))
+            .expect("register state_materializer_shard_bytes_total");
+
+        let state_materializer_errors_total = IntCounter::new(
+            "noetl_worker_state_materializer_errors_total",
+            "Shadow state-materializer encode/write failures (counted, never failing the event).",
+        )
+        .expect("state_materializer_errors_total metric");
+        registry
+            .register(Box::new(state_materializer_errors_total.clone()))
+            .expect("register state_materializer_errors_total");
+
+        let state_materializer_evicted_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_materializer_evicted_total",
+                "Open state shards evicted before sealing — reason idle / max_open (abandoned-execution backstop).",
+            ),
+            &["reason"],
+        )
+        .expect("state_materializer_evicted_total metric");
+        registry
+            .register(Box::new(state_materializer_evicted_total.clone()))
+            .expect("register state_materializer_evicted_total");
+
+        let state_materializer_open_shards = IntGauge::new(
+            "noetl_worker_state_materializer_open_shards",
+            "Resident open (un-sealed) state shards — the writer's working set (O(live executions)).",
+        )
+        .expect("state_materializer_open_shards metric");
+        registry
+            .register(Box::new(state_materializer_open_shards.clone()))
+            .expect("register state_materializer_open_shards");
+
+        let state_materializer_cycle_duration_seconds = Histogram::with_opts(HistogramOpts::new(
+            "noetl_worker_state_materializer_cycle_duration_seconds",
+            "Latency of one shadow state-materializer drain→project→write→ack cycle.",
+        ))
+        .expect("state_materializer_cycle_duration_seconds metric");
+        registry
+            .register(Box::new(state_materializer_cycle_duration_seconds.clone()))
+            .expect("register state_materializer_cycle_duration_seconds");
+
         Self {
             registry,
             pulls_total,
@@ -1108,6 +1209,14 @@ impl WorkerMetrics {
             worker_ready,
             state_builder_healthy,
             state_builder_consumer_recreate_total,
+            state_materializer_drained_total,
+            state_materializer_rows_total,
+            state_materializer_shards_written_total,
+            state_materializer_shard_bytes_total,
+            state_materializer_errors_total,
+            state_materializer_evicted_total,
+            state_materializer_open_shards,
+            state_materializer_cycle_duration_seconds,
         }
     }
 
@@ -1628,6 +1737,63 @@ pub fn record_state_builder_consumer_recreate(reason: &str) {
         .state_builder_consumer_recreate_total
         .with_label_values(&[reason])
         .inc();
+}
+
+/// Record one shadow state-materializer drain cycle (noetl/ai-meta#166 Phase 2).
+#[allow(clippy::too_many_arguments)]
+pub fn record_state_materializer_cycle(
+    drained: u64,
+    rows: u64,
+    shards_written: u64,
+    sealed: u64,
+    shard_bytes: u64,
+    skipped: u64,
+    errors: u64,
+    duration_seconds: f64,
+) {
+    let _ = skipped; // counted in the loop's debug line; no dedicated metric.
+    let m = WorkerMetrics::global();
+    if drained > 0 {
+        m.state_materializer_drained_total.inc_by(drained);
+    }
+    if rows > 0 {
+        m.state_materializer_rows_total.inc_by(rows);
+    }
+    // shards_written counts BOTH open + sealed writes this cycle; `sealed` is the
+    // subset that sealed, so the open writes are the difference.
+    let open_writes = shards_written.saturating_sub(sealed);
+    if open_writes > 0 {
+        m.state_materializer_shards_written_total
+            .with_label_values(&["open"])
+            .inc_by(open_writes);
+    }
+    if sealed > 0 {
+        m.state_materializer_shards_written_total
+            .with_label_values(&["sealed"])
+            .inc_by(sealed);
+    }
+    if shard_bytes > 0 {
+        m.state_materializer_shard_bytes_total.inc_by(shard_bytes);
+    }
+    if errors > 0 {
+        m.state_materializer_errors_total.inc_by(errors);
+    }
+    m.state_materializer_cycle_duration_seconds
+        .observe(duration_seconds);
+}
+
+/// Set the resident-open-shards gauge (noetl/ai-meta#166 Phase 2).
+pub fn set_state_materializer_open_shards(n: i64) {
+    WorkerMetrics::global().state_materializer_open_shards.set(n);
+}
+
+/// Record open state shards evicted before sealing (noetl/ai-meta#166 Phase 2).
+/// `reason` is `idle` (TTL sweep) or `max_open` (resident-ceiling backstop).
+pub fn record_state_materializer_evicted(reason: &str, n: usize) {
+    WorkerMetrics::global()
+        .state_materializer_evicted_total
+        .with_label_values(&[reason])
+        .inc_by(n as u64);
 }
 
 // Unused-warning suppression for fields that aren't read directly
