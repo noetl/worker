@@ -1423,6 +1423,15 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
     let mut dead_since: Option<Instant> = None;
     let unhealthy_after = unhealthy_after();
     let rebuild_after = rebuild_after();
+    // noetl/ai-meta#166: the bounded-cache TTL/byte sweep runs on a throttled
+    // cadence on BOTH the busy and idle paths.  Idle-path sweeping is the
+    // load-bearing case: the system pool at idle (62m CPU, few new events) is
+    // exactly when the 654 stuck/abandoned chains must be evicted — gating the
+    // sweep behind `consumed > 0` would never reclaim them on a quiet stream.
+    // Throttled (default 15s) so the 25ms idle re-poll grid (noetl/ai-meta#130)
+    // doesn't spin an O(n) sweep + index lock 40×/sec.
+    let mut last_sweep = Instant::now();
+    let sweep_interval = Duration::from_secs(env_u64("NOETL_STATE_INDEX_SWEEP_SECS", 15));
 
     // Initial connect: retry with backoff until NATS is reachable and the
     // consumer is created (a NATS bounce at boot must not kill the drain task).
@@ -1619,6 +1628,42 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         last_healthy = Instant::now();
         crate::metrics::set_state_builder_healthy(true);
 
+        // noetl/ai-meta#166: throttled bounded-cache sweep — runs on idle AND
+        // busy iterations so idle/abandoned chains are reclaimed even when no new
+        // events are arriving (the system-pool-at-idle case).  A no-op when the
+        // policy is unbounded.  Also refreshes the resident-set gauges so the
+        // OOM-trail observability stays live on a quiet stream.
+        if last_sweep.elapsed() >= sweep_interval {
+            last_sweep = Instant::now();
+            let (indexed, events, bytes) = {
+                let mut idx = index.lock().await;
+                let evicted = idx.enforce_limits();
+                if evicted.total() > 0 {
+                    crate::metrics::record_state_builder_eviction("ttl", evicted.ttl);
+                    crate::metrics::record_state_builder_eviction(
+                        "max_executions",
+                        evicted.max_executions,
+                    );
+                    crate::metrics::record_state_builder_eviction(
+                        "byte_ceiling",
+                        evicted.byte_ceiling,
+                    );
+                    tracing::debug!(
+                        ttl = evicted.ttl,
+                        max_executions = evicted.max_executions,
+                        byte_ceiling = evicted.byte_ceiling,
+                        resident = idx.execution_count(),
+                        bytes = idx.total_bytes(),
+                        "state-builder bounded-cache eviction sweep (noetl/ai-meta#166)"
+                    );
+                }
+                (idx.execution_count(), idx.event_count(), idx.total_bytes())
+            };
+            crate::metrics::set_state_builder_indexed_executions(indexed as i64);
+            crate::metrics::set_state_builder_index_events(events as i64);
+            crate::metrics::set_state_builder_index_bytes(bytes as i64);
+        }
+
         if consumed == 0 {
             tokio::time::sleep(config.idle_sleep).await;
             continue;
@@ -1661,44 +1706,23 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
                 }
             }
         }
-        let (indexed, events, bytes) = {
+        let (indexed, bytes) = {
             let mut idx = index.lock().await;
+            // Terminal eviction stays per-batch — the cheap O(terminals) fast
+            // path that frees a chain the instant it completes.  The TTL/byte
+            // bounded-cache sweep is the throttled periodic pass above.
             for eid in terminals {
                 idx.evict(eid);
             }
-            // noetl/ai-meta#166 Phase 1: enforce the bounded-cache policy each
-            // batch — TTL-evict idle/abandoned non-terminal chains and hold the
-            // resident set under the byte ceiling.  A no-op (zero stats) when the
-            // policy is unbounded (today's default), so this is behaviour-neutral
-            // until an operator sets the env knobs.
-            let evicted = idx.enforce_limits();
-            if evicted.total() > 0 {
-                crate::metrics::record_state_builder_eviction("ttl", evicted.ttl);
-                crate::metrics::record_state_builder_eviction(
-                    "max_executions",
-                    evicted.max_executions,
-                );
-                crate::metrics::record_state_builder_eviction("byte_ceiling", evicted.byte_ceiling);
-                tracing::debug!(
-                    ttl = evicted.ttl,
-                    max_executions = evicted.max_executions,
-                    byte_ceiling = evicted.byte_ceiling,
-                    resident = idx.execution_count(),
-                    bytes = idx.total_bytes(),
-                    "state-builder bounded-cache eviction (noetl/ai-meta#166)"
-                );
-            }
-            (idx.execution_count(), idx.event_count(), idx.total_bytes())
+            (idx.execution_count(), idx.total_bytes())
         };
         // noetl/ai-meta#119 rehydration proof: surface the indexed-execution count
         // (the bug was this stuck at 0 after a restart — the durable cursor outran
         // the empty index).  A non-zero count after boot means the index rebuilt
         // from the retained WAL.  Log the first non-empty rebuild once per process.
+        // O(1) gauges refreshed every busy batch; the O(n) event_count gauge is
+        // refreshed by the throttled sweep above (noetl/ai-meta#166).
         crate::metrics::set_state_builder_indexed_executions(indexed as i64);
-        // noetl/ai-meta#166: the resident-memory observability the OOM trail was
-        // missing — events held and the approximate byte ledger the byte ceiling
-        // bounds.
-        crate::metrics::set_state_builder_index_events(events as i64);
         crate::metrics::set_state_builder_index_bytes(bytes as i64);
         if !rehydrated && indexed > 0 {
             rehydrated = true;
