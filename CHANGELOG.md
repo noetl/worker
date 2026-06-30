@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.48.1](https://github.com/noetl/worker/compare/v5.48.0...v5.48.1) (2026-06-30)
+
+### Bug Fixes
+
+* **state_builder:** self-heal NATS consumer loss + /livez backstop ([#143](https://github.com/noetl/worker/issues/143)) ([cc9ae22](https://github.com/noetl/worker/commit/cc9ae224e2b67b732f4d0cb15902b7dda0c182a9)), closes [noetl/ai-meta#163](https://github.com/noetl/ai-meta/issues/163) [noetl/ai-meta#163](https://github.com/noetl/ai-meta/issues/163) [noetl/ai-meta#163](https://github.com/noetl/ai-meta/issues/163) [noetl/ai-meta#156](https://github.com/noetl/ai-meta/issues/156) [noetl/ai-meta#155](https://github.com/noetl/ai-meta/issues/155)
+
 ## [5.48.0](https://github.com/noetl/worker/compare/v5.47.3...v5.48.0) (2026-06-29)
 
 ### Features
