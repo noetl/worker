@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.49.0](https://github.com/noetl/worker/compare/v5.48.1...v5.49.0) (2026-06-30)
+
+### Features
+
+* **state_builder:** bound the off-server WAL index — slim chain + LRU/TTL/byte-ceiling eviction + cold-rebuild-on-miss ([#166](https://github.com/noetl/worker/issues/166) Phase 1) ([149a78d](https://github.com/noetl/worker/commit/149a78d45988e43a0b11ac7b171d7cb2b90a3e3d)), closes [#156](https://github.com/noetl/worker/issues/156) [noetl/ai-meta#163](https://github.com/noetl/ai-meta/issues/163) [noetl/ai-meta#155](https://github.com/noetl/ai-meta/issues/155)
+
 ## [5.48.1](https://github.com/noetl/worker/compare/v5.48.0...v5.48.1) (2026-06-30)
 
 ### Bug Fixes
