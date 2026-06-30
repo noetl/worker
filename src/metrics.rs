@@ -264,6 +264,30 @@ pub struct WorkerMetrics {
     /// every boot; this gauge going **> 0** after a restart is the rehydration
     /// proof.
     pub state_builder_indexed_executions: IntGauge,
+    /// Total events resident across all chains in the pool-side WAL index
+    /// (noetl/ai-meta#166).  The `654 executions × ~27 events` headline of the
+    /// system-pool OOM: this is the `× events` factor.
+    pub state_builder_index_events: IntGauge,
+    /// Approximate resident bytes the pool-side WAL index holds
+    /// (noetl/ai-meta#166 §5.1) — the bounded-cache byte ledger the
+    /// `NOETL_STATE_INDEX_MAX_BYTES` ceiling holds down.  Before this work the
+    /// index grew `O(all non-terminal event history × full-envelope-size)` to
+    /// ~1.28 GiB at idle; this gauge makes the resident set observable and the
+    /// ceiling's effect measurable.
+    pub state_builder_index_bytes: IntGauge,
+    /// Bounded-cache evictions by `reason` (noetl/ai-meta#166 §5.1): `ttl` (idle
+    /// non-terminal chain swept — the stuck/abandoned-execution class terminal
+    /// eviction misses), `max_executions` (LRU over the concurrent-chain cap),
+    /// `byte_ceiling` (LRU under the hard resident-byte ceiling).  A rising `ttl`
+    /// rate is the cure for the OOM treadmill firing.
+    pub state_builder_evictions_total: IntCounterVec,
+    /// Cold-rebuild-on-miss outcomes (noetl/ai-meta#166 §5.2): `served` (re-read
+    /// the missed execution from the retained WAL and the drive then built its
+    /// state), `incomplete` (re-indexed events but the chain still couldn't reach
+    /// genesis — fell back), `empty` (no events for it in the retained window),
+    /// `throttled` (the concurrency cap was saturated — fell back).  The safety
+    /// net that makes eviction wedge-safe with tail-attach off.
+    pub state_builder_rehydrate_total: IntCounterVec,
     /// Per-phase latency of loading a wasm plug-in module
     /// (noetl/ai-meta#130 cold-start): `fetch` — the HTTP GET of the module
     /// bytes from the server catalog; `compile` — the Cranelift JIT compile
@@ -848,6 +872,48 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_indexed_executions.clone()))
             .expect("register state_builder_indexed_executions");
 
+        let state_builder_index_events = IntGauge::new(
+            "noetl_worker_state_builder_index_events",
+            "Total events resident across all chains in the pool-side WAL index (noetl/ai-meta#166).",
+        )
+        .expect("state_builder_index_events metric");
+        registry
+            .register(Box::new(state_builder_index_events.clone()))
+            .expect("register state_builder_index_events");
+
+        let state_builder_index_bytes = IntGauge::new(
+            "noetl_worker_state_builder_index_bytes",
+            "Approximate resident bytes held by the pool-side WAL index — the bounded-cache byte ledger NOETL_STATE_INDEX_MAX_BYTES holds down (noetl/ai-meta#166).",
+        )
+        .expect("state_builder_index_bytes metric");
+        registry
+            .register(Box::new(state_builder_index_bytes.clone()))
+            .expect("register state_builder_index_bytes");
+
+        let state_builder_evictions_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_evictions_total",
+                "Bounded-cache evictions by reason — ttl / max_executions / byte_ceiling (noetl/ai-meta#166).",
+            ),
+            &["reason"],
+        )
+        .expect("state_builder_evictions_total metric");
+        registry
+            .register(Box::new(state_builder_evictions_total.clone()))
+            .expect("register state_builder_evictions_total");
+
+        let state_builder_rehydrate_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_rehydrate_total",
+                "Cold-rebuild-on-miss outcomes — served / incomplete / empty / throttled (noetl/ai-meta#166).",
+            ),
+            &["outcome"],
+        )
+        .expect("state_builder_rehydrate_total metric");
+        registry
+            .register(Box::new(state_builder_rehydrate_total.clone()))
+            .expect("register state_builder_rehydrate_total");
+
         let state_builder_event_scans_total = IntCounter::new(
             "noetl_worker_state_builder_event_scans_total",
             "noetl.event scans the off-server state builder issued (RFC #115 tenet 3 no-scan proof; stays 0).",
@@ -1033,6 +1099,10 @@ impl WorkerMetrics {
             state_builder_drive_wait_total,
             state_builder_tail_total,
             state_builder_indexed_executions,
+            state_builder_index_events,
+            state_builder_index_bytes,
+            state_builder_evictions_total,
+            state_builder_rehydrate_total,
             plugin_load_seconds,
             plugin_warm_total,
             worker_ready,
@@ -1410,6 +1480,38 @@ pub fn set_state_builder_indexed_executions(n: i64) {
     WorkerMetrics::global()
         .state_builder_indexed_executions
         .set(n);
+}
+
+/// Set the total events resident across all chains in the pool-side WAL index
+/// (noetl/ai-meta#166).
+pub fn set_state_builder_index_events(n: i64) {
+    WorkerMetrics::global().state_builder_index_events.set(n);
+}
+
+/// Set the approximate resident bytes the pool-side WAL index holds — the
+/// bounded-cache byte ledger (noetl/ai-meta#166).
+pub fn set_state_builder_index_bytes(n: i64) {
+    WorkerMetrics::global().state_builder_index_bytes.set(n);
+}
+
+/// Record `n` bounded-cache evictions for `reason` (`ttl` | `max_executions` |
+/// `byte_ceiling`) — noetl/ai-meta#166.  A no-op when `n == 0`.
+pub fn record_state_builder_eviction(reason: &str, n: usize) {
+    if n > 0 {
+        WorkerMetrics::global()
+            .state_builder_evictions_total
+            .with_label_values(&[reason])
+            .inc_by(n as u64);
+    }
+}
+
+/// Record one cold-rebuild-on-miss outcome (`served` | `incomplete` | `empty` |
+/// `throttled`) — noetl/ai-meta#166 §5.2.
+pub fn record_state_builder_rehydrate(outcome: &str) {
+    WorkerMetrics::global()
+        .state_builder_rehydrate_total
+        .with_label_values(&[outcome])
+        .inc();
 }
 
 /// Record one off-server state build outcome (`cache_hit` | `incremental` |
