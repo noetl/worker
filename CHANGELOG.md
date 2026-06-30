@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.50.0](https://github.com/noetl/worker/compare/v5.49.0...v5.50.0) (2026-06-30)
+
+### Features
+
+* **state_materializer:** shadow object-store state-shard writer ([#166](https://github.com/noetl/worker/issues/166) Phase 2) ([f160f3e](https://github.com/noetl/worker/commit/f160f3e681a44ea4acf4f9babc65a05eb9b541ac)), closes [noetl/worker#146](https://github.com/noetl/worker/issues/146)
+
 ## [5.49.0](https://github.com/noetl/worker/compare/v5.48.1...v5.49.0) (2026-06-30)
 
 ### Features
