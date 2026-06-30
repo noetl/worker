@@ -84,6 +84,16 @@ const DEFAULT_MAX_OPEN: usize = 8_192;
 /// Idle TTL: an open shard not touched within this window is swept (its execution
 /// is wedged / abandoned and will never seal). Mirrors the Phase-1 TTL idea.
 const DEFAULT_OPEN_TTL_SECS: u64 = 3_600;
+/// Minimum interval between successive **open**-shard rewrites for one execution
+/// (RFC §4.3 "append on a cadence"). The open shard is rewritten idempotently to
+/// the SAME object key; an object-store backend (e.g. GCS) rate-limits mutations
+/// of a single object (~1/s), so rewriting it every drain cycle a live multi-hop
+/// execution spans amplifies into HTTP 429s. Throttling to ≤1 open write / this
+/// interval / execution keeps the rate well under that ceiling. The terminal
+/// **sealed** shard (a distinct key) is never throttled. Default 30s → a typical
+/// sub-30s turn writes the open shard ~once then seals; longer executions get a
+/// periodic open snapshot.
+const DEFAULT_OPEN_MIN_INTERVAL_SECS: u64 = 30;
 
 /// Terminal event types — observing one seals the execution's shard and evicts it
 /// from the open set. BOTH the dotted (`playbook.completed`) and underscore
@@ -155,6 +165,9 @@ pub struct StateMaterializerConfig {
     pub extracted_budget: usize,
     pub max_open: usize,
     pub open_ttl: Duration,
+    /// Minimum interval between open-shard rewrites per execution (write-amplification
+    /// throttle — see [`DEFAULT_OPEN_MIN_INTERVAL_SECS`]).
+    pub open_min_interval: Duration,
     pub cell: CellSeed,
 }
 
@@ -179,6 +192,10 @@ impl StateMaterializerConfig {
             extracted_budget: env_u64("NOETL_STATE_SHARD_EXTRACTED_BUDGET", DEFAULT_EXTRACTED_BUDGET as u64) as usize,
             max_open: env_u64("NOETL_STATE_SHARD_MAX_OPEN", DEFAULT_MAX_OPEN as u64) as usize,
             open_ttl: Duration::from_secs(env_u64("NOETL_STATE_SHARD_OPEN_TTL_SECS", DEFAULT_OPEN_TTL_SECS)),
+            open_min_interval: Duration::from_secs(env_u64(
+                "NOETL_STATE_SHARD_OPEN_MIN_INTERVAL_SECS",
+                DEFAULT_OPEN_MIN_INTERVAL_SECS,
+            )),
             cell: CellSeed::from_env(),
         })
     }
@@ -277,6 +294,9 @@ struct OpenShard {
     /// read-side concern).
     rows: BTreeMap<i64, SlimRow>,
     last_activity: Instant,
+    /// When the open shard was last rewritten to object store — the cadence
+    /// throttle anchor (RFC §4.3). `None` until the first open write.
+    last_open_write: Option<Instant>,
 }
 
 impl OpenShard {
@@ -364,6 +384,7 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
                 project: None,
                 rows: BTreeMap::new(),
                 last_activity: now,
+                last_open_write: None,
             });
             // Pin tenant/project from the first result_ref URN seen (co-location
             // with that execution's result bytes); default until then.
@@ -385,13 +406,27 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
         }
 
         // Write open shards for live executions touched this cycle (skip those
-        // that also sealed — they get the sealed write below).
+        // that also sealed — they get the sealed write below). Throttled per
+        // execution to ≤1 open rewrite / open_min_interval (RFC §4.3 cadence):
+        // the open shard is rewritten to the SAME object key, which an object
+        // store rate-limits (~1 mutation/s/object), so an un-throttled per-cycle
+        // rewrite of a live multi-hop execution amplifies into HTTP 429s.
         for eid in &touched {
             if sealed.contains(eid) {
                 continue;
             }
+            let due = open
+                .get(eid)
+                .map(|s| s.last_open_write.is_none_or(|t| now.duration_since(t) >= config.open_min_interval))
+                .unwrap_or(false);
+            if !due {
+                continue;
+            }
             if let Some(shard) = open.get(eid) {
                 write_shard(&client, &config.cell, *eid, shard, ShardSeal::Open, &mut tally).await;
+                if let Some(s) = open.get_mut(eid) {
+                    s.last_open_write = Some(now);
+                }
             }
         }
         // Seal + evict terminal executions.
@@ -755,6 +790,7 @@ mod tests {
             open.insert(i, OpenShard {
                 tenant: None, project: None, rows: BTreeMap::new(),
                 last_activity: base + Duration::from_millis(i as u64),
+                last_open_write: None,
             });
         }
         enforce_max_open(&mut open, 4);
@@ -770,13 +806,26 @@ mod tests {
         let mut open: HashMap<i64, OpenShard> = HashMap::new();
         let now = Instant::now();
         // Stale: last activity 2h ago.
-        open.insert(1, OpenShard { tenant: None, project: None, rows: BTreeMap::new(), last_activity: now - Duration::from_secs(7200) });
+        open.insert(1, OpenShard { tenant: None, project: None, rows: BTreeMap::new(), last_activity: now - Duration::from_secs(7200), last_open_write: None });
         // Fresh: just now.
-        open.insert(2, OpenShard { tenant: None, project: None, rows: BTreeMap::new(), last_activity: now });
+        open.insert(2, OpenShard { tenant: None, project: None, rows: BTreeMap::new(), last_activity: now, last_open_write: None });
         let swept = sweep_idle(&mut open, Duration::from_secs(3600), now);
         assert_eq!(swept, 1);
         assert!(!open.contains_key(&1));
         assert!(open.contains_key(&2));
+    }
+
+    #[test]
+    fn open_write_cadence_gate() {
+        // The write-amplification throttle (RFC §4.3): an open shard is due for a
+        // rewrite only on first sight (last_open_write None) or after the interval
+        // elapsed — caps same-object mutations under the object-store rate limit.
+        let now = Instant::now();
+        let interval = Duration::from_secs(30);
+        let due = |last: Option<Instant>| last.is_none_or(|t| now.duration_since(t) >= interval);
+        assert!(due(None), "first open write is always due");
+        assert!(!due(Some(now - Duration::from_secs(5))), "5s after a write → throttled");
+        assert!(due(Some(now - Duration::from_secs(31))), "31s after a write → due again");
     }
 
     #[test]
