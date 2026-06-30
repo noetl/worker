@@ -195,10 +195,24 @@ impl Worker {
         } else {
             None
         };
+        // When this worker runs the state materializer (system pool, under
+        // NOETL_STATE_SHARD_WRITE), the lag poller also tracks the
+        // noetl_state_materializer consumer backlog — the writer-lag health
+        // signal (noetl/ai-meta#166 Phase 2 §9 writer-lag risk).
+        let state_materializer_lag_target = if crate::state_materializer::enabled() {
+            let stream = std::env::var("NOETL_STATE_SHARD_STREAM")
+                .unwrap_or_else(|_| crate::materializer::EVENT_STREAM.to_string());
+            let consumer = std::env::var("NOETL_STATE_SHARD_CONSUMER")
+                .unwrap_or_else(|_| crate::state_materializer::STATE_MATERIALIZER_CONSUMER.to_string());
+            Some((stream, consumer))
+        } else {
+            None
+        };
         let lag_handle = crate::nats::lag_poller::spawn(
             self.source.clone(),
             lag_poll_interval,
             materializer_lag_target.clone(),
+            state_materializer_lag_target.clone(),
         );
         tracing::info!(
             interval_secs = lag_poll_interval.as_secs(),
@@ -234,6 +248,17 @@ impl Worker {
         let result_materializer_handle =
             crate::result_materializer::ResultMaterializerConfig::from_env(&self.config)
                 .map(|cfg| crate::result_materializer::spawn(cfg, self.client.clone()));
+
+        // Start the state materializer (noetl/ai-meta#166 Phase 2) when enabled
+        // (system worker pool only).  Yet ANOTHER separate noetl_events consumer
+        // (noetl_state_materializer, self-ensured) that projects each execution's
+        // slim event-chain into a per-execution Feather state shard on object
+        // store — SHADOW: nothing reads the shards yet (Phase 3), and it is
+        // READ-ONLY w.r.t. noetl.* (object PUT only), so it can neither perturb
+        // the drive nor the #103 sole-writer.  Default off (NOETL_STATE_SHARD_WRITE).
+        let state_materializer_handle =
+            crate::state_materializer::StateMaterializerConfig::from_env(&self.config)
+                .map(|cfg| crate::state_materializer::spawn(cfg, self.client.clone()));
 
         // Off-server state-builder drain (noetl/ai-meta#115 Phase 4): drain the
         // noetl_events WAL into the shared pool-side chain index (system worker
@@ -278,6 +303,9 @@ impl Worker {
             h.abort();
         }
         if let Some(h) = result_materializer_handle {
+            h.abort();
+        }
+        if let Some(h) = state_materializer_handle {
             h.abort();
         }
         if let Some(h) = state_builder_handle {

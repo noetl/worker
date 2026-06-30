@@ -71,6 +71,7 @@ pub fn spawn(
     source: Arc<Mutex<NatsCommandSource>>,
     poll_interval: Duration,
     materializer: Option<(String, String)>,
+    state_materializer: Option<(String, String)>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(poll_interval);
@@ -78,8 +79,8 @@ pub fn spawn(
         // BEFORE the first scrape, even on a freshly-started pod.
         ticker.tick().await;
         loop {
-            // Snapshot both consumers under a single mutex acquisition.
-            let (cmd, mat) = {
+            // Snapshot every tracked consumer under a single mutex acquisition.
+            let (cmd, mat, state) = {
                 let source = source.lock().await;
                 let subscriber = source.subscriber();
                 let cmd_stream = subscriber.stream_name().to_string();
@@ -93,11 +94,23 @@ pub fn spawn(
                 } else {
                     None
                 };
-                (cmd, mat)
+                // The state materializer (noetl/ai-meta#166 Phase 2) is its own
+                // durable consumer; its backlog is the writer-lag signal the RFC
+                // asks for — surfaced on the same gauge, distinct label set.
+                let state = if let Some((stream, consumer)) = state_materializer.as_ref() {
+                    let result = subscriber.consumer_lag_for(stream, consumer).await;
+                    Some((stream.clone(), consumer.clone(), result))
+                } else {
+                    None
+                };
+                (cmd, mat, state)
             };
 
             record_pair(cmd.0, cmd.1, cmd.2);
             if let Some((stream, consumer, result)) = mat {
+                record_pair(stream, consumer, result);
+            }
+            if let Some((stream, consumer, result)) = state {
                 record_pair(stream, consumer, result);
             }
 
