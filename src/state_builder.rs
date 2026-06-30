@@ -46,7 +46,7 @@
 //! [server#245]: https://github.com/noetl/server/pull/245
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_nats::jetstream::{
@@ -868,6 +868,157 @@ pub fn spawn_drain(config: DrainConfig, index: SharedWalIndex) -> tokio::task::J
     })
 }
 
+/// Backoff floor/ceiling for the state-builder consumer reconnect+rebuild path
+/// (noetl/ai-meta#161).  Starts at 250ms, doubles per failed attempt, caps at
+/// 10s — fast enough to recover from a NATS bounce in seconds, slow enough not
+/// to hammer a still-down server.
+const REBUILD_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// How long the dead-consumer signature must persist before the drain tears the
+/// consumer down and recreates it.  Tolerates a single transient blip; a real
+/// orphaned consumer (NATS restart) keeps signalling and crosses this quickly.
+/// Env override `NOETL_STATE_BUILDER_REBUILD_SECS` (default 5s).
+fn rebuild_after() -> Duration {
+    Duration::from_secs(env_u64("NOETL_STATE_BUILDER_REBUILD_SECS", 5))
+}
+
+/// How long the drain may be continuously unable to serve before `/livez` flips
+/// to failing so Kubernetes restarts the pod as a backstop to the in-process
+/// self-heal.  Longer than [`rebuild_after`] so the worker gets to recover on
+/// its own first.  Env override `NOETL_STATE_BUILDER_UNHEALTHY_SECS` (default
+/// 45s).
+fn unhealthy_after() -> Duration {
+    Duration::from_secs(env_u64("NOETL_STATE_BUILDER_UNHEALTHY_SECS", 45))
+}
+
+/// True when a JetStream pull/connect error indicates the consumer or connection
+/// is gone (NATS server restarted, consumer orphaned/deleted) rather than
+/// transiently busy — the noetl/ai-meta#161 wedge signature.  The orphaned
+/// consumer surfaces as a repeated `503 "no responders"` while pulling; a
+/// deleted consumer surfaces as "consumer not found"/"consumer deleted".
+fn is_consumer_dead<E: std::fmt::Display>(err: &E) -> bool {
+    let s = err.to_string().to_ascii_lowercase();
+    s.contains("503")
+        || s.contains("no responders")
+        || s.contains("no responder")
+        || s.contains("consumer not found")
+        || s.contains("consumer deleted")
+        || s.contains("consumer is gone")
+        || s.contains("consumer not active")
+        || s.contains("no consumer")
+}
+
+/// Decision returned by [`on_dead_signal`].
+enum DeadAction {
+    /// Dead signal sustained past the rebuild threshold — tear down + recreate.
+    Rebuild,
+    /// Dead signal not yet sustained — retry the same consumer briefly.
+    Retry,
+}
+
+/// Fold a dead-consumer observation into the rolling `dead_since` timer and
+/// decide whether to rebuild now (sustained past `rebuild_after`) or keep
+/// retrying.  Flips the health gauge to unhealthy once the drain has been unable
+/// to serve for `unhealthy_after` so the `/livez` backstop can fire.
+fn on_dead_signal(
+    dead_since: &mut Option<Instant>,
+    last_healthy: &Instant,
+    rebuild_after: Duration,
+    unhealthy_after: Duration,
+) -> DeadAction {
+    let since = *dead_since.get_or_insert_with(Instant::now);
+    if since.elapsed() >= rebuild_after {
+        DeadAction::Rebuild
+    } else {
+        if last_healthy.elapsed() >= unhealthy_after {
+            crate::metrics::set_state_builder_healthy(false);
+        }
+        DeadAction::Retry
+    }
+}
+
+/// Connect to NATS and create the state-builder drain consumer (noetl/ai-meta
+/// #161).  Returns the live client (kept in scope for the consumer's lifetime)
+/// plus the consumer.  Factored out of the old inline `run_drain_loop` setup so
+/// the reconnect path can call it on every rebuild.
+async fn connect_drain_consumer(
+    config: &DrainConfig,
+) -> Result<(
+    async_nats::Client,
+    jetstream::consumer::Consumer<PullConfig>,
+)> {
+    let client = match (&config.nats_user, &config.nats_password) {
+        (Some(u), Some(p)) => ConnectOptions::with_user_and_password(u.clone(), p.clone())
+            .connect(&config.nats_url)
+            .await
+            .context("state-builder NATS connect (user/pass)")?,
+        _ => async_nats::connect(&config.nats_url)
+            .await
+            .context("state-builder NATS connect")?,
+    };
+    let js = jetstream::new(client.clone());
+    let stream = js
+        .get_stream(&config.stream)
+        .await
+        .with_context(|| format!("state-builder get_stream {}", config.stream))?;
+    let durable = config.durable.is_some();
+    let consumer = stream
+        .create_consumer(PullConfig {
+            durable_name: config.durable.clone(),
+            filter_subject: "noetl.events.>".to_string(),
+            deliver_policy: DeliverPolicy::All,
+            ack_policy: if durable {
+                AckPolicy::Explicit
+            } else {
+                AckPolicy::None
+            },
+            ..Default::default()
+        })
+        .await
+        .context("state-builder create_consumer")?;
+    Ok((client, consumer))
+}
+
+/// (Re)connect with exponential backoff until a consumer is established
+/// (noetl/ai-meta#161).  Loops on failure forever — a permanently-down NATS
+/// keeps the drain trying rather than exiting the task (a dead task would never
+/// recover even after NATS returns).  Each failed attempt bumps
+/// `connect_error` and, once the drain has been unable to serve for
+/// `unhealthy_after`, flips `/livez` so Kubernetes restarts the pod.  Resets
+/// `backoff` to the floor on success.
+async fn connect_with_backoff(
+    config: &DrainConfig,
+    backoff: &mut Duration,
+    last_healthy: &Instant,
+    unhealthy_after: Duration,
+) -> (
+    async_nats::Client,
+    jetstream::consumer::Consumer<PullConfig>,
+) {
+    loop {
+        match connect_drain_consumer(config).await {
+            Ok(pair) => {
+                *backoff = REBUILD_BACKOFF_MIN;
+                return pair;
+            }
+            Err(e) => {
+                crate::metrics::record_state_builder_consumer_recreate("connect_error");
+                if last_healthy.elapsed() >= unhealthy_after {
+                    crate::metrics::set_state_builder_healthy(false);
+                }
+                tracing::warn!(
+                    error = %e,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "state-builder connect/create_consumer failed; backing off then retrying (noetl/ai-meta#161)"
+                );
+                tokio::time::sleep(*backoff).await;
+                *backoff = (*backoff * 2).min(REBUILD_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
 /// Connect → consumer (durable authoritative, or ephemeral DeliverAll/AckNone
 /// shadow) → drain → index → advance.
 ///
@@ -884,23 +1035,6 @@ pub fn spawn_drain(config: DrainConfig, index: SharedWalIndex) -> tokio::task::J
 /// pre-#119 shape, an instant revert).  Either way the index is the same — the
 /// chain walk + cache produce identical state.
 async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()> {
-    let client = match (&config.nats_user, &config.nats_password) {
-        (Some(u), Some(p)) => {
-            ConnectOptions::with_user_and_password(u.clone(), p.clone())
-                .connect(&config.nats_url)
-                .await
-                .context("state-builder shadow NATS connect (user/pass)")?
-        }
-        _ => async_nats::connect(&config.nats_url)
-            .await
-            .context("state-builder shadow NATS connect")?,
-    };
-    let js = jetstream::new(client);
-    let stream = js
-        .get_stream(&config.stream)
-        .await
-        .with_context(|| format!("state-builder get_stream {}", config.stream))?;
-
     // `authoritative` (mode) governs the *advance timing* (advance-on-demand in
     // the command dispatch vs. advance-in-loop for shadow) + terminal eviction.
     // `durable` (a consumer name is configured) governs the *ack policy*: only a
@@ -910,20 +1044,28 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
     // authoritative drain is `authoritative && !durable`.
     let authoritative = config.mode == BuilderMode::Authoritative;
     let durable = config.durable.is_some();
-    let consumer = stream
-        .create_consumer(PullConfig {
-            durable_name: config.durable.clone(),
-            filter_subject: "noetl.events.>".to_string(),
-            deliver_policy: DeliverPolicy::All,
-            ack_policy: if durable {
-                AckPolicy::Explicit
-            } else {
-                AckPolicy::None
-            },
-            ..Default::default()
-        })
-        .await
-        .context("state-builder create_consumer")?;
+
+    // One-shot rehydration breadcrumb: log the first batch that populates the
+    // index after boot, so a restart leaves a clear "index rehydrated from the
+    // retained WAL" marker (the #119 stall was a permanently-empty index).
+    let mut rehydrated = false;
+    // noetl/ai-meta#161 self-heal state.  `backoff` and `last_healthy` persist
+    // across consumer rebuilds so a flapping reconnect that never recovers still
+    // trips `/livez` after the unhealthy window.  `dead_since` tracks how long
+    // the *current* consumer has emitted the dead signal — reset on every
+    // successful cycle so a single transient blip never forces a rebuild.
+    let mut backoff = REBUILD_BACKOFF_MIN;
+    let mut last_healthy = Instant::now();
+    let mut dead_since: Option<Instant> = None;
+    let unhealthy_after = unhealthy_after();
+    let rebuild_after = rebuild_after();
+
+    // Initial connect: retry with backoff until NATS is reachable and the
+    // consumer is created (a NATS bounce at boot must not kill the drain task).
+    let (mut _client, mut consumer) =
+        connect_with_backoff(&config, &mut backoff, &last_healthy, unhealthy_after).await;
+    last_healthy = Instant::now();
+    crate::metrics::set_state_builder_healthy(true);
 
     tracing::info!(
         stream = %config.stream,
@@ -932,13 +1074,9 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         mode = ?config.mode,
         batch = config.batch,
         "off-server state-builder drain started (WAL drain, zero noetl.event scans; \
-         rebuilds the in-memory index from the retained WAL on boot — noetl/ai-meta#119)"
+         rebuilds the in-memory index from the retained WAL on boot — noetl/ai-meta#119; \
+         self-heals on NATS consumer loss — noetl/ai-meta#161)"
     );
-
-    // One-shot rehydration breadcrumb: log the first batch that populates the
-    // index after boot, so a restart leaves a clear "index rehydrated from the
-    // retained WAL" marker (the #119 stall was a permanently-empty index).
-    let mut rehydrated = false;
 
     loop {
         let mut batch = match consumer
@@ -950,6 +1088,48 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         {
             Ok(b) => b,
             Err(e) => {
+                // noetl/ai-meta#161: a NATS server bounce orphans the pull
+                // consumer; the old code hot-looped a `503 "no responders"` storm
+                // against the dead consumer forever, the index stopped advancing
+                // → `__orchestrate__` saw `commands=0` → every off-server drive
+                // (incl. auth login) wedged until a manual `rollout restart`.
+                // Now: on a sustained dead signal, tear the consumer down and
+                // recreate it (reconnecting NATS) with backoff.
+                if is_consumer_dead(&e) {
+                    if let DeadAction::Rebuild = on_dead_signal(
+                        &mut dead_since,
+                        &last_healthy,
+                        rebuild_after,
+                        unhealthy_after,
+                    ) {
+                        crate::metrics::record_state_builder_consumer_recreate("drain_dead");
+                        crate::metrics::set_state_builder_healthy(false);
+                        tracing::warn!(
+                            error = %e,
+                            "state-builder consumer dead (NATS bounce / orphaned consumer); tearing down + recreating (noetl/ai-meta#161)"
+                        );
+                        let (c, k) = connect_with_backoff(
+                            &config,
+                            &mut backoff,
+                            &last_healthy,
+                            unhealthy_after,
+                        )
+                        .await;
+                        _client = c;
+                        consumer = k;
+                        last_healthy = Instant::now();
+                        dead_since = None;
+                        crate::metrics::set_state_builder_healthy(true);
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            "state-builder consumer error (dead signal); will recreate if sustained (noetl/ai-meta#161)"
+                        );
+                        tokio::time::sleep(REBUILD_BACKOFF_MIN).await;
+                    }
+                    continue;
+                }
+                dead_since = None;
                 tracing::warn!(error = %e, "state-builder batch failed; backing off");
                 tokio::time::sleep(config.idle_sleep).await;
                 continue;
@@ -959,6 +1139,10 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         let mut touched: Vec<i64> = Vec::new();
         let mut consumed = 0u64;
         let mut terminals: Vec<i64> = Vec::new();
+        // Set when a dead-consumer signal surfaces mid-drain (noetl/ai-meta#161)
+        // so the post-batch handler can decide rebuild-vs-retry once the batch
+        // stops; the events consumed before it are already indexed.
+        let mut dead_msg: Option<String> = None;
         // noetl/ai-meta#130: apply each message under its OWN short lock and
         // release between messages — do NOT hold the index lock across
         // `batch.next().await`.  The pull is `.expires(timeout_ms)`-bounded, so on
@@ -974,6 +1158,13 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
+                    if is_consumer_dead(&e) {
+                        // Dead signal mid-drain — stop draining this batch and let
+                        // the post-batch handler decide rebuild vs retry
+                        // (noetl/ai-meta#161).
+                        dead_msg = Some(e.to_string());
+                        break;
+                    }
                     tracing::warn!(error = %e, "state-builder message error");
                     continue;
                 }
@@ -1024,6 +1215,45 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
                 let _ = msg.ack().await;
             }
         }
+
+        // noetl/ai-meta#161: a dead-consumer signal surfaced while draining.
+        // Recreate the consumer if it has persisted past `rebuild_after`,
+        // otherwise fall through and retry — the events consumed so far this
+        // cycle are already indexed.
+        if let Some(err) = dead_msg.take() {
+            if let DeadAction::Rebuild =
+                on_dead_signal(&mut dead_since, &last_healthy, rebuild_after, unhealthy_after)
+            {
+                crate::metrics::record_state_builder_consumer_recreate("drain_dead");
+                crate::metrics::set_state_builder_healthy(false);
+                tracing::warn!(
+                    error = %err,
+                    "state-builder consumer dead mid-drain (NATS bounce / orphaned consumer); recreating (noetl/ai-meta#161)"
+                );
+                let (c, k) =
+                    connect_with_backoff(&config, &mut backoff, &last_healthy, unhealthy_after)
+                        .await;
+                _client = c;
+                consumer = k;
+                last_healthy = Instant::now();
+                dead_since = None;
+                crate::metrics::set_state_builder_healthy(true);
+            } else {
+                tracing::warn!(
+                    error = %err,
+                    "state-builder consumer error mid-drain (dead signal); will recreate if sustained (noetl/ai-meta#161)"
+                );
+                tokio::time::sleep(REBUILD_BACKOFF_MIN).await;
+            }
+            continue;
+        }
+
+        // Successful pull cycle (even an idle 0-message expiry): the consumer is
+        // alive and serving — clear the dead timer and refresh health so `/livez`
+        // stays green and the unhealthy timer resets (noetl/ai-meta#161).
+        dead_since = None;
+        last_healthy = Instant::now();
+        crate::metrics::set_state_builder_healthy(true);
 
         if consumed == 0 {
             tokio::time::sleep(config.idle_sleep).await;
@@ -1144,6 +1374,73 @@ fn env_u64(key: &str, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- noetl/ai-meta#161 self-heal helpers ----
+
+    #[test]
+    fn is_consumer_dead_matches_orphaned_signatures() {
+        // The exact prod fingerprint from the #161 outage.
+        assert!(is_consumer_dead(&anyhow::anyhow!(
+            "error while processing messages from the stream: 503, None"
+        )));
+        assert!(is_consumer_dead(&"no responders available for request"));
+        assert!(is_consumer_dead(&"consumer not found"));
+        assert!(is_consumer_dead(&"consumer deleted"));
+        assert!(is_consumer_dead(&"503 Service Unavailable"));
+    }
+
+    #[test]
+    fn is_consumer_dead_ignores_transient_errors() {
+        // A normal idle timeout / transient I/O blip must NOT be treated as a
+        // dead consumer — those recover on the next pull without a rebuild.
+        assert!(!is_consumer_dead(&"deadline exceeded"));
+        assert!(!is_consumer_dead(&"connection reset by peer"));
+        assert!(!is_consumer_dead(&"timed out waiting for messages"));
+        assert!(!is_consumer_dead(&"broken pipe"));
+    }
+
+    #[test]
+    fn on_dead_signal_retries_until_sustained_then_rebuilds() {
+        let rebuild_after = Duration::from_millis(50);
+        let unhealthy_after = Duration::from_secs(60);
+        let last_healthy = Instant::now();
+        let mut dead_since: Option<Instant> = None;
+
+        // First observation arms the timer and asks to retry, not rebuild.
+        assert!(matches!(
+            on_dead_signal(&mut dead_since, &last_healthy, rebuild_after, unhealthy_after),
+            DeadAction::Retry
+        ));
+        assert!(dead_since.is_some());
+
+        // After the dead signal has persisted past `rebuild_after`, it rebuilds.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(
+            on_dead_signal(&mut dead_since, &last_healthy, rebuild_after, unhealthy_after),
+            DeadAction::Rebuild
+        ));
+    }
+
+    #[test]
+    fn on_dead_signal_flips_unhealthy_past_window() {
+        // last_healthy already past the unhealthy window → the retry path flips
+        // the health gauge to false so /livez fails (backstop restart).
+        let rebuild_after = Duration::from_secs(60); // never rebuild in this test
+        // Zero window → already past it on the first observation (avoids
+        // `Instant - Duration` underflow on freshly-booted hosts).
+        let unhealthy_after = Duration::ZERO;
+        let last_healthy = Instant::now();
+        let mut dead_since: Option<Instant> = None;
+
+        crate::metrics::set_state_builder_healthy(true);
+        assert!(matches!(
+            on_dead_signal(&mut dead_since, &last_healthy, rebuild_after, unhealthy_after),
+            DeadAction::Retry
+        ));
+        assert!(!crate::metrics::state_builder_healthy());
+        // Restore the gauge so other tests in the binary see the default.
+        crate::metrics::set_state_builder_healthy(true);
+    }
 
     /// A `noetl_events`-shaped payload for one event.
     fn ev(event_id: i64, prev: Option<i64>, event_type: &str) -> serde_json::Value {
