@@ -284,6 +284,24 @@ pub struct WorkerMetrics {
     /// probe reads this so Kubernetes only routes / completes a rollout once the
     /// worker is warm.
     pub worker_ready: IntGauge,
+    /// State-builder drain health (noetl/ai-meta#161): `1` while the authoritative
+    /// WAL drain is connected and serving, `0` when it has been continuously
+    /// erroring against a likely-orphaned JetStream consumer for longer than
+    /// `NOETL_STATE_BUILDER_UNHEALTHY_SECS`.  The `/livez` probe reads this so
+    /// Kubernetes auto-restarts a pod whose `state_builder` wedged after a NATS
+    /// server bounce (the 503/"no responders" storm that drove orchestrate
+    /// `commands=0` and locked out every off-server drive).  Defaults to `1` so
+    /// workers that don't run the builder (mode `Off`, e.g. the request pool)
+    /// always report alive.
+    pub state_builder_healthy: IntGauge,
+    /// Count of state-builder consumer/connection rebuilds (noetl/ai-meta#161),
+    /// partitioned by `reason`: `connect_error` — initial connect / create_consumer
+    /// failed and is being retried with backoff; `drain_dead` — a live consumer
+    /// started returning the dead-consumer signature (503 / no-responders /
+    /// consumer-not-found) past the rebuild threshold and was torn down + recreated.
+    /// A rising `drain_dead` rate is the self-heal firing — the worker recovering
+    /// from a NATS bounce on its own instead of wedging until a manual restart.
+    pub state_builder_consumer_recreate_total: IntCounterVec,
 }
 
 impl WorkerMetrics {
@@ -681,12 +699,10 @@ impl WorkerMetrics {
             .register(Box::new(materializer_project_errors_total.clone()))
             .expect("register materializer_project_errors_total");
 
-        let materializer_cycle_duration_seconds = Histogram::with_opts(
-            HistogramOpts::new(
-                "noetl_worker_materializer_cycle_duration_seconds",
-                "Latency of one materializer drain→project→ack cycle.",
-            ),
-        )
+        let materializer_cycle_duration_seconds = Histogram::with_opts(HistogramOpts::new(
+            "noetl_worker_materializer_cycle_duration_seconds",
+            "Latency of one materializer drain→project→ack cycle.",
+        ))
         .expect("materializer_cycle_duration_seconds metric");
         registry
             .register(Box::new(materializer_cycle_duration_seconds.clone()))
@@ -858,7 +874,9 @@ impl WorkerMetrics {
                 "noetl_worker_state_builder_chain_hops",
                 "Chain-walk depth (spine length) per off-server cold rebuild (RFC #115 Phase 4).",
             )
-            .buckets(vec![1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]),
+            .buckets(vec![
+                1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+            ]),
         )
         .expect("state_builder_chain_hops metric");
         registry
@@ -937,6 +955,31 @@ impl WorkerMetrics {
             .register(Box::new(worker_ready.clone()))
             .expect("register worker_ready");
 
+        let state_builder_healthy = IntGauge::new(
+            "noetl_worker_state_builder_healthy",
+            "State-builder drain health — 1 connected/serving, 0 wedged on a dead NATS consumer; the /livez probe reads this (noetl/ai-meta#161).",
+        )
+        .expect("state_builder_healthy metric");
+        // Default healthy: a worker that never runs the authoritative drain
+        // (mode Off — the request pool) must report alive, and the drain itself
+        // is healthy until it has been erroring past the unhealthy threshold.
+        state_builder_healthy.set(1);
+        registry
+            .register(Box::new(state_builder_healthy.clone()))
+            .expect("register state_builder_healthy");
+
+        let state_builder_consumer_recreate_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_consumer_recreate_total",
+                "State-builder consumer/connection rebuilds — reason connect_error / drain_dead; the self-heal firing (noetl/ai-meta#161).",
+            ),
+            &["reason"],
+        )
+        .expect("state_builder_consumer_recreate_total metric");
+        registry
+            .register(Box::new(state_builder_consumer_recreate_total.clone()))
+            .expect("register state_builder_consumer_recreate_total");
+
         Self {
             registry,
             pulls_total,
@@ -993,6 +1036,8 @@ impl WorkerMetrics {
             plugin_load_seconds,
             plugin_warm_total,
             worker_ready,
+            state_builder_healthy,
+            state_builder_consumer_recreate_total,
         }
     }
 
@@ -1246,14 +1291,17 @@ pub fn record_materializer_cycle(
     if acked > 0 {
         m.materializer_acked_total.inc_by(acked);
     }
-    m.materializer_cycle_duration_seconds.observe(duration_seconds);
+    m.materializer_cycle_duration_seconds
+        .observe(duration_seconds);
 }
 
 /// Record a materializer project failure — the batch is NOT acked and will
 /// redeliver after the consumer's ack-wait. This is the no-loss guarantee's
 /// observability surface.
 pub fn record_materializer_project_error() {
-    WorkerMetrics::global().materializer_project_errors_total.inc();
+    WorkerMetrics::global()
+        .materializer_project_errors_total
+        .inc();
 }
 
 /// Record one shadow result-materializer cycle (noetl/ai-meta#104 Phase B).
@@ -1287,7 +1335,8 @@ pub fn record_result_materializer_cycle(
     if errors > 0 {
         m.result_materializer_errors_total.inc_by(errors);
     }
-    m.result_materializer_cycle_duration_seconds.observe(duration_seconds);
+    m.result_materializer_cycle_duration_seconds
+        .observe(duration_seconds);
 }
 
 /// Record one resolve-by-URN read-path attempt (noetl/ai-meta#104 Phase C).
@@ -1348,7 +1397,9 @@ pub fn record_result_producer_stage(outcome: &str) {
 /// state builder (noetl/ai-meta#115 Phase 4).
 pub fn record_state_builder_wal_events(n: u64) {
     if n > 0 {
-        WorkerMetrics::global().state_builder_wal_events_total.inc_by(n);
+        WorkerMetrics::global()
+            .state_builder_wal_events_total
+            .inc_by(n);
     }
 }
 
@@ -1448,6 +1499,33 @@ pub fn set_worker_ready(ready: bool) {
 /// Read the worker-readiness gauge — the `/readyz` handler's source of truth.
 pub fn worker_ready() -> bool {
     WorkerMetrics::global().worker_ready.get() == 1
+}
+
+/// Set the state-builder health gauge (noetl/ai-meta#161).  `true` while the
+/// authoritative WAL drain is connected and serving; `false` once it has been
+/// continuously erroring against a dead JetStream consumer past the unhealthy
+/// threshold.  The `/livez` probe reads this so a wedged system-pool pod is
+/// auto-restarted by Kubernetes as the backstop to the in-process self-heal.
+pub fn set_state_builder_healthy(healthy: bool) {
+    WorkerMetrics::global()
+        .state_builder_healthy
+        .set(if healthy { 1 } else { 0 });
+}
+
+/// Read the state-builder health gauge — the `/livez` handler's source of truth.
+pub fn state_builder_healthy() -> bool {
+    WorkerMetrics::global().state_builder_healthy.get() == 1
+}
+
+/// Record a state-builder consumer/connection rebuild (noetl/ai-meta#161).
+/// `reason` is `connect_error` (initial connect / create_consumer retry) or
+/// `drain_dead` (a live consumer hit the dead-consumer signature past threshold
+/// and was torn down + recreated — the self-heal firing).
+pub fn record_state_builder_consumer_recreate(reason: &str) {
+    WorkerMetrics::global()
+        .state_builder_consumer_recreate_total
+        .with_label_values(&[reason])
+        .inc();
 }
 
 // Unused-warning suppression for fields that aren't read directly
@@ -1658,7 +1736,9 @@ mod tests {
 
         let text = String::from_utf8(m.encode()).unwrap();
         assert!(text.contains("# HELP noetl_worker_call_done_skipped_pending_callback_total"));
-        assert!(text.contains("# TYPE noetl_worker_call_done_skipped_pending_callback_total counter"));
+        assert!(
+            text.contains("# TYPE noetl_worker_call_done_skipped_pending_callback_total counter")
+        );
         assert!(text.contains(
             "noetl_worker_call_done_skipped_pending_callback_total{tool_kind=\"container\"}"
         ));

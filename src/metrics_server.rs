@@ -42,7 +42,8 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz_handler))
-        .route("/readyz", get(readyz_handler));
+        .route("/readyz", get(readyz_handler))
+        .route("/livez", get(livez_handler));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -94,6 +95,24 @@ async fn readyz_handler() -> impl IntoResponse {
         (StatusCode::OK, "ready")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "warming")
+    }
+}
+
+/// `GET /livez` — liveness check for the state-builder drain (noetl/ai-meta#161).
+/// Returns 200 while the authoritative WAL drain is connected and serving, 503
+/// once it has been continuously erroring against a likely-orphaned JetStream
+/// consumer past `NOETL_STATE_BUILDER_UNHEALTHY_SECS`.  Wiring this as the
+/// system-pool deployment's `livenessProbe` makes Kubernetes auto-restart a pod
+/// whose `state_builder` wedged after a NATS server bounce — the backstop to the
+/// in-process self-heal (consumer recreate), which handles the common case
+/// without a restart.  Workers that don't run the drive (mode `Off` — the
+/// request pool) keep the gauge at its default `1`, so this stays 200 for them
+/// and the probe is safe to apply fleet-wide.
+async fn livez_handler() -> impl IntoResponse {
+    if crate::metrics::state_builder_healthy() {
+        (StatusCode::OK, "alive")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "state_builder wedged")
     }
 }
 
