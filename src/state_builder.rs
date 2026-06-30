@@ -62,6 +62,13 @@ use futures::StreamExt;
 /// of the server chain-walk's `chain_has_genesis` guard (server#245).
 const GENESIS_EVENT_TYPE: &str = "playbook_started";
 
+/// Fixed per-event overhead added to the JSON-payload estimate when sizing an
+/// [`IndexedEvent`] for the byte ledger (noetl/ai-meta#166 §5.1): the `event_id`
+/// HashMap key + the `IndexedEvent` struct (the `prev_event_id`, the
+/// `event_type` String header, the `bytes` field) + map-bucket overhead.  Rough;
+/// the byte ceiling is a soft bound.
+const INDEXED_EVENT_OVERHEAD: usize = 96;
+
 /// One indexed event: the chain link + the event type (for the genesis guard) +
 /// the raw `noetl_events` payload (the input a `from_events` build consumes).
 #[derive(Debug, Clone)]
@@ -70,9 +77,86 @@ struct IndexedEvent {
     /// (`None` at the chain root). The link the walk follows.
     prev_event_id: Option<i64>,
     event_type: String,
-    /// The full event JSON as published to `noetl_events` — kept so a chain walk
-    /// can hand the ordered spine to a `from_events` build verbatim.
+    /// The event JSON the chain walk hands to a `from_events` build.  By default
+    /// the full envelope as published to `noetl_events`; under
+    /// `NOETL_STATE_INDEX_SLIM` (noetl/ai-meta#166 §4.1) a **lossless** projection
+    /// to only the fields the orchestrate-core `Event` deserializer reads — every
+    /// other top-level envelope field is dropped by serde on decode anyway, so the
+    /// projection is output-equivalent by construction (the drive sees the same
+    /// `Event`); it only stops resident memory carrying bytes `from_events` never
+    /// looks at (`node_id`, `node_type`, `duration`, `stack_trace`, `trace_*`, …).
     raw: serde_json::Value,
+    /// Approximate resident byte cost of [`Self::raw`] — maintained on apply so
+    /// the bounded cache (noetl/ai-meta#166 §5.1) can enforce a byte ceiling
+    /// without re-serializing the whole index. An estimate (string lengths +
+    /// structural overhead), not an exact `serde_json` byte count; the ceiling is
+    /// a soft bound so an approximation is sufficient and far cheaper.
+    bytes: usize,
+}
+
+/// Approximate the resident byte cost of a JSON value — string content + a small
+/// structural constant per node.  Used to maintain the bounded-cache byte ledger
+/// (noetl/ai-meta#166 §5.1) cheaply, without re-serializing.  Deliberately rough:
+/// the byte ceiling is a soft bound, so an estimate that tracks the real shape
+/// (dominated by string payloads) is sufficient.
+fn approx_json_bytes(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(_) => 5,
+        serde_json::Value::Number(_) => 8,
+        serde_json::Value::String(s) => s.len() + 2,
+        serde_json::Value::Array(a) => {
+            2 + a.len() + a.iter().map(approx_json_bytes).sum::<usize>()
+        }
+        serde_json::Value::Object(m) => {
+            2 + m
+                .iter()
+                .map(|(k, val)| k.len() + 4 + approx_json_bytes(val))
+                .sum::<usize>()
+        }
+    }
+}
+
+/// The top-level envelope keys the orchestrate-core `Event` deserializer
+/// (`repos/server/orchestrate-core/src/event.rs`) actually reads.  The slim
+/// projection (noetl/ai-meta#166 §4.1) keeps exactly these; serde drops every
+/// other key on decode, so a `from_events` build over the slim payload produces
+/// the identical `Event` — and therefore the identical drive decision — as over
+/// the full envelope.  `timestamp` AND its `created_at` alias are both kept so
+/// the projection works whether the producer stamped the WAL/envelope name
+/// (`timestamp`) or the DB column name (`created_at`).
+const SLIM_EVENT_KEYS: &[&str] = &[
+    "event_id",
+    "execution_id",
+    "catalog_id",
+    "event_type",
+    "node_name",
+    "status",
+    "context",
+    "result",
+    "meta",
+    "timestamp",
+    "created_at",
+    "parent_execution_id",
+    "attempt",
+];
+
+/// Project a `noetl_events` envelope down to [`SLIM_EVENT_KEYS`] — the lossless
+/// slim-chain transform (noetl/ai-meta#166 §4.1).  A non-object payload (never
+/// expected for a chainable event) passes through unchanged.
+fn slim_event_payload(payload: &serde_json::Value) -> serde_json::Value {
+    match payload.as_object() {
+        Some(obj) => {
+            let mut out = serde_json::Map::with_capacity(SLIM_EVENT_KEYS.len());
+            for key in SLIM_EVENT_KEYS {
+                if let Some(val) = obj.get(*key) {
+                    out.insert((*key).to_string(), val.clone());
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        None => payload.clone(),
+    }
 }
 
 /// Outcome of advancing one execution's cached spine to the current head — the
@@ -165,6 +249,11 @@ pub struct ExecutionChain {
     /// How [`Self::chain_walk`] / [`Self::advance`] order the spine — injected by
     /// the owning [`WalEventIndex`] (noetl/ai-meta#117).  Default `Causal`.
     order: SpineOrder,
+    /// Running sum of [`IndexedEvent::bytes`] across this chain's indexed events
+    /// — the per-execution slice of the bounded-cache byte ledger
+    /// (noetl/ai-meta#166 §5.1).  Maintained incrementally on apply (delta on a
+    /// redelivery overwrite) so the index never walks all events to size itself.
+    bytes: usize,
 }
 
 impl ExecutionChain {
@@ -180,16 +269,33 @@ impl ExecutionChain {
     /// JetStream redelivery) overwrites with identical data and never double-counts
     /// the head. Returns `true` if this event was new to the index.
     pub fn apply(&mut self, event_id: i64, prev_event_id: Option<i64>, event_type: String, raw: serde_json::Value) -> bool {
-        let is_new = !self.events.contains_key(&event_id);
+        let bytes = approx_json_bytes(&raw) + INDEXED_EVENT_OVERHEAD;
+        // Adjust the byte ledger by the delta: a redelivery overwrite replaces an
+        // existing entry's cost, a new event adds its cost.
+        let is_new = match self.events.get(&event_id) {
+            Some(prior) => {
+                self.bytes = self.bytes.saturating_sub(prior.bytes);
+                false
+            }
+            None => true,
+        };
+        self.bytes += bytes;
         self.events.insert(
             event_id,
-            IndexedEvent { prev_event_id, event_type, raw },
+            IndexedEvent { prev_event_id, event_type, raw, bytes },
         );
         // Advance the head monotonically — the chain tip is the max id seen.
         if self.head.is_none_or(|h| event_id > h) {
             self.head = Some(event_id);
         }
         is_new
+    }
+
+    /// Approximate resident bytes this chain's indexed events occupy
+    /// (noetl/ai-meta#166 §5.1) — the per-execution byte-ledger slice the
+    /// bounded cache sums to enforce the byte ceiling.
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Current chain head (max applied `event_id`), if any.
@@ -421,15 +527,111 @@ impl ExecutionChain {
     }
 }
 
+/// Bounded-cache eviction policy for the pool-side WAL index
+/// (noetl/ai-meta#166 Phase 1, RFC §5.1).  Every knob defaults to **off**
+/// (unbounded = today's behaviour) so a worker carrying this code is
+/// byte-for-byte behaviour-neutral until an operator sets the env vars — the
+/// deploy is safe before the flags are flipped.
+///
+/// Resolved from env by [`Self::from_env`]:
+/// - `NOETL_STATE_INDEX_MAX_BYTES` → [`Self::max_bytes`] (hard resident ceiling;
+///   the bounded-memory guarantee — evict LRU until under it).
+/// - `NOETL_STATE_INDEX_TTL_SECS` → [`Self::ttl`] (idle TTL; evicts a
+///   non-terminal execution not driven / not fed an event for this long — the
+///   fix for the stuck/abandoned executions terminal-eviction misses, RFC §1.3).
+/// - `NOETL_STATE_INDEX_MAX_EXECUTIONS` → [`Self::max_executions`] (cap on
+///   concurrent resident chains).
+/// - `NOETL_STATE_INDEX_SLIM` → [`Self::slim`] (store the lossless slim
+///   projection instead of the full envelope — RFC §4.1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvictionPolicy {
+    pub max_bytes: Option<usize>,
+    pub ttl: Option<Duration>,
+    pub max_executions: Option<usize>,
+    pub slim: bool,
+}
+
+impl EvictionPolicy {
+    /// Resolve the policy from env.  Unset / zero / unparseable → that knob stays
+    /// off, so the default policy is fully unbounded (today's behaviour).
+    pub fn from_env() -> Self {
+        let max_bytes = std::env::var("NOETL_STATE_INDEX_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0);
+        let ttl = std::env::var("NOETL_STATE_INDEX_TTL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .map(Duration::from_secs);
+        let max_executions = std::env::var("NOETL_STATE_INDEX_MAX_EXECUTIONS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0);
+        let slim = matches!(
+            std::env::var("NOETL_STATE_INDEX_SLIM")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        Self {
+            max_bytes,
+            ttl,
+            max_executions,
+            slim,
+        }
+    }
+
+    /// True when any eviction bound (bytes / TTL / max-executions) is set — i.e.
+    /// the index is no longer unbounded.  `slim` alone doesn't make the policy
+    /// "active" for the periodic sweep; it only changes what's stored.
+    pub fn bounds_memory(&self) -> bool {
+        self.max_bytes.is_some() || self.ttl.is_some() || self.max_executions.is_some()
+    }
+}
+
+/// One bounded-cache eviction sweep's accounting (noetl/ai-meta#166 §5.1) — how
+/// many chains left by each reason, so the drain can record the
+/// `state_builder_evictions_total{reason}` metric.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvictionStats {
+    pub ttl: usize,
+    pub max_executions: usize,
+    pub byte_ceiling: usize,
+}
+
+impl EvictionStats {
+    pub fn total(&self) -> usize {
+        self.ttl + self.max_executions + self.byte_ceiling
+    }
+}
+
 /// Pool-side index of all in-flight executions' chains. Holds one
 /// [`ExecutionChain`] per `execution_id`; terminal executions are evicted to
-/// bound memory (RFC §5.2 — eviction, never staleness invalidation).
+/// bound memory (RFC §5.2 — eviction, never staleness invalidation).  Under a
+/// non-default [`EvictionPolicy`] (noetl/ai-meta#166 Phase 1) idle/abandoned
+/// non-terminal chains are also evicted by TTL and the resident set is held
+/// under a hard byte ceiling — so memory is `O(active working set)` rather than
+/// `O(all non-terminal event history)`.
 #[derive(Debug, Default)]
 pub struct WalEventIndex {
     chains: HashMap<i64, ExecutionChain>,
     /// Spine ordering injected into every chain this index creates
     /// (noetl/ai-meta#117).  Default `Causal`.
     order: SpineOrder,
+    /// Bounded-cache policy (noetl/ai-meta#166).  Default = unbounded.
+    policy: EvictionPolicy,
+    /// Last-activity instant per execution — refreshed when an event is applied
+    /// for it or when its spine is built (driven).  The LRU/TTL key.  Held here
+    /// (not on the clockless [`ExecutionChain`]) so the chain stays a pure,
+    /// deterministic function of its events for unit testing.
+    access: HashMap<i64, Instant>,
+    /// Running sum of every resident chain's [`ExecutionChain::bytes`] — the
+    /// bounded-cache byte ledger.  Maintained incrementally on apply / evict so
+    /// the byte ceiling never walks the whole index to size it.
+    total_bytes: usize,
 }
 
 /// Event types that put an execution into a terminal state — the eviction signal
@@ -455,11 +657,44 @@ impl WalEventIndex {
         }
     }
 
+    /// An index with both the spine ordering and the bounded-cache eviction
+    /// policy resolved from env (noetl/ai-meta#166) — the worker's startup
+    /// constructor.
+    pub fn with_order_policy(order: SpineOrder, policy: EvictionPolicy) -> Self {
+        Self {
+            order,
+            policy,
+            ..Default::default()
+        }
+    }
+
+    /// The active eviction policy.
+    pub fn policy(&self) -> EvictionPolicy {
+        self.policy
+    }
+
+    /// Swap the eviction policy — test seam for sizing a ceiling against a
+    /// measured resident set.
+    #[cfg(test)]
+    fn set_policy_for_test(&mut self, policy: EvictionPolicy) {
+        self.policy = policy;
+    }
+
     /// Index one WAL event payload (the `noetl_events` shape). Extracts the chain
     /// fields and routes them to the owning execution's [`ExecutionChain`].
     /// Returns the `(execution_id, is_new, is_terminal)` triple, or `None` when the
     /// payload isn't a chainable event (no `event_id`/`execution_id`).
     pub fn apply(&mut self, payload: &serde_json::Value) -> Option<(i64, bool, bool)> {
+        self.apply_at(payload, Instant::now())
+    }
+
+    /// [`Self::apply`] with an explicit activity instant — the clock is injected
+    /// so unit tests can drive TTL eviction deterministically.
+    pub fn apply_at(
+        &mut self,
+        payload: &serde_json::Value,
+        now: Instant,
+    ) -> Option<(i64, bool, bool)> {
         let obj = payload.as_object()?;
         let event_id = obj.get("event_id").and_then(|v| v.as_i64())?;
         let execution_id = obj.get("execution_id").and_then(|v| v.as_i64())?;
@@ -471,12 +706,43 @@ impl WalEventIndex {
             .to_string();
         let is_terminal = TERMINAL_EVENT_TYPES.contains(&event_type.as_str());
         let order = self.order;
+        // Slim projection (noetl/ai-meta#166 §4.1): store only the fields the
+        // orchestrate-core `Event` deserializer reads.  Lossless w.r.t.
+        // `from_events` (serde drops the rest on decode regardless), so the drive
+        // decision is identical — it just stops the index carrying bytes the
+        // build never looks at.
+        let stored = if self.policy.slim {
+            slim_event_payload(payload)
+        } else {
+            payload.clone()
+        };
         let chain = self
             .chains
             .entry(execution_id)
             .or_insert_with(|| ExecutionChain::with_order(order));
-        let is_new = chain.apply(event_id, prev_event_id, event_type, payload.clone());
+        let before = chain.bytes();
+        let is_new = chain.apply(event_id, prev_event_id, event_type, stored);
+        let after = chain.bytes();
+        // Maintain the index-wide byte ledger by the chain's delta.
+        self.total_bytes = self.total_bytes + after - before;
+        // An applied event is activity for this execution — refresh its LRU/TTL
+        // stamp so a chain receiving WAL events is never evicted as idle.
+        self.access.insert(execution_id, now);
         Some((execution_id, is_new, is_terminal))
+    }
+
+    /// Refresh an execution's last-activity stamp (noetl/ai-meta#166) — called on
+    /// the drive path when a spine is built, so a *driven* execution counts as
+    /// active for LRU/TTL even between WAL events.
+    pub fn touch(&mut self, execution_id: i64) {
+        self.touch_at(execution_id, Instant::now());
+    }
+
+    /// [`Self::touch`] with an explicit instant (test seam).
+    pub fn touch_at(&mut self, execution_id: i64, now: Instant) {
+        if self.chains.contains_key(&execution_id) {
+            self.access.insert(execution_id, now);
+        }
     }
 
     /// Borrow an execution's chain (for advance / walk).
@@ -489,14 +755,108 @@ impl WalEventIndex {
     }
 
     /// Drop a terminal execution's chain — frees memory. Mirrors the server's
-    /// orch-cache + chain-head eviction on a terminal event.
+    /// orch-cache + chain-head eviction on a terminal event.  Keeps the byte
+    /// ledger + access map in step with the removed chain (noetl/ai-meta#166).
     pub fn evict(&mut self, execution_id: i64) {
-        self.chains.remove(&execution_id);
+        if let Some(chain) = self.chains.remove(&execution_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(chain.bytes());
+        }
+        self.access.remove(&execution_id);
     }
 
     /// Number of executions currently indexed.
     pub fn execution_count(&self) -> usize {
         self.chains.len()
+    }
+
+    /// Approximate total resident bytes across all indexed chains (the bounded-
+    /// cache byte ledger, noetl/ai-meta#166 §5.1).
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Total indexed events across all chains — the resident-events gauge
+    /// (the `654 × 27` headline of the #166 problem statement).
+    pub fn event_count(&self) -> usize {
+        self.chains.values().map(|c| c.len()).sum()
+    }
+
+    /// Enforce the bounded-cache policy (noetl/ai-meta#166 §5.1), evicting chains
+    /// in priority order: **TTL** (idle non-terminal — the stuck/abandoned
+    /// executions terminal-eviction misses), then **max-executions**, then the
+    /// hard **byte ceiling**.  Both count-based passes evict least-recently-active
+    /// first (LRU), so the *currently-driven* working set is the last to go and a
+    /// sanely-sized ceiling never touches it.  Returns per-reason [`EvictionStats`]
+    /// for the drain's metric.  A no-op when the policy is unbounded (today's
+    /// behaviour).  `now` is injected for deterministic testing.
+    pub fn enforce_limits_at(&mut self, now: Instant) -> EvictionStats {
+        let mut stats = EvictionStats::default();
+        if !self.policy.bounds_memory() {
+            return stats;
+        }
+
+        // 1) TTL — evict any chain idle longer than the TTL.  A chain with no
+        //    access stamp (shouldn't happen — apply always stamps) is treated as
+        //    idle-forever and swept.
+        if let Some(ttl) = self.policy.ttl {
+            let stale: Vec<i64> = self
+                .chains
+                .keys()
+                .copied()
+                .filter(|eid| {
+                    self.access
+                        .get(eid)
+                        .map(|t| now.saturating_duration_since(*t) >= ttl)
+                        .unwrap_or(true)
+                })
+                .collect();
+            for eid in stale {
+                self.evict(eid);
+                stats.ttl += 1;
+            }
+        }
+
+        // 2) Max-executions — evict LRU until at or under the cap.
+        if let Some(max) = self.policy.max_executions {
+            while self.chains.len() > max {
+                match self.lru_execution() {
+                    Some(eid) => {
+                        self.evict(eid);
+                        stats.max_executions += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // 3) Byte ceiling — the bounded-memory guarantee.  Evict LRU until the
+        //    resident set is at or under the ceiling.
+        if let Some(max_bytes) = self.policy.max_bytes {
+            while self.total_bytes > max_bytes && !self.chains.is_empty() {
+                match self.lru_execution() {
+                    Some(eid) => {
+                        self.evict(eid);
+                        stats.byte_ceiling += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        stats
+    }
+
+    /// [`Self::enforce_limits_at`] at the current instant — the drain-loop entry.
+    pub fn enforce_limits(&mut self) -> EvictionStats {
+        self.enforce_limits_at(Instant::now())
+    }
+
+    /// The least-recently-active resident execution (LRU eviction victim).  A
+    /// chain missing from `access` sorts oldest (evicted first).
+    fn lru_execution(&self) -> Option<i64> {
+        self.chains
+            .keys()
+            .copied()
+            .min_by_key(|eid| self.access.get(eid).copied())
     }
 
     /// Advance an execution's cached spine (exercising the cache: hit /
@@ -681,6 +1041,10 @@ pub async fn build_offserver_input(
             Some(target) => idx.build_spine_to(execution_id, target),
             None => idx.build_spine(execution_id),
         };
+        // Refresh the LRU/TTL stamp: an execution being driven is active even
+        // between WAL events, so the bounded cache (noetl/ai-meta#166) keeps it
+        // resident and evicts only genuinely idle chains.
+        idx.touch(execution_id);
         let chain = idx.chain(execution_id);
         // Stateless off-server drive (RFC #115 Phase 4 remainder): when the
         // server did NOT supply `trigger_event_type` (it no longer reads
@@ -1059,6 +1423,15 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
     let mut dead_since: Option<Instant> = None;
     let unhealthy_after = unhealthy_after();
     let rebuild_after = rebuild_after();
+    // noetl/ai-meta#166: the bounded-cache TTL/byte sweep runs on a throttled
+    // cadence on BOTH the busy and idle paths.  Idle-path sweeping is the
+    // load-bearing case: the system pool at idle (62m CPU, few new events) is
+    // exactly when the 654 stuck/abandoned chains must be evicted — gating the
+    // sweep behind `consumed > 0` would never reclaim them on a quiet stream.
+    // Throttled (default 15s) so the 25ms idle re-poll grid (noetl/ai-meta#130)
+    // doesn't spin an O(n) sweep + index lock 40×/sec.
+    let mut last_sweep = Instant::now();
+    let sweep_interval = Duration::from_secs(env_u64("NOETL_STATE_INDEX_SWEEP_SECS", 15));
 
     // Initial connect: retry with backoff until NATS is reachable and the
     // consumer is created (a NATS bounce at boot must not kill the drain task).
@@ -1255,6 +1628,42 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         last_healthy = Instant::now();
         crate::metrics::set_state_builder_healthy(true);
 
+        // noetl/ai-meta#166: throttled bounded-cache sweep — runs on idle AND
+        // busy iterations so idle/abandoned chains are reclaimed even when no new
+        // events are arriving (the system-pool-at-idle case).  A no-op when the
+        // policy is unbounded.  Also refreshes the resident-set gauges so the
+        // OOM-trail observability stays live on a quiet stream.
+        if last_sweep.elapsed() >= sweep_interval {
+            last_sweep = Instant::now();
+            let (indexed, events, bytes) = {
+                let mut idx = index.lock().await;
+                let evicted = idx.enforce_limits();
+                if evicted.total() > 0 {
+                    crate::metrics::record_state_builder_eviction("ttl", evicted.ttl);
+                    crate::metrics::record_state_builder_eviction(
+                        "max_executions",
+                        evicted.max_executions,
+                    );
+                    crate::metrics::record_state_builder_eviction(
+                        "byte_ceiling",
+                        evicted.byte_ceiling,
+                    );
+                    tracing::debug!(
+                        ttl = evicted.ttl,
+                        max_executions = evicted.max_executions,
+                        byte_ceiling = evicted.byte_ceiling,
+                        resident = idx.execution_count(),
+                        bytes = idx.total_bytes(),
+                        "state-builder bounded-cache eviction sweep (noetl/ai-meta#166)"
+                    );
+                }
+                (idx.execution_count(), idx.event_count(), idx.total_bytes())
+            };
+            crate::metrics::set_state_builder_indexed_executions(indexed as i64);
+            crate::metrics::set_state_builder_index_events(events as i64);
+            crate::metrics::set_state_builder_index_bytes(bytes as i64);
+        }
+
         if consumed == 0 {
             tokio::time::sleep(config.idle_sleep).await;
             continue;
@@ -1297,18 +1706,24 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
                 }
             }
         }
-        let indexed = {
+        let (indexed, bytes) = {
             let mut idx = index.lock().await;
+            // Terminal eviction stays per-batch — the cheap O(terminals) fast
+            // path that frees a chain the instant it completes.  The TTL/byte
+            // bounded-cache sweep is the throttled periodic pass above.
             for eid in terminals {
                 idx.evict(eid);
             }
-            idx.execution_count()
+            (idx.execution_count(), idx.total_bytes())
         };
         // noetl/ai-meta#119 rehydration proof: surface the indexed-execution count
         // (the bug was this stuck at 0 after a restart — the durable cursor outran
         // the empty index).  A non-zero count after boot means the index rebuilt
         // from the retained WAL.  Log the first non-empty rebuild once per process.
+        // O(1) gauges refreshed every busy batch; the O(n) event_count gauge is
+        // refreshed by the throttled sweep above (noetl/ai-meta#166).
         crate::metrics::set_state_builder_indexed_executions(indexed as i64);
+        crate::metrics::set_state_builder_index_bytes(bytes as i64);
         if !rehydrated && indexed > 0 {
             rehydrated = true;
             tracing::info!(
@@ -1369,6 +1784,165 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+// ── Cold-rebuild on cache miss (noetl/ai-meta#166 §5.2) ──────────────────────
+//
+// When the bounded cache evicts an execution that is later driven again (a
+// callback-resumed block, an ownership change), the live drain won't re-deliver
+// that execution's already-consumed events, so its chain can't reach genesis and
+// the build is permanently `Incomplete` — a wedge, since the #156 tail-attach
+// accelerator is OFF in prod and the drive has no server-built fallback on the
+// stateless edge.  This path makes eviction wedge-safe: on a miss it re-reads the
+// retained `noetl_events` WAL (bounded — 24h, `discard=old`, ~tens of MiB) with a
+// one-shot ephemeral consumer and re-indexes ONLY the missed execution's events,
+// then the drive re-attempts the build.  Bounded by a deadline + a message cap;
+// gated off by default so it's opt-in alongside eviction.
+
+/// True when `NOETL_STATE_INDEX_REHYDRATE_ON_MISS` is truthy — enables the
+/// targeted retained-WAL cold-rebuild on a bounded-cache miss (noetl/ai-meta#166
+/// §5.2).  Default off.  Pairs with the eviction knobs: enable both together so
+/// an evicted-then-resumed execution self-heals instead of wedging.
+pub fn rehydrate_on_miss_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_STATE_INDEX_REHYDRATE_ON_MISS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Resolved config for a targeted WAL cold-rebuild (noetl/ai-meta#166 §5.2).
+#[derive(Clone)]
+pub struct RehydrateConfig {
+    pub nats_url: String,
+    pub nats_user: Option<String>,
+    pub nats_password: Option<String>,
+    pub stream: String,
+    pub batch: u32,
+    /// Per-pull long-poll expiry — short so an empty pull (caught up) returns
+    /// quickly.
+    pub poll_ms: u64,
+    /// Overall wall-clock budget for one rehydrate (caps the rare miss-path cost
+    /// so a cold-rebuild can never become a #130/#156-class latency regression).
+    pub deadline_ms: u64,
+    /// Hard cap on messages scanned in one rehydrate (belt-and-suspenders against
+    /// an unexpectedly large retained stream).
+    pub max_messages: u64,
+}
+
+impl RehydrateConfig {
+    pub fn from_env(nats_url: &str) -> Self {
+        let (nats_url, nats_user, nats_password) = parse_nats_credentials(nats_url);
+        Self {
+            nats_url,
+            nats_user,
+            nats_password,
+            stream: std::env::var("NOETL_STATE_BUILDER_STREAM")
+                .unwrap_or_else(|_| EVENT_STREAM.to_string()),
+            batch: env_u32("NOETL_STATE_INDEX_REHYDRATE_BATCH", 500).clamp(1, 2000),
+            poll_ms: env_u64("NOETL_STATE_INDEX_REHYDRATE_POLL_MS", 300).clamp(50, 5_000),
+            deadline_ms: env_u64("NOETL_STATE_INDEX_REHYDRATE_DEADLINE_MS", 3_000).clamp(100, 30_000),
+            max_messages: env_u64("NOETL_STATE_INDEX_REHYDRATE_MAX_MESSAGES", 100_000),
+        }
+    }
+}
+
+/// Targeted retained-WAL cold-rebuild for ONE execution (noetl/ai-meta#166 §5.2).
+/// Opens a one-shot ephemeral `DeliverPolicy::All` / `AckPolicy::None` consumer on
+/// the `noetl_events` stream, drains the retained window applying **only**
+/// `execution_id`'s events into the shared index, and returns the count applied.
+/// Bounded by `deadline_ms` + `max_messages`; any NATS error returns `0` so the
+/// caller just falls back exactly as today (the rehydrate can never make a miss
+/// worse than the pre-existing fallback — it only ADDS events to the index).
+///
+/// Filtering to the single execution is what keeps this from re-bloating the
+/// index back to the full 24h window: a generic replay would re-index everything
+/// the eviction just freed.
+pub async fn rehydrate_execution_from_wal(
+    cfg: &RehydrateConfig,
+    index: &SharedWalIndex,
+    execution_id: i64,
+) -> usize {
+    let deadline = Instant::now() + Duration::from_millis(cfg.deadline_ms);
+    let connect = async {
+        let client = match (&cfg.nats_user, &cfg.nats_password) {
+            (Some(u), Some(p)) => {
+                ConnectOptions::with_user_and_password(u.clone(), p.clone())
+                    .connect(&cfg.nats_url)
+                    .await
+            }
+            _ => async_nats::connect(&cfg.nats_url).await,
+        }?;
+        let js = jetstream::new(client.clone());
+        let stream = js.get_stream(&cfg.stream).await?;
+        let consumer = stream
+            .create_consumer(PullConfig {
+                durable_name: None,
+                filter_subject: "noetl.events.>".to_string(),
+                deliver_policy: DeliverPolicy::All,
+                ack_policy: AckPolicy::None,
+                ..Default::default()
+            })
+            .await?;
+        Ok::<_, async_nats::Error>((client, consumer))
+    };
+    let (_client, consumer) = match connect.await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(execution_id, error = %e, "state-builder cold-rebuild connect failed (noetl/ai-meta#166)");
+            return 0;
+        }
+    };
+
+    let mut applied = 0usize;
+    let mut scanned = 0u64;
+    while Instant::now() < deadline && scanned < cfg.max_messages {
+        let mut batch = match consumer
+            .batch()
+            .max_messages(cfg.batch as usize)
+            .expires(Duration::from_millis(cfg.poll_ms))
+            .messages()
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => break,
+        };
+        let mut got = 0u64;
+        while let Some(Ok(msg)) = batch.next().await {
+            got += 1;
+            scanned += 1;
+            let payload: serde_json::Value = match serde_json::from_slice(&msg.payload) {
+                Ok(v) => v,
+                Err(_) => match std::str::from_utf8(&msg.payload)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+            // Only the missed execution's events — keep the index from re-growing.
+            if payload.get("execution_id").and_then(|v| v.as_i64()) != Some(execution_id) {
+                continue;
+            }
+            {
+                let mut idx = index.lock().await;
+                idx.apply(&payload);
+            }
+            applied += 1;
+            if scanned >= cfg.max_messages {
+                break;
+            }
+        }
+        // An empty pull means the retained window is fully scanned (caught up).
+        if got == 0 {
+            break;
+        }
+    }
+    applied
 }
 
 #[cfg(test)]
@@ -2061,5 +2635,230 @@ mod tests {
         let chain = chain_from(&spine);
         let walk = chain.chain_walk().expect("complete");
         assert_eq!(walk, (1..=10).collect::<Vec<i64>>());
+    }
+
+    // ---- noetl/ai-meta#166 Phase 1: slim chain + bounded cache ----
+
+    /// A fat envelope: the Event-relevant fields PLUS the non-Event fields a real
+    /// `noetl_events` envelope carries (`node_id`, `node_type`, `duration`,
+    /// `stack_trace`, `trace_component`, `parent_event_id`, an `extra` blob).
+    fn fat_event(event_id: i64, prev: Option<i64>, event_type: &str, bulk: usize) -> serde_json::Value {
+        serde_json::json!({
+            "event_id": event_id,
+            "execution_id": 42,
+            "prev_event_id": prev,
+            "event_type": event_type,
+            "node_name": "step_a",
+            "status": "completed",
+            "created_at": "2026-06-30T00:00:00Z",
+            "result": { "data": "r".repeat(bulk) },   // Event field — KEPT (load-bearing)
+            "context": { "workload": {"k": "v"} },     // Event field — KEPT
+            // Non-Event envelope fields — dropped by from_events' serde anyway:
+            "node_id": "n".repeat(bulk),
+            "node_type": "task",
+            "duration": 1.23,
+            "stack_trace": "s".repeat(bulk),
+            "trace_component": "worker",
+            "parent_event_id": 7,
+            "some_extra_blob": "x".repeat(bulk),
+        })
+    }
+
+    #[test]
+    fn slim_projection_keeps_event_fields_drops_the_rest() {
+        let full = fat_event(2, Some(1), "command.completed", 100);
+        let slim = slim_event_payload(&full);
+        let obj = slim.as_object().unwrap();
+        // Every Event-deserialized field survives…
+        for k in ["event_id", "execution_id", "event_type", "node_name", "status", "result", "context", "created_at"] {
+            assert!(obj.contains_key(k), "slim must keep Event field {k}");
+        }
+        // …and the non-Event envelope fields are gone.
+        for k in ["node_id", "node_type", "duration", "stack_trace", "trace_component", "parent_event_id", "some_extra_blob", "prev_event_id"] {
+            assert!(!obj.contains_key(k), "slim must drop non-Event field {k}");
+        }
+        // Output-equivalence by construction: the kept body fields are byte-identical.
+        assert_eq!(obj.get("result"), full.get("result"));
+        assert_eq!(obj.get("context"), full.get("context"));
+        // And the slim payload is strictly smaller.
+        assert!(approx_json_bytes(&slim) < approx_json_bytes(&full));
+    }
+
+    #[test]
+    fn slim_index_builds_identical_spine_to_full() {
+        // The drive sees the SAME ordered Event spine whether the index stored the
+        // full envelope or the slim projection — output-equivalence at the index
+        // boundary (the from_events input is identical for the kept fields).
+        let events = vec![
+            fat_event(1, None, "playbook_started", 50),
+            fat_event(2, Some(1), "command.issued", 50),
+            fat_event(3, Some(2), "command.completed", 50),
+        ];
+
+        let mut full = WalEventIndex::new();
+        for e in &events {
+            full.apply(e);
+        }
+        let (_, full_spine) = full.build_spine_to(42, 3);
+
+        let mut slim = WalEventIndex::with_order_policy(
+            SpineOrder::Causal,
+            EvictionPolicy { slim: true, ..Default::default() },
+        );
+        for e in &events {
+            slim.apply(e);
+        }
+        let (_, slim_spine) = slim.build_spine_to(42, 3);
+
+        let full_spine = full_spine.expect("full spine");
+        let slim_spine = slim_spine.expect("slim spine");
+        // Same ids in the same causal order.
+        let ids = |s: &[serde_json::Value]| -> Vec<i64> {
+            s.iter().map(|e| e["event_id"].as_i64().unwrap()).collect()
+        };
+        assert_eq!(ids(&full_spine), ids(&slim_spine));
+        // The kept Event fields are byte-identical on the slim spine; the slim
+        // index holds strictly fewer bytes.
+        for (f, s) in full_spine.iter().zip(slim_spine.iter()) {
+            assert_eq!(f["result"], s["result"]);
+            assert_eq!(f["context"], s["context"]);
+            assert_eq!(f["event_type"], s["event_type"]);
+        }
+        assert!(slim.total_bytes() < full.total_bytes(), "slim index is smaller");
+    }
+
+    #[test]
+    fn byte_ledger_tracks_apply_overwrite_and_evict() {
+        let mut idx = WalEventIndex::new();
+        assert_eq!(idx.total_bytes(), 0);
+        idx.apply(&fat_event(1, None, "playbook_started", 100));
+        let after_one = idx.total_bytes();
+        assert!(after_one > 0);
+        // Redelivery (same event_id) is an overwrite, not a double-count.
+        idx.apply(&fat_event(1, None, "playbook_started", 100));
+        assert_eq!(idx.total_bytes(), after_one, "redelivery must not double-count bytes");
+        // A second execution adds bytes; evicting it returns to the prior total.
+        idx.apply(&serde_json::json!({"event_id": 9, "execution_id": 77, "event_type": "playbook_started"}));
+        assert!(idx.total_bytes() > after_one);
+        idx.evict(77);
+        assert_eq!(idx.total_bytes(), after_one, "evict must subtract the chain's bytes");
+        assert_eq!(idx.execution_count(), 1);
+    }
+
+    #[test]
+    fn ttl_eviction_sweeps_idle_keeps_active() {
+        // The cure for the 654 idle/abandoned executions: TTL evicts a chain not
+        // touched within the TTL, while an active (recently-touched) one survives.
+        let ttl = Duration::from_secs(900);
+        let mut idx = WalEventIndex::with_order_policy(
+            SpineOrder::Causal,
+            EvictionPolicy { ttl: Some(ttl), ..Default::default() },
+        );
+        let t0 = Instant::now();
+        // Two executions applied at t0.
+        idx.apply_at(&serde_json::json!({"event_id": 1, "execution_id": 100, "event_type": "playbook_started"}), t0);
+        idx.apply_at(&serde_json::json!({"event_id": 2, "execution_id": 200, "event_type": "playbook_started"}), t0);
+        assert_eq!(idx.execution_count(), 2);
+        // 200 stays active (driven just before the sweep); 100 goes idle.
+        let sweep = t0 + ttl + Duration::from_secs(1);
+        idx.touch_at(200, sweep - Duration::from_secs(1));
+        let stats = idx.enforce_limits_at(sweep);
+        assert_eq!(stats.ttl, 1, "exactly the idle chain evicted");
+        assert_eq!(stats.total(), 1);
+        assert!(idx.chain(100).is_none(), "idle chain evicted");
+        assert!(idx.chain(200).is_some(), "active chain survives TTL");
+    }
+
+    #[test]
+    fn byte_ceiling_evicts_lru_until_under() {
+        // The hard bounded-memory guarantee: evict least-recently-active chains
+        // until resident bytes are under the ceiling.
+        let mut idx = WalEventIndex::with_order_policy(SpineOrder::Causal, EvictionPolicy::default());
+        let t0 = Instant::now();
+        // Three executions, applied oldest→newest, each ~same size.
+        for (i, eid) in [100, 200, 300].into_iter().enumerate() {
+            idx.apply_at(
+                &serde_json::json!({"event_id": eid, "execution_id": eid, "event_type": "playbook_started", "result": {"d": "z".repeat(200)}}),
+                t0 + Duration::from_secs(i as u64),
+            );
+        }
+        let one = idx.total_bytes() / 3;
+        // Set a ceiling that fits ~2 of the 3 chains.
+        idx.set_policy_for_test(EvictionPolicy { max_bytes: Some(one * 2 + one / 2), ..Default::default() });
+        let stats = idx.enforce_limits_at(t0 + Duration::from_secs(10));
+        assert!(stats.byte_ceiling >= 1);
+        assert!(idx.total_bytes() <= one * 2 + one / 2, "resident set held under the ceiling");
+        // The LRU (oldest, execution 100) was the first evicted.
+        assert!(idx.chain(100).is_none(), "LRU victim evicted first");
+        assert!(idx.chain(300).is_some(), "most-recently-active survives");
+    }
+
+    #[test]
+    fn max_executions_evicts_lru() {
+        let mut idx = WalEventIndex::with_order_policy(
+            SpineOrder::Causal,
+            EvictionPolicy { max_executions: Some(2), ..Default::default() },
+        );
+        let t0 = Instant::now();
+        for (i, eid) in [100, 200, 300].into_iter().enumerate() {
+            idx.apply_at(
+                &serde_json::json!({"event_id": eid, "execution_id": eid, "event_type": "playbook_started"}),
+                t0 + Duration::from_secs(i as u64),
+            );
+        }
+        let stats = idx.enforce_limits_at(t0 + Duration::from_secs(10));
+        assert_eq!(stats.max_executions, 1);
+        assert_eq!(idx.execution_count(), 2);
+        assert!(idx.chain(100).is_none(), "oldest evicted to honor the cap");
+    }
+
+    #[test]
+    fn unbounded_policy_never_evicts() {
+        // Behaviour-neutral default: with no bounds set, enforce_limits is a no-op
+        // even for ancient chains (today's behaviour — only terminal eviction).
+        let mut idx = WalEventIndex::new();
+        let t0 = Instant::now();
+        idx.apply_at(&serde_json::json!({"event_id": 1, "execution_id": 100, "event_type": "playbook_started"}), t0);
+        let stats = idx.enforce_limits_at(t0 + Duration::from_secs(86_400));
+        assert_eq!(stats.total(), 0);
+        assert_eq!(idx.execution_count(), 1);
+    }
+
+    #[test]
+    fn cold_rebuild_after_eviction_reindexes_from_replayed_events() {
+        // Models cold-rebuild-on-miss (§5.2) at the index layer: an execution is
+        // evicted (cache miss), then its events are re-applied (the targeted WAL
+        // re-replay) and the spine builds again — identical to before eviction.
+        let mut idx = WalEventIndex::new();
+        let events = linear_spine(4);
+        for e in &events {
+            idx.apply(e);
+        }
+        let (_, before) = idx.build_spine_to(42, 4);
+        let before = before.expect("pre-eviction spine");
+        // Evict (bounded-cache miss).
+        idx.evict(42);
+        let (miss, none) = idx.build_spine_to(42, 4);
+        assert!(matches!(miss, AdvanceOutcome::Incomplete));
+        assert!(none.is_none(), "evicted execution misses");
+        // Re-replay the retained events for it (what rehydrate_execution_from_wal
+        // does over NATS) → the spine rebuilds identically.
+        for e in &events {
+            idx.apply(e);
+        }
+        let (_, after) = idx.build_spine_to(42, 4);
+        let after = after.expect("rehydrated spine");
+        let ids = |s: &[serde_json::Value]| -> Vec<i64> {
+            s.iter().map(|e| e["event_id"].as_i64().unwrap()).collect()
+        };
+        assert_eq!(ids(&before), ids(&after), "cold-rebuild reproduces the same spine");
+    }
+
+    #[test]
+    fn policy_from_env_defaults_unbounded() {
+        // With none of the knobs set the policy bounds nothing (behaviour-neutral).
+        let p = EvictionPolicy::default();
+        assert!(!p.bounds_memory());
+        assert!(p.max_bytes.is_none() && p.ttl.is_none() && p.max_executions.is_none() && !p.slim);
     }
 }

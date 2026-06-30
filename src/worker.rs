@@ -117,9 +117,17 @@ impl Worker {
         // The spine ordering (noetl/ai-meta#117) is resolved from env once: causal
         // (`prev_event_id` chain) order by default, so fan-in survives an
         // `event_id`-vs-chain inversion under high-concurrency fan-out.
+        // noetl/ai-meta#166 Phase 1: the index now carries a bounded-cache
+        // eviction policy resolved from env (TTL / byte-ceiling / max-executions
+        // + the slim-chain projection).  Every knob defaults to off (unbounded =
+        // today's behaviour), so a worker carrying this code is behaviour-neutral
+        // until an operator sets the env vars.
         let state_builder_index: crate::state_builder::SharedWalIndex =
             crate::state_builder::SharedWalIndex::new(
-                crate::state_builder::WalEventIndex::with_order(crate::state_builder::spine_order()),
+                crate::state_builder::WalEventIndex::with_order_policy(
+                    crate::state_builder::spine_order(),
+                    crate::state_builder::EvictionPolicy::from_env(),
+                ),
             );
 
         // Create executor.  Under `NOETL_STATE_BUILDER=offserver` it builds the
@@ -133,6 +141,7 @@ impl Worker {
             arrow_cache.clone(),
             crate::state_builder::builder_mode(),
             state_builder_index.clone(),
+            config.nats_url.clone(),
         ));
 
         // Create semaphore for concurrency control

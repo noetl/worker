@@ -176,6 +176,23 @@ pub struct CommandExecutor {
     /// when the builder is authoritative.
     #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
     state_builder_index: crate::state_builder::SharedWalIndex,
+
+    /// NATS URL for the targeted retained-WAL cold-rebuild on a bounded-cache
+    /// miss (noetl/ai-meta#166 §5.2).  The executor connects on demand only on
+    /// the rare miss path; the steady-state drive never touches NATS here.
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    state_builder_nats_url: String,
+
+    /// Whether cold-rebuild-on-miss is enabled (`NOETL_STATE_INDEX_REHYDRATE_ON_MISS`),
+    /// resolved once at construction (noetl/ai-meta#166 §5.2).
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    rehydrate_on_miss: bool,
+
+    /// Concurrency cap on in-flight cold-rebuilds (noetl/ai-meta#166 §5.2) — a
+    /// restart-under-load miss storm must not fan out into N simultaneous WAL
+    /// re-scans.  A miss that can't get a permit just falls back as today.
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    rehydrate_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl CommandExecutor {
@@ -197,6 +214,7 @@ impl CommandExecutor {
         arrow_cache: Arc<ArrowIpcSharedMemoryCache>,
         state_builder_mode: crate::state_builder::BuilderMode,
         state_builder_index: crate::state_builder::SharedWalIndex,
+        state_builder_nats_url: String,
     ) -> Self {
         let keychain_env = load_keychain_env_allowlist();
         if !keychain_env.is_empty() {
@@ -230,6 +248,18 @@ impl CommandExecutor {
             wasm_dispatcher,
             state_builder_mode,
             state_builder_index,
+            state_builder_nats_url,
+            rehydrate_on_miss: crate::state_builder::rehydrate_on_miss_enabled(),
+            // Small fixed cap: cold-rebuilds are a rare miss-path event; 2 lets a
+            // couple proceed concurrently without a restart-under-load WAL-scan
+            // storm.  Env-overridable for tuning.
+            rehydrate_gate: Arc::new(tokio::sync::Semaphore::new(
+                std::env::var("NOETL_STATE_INDEX_REHYDRATE_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(2),
+            )),
         }
     }
 
@@ -1867,7 +1897,60 @@ impl CommandExecutor {
             }
         }
 
-        // WAL chain still incomplete after the retry window.
+        // WAL chain still incomplete after the retry window.  Before falling
+        // back, try a targeted cold-rebuild from the retained WAL
+        // (noetl/ai-meta#166 §5.2) — the safety net that makes bounded-cache
+        // eviction wedge-safe: an evicted-then-resumed execution's events aren't
+        // re-delivered by the live drain, so re-read them once from the WAL and
+        // re-attempt the build.  Gated off by default; capped concurrency so a
+        // miss storm can't fan out into many WAL scans.
+        if self.rehydrate_on_miss {
+            if let Ok(_permit) = self.rehydrate_gate.try_acquire() {
+                let cfg = crate::state_builder::RehydrateConfig::from_env(
+                    &self.state_builder_nats_url,
+                );
+                let applied = crate::state_builder::rehydrate_execution_from_wal(
+                    &cfg,
+                    &self.state_builder_index,
+                    execution_id,
+                )
+                .await;
+                if applied > 0 {
+                    if let Some(bytes) = crate::state_builder::build_offserver_input(
+                        &self.state_builder_index,
+                        execution_id,
+                        &playbook,
+                        trigger_event_type,
+                        trigger_event_id,
+                        expected_head,
+                        atomic_item_context,
+                    )
+                    .await
+                    {
+                        crate::metrics::record_state_builder_rehydrate("served");
+                        crate::metrics::record_state_builder_drive("served_rehydrated");
+                        tracing::info!(
+                            execution_id,
+                            applied,
+                            "off-server drive: cold-rebuilt state from retained WAL after cache miss (noetl/ai-meta#166)"
+                        );
+                        return OffserverDispatch::Wasm {
+                            entry: "run".to_string(),
+                            input: bytes,
+                        };
+                    }
+                    // Re-indexed events but still incomplete (genesis trimmed from
+                    // the retained window) → fall through to the normal fallback.
+                    crate::metrics::record_state_builder_rehydrate("incomplete");
+                } else {
+                    crate::metrics::record_state_builder_rehydrate("empty");
+                }
+            } else {
+                // Concurrency cap saturated — skip the rebuild, fall back as today.
+                crate::metrics::record_state_builder_rehydrate("throttled");
+            }
+        }
+
         if stateless {
             // No server-built state to fall back to — a benign no-op; the server
             // reconcile poller re-drives once the drain catches up.  Conservative:
@@ -3282,6 +3365,7 @@ mod tests {
             cache,
             crate::state_builder::BuilderMode::Off,
             crate::state_builder::SharedWalIndex::new(crate::state_builder::WalEventIndex::new()),
+            "nats://localhost:4222".to_string(),
         );
 
         // Verify tools are registered
@@ -3898,6 +3982,7 @@ mod tests {
             test_cache("wkr-test-predispatch"),
             crate::state_builder::BuilderMode::Off,
             crate::state_builder::SharedWalIndex::new(crate::state_builder::WalEventIndex::new()),
+            "nats://localhost:4222".to_string(),
         )
     }
 
