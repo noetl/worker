@@ -144,7 +144,7 @@ const SLIM_EVENT_KEYS: &[&str] = &[
 /// Project a `noetl_events` envelope down to [`SLIM_EVENT_KEYS`] — the lossless
 /// slim-chain transform (noetl/ai-meta#166 §4.1).  A non-object payload (never
 /// expected for a chainable event) passes through unchanged.
-fn slim_event_payload(payload: &serde_json::Value) -> serde_json::Value {
+pub fn slim_event_payload(payload: &serde_json::Value) -> serde_json::Value {
     match payload.as_object() {
         Some(obj) => {
             let mut out = serde_json::Map::with_capacity(SLIM_EVENT_KEYS.len());
@@ -157,6 +157,27 @@ fn slim_event_payload(payload: &serde_json::Value) -> serde_json::Value {
         }
         None => payload.clone(),
     }
+}
+
+/// The per-event payload the noetl/ai-meta#166 Phase-3 **state shard** stores in
+/// its `payload` column: [`slim_event_payload`] PLUS `prev_event_id`.
+///
+/// [`slim_event_payload`] deliberately omits `prev_event_id` because the
+/// in-memory [`WalEventIndex::apply`] extracts the chain link into the
+/// [`ExecutionChain`] node from the FULL envelope and stores it *outside* the raw
+/// payload — so the resident raw never carries it.  The Phase-3 cold-load reader
+/// ([`crate::state_reader`]), however, sees ONLY this stored payload, so the link
+/// must ride *inside* it or the reconstructed chain has no edges to walk.
+/// `apply` strips `prev_event_id` back out when it stores `raw` (it is not in
+/// [`SLIM_EVENT_KEYS`]), so the stored raw remains byte-identical to the
+/// WAL-replay path — the shard reconstructs the identical chain AND the identical
+/// spine.
+pub fn shard_chain_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let mut slim = slim_event_payload(payload);
+    if let (Some(obj), Some(prev)) = (slim.as_object_mut(), payload.get("prev_event_id")) {
+        obj.insert("prev_event_id".to_string(), prev.clone());
+    }
+    slim
 }
 
 /// Outcome of advancing one execution's cached spine to the current head — the
