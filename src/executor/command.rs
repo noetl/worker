@@ -193,6 +193,26 @@ pub struct CommandExecutor {
     /// re-scans.  A miss that can't get a permit just falls back as today.
     #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
     rehydrate_gate: Arc<tokio::sync::Semaphore>,
+
+    /// Whether cold-load-from-shard is enabled (`NOETL_STATE_SHARD_READ`),
+    /// resolved once at construction (noetl/ai-meta#166 Phase 3).  On a drive
+    /// miss the executor reads the execution's Feather state shard from object
+    /// store instead of replaying the retained WAL; default off → the miss path
+    /// is byte-identical to today's WAL replay.
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    shard_read: bool,
+
+    /// Whether the shard-vs-WAL equivalence dual-build guard is enabled
+    /// (`NOETL_STATE_SHARD_READ_VERIFY`) — noetl/ai-meta#166 Phase 3.  A
+    /// validation/canary knob (pays both reads); off in steady state.
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    shard_read_verify: bool,
+
+    /// Cell placement seed for reconstructing the state-shard object key on a
+    /// cold-load (noetl/ai-meta#166 Phase 3) — reads the SAME `NOETL_RESULT_CELL_*`
+    /// env the writer used, so the reader resolves the identical §7 key.
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    shard_read_cell: crate::state_materializer::CellSeed,
 }
 
 impl CommandExecutor {
@@ -260,6 +280,9 @@ impl CommandExecutor {
                     .filter(|&n| n > 0)
                     .unwrap_or(2),
             )),
+            shard_read: crate::state_reader::shard_read_enabled(),
+            shard_read_verify: crate::state_reader::shard_read_verify_enabled(),
+            shard_read_cell: crate::state_materializer::CellSeed::from_env(),
         }
     }
 
@@ -1897,13 +1920,118 @@ impl CommandExecutor {
             }
         }
 
-        // WAL chain still incomplete after the retry window.  Before falling
-        // back, try a targeted cold-rebuild from the retained WAL
-        // (noetl/ai-meta#166 §5.2) — the safety net that makes bounded-cache
-        // eviction wedge-safe: an evicted-then-resumed execution's events aren't
-        // re-delivered by the live drain, so re-read them once from the WAL and
-        // re-attempt the build.  Gated off by default; capped concurrency so a
-        // miss storm can't fan out into many WAL scans.
+        // WAL chain still incomplete after the retry window.
+        //
+        // noetl/ai-meta#166 Phase 3: try the object-store Feather **state shard**
+        // FIRST — one keyed `object_get` (~tens of ms) replaces the retained-WAL
+        // scan the rehydrate below pays (up to the whole 24h window, bounded to the
+        // rehydrate deadline).  The shard carries the verbatim slim payload per
+        // event, so the reconstructed chain is byte-equivalent to the WAL replay by
+        // construction; a missing / stale / undecodable shard falls straight
+        // through to the WAL replay (belt-and-suspenders — correctness never
+        // depends on the shard alone).  Gated off by default (`NOETL_STATE_SHARD_READ`).
+        if self.shard_read {
+            let shard_t0 = std::time::Instant::now();
+            let outcome = crate::state_reader::cold_load_from_shard(
+                &self.client,
+                &self.shard_read_cell,
+                &self.state_builder_index,
+                execution_id,
+            )
+            .await;
+            crate::metrics::observe_state_shard_read_duration(shard_t0.elapsed().as_secs_f64());
+            match outcome {
+                crate::state_reader::ColdLoad::Applied(applied) => {
+                    if let Some(bytes) = crate::state_builder::build_offserver_input(
+                        &self.state_builder_index,
+                        execution_id,
+                        &playbook,
+                        trigger_event_type,
+                        trigger_event_id,
+                        expected_head,
+                        atomic_item_context,
+                    )
+                    .await
+                    {
+                        // Equivalence dual-build guard (`NOETL_STATE_SHARD_READ_VERIFY`,
+                        // validation/canary): also run the WAL replay and byte-compare
+                        // the two spines.  `apply` overwrites by `event_id`, so after
+                        // the replay `cached_spine_events` reflects the WAL bodies — a
+                        // second build yields the WAL spine.  Any divergence → serve
+                        // the WAL build + tripwire metric; never serve divergent state.
+                        if self.shard_read_verify {
+                            if let Ok(_permit) = self.rehydrate_gate.try_acquire() {
+                                let cfg = crate::state_builder::RehydrateConfig::from_env(
+                                    &self.state_builder_nats_url,
+                                );
+                                crate::state_builder::rehydrate_execution_from_wal(
+                                    &cfg,
+                                    &self.state_builder_index,
+                                    execution_id,
+                                )
+                                .await;
+                            }
+                            let wal_bytes = crate::state_builder::build_offserver_input(
+                                &self.state_builder_index,
+                                execution_id,
+                                &playbook,
+                                trigger_event_type,
+                                trigger_event_id,
+                                expected_head,
+                                atomic_item_context,
+                            )
+                            .await;
+                            if let Some(wal) = wal_bytes {
+                                if wal != bytes {
+                                    crate::metrics::record_state_equivalence_mismatch();
+                                    crate::metrics::record_state_shard_read("fallback");
+                                    crate::metrics::record_state_builder_drive("served_shard_mismatch");
+                                    tracing::warn!(
+                                        execution_id,
+                                        applied,
+                                        "off-server drive: shard-vs-WAL spine MISMATCH under verify; serving WAL build (noetl/ai-meta#166 Phase 3)"
+                                    );
+                                    return OffserverDispatch::Wasm {
+                                        entry: "run".to_string(),
+                                        input: wal,
+                                    };
+                                }
+                            }
+                        }
+                        crate::metrics::record_state_shard_read("hit");
+                        crate::metrics::record_state_builder_drive("served_shard");
+                        tracing::info!(
+                            execution_id,
+                            applied,
+                            "off-server drive: cold-loaded state from object-store shard after cache miss (noetl/ai-meta#166 Phase 3)"
+                        );
+                        return OffserverDispatch::Wasm {
+                            entry: "run".to_string(),
+                            input: bytes,
+                        };
+                    }
+                    // Shard applied but the chain still can't reach expected_head
+                    // (stale open shard — tail beyond its last write) → the WAL
+                    // replay below supplies the tail.
+                    crate::metrics::record_state_shard_read("fallback");
+                }
+                // No shard object (never written / GC'd) or it added nothing new.
+                crate::state_reader::ColdLoad::NotFound | crate::state_reader::ColdLoad::Empty => {
+                    crate::metrics::record_state_shard_read("miss");
+                }
+                // Object-store / decode error → conservative WAL fall-back.
+                crate::state_reader::ColdLoad::Error => {
+                    crate::metrics::record_state_shard_read("fallback");
+                }
+            }
+        }
+
+        // Before falling back to the server, try a targeted cold-rebuild from the
+        // retained WAL (noetl/ai-meta#166 §5.2) — the safety net that makes
+        // bounded-cache eviction wedge-safe: an evicted-then-resumed execution's
+        // events aren't re-delivered by the live drain, so re-read them once from
+        // the WAL and re-attempt the build.  Gated off by default; capped
+        // concurrency so a miss storm can't fan out into many WAL scans.
         if self.rehydrate_on_miss {
             if let Ok(_permit) = self.rehydrate_gate.try_acquire() {
                 let cfg = crate::state_builder::RehydrateConfig::from_env(

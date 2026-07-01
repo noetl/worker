@@ -288,6 +288,25 @@ pub struct WorkerMetrics {
     /// `throttled` (the concurrency cap was saturated — fell back).  The safety
     /// net that makes eviction wedge-safe with tail-attach off.
     pub state_builder_rehydrate_total: IntCounterVec,
+    /// Cold-load-from-shard outcomes (noetl/ai-meta#166 Phase 3): `hit` — the
+    /// Feather state shard was read + decoded + the reconstructed chain served
+    /// the drive; `miss` — no shard object existed (both `sealed`/`open` 404 →
+    /// fell through to the WAL-replay path); `fallback` — a shard existed but the
+    /// reconstructed chain was still incomplete (stale open shard, tail beyond) or
+    /// undecodable, so the WAL-replay path ran.  The payoff metric: `hit` is one
+    /// object read (~tens of ms) replacing a retained-WAL scan (≤ the rehydrate
+    /// deadline).
+    pub state_shard_reads_total: IntCounterVec,
+    /// Wall-clock of one cold-load-from-shard attempt — the `object_get` +
+    /// Feather-decode + chain-apply round-trip (noetl/ai-meta#166 Phase 3).  The
+    /// number that proves the latency payoff vs the WAL-replay miss cost.
+    pub state_shard_read_duration_seconds: Histogram,
+    /// Equivalence-guard tripwire (noetl/ai-meta#166 Phase 3): incremented when a
+    /// shard-reconstructed spine did NOT byte-match the WAL-replay spine under the
+    /// `NOETL_STATE_SHARD_READ_VERIFY` dual-build check.  MUST stay 0 — any
+    /// increment means the shard served divergent state and the drive fell back to
+    /// the WAL build (never serves the wrong state).
+    pub state_equivalence_mismatch_total: IntCounter,
     /// Per-phase latency of loading a wasm plug-in module
     /// (noetl/ai-meta#130 cold-start): `fetch` — the HTTP GET of the module
     /// bytes from the server catalog; `compile` — the Cranelift JIT compile
@@ -936,6 +955,41 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_rehydrate_total.clone()))
             .expect("register state_builder_rehydrate_total");
 
+        let state_shard_reads_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_shard_reads_total",
+                "Cold-load-from-shard outcomes — hit / miss / fallback (noetl/ai-meta#166 Phase 3).",
+            ),
+            &["outcome"],
+        )
+        .expect("state_shard_reads_total metric");
+        registry
+            .register(Box::new(state_shard_reads_total.clone()))
+            .expect("register state_shard_reads_total");
+
+        let state_shard_read_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_worker_state_shard_read_duration_seconds",
+                "Cold-load-from-shard latency — object_get + Feather decode + chain apply (noetl/ai-meta#166 Phase 3).",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
+            ]),
+        )
+        .expect("state_shard_read_duration_seconds metric");
+        registry
+            .register(Box::new(state_shard_read_duration_seconds.clone()))
+            .expect("register state_shard_read_duration_seconds");
+
+        let state_equivalence_mismatch_total = IntCounter::new(
+            "noetl_worker_state_equivalence_mismatch_total",
+            "Shard-vs-WAL spine byte-divergence under NOETL_STATE_SHARD_READ_VERIFY (noetl/ai-meta#166 Phase 3; MUST stay 0).",
+        )
+        .expect("state_equivalence_mismatch_total metric");
+        registry
+            .register(Box::new(state_equivalence_mismatch_total.clone()))
+            .expect("register state_equivalence_mismatch_total");
+
         let state_builder_event_scans_total = IntCounter::new(
             "noetl_worker_state_builder_event_scans_total",
             "noetl.event scans the off-server state builder issued (RFC #115 tenet 3 no-scan proof; stays 0).",
@@ -1204,6 +1258,9 @@ impl WorkerMetrics {
             state_builder_index_bytes,
             state_builder_evictions_total,
             state_builder_rehydrate_total,
+            state_shard_reads_total,
+            state_shard_read_duration_seconds,
+            state_equivalence_mismatch_total,
             plugin_load_seconds,
             plugin_warm_total,
             worker_ready,
@@ -1621,6 +1678,29 @@ pub fn record_state_builder_rehydrate(outcome: &str) {
         .state_builder_rehydrate_total
         .with_label_values(&[outcome])
         .inc();
+}
+
+/// Record one cold-load-from-shard outcome (`hit` | `miss` | `fallback`) —
+/// noetl/ai-meta#166 Phase 3.
+pub fn record_state_shard_read(outcome: &str) {
+    WorkerMetrics::global()
+        .state_shard_reads_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Observe one cold-load-from-shard latency sample (seconds) — noetl/ai-meta#166
+/// Phase 3.  The payoff number vs the WAL-replay miss cost.
+pub fn observe_state_shard_read_duration(secs: f64) {
+    WorkerMetrics::global()
+        .state_shard_read_duration_seconds
+        .observe(secs);
+}
+
+/// Record one shard-vs-WAL spine divergence (the `NOETL_STATE_SHARD_READ_VERIFY`
+/// dual-build tripwire) — noetl/ai-meta#166 Phase 3.  MUST stay 0.
+pub fn record_state_equivalence_mismatch() {
+    WorkerMetrics::global().state_equivalence_mismatch_total.inc();
 }
 
 /// Record one off-server state build outcome (`cache_hit` | `incremental` |

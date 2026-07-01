@@ -134,7 +134,11 @@ pub struct CellSeed {
 }
 
 impl CellSeed {
-    fn from_env() -> Self {
+    /// Resolve the cell seed from the `NOETL_RESULT_CELL_*` env vars — the SAME
+    /// vars the result materializer reads, so a state shard co-locates with the
+    /// execution's result bytes.  Public so the Phase-3 cold-load reader
+    /// ([`crate::state_reader`]) resolves the identical placement the writer used.
+    pub fn from_env() -> Self {
         Self {
             env: std::env::var("NOETL_RESULT_CELL_ENV").unwrap_or_else(|_| "dev".to_string()),
             region: std::env::var("NOETL_RESULT_CELL_REGION").unwrap_or_else(|_| "local".to_string()),
@@ -146,7 +150,7 @@ impl CellSeed {
     /// Resolve the placement for a state shard: derive the folder shard from the
     /// stable shard hash (== the execution's result-byte folder), home it on the
     /// one configured cell.
-    fn placement_for(&self, coords: &StateCoordinates) -> CellPlacement {
+    pub fn placement_for(&self, coords: &StateCoordinates) -> CellPlacement {
         CellPlacement::new(&self.env, &self.region, &self.cell, coords.shard_key(self.shard_count))
     }
 }
@@ -282,6 +286,18 @@ struct SlimRow {
     status: Option<String>,
     result_ref: Option<String>,
     extracted: Option<String>,
+    /// The **verbatim** slim event payload — [`crate::state_builder::slim_event_payload`]
+    /// of the full `noetl_events` envelope, serialized compact
+    /// (noetl/ai-meta#166 Phase 3).  This is the byte-for-byte input the Phase-3
+    /// cold-load reader ([`crate::state_reader`]) feeds back into
+    /// `WalEventIndex::apply` so the reconstructed chain is **byte-equivalent** to
+    /// the WAL-replay/in-memory path — the drive makes routing decisions
+    /// (`next.arcs`/`when`) from `context`/`result`/`meta`, which are load-bearing
+    /// and therefore carried here in full rather than dropped.  The slim
+    /// projection keeps only the fields the orchestrate-core `Event` deserializer
+    /// reads (serde drops the rest on decode regardless), so this is the smallest
+    /// payload that still reconstructs the identical `Event`.
+    payload: String,
 }
 
 /// One execution's in-progress (open) state shard accumulator.
@@ -530,10 +546,11 @@ fn encode_slim_chain<'a>(rows: impl Iterator<Item = &'a SlimRow>) -> serde_json:
             r.status,
             r.result_ref,
             r.extracted,
+            r.payload,
         ]));
     }
     serde_json::json!({
-        "columns": ["event_id", "prev_event_id", "event_type", "node_name", "status", "result_ref", "extracted"],
+        "columns": ["event_id", "prev_event_id", "event_type", "node_name", "status", "result_ref", "extracted", "payload"],
         "rows": out_rows,
     })
 }
@@ -618,6 +635,15 @@ fn project_event(row: &serde_json::Value, extracted_budget: usize) -> Option<Pro
         .map(|c| (Some(c.tenant), Some(c.project)))
         .unwrap_or((None, None));
 
+    // The verbatim slim payload (noetl/ai-meta#166 Phase 3): the exact bytes the
+    // in-memory WAL index reconstructs its chain node + stored raw from, so the
+    // cold-load reader rebuilds a byte-equivalent chain.  `shard_chain_payload`
+    // is the slim projection PLUS `prev_event_id` (the chain link the reader needs
+    // in-band; the index strips it back out on apply).  Compact JSON (no
+    // whitespace) so the stored bytes are stable across writer runs.
+    let payload = serde_json::to_string(&crate::state_builder::shard_chain_payload(row))
+        .unwrap_or_default();
+
     Some(Projected {
         execution_id,
         row: SlimRow {
@@ -628,6 +654,7 @@ fn project_event(row: &serde_json::Value, extracted_budget: usize) -> Option<Pro
             status,
             result_ref,
             extracted,
+            payload,
         },
         tenant,
         project,
@@ -758,18 +785,19 @@ mod tests {
         // The slim chain encodes to a non-empty Feather batch whose rows carry the
         // result_ref URN — the shadow-shard correctness proof.
         let rows = vec![
-            SlimRow { event_id: 1, prev_event_id: None, event_type: "playbook_started".into(), node_name: Some("start".into()), status: Some("running".into()), result_ref: None, extracted: None },
-            SlimRow { event_id: 2, prev_event_id: Some(1), event_type: "command.completed".into(), node_name: Some("load".into()), status: Some("completed".into()), result_ref: Some("noetl://muno/travel/results/325/load/0/0/1".into()), extracted: Some("{\"rows\":4}".into()) },
+            SlimRow { event_id: 1, prev_event_id: None, event_type: "playbook_started".into(), node_name: Some("start".into()), status: Some("running".into()), result_ref: None, extracted: None, payload: "{\"event_id\":1,\"event_type\":\"playbook_started\"}".into() },
+            SlimRow { event_id: 2, prev_event_id: Some(1), event_type: "command.completed".into(), node_name: Some("load".into()), status: Some("completed".into()), result_ref: Some("noetl://muno/travel/results/325/load/0/0/1".into()), extracted: Some("{\"rows\":4}".into()), payload: "{\"event_id\":2,\"event_type\":\"command.completed\"}".into() },
         ];
         let tabular = encode_slim_chain(rows.iter());
         let enc = noetl_tools::arrow_codec::try_encode_tabular_json(&tabular).expect("slim chain → Feather");
         assert!(!enc.bytes.is_empty());
         assert_eq!(enc.row_count, 2);
-        // Round-trips back through the decoder with the result_ref preserved.
+        // Round-trips back through the decoder with the result_ref + payload columns.
         let batches = noetl_tools::arrow_codec::decode_record_batches(&enc.bytes).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2);
-        assert_eq!(batches[0].num_columns(), 7);
+        // 8 columns now: the 7 slim columns + the Phase-3 verbatim `payload` column.
+        assert_eq!(batches[0].num_columns(), 8);
     }
 
     #[test]
