@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.51.0](https://github.com/noetl/worker/compare/v5.50.1...v5.51.0) (2026-07-03)
+
+### Features
+
+* **state_reader:** cold-load execution state from object-store shard on drive miss ([#166](https://github.com/noetl/worker/issues/166) Phase 3) ([853c1bb](https://github.com/noetl/worker/commit/853c1bbb8a2dbd6e7d19cba0b0280bbf4162ad70)), closes [noetl/worker#150](https://github.com/noetl/worker/issues/150) [noetl/ai-meta#155](https://github.com/noetl/ai-meta/issues/155)
+
 ## [5.50.1](https://github.com/noetl/worker/compare/v5.50.0...v5.50.1) (2026-06-30)
 
 ### Bug Fixes
