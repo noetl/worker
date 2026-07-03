@@ -21,6 +21,7 @@ pub mod metrics;
 pub mod state_builder;
 pub mod state_locator;
 pub mod state_materializer;
+pub mod state_reader;
 pub mod metrics_server;
 pub mod nats;
 /// WASM plug-in host for the system worker pool (noetl/ai-meta#105). Gated
