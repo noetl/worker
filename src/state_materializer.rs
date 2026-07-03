@@ -784,7 +784,7 @@ mod tests {
     fn slim_chain_encodes_to_feather_with_ref_column() {
         // The slim chain encodes to a non-empty Feather batch whose rows carry the
         // result_ref URN — the shadow-shard correctness proof.
-        let rows = vec![
+        let rows = [
             SlimRow { event_id: 1, prev_event_id: None, event_type: "playbook_started".into(), node_name: Some("start".into()), status: Some("running".into()), result_ref: None, extracted: None, payload: "{\"event_id\":1,\"event_type\":\"playbook_started\"}".into() },
             SlimRow { event_id: 2, prev_event_id: Some(1), event_type: "command.completed".into(), node_name: Some("load".into()), status: Some("completed".into()), result_ref: Some("noetl://muno/travel/results/325/load/0/0/1".into()), extracted: Some("{\"rows\":4}".into()), payload: "{\"event_id\":2,\"event_type\":\"command.completed\"}".into() },
         ];
