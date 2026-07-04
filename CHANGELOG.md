@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.52.0](https://github.com/noetl/worker/compare/v5.51.0...v5.52.0) (2026-07-04)
+
+### Features
+
+* **state_builder:** execution-affinity routing for off-server drive cache ([#166](https://github.com/noetl/worker/issues/166) Phase 4) ([#152](https://github.com/noetl/worker/issues/152)) ([8728bfd](https://github.com/noetl/worker/commit/8728bfdd13884cc1e0148ea507cf48b9a70f6c9d)), closes [#116](https://github.com/noetl/worker/issues/116) [noetl/worker#151](https://github.com/noetl/worker/issues/151)
+
 ## [5.51.0](https://github.com/noetl/worker/compare/v5.50.1...v5.51.0) (2026-07-03)
 
 ### Features
