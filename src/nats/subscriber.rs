@@ -330,6 +330,25 @@ impl NatsSubscriber {
         Ok(())
     }
 
+    /// Negatively acknowledge a message with an explicit redelivery delay
+    /// (noetl/ai-meta#166 Phase 4). Used by execution-affinity steering: a
+    /// replica that pulls a drive command it does not own NAKs it back to
+    /// the shared durable consumer with a small delay so the **owning**
+    /// replica gets a window to pull the redelivery (and the non-owner does
+    /// not hot-spin re-grabbing its own NAK). The delay is advisory —
+    /// correctness never depends on it; a `Nak(None)` (immediate) redelivery
+    /// would still be correct, just noisier.
+    pub async fn nack_with_delay(
+        &self,
+        msg: &async_nats::jetstream::Message,
+        delay: std::time::Duration,
+    ) -> Result<()> {
+        msg.ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to nack (delayed) message: {}", e))?;
+        Ok(())
+    }
+
     /// Stream name this subscriber is bound to.  Exposed so the lag
     /// poller can label its gauges with the same names the consumer
     /// + KEDA see.
