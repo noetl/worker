@@ -75,11 +75,18 @@ impl Worker {
         // command source.  The source owns its own clone of the
         // client for `claim_command` calls; Worker keeps a
         // separate clone for register / deregister / heartbeat.
+        // noetl/ai-meta#166 Phase 4: resolve the execution-affinity routing
+        // policy from env. Default is behaviour-neutral (single-shard,
+        // `NOETL_STATE_AFFINITY_ROUTE` off) so a worker carrying this code
+        // steers nothing until an operator sets `NOETL_SHARD_COUNT > 1` and
+        // turns the flag on — on a stateful (system) pool only.
+        let affinity = crate::sharding::AffinityConfig::from_env();
         let source = Arc::new(Mutex::new(NatsCommandSource::new(
             subscriber,
             client.clone(),
             config.worker_id.clone(),
             crate::nats::segment_from_filter(&config.nats_filter_subject),
+            affinity,
         )));
 
         // One snowflake generator per worker process — populates the

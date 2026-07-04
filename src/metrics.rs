@@ -70,6 +70,12 @@ pub fn outcome_label(outcome: &ClaimOutcome) -> &'static str {
 pub struct WorkerMetrics {
     pub registry: Registry,
     pub pulls_total: IntCounterVec,
+    /// Execution-affinity routing decisions (noetl/ai-meta#166 Phase 4),
+    /// partitioned by `decision` ∈ {owned, redirected, forced_local}. Only
+    /// drive commands under a multi-shard, affinity-enabled pool are
+    /// recorded; `owned` is the affinity-hit numerator, `redirected` +
+    /// `forced_local` the miss/steer counts.
+    pub affinity_decisions_total: IntCounterVec,
     pub pull_duration_seconds: Histogram,
     pub dispatch_duration_seconds: HistogramVec,
     pub dispatch_errors_total: IntCounterVec,
@@ -384,6 +390,19 @@ impl WorkerMetrics {
         registry
             .register(Box::new(pulls_total.clone()))
             .expect("register pulls_total");
+
+        let affinity_decisions_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_affinity_decisions_total",
+                "Execution-affinity routing decisions for drive commands \
+                 (noetl/ai-meta#166 Phase 4), partitioned by decision.",
+            ),
+            &["decision"],
+        )
+        .expect("affinity_decisions_total metric");
+        registry
+            .register(Box::new(affinity_decisions_total.clone()))
+            .expect("register affinity_decisions_total");
 
         let pull_duration_seconds = Histogram::with_opts(
             HistogramOpts::new(
@@ -1204,6 +1223,7 @@ impl WorkerMetrics {
         Self {
             registry,
             pulls_total,
+            affinity_decisions_total,
             pull_duration_seconds,
             dispatch_duration_seconds,
             dispatch_errors_total,
@@ -1307,6 +1327,18 @@ pub fn record_pull(outcome: &ClaimOutcome, duration_seconds: f64) {
         .with_label_values(&[outcome_label(outcome)])
         .inc();
     m.pull_duration_seconds.observe(duration_seconds);
+}
+
+/// Record an execution-affinity routing decision (noetl/ai-meta#166 Phase 4).
+/// `decision` is one of `owned` / `redirected` / `forced_local`
+/// ([`crate::sharding::AffinityDecision::metric_label`]); the not-applicable
+/// case is not recorded (it is every tool command and would swamp the
+/// counter).
+pub fn record_affinity_decision(decision: &str) {
+    WorkerMetrics::global()
+        .affinity_decisions_total
+        .with_label_values(&[decision])
+        .inc();
 }
 
 /// Record one completed dispatch.  `error` is `true` if the tool

@@ -30,6 +30,7 @@ pub mod nats;
 pub mod plugin;
 pub mod ratelimit;
 pub mod scrub;
+pub mod sharding;
 pub mod snowflake;
 pub mod spool_runtime;
 pub mod subscription;

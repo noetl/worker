@@ -51,6 +51,8 @@ use noetl_executor::worker::source::{
     ClaimOutcome, Command as ExecutorCommand, CommandSource, Pulled,
 };
 
+use crate::sharding::{AffinityConfig, AffinityDecision};
+
 use crate::client::{ClaimResult, Command as WorkerCommand, ControlPlaneClient};
 use crate::nats::subscriber::{CommandNotification, NatsSubscriber};
 
@@ -90,6 +92,14 @@ pub struct NatsCommandSource {
     /// segment (noetl/ai-meta#108) — defence-in-depth against a JetStream
     /// consumer whose `filter_subject` drifted broad.
     segment: Option<String>,
+    /// Execution-affinity routing policy (noetl/ai-meta#166 Phase 4). All
+    /// replicas of a pool share one durable consumer, so a drive command
+    /// (`__orchestrate__`) lands on a random replica — often one without the
+    /// execution warm in its WAL index. When [`AffinityConfig::is_active`],
+    /// a replica that pulls a drive command it does not own NAKs it back to
+    /// the shared consumer (bounded) to steer it toward the owning replica,
+    /// keeping Phase-3 cold-loads rare. Default = disabled (behaviour-neutral).
+    affinity: AffinityConfig,
 }
 
 /// Decline predicate: given this worker's segment and a command's target
@@ -124,17 +134,22 @@ impl NatsCommandSource {
     /// stream / consumer; the client must be configured with the
     /// control-plane URL.  `segment` is this worker's pool segment (see the
     /// field doc) — pass `segment_from_filter(&config.nats_filter_subject)`.
+    /// `affinity` is the execution-affinity policy (noetl/ai-meta#166 Phase
+    /// 4) — pass [`AffinityConfig::from_env`]; its default is
+    /// behaviour-neutral (single-shard, disabled).
     pub fn new(
         subscriber: NatsSubscriber,
         client: ControlPlaneClient,
         worker_id: impl Into<String>,
         segment: Option<String>,
+        affinity: AffinityConfig,
     ) -> Self {
         Self {
             subscriber,
             client,
             worker_id: worker_id.into(),
             segment,
+            affinity,
         }
     }
 
@@ -238,6 +253,64 @@ impl CommandSource for NatsCommandSource {
                 self.subscriber.ack(&msg).await?;
                 continue;
             }
+
+            // Execution-affinity steering (noetl/ai-meta#166 Phase 4). All
+            // replicas of a pool share one durable consumer, so a drive
+            // command (`__orchestrate__`) is delivered to a random replica —
+            // often one without the execution warm in its WAL index, forcing
+            // a Phase-3 cold-load. When affinity is active AND this is a drive
+            // command this replica does not own, NAK it (with a small delay)
+            // so the owning replica gets a window to pull the redelivery.
+            // Bounded by `max_redirects`: once exhausted (owner presumed
+            // absent, e.g. mid-rebalance / pod loss) we process it locally via
+            // the cold-load / WAL-replay backstop. Correctness never depends
+            // on where the hop lands — a NAK-before-claim performs no claim
+            // and emits no event, so a redirect can neither drop nor
+            // double-process a hop (claim atomicity is the exactly-once gate).
+            // Only drive commands pay the `info()` parse; non-drive tool
+            // commands and the affinity-off default skip this entirely.
+            if self.affinity.is_active() && notification.step == crate::sharding::DRIVE_STEP_NAME {
+                // `delivered` starts at 1 on first delivery. If the reply
+                // subject can't be parsed we can't bound the NAK, so treat
+                // the budget as exhausted (process locally) — never risk a
+                // NAK loop on an uninspectable message.
+                let delivered = msg.info().map(|info| info.delivered).unwrap_or(i64::MAX);
+                let decision =
+                    self.affinity
+                        .decide(true, notification.execution_id, delivered);
+                if let Some(label) = decision.metric_label() {
+                    crate::metrics::record_affinity_decision(label);
+                }
+                match decision {
+                    AffinityDecision::Redirect => {
+                        tracing::debug!(
+                            execution_id = notification.execution_id,
+                            command_id = %notification.command_id,
+                            delivered,
+                            shard_index = self.affinity.shard_index,
+                            shard_count = self.affinity.shard_count,
+                            "Affinity redirect: NAK drive command to steer to its owner replica"
+                        );
+                        self.subscriber
+                            .nack_with_delay(&msg, self.affinity.nak_delay)
+                            .await?;
+                        continue;
+                    }
+                    AffinityDecision::ForcedLocal => {
+                        tracing::debug!(
+                            execution_id = notification.execution_id,
+                            command_id = %notification.command_id,
+                            delivered,
+                            "Affinity: redirect budget exhausted (owner absent) — \
+                             processing drive locally via cold-load backstop"
+                        );
+                    }
+                    // Owned → warm-index hit expected; NotApplicable can't
+                    // occur here (is_active + drive step). Fall through to run.
+                    _ => {}
+                }
+            }
+
             break (notification, msg);
         };
 
