@@ -17,9 +17,12 @@ COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies - this layer is cached as long as Cargo.toml/Cargo.lock don't change
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Build the application
+# Build the application.  `ehdb-selfcheck` ships alongside the worker so the
+# in-process EHDB integration (noetl/ehdb#234) can be exercised inside the
+# deployed image (kind validation + operator preflight); it is not on the
+# worker's request path.
 COPY . .
-RUN cargo build --release --bin noetl-worker
+RUN cargo build --release --bin noetl-worker --bin ehdb-selfcheck
 
 # Runtime stage
 FROM alpine:3.22.2 AS runtime
@@ -29,8 +32,9 @@ WORKDIR /app
 # Install necessary runtime dependencies
 RUN apk add --no-cache libgcc libxslt ca-certificates openssl python3 py3-pip
 
-# Copy the compiled binary
+# Copy the compiled binaries
 COPY --from=builder /app/target/release/noetl-worker ./noetl-worker
+COPY --from=builder /app/target/release/ehdb-selfcheck ./ehdb-selfcheck
 
 # Default environment variables
 ENV WORKER_POOL_NAME=worker-rust-pool \

@@ -10,6 +10,7 @@
 
 pub mod client;
 pub mod config;
+pub mod ehdb;
 pub mod events;
 pub mod executor;
 pub mod materializer;
