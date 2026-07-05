@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-use noetl_worker::ehdb::{self, dataplane, eventlog, eventstream, rag, readiness, systemstore};
+use noetl_worker::ehdb::{
+    self, dataplane, eventlog, eventstream, projection, rag, readiness, systemstore,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,6 +50,8 @@ fn main() -> ExitCode {
         Some("rag-suite") => run_rag_suite(&env, &flags),
         Some("mirror-eventlog") => run_mirror_eventlog(&env, &flags),
         Some("eventlog-suite") => run_eventlog_suite(&env, &flags),
+        Some("mirror-projection") => run_mirror_projection(&env, &flags),
+        Some("projection-suite") => run_projection_suite(&env, &flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -899,6 +903,190 @@ fn eventlog_exit(outcome: eventlog::EventLogOutcome) -> ExitCode {
     }
 }
 
+// --- projection read-model shadow (EHDB Phase 7) ---------------------------
+
+fn pr_opts(flags: &Flags) -> projection::ProjectionOptions {
+    projection::ProjectionOptions {
+        tenant: flags.get("tenant"),
+        namespace: flags.get("namespace"),
+        consumer: flags.get("consumer"),
+        transaction_id: flags.get("transaction-id"),
+    }
+}
+
+/// Build a deterministic `count`-event drive for one execution: event 1 starts
+/// (running), the middle events are `command.completed`, the last is
+/// `playbook.completed` (terminal).  Returns the events plus the authoritative
+/// materializer fold the shadow must match: one completed/terminal execution
+/// with `event_count == count` and offset `count`.
+fn projection_drive(
+    execution_id: &str,
+    count: u64,
+) -> (
+    Vec<ehdb_reference::ProjectionEventInput>,
+    Vec<ehdb_reference::AuthoritativeExecutionState>,
+    u64,
+) {
+    let count = count.max(1);
+    let events = (1..=count)
+        .map(|seq| {
+            let (event_type, node, status) = if seq == count {
+                ("playbook.completed", "finish", "completed")
+            } else if seq == 1 {
+                ("playbook_started", "start", "running")
+            } else {
+                ("command.completed", "load", "completed")
+            };
+            ehdb_reference::ProjectionEventInput {
+                global_sequence: seq,
+                event_id: 10 + seq as i64,
+                execution_id: execution_id.to_string(),
+                event_type: event_type.to_string(),
+                node_name: Some(node.to_string()),
+                status: Some(status.to_string()),
+                prev_event_id: None,
+            }
+        })
+        .collect();
+    let authoritative = vec![ehdb_reference::AuthoritativeExecutionState {
+        execution_id: execution_id.to_string(),
+        status: "completed".to_string(),
+        event_count: count as usize,
+        terminal: true,
+    }];
+    (events, authoritative, count)
+}
+
+fn run_mirror_projection(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let Some(execution_id) = flags.req("execution-id") else {
+        return usage_exit();
+    };
+    let count = flags.parse_u64("events").unwrap_or(3);
+    let (events, authoritative, offset) = projection_drive(&execution_id, count);
+    let r = projection::shadow_project(
+        env,
+        &events,
+        &authoritative,
+        Some(offset),
+        &pr_opts(flags),
+        true,
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "mirror-projection",
+            "mode": r.mode.as_str(),
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "applied": r.applied,
+            "checkpoint": r.checkpoint,
+            "parity": r.parity,
+        })
+    );
+    print_metrics_footer();
+    projection_exit(r.outcome)
+}
+
+/// Deterministic one-process projection shadow drive: materialize a three-event
+/// drive into a fresh projection store and compare against the authoritative
+/// fold.  Off / disabled ⇒ byte-identical no-op proof (materialize=disabled +
+/// empty metrics), same shape as `eventlog-suite`.  Enabled ⇒ the read-models
+/// hold parity against the authoritative materializer and the checkpoint catches
+/// up (lag 0); a second apply is an idempotent replay (applied 0, parity holds).
+fn run_projection_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let execution_id = flags
+        .get("execution-id")
+        .unwrap_or_else(|| "100".to_string());
+    let (events, authoritative, offset) = projection_drive(&execution_id, 3);
+
+    // First apply doubles as the disabled probe: in off/disabled mode it does not
+    // materialize; in shadow mode it materializes the whole drive.
+    let first = projection::shadow_project(
+        env,
+        &events,
+        &authoritative,
+        Some(offset),
+        &pr_opts(flags),
+        true,
+    );
+    if first.outcome == projection::ProjectionOutcome::Disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-projection-selfcheck",
+                "ehdb": "disabled",
+                "mode": first.mode.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let first_ok = first.outcome == projection::ProjectionOutcome::Materialized
+        && first.parity.as_ref().map(|p| p.holds()).unwrap_or(false)
+        && first.applied == Some(3);
+
+    // Second apply of the same drive → idempotent replay: nothing new applied,
+    // parity still holds.
+    let second = projection::shadow_project(
+        env,
+        &events,
+        &authoritative,
+        Some(offset),
+        &pr_opts(flags),
+        true,
+    );
+    let second_ok = second.outcome == projection::ProjectionOutcome::Materialized
+        && second.applied == Some(0)
+        && second.parity.as_ref().map(|p| p.holds()).unwrap_or(false);
+
+    let ok = first_ok && second_ok;
+    let metrics = render_metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-projection-selfcheck",
+            "ehdb": "enabled",
+            "mode": first.mode.as_str(),
+            "role": first.role.map(|x| x.as_str()),
+            "ok": ok,
+            "steps": [
+                {"step": "apply_1", "outcome": first.outcome.as_str(),
+                 "applied": first.applied, "checkpoint": first.checkpoint,
+                 "parity_holds": first.parity.as_ref().map(|p| p.holds())},
+                {"step": "apply_2_replay", "outcome": second.outcome.as_str(),
+                 "applied": second.applied, "checkpoint": second.checkpoint,
+                 "parity_holds": second.parity.as_ref().map(|p| p.holds())},
+            ],
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+
+    if ok && metrics_is_secret_free(&metrics) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn projection_exit(outcome: projection::ProjectionOutcome) -> ExitCode {
+    use projection::ProjectionOutcome as O;
+    match outcome {
+        O::GuardRefused | O::Invalid | O::PrimaryUnavailable => ExitCode::from(4),
+        O::Rejected => ExitCode::from(3),
+        O::Unavailable | O::ParityMismatch => ExitCode::from(5),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn dp_opts(flags: &Flags) -> dataplane::DataPlaneOptions {
@@ -1025,6 +1213,8 @@ fn usage() -> &'static str {
      rag-suite       [--document-id <id>]\n  \
      mirror-eventlog --execution-id <id> --payload <text> [--authoritative-sequence <n>]\n  \
      eventlog-suite  [--execution-id <id>]\n  \
+     mirror-projection --execution-id <id> [--events <n>] [--consumer <c>]\n  \
+     projection-suite  [--execution-id <id>] [--consumer <c>]\n  \
      common:  [--tenant <t>] [--namespace <n>] [--transaction-id <id>]"
 }
 

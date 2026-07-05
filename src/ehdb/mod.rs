@@ -35,6 +35,7 @@ pub mod eventlog;
 pub mod eventstream;
 pub mod guard;
 pub mod metrics;
+pub mod projection;
 pub mod rag;
 pub mod readiness;
 pub mod systemstore;

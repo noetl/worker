@@ -48,6 +48,7 @@ struct EhdbMetricsState {
     systemstore: FamilyState,
     rag: FamilyState,
     eventlog: FamilyState,
+    projection: FamilyState,
 }
 
 fn state() -> &'static Mutex<EhdbMetricsState> {
@@ -182,6 +183,30 @@ pub fn record_eventlog(
     );
 }
 
+/// Record one projection shadow op (EHDB Phase 7).  `disabled` outcomes are not
+/// recorded, preserving the byte-identical `/metrics` invariant.
+pub fn record_projection(
+    operation: &str,
+    outcome: &str,
+    ok: bool,
+    degraded: bool,
+    duration_seconds: f64,
+) {
+    if outcome == "disabled" {
+        return;
+    }
+    let mut s = state().lock().expect("ehdb metrics lock");
+    s.projection.record(
+        vec![
+            ("operation".to_string(), operation.to_string()),
+            ("outcome".to_string(), outcome.to_string()),
+        ],
+        ok,
+        degraded,
+        duration_seconds,
+    );
+}
+
 /// Render all EHDB metric families as Prometheus text lines.  Returns an empty
 /// vec when no non-disabled EHDB op has run (the disabled/no-op case), so the
 /// worker `/metrics` output stays byte-identical.
@@ -255,6 +280,12 @@ pub fn render_lines() -> Vec<String> {
         "eventlog",
         "EHDB event-log shadow operations by operation and outcome",
     );
+    render_op_family(
+        &mut lines,
+        &s.projection,
+        "projection",
+        "EHDB projection read-model shadow operations by operation and outcome",
+    );
 
     lines
 }
@@ -324,6 +355,7 @@ mod tests {
         record_systemstore("publish", "disabled", true, false, 0.0);
         record_rag("retrieve", "disabled", true, false, 0.0);
         record_eventlog("mirror", "disabled", true, false, 0.0);
+        record_projection("materialize", "disabled", true, false, 0.0);
         assert!(render_lines().is_empty());
     }
 

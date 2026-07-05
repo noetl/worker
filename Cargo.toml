@@ -248,10 +248,15 @@ arrow = "53"
 # Phase 6 (noetl/ehdb#241) adds the event-log core engine + driver interface
 # (`LocalReferenceEventLogDriver` / `EventLogDriver` / `compare_shadow_parity`)
 # that `src/ehdb/eventlog.rs` binds for the disabled-by-default shadow.
+# Phase 7 (noetl/ehdb#241 / engine PR ehdb#243) adds the projection / read-model
+# core engine + driver interface (`LocalReferenceProjectionEngine` /
+# `ProjectionDriver` / `compare_projection_parity`) that `src/ehdb/projection.rs`
+# binds for the disabled-by-default projection shadow (dual-materialize + compare
+# vs the Postgres materializer, never serve reads from EHDB).
 # arrow 53 matches the worker's own arrow pin.  Disabled by default: no code path
 # opens a runtime unless NOETL_EHDB_ENABLED is truthy AND the role is a data-plane
 # role, so the dependency is inert at rest.
-ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "9a9b28d635161c0c10daa1c90550ade4f3eb3e2a" }
+ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "e0f1c0f8dcfdd698a4c2b507b11bcb76db46a414" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
