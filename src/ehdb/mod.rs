@@ -31,6 +31,7 @@ use std::collections::HashMap;
 
 pub mod contract;
 pub mod dataplane;
+pub mod eventlog;
 pub mod eventstream;
 pub mod guard;
 pub mod metrics;

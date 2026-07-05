@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-use noetl_worker::ehdb::{self, dataplane, eventstream, rag, readiness, systemstore};
+use noetl_worker::ehdb::{self, dataplane, eventlog, eventstream, rag, readiness, systemstore};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,6 +46,8 @@ fn main() -> ExitCode {
         Some("ingest-rag") => run_ingest_rag(&env, &flags),
         Some("retrieve-rag") => run_retrieve_rag(&env, &flags),
         Some("rag-suite") => run_rag_suite(&env, &flags),
+        Some("mirror-eventlog") => run_mirror_eventlog(&env, &flags),
+        Some("eventlog-suite") => run_eventlog_suite(&env, &flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -763,6 +765,140 @@ fn run_rag_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
     }
 }
 
+// --- event-log shadow (EHDB Phase 6) ---------------------------------------
+
+fn el_opts(flags: &Flags) -> eventlog::EventLogOptions {
+    eventlog::EventLogOptions {
+        tenant: flags.get("tenant"),
+        namespace: flags.get("namespace"),
+        transaction_id: flags.get("transaction-id"),
+    }
+}
+
+fn run_mirror_eventlog(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let (Some(execution_id), Some(payload)) = (flags.req("execution-id"), flags.req("payload"))
+    else {
+        return usage_exit();
+    };
+    let authoritative = flags.parse_u64("authoritative-sequence");
+    let r = eventlog::mirror_event(
+        env,
+        &execution_id,
+        authoritative,
+        &payload,
+        &el_opts(flags),
+        true,
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "mirror-eventlog",
+            "mode": r.mode.as_str(),
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "global_sequence": r.global_sequence,
+            "parity": r.parity,
+        })
+    );
+    print_metrics_footer();
+    eventlog_exit(r.outcome)
+}
+
+/// Deterministic one-process event-log shadow drive: mirror three events into a
+/// fresh log with a controlled 1-based authoritative sequence.  Off / disabled
+/// ⇒ byte-identical no-op proof (mirror=disabled + empty metrics), same shape as
+/// `suite` / `rag-suite`.  Enabled ⇒ every mirror holds parity
+/// (`global_sequence == log_record_count`, and == the authoritative sequence).
+fn run_eventlog_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let execution_id = flags
+        .get("execution-id")
+        .unwrap_or_else(|| "100".to_string());
+
+    // First mirror doubles as the disabled probe: in off/disabled mode it does
+    // not append; in shadow mode it is event seq 1.
+    let first = eventlog::mirror_event(
+        env,
+        &execution_id,
+        Some(1),
+        "{\"seq\":1}",
+        &el_opts(flags),
+        true,
+    );
+    if first.outcome == eventlog::EventLogOutcome::Disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-eventlog-selfcheck",
+                "ehdb": "disabled",
+                "mode": first.mode.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let mut steps = Vec::new();
+    let mut ok = first.outcome == eventlog::EventLogOutcome::Mirrored;
+    steps.push(
+        serde_json::json!({"step":"mirror_1","outcome": first.outcome.as_str(),
+        "global_sequence": first.global_sequence}),
+    );
+
+    for seq in [2u64, 3] {
+        let r = eventlog::mirror_event(
+            env,
+            &execution_id,
+            Some(seq),
+            &format!("{{\"seq\":{seq}}}"),
+            &el_opts(flags),
+            true,
+        );
+        ok &= r.outcome == eventlog::EventLogOutcome::Mirrored
+            && r.parity.as_ref().map(|p| p.holds()).unwrap_or(false);
+        steps.push(serde_json::json!({"step": format!("mirror_{seq}"),
+            "outcome": r.outcome.as_str(), "global_sequence": r.global_sequence,
+            "parity_holds": r.parity.as_ref().map(|p| p.holds())}));
+    }
+
+    let metrics = render_metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-eventlog-selfcheck",
+            "ehdb": "enabled",
+            "mode": first.mode.as_str(),
+            "role": first.role.map(|x| x.as_str()),
+            "ok": ok,
+            "steps": steps,
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+
+    if ok && metrics_is_secret_free(&metrics) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn eventlog_exit(outcome: eventlog::EventLogOutcome) -> ExitCode {
+    use eventlog::EventLogOutcome as O;
+    match outcome {
+        O::GuardRefused | O::Invalid | O::PrimaryUnavailable => ExitCode::from(4),
+        O::Rejected => ExitCode::from(3),
+        O::Unavailable | O::ParityMismatch => ExitCode::from(5),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn dp_opts(flags: &Flags) -> dataplane::DataPlaneOptions {
@@ -887,6 +1023,8 @@ fn usage() -> &'static str {
      ingest-rag      --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>]\n  \
      retrieve-rag    --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>]\n  \
      rag-suite       [--document-id <id>]\n  \
+     mirror-eventlog --execution-id <id> --payload <text> [--authoritative-sequence <n>]\n  \
+     eventlog-suite  [--execution-id <id>]\n  \
      common:  [--tenant <t>] [--namespace <n>] [--transaction-id <id>]"
 }
 
