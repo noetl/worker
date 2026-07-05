@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.59.0](https://github.com/noetl/worker/compare/v5.58.0...v5.59.0) (2026-07-05)
+
+### Features
+
+* **ehdb:** disabled-by-default object/blob SHADOW wiring (Phase 8) ([#159](https://github.com/noetl/worker/issues/159)) ([61fd790](https://github.com/noetl/worker/commit/61fd790bc27ba96b365e4da656470949a6f31600)), closes [#158](https://github.com/noetl/worker/issues/158) [ehdb#245](https://github.com/noetl/ehdb/issues/245) [#166](https://github.com/noetl/worker/issues/166) [#104](https://github.com/noetl/worker/issues/104) [noetl/ai-meta#234](https://github.com/noetl/ai-meta/issues/234)
+
 ## [5.58.0](https://github.com/noetl/worker/compare/v5.57.0...v5.58.0) (2026-07-05)
 
 ### Features
