@@ -34,6 +34,7 @@ pub mod dataplane;
 pub mod eventstream;
 pub mod guard;
 pub mod metrics;
+pub mod rag;
 pub mod readiness;
 pub mod systemstore;
 

@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-use noetl_worker::ehdb::{self, dataplane, eventstream, readiness, systemstore};
+use noetl_worker::ehdb::{self, dataplane, eventstream, rag, readiness, systemstore};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,6 +43,9 @@ fn main() -> ExitCode {
         Some("bind-system") => run_bind_system(&env, &flags),
         Some("resolve-system") => run_resolve_system(&env, &flags),
         Some("system-suite") => run_system_suite(&env, &flags),
+        Some("ingest-rag") => run_ingest_rag(&env, &flags),
+        Some("retrieve-rag") => run_retrieve_rag(&env, &flags),
+        Some("rag-suite") => run_rag_suite(&env, &flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -524,6 +527,242 @@ fn run_system_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
     }
 }
 
+// --- bounded RAG retrieval (EHDB Phase E) ----------------------------------
+
+fn rag_opts(flags: &Flags) -> rag::RagOptions {
+    rag::RagOptions {
+        tenant: flags.get("tenant"),
+        namespace: flags.get("namespace"),
+        transaction_id: flags.get("transaction-id"),
+    }
+}
+
+/// Build a document from `--document-id` + a `||`-joined `--chunks` string;
+/// ordinals + chunk ids are assigned positionally.
+fn document_from_flags(flags: &Flags) -> Option<rag::RagDocument> {
+    let document_id = flags.req("document-id")?;
+    let chunks_raw = flags.req("chunks")?;
+    let chunks = chunks_raw
+        .split("||")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .enumerate()
+        .map(|(index, text)| rag::RagChunk {
+            chunk_id: format!("{document_id}-{index}"),
+            ordinal: index as u32,
+            text: text.to_string(),
+            checksum: format!("len-{}", text.len()),
+        })
+        .collect();
+    Some(rag::RagDocument {
+        document_id,
+        source_uri: flags
+            .get("source-uri")
+            .unwrap_or_else(|| "artifact://selfcheck/source.md".to_string()),
+        content_type: flags
+            .get("content-type")
+            .unwrap_or_else(|| "text/plain".to_string()),
+        chunks,
+    })
+}
+
+fn query_from_flags(flags: &Flags) -> Option<rag::RagQuery> {
+    Some(rag::RagQuery {
+        query: flags.req("query")?,
+        top_k: flags.parse_usize("top-k").unwrap_or(0),
+        max_chunk_bytes: flags.parse_usize("max-chunk-bytes").unwrap_or(0),
+        time_budget_ms: flags.parse_u64("time-budget-ms").unwrap_or(0),
+    })
+}
+
+fn run_ingest_rag(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let Some(document) = document_from_flags(flags) else {
+        return usage_exit();
+    };
+    let r = rag::ingest(env, &document, &rag_opts(flags), true);
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "ingest-rag",
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "ingest": r.ingest,
+        })
+    );
+    print_metrics_footer();
+    rag_exit(r.outcome)
+}
+
+fn run_retrieve_rag(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let Some(query) = query_from_flags(flags) else {
+        return usage_exit();
+    };
+    let r = rag::retrieve(env, &query, &rag_opts(flags), true);
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "retrieve-rag",
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "retrieve": r.retrieve,
+        })
+    );
+    print_metrics_footer();
+    rag_exit(r.outcome)
+}
+
+/// Run a full deterministic RAG drive in ONE process: ingest a 3-chunk document
+/// → retrieve (top-k truncation) → retrieve (empty) → retrieve (over-limit
+/// rejected).  Proves ingest + bounded retrieval + the top-k / reject bounds.
+/// Disabled ⇒ byte-identical no-op proof (retrieve=disabled + empty metrics),
+/// same shape as `suite` / `system-suite`.
+fn run_rag_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let document_id = flags
+        .get("document-id")
+        .unwrap_or_else(|| "rag_selfcheck".to_string());
+
+    // Disabled short-circuit: prove the byte-identical no-op.
+    let pre = rag::retrieve(
+        env,
+        &rag::RagQuery {
+            query: "retrieval".to_string(),
+            top_k: 0,
+            max_chunk_bytes: 0,
+            time_budget_ms: 0,
+        },
+        &rag_opts(flags),
+        true,
+    );
+    if pre.outcome == rag::RagOutcome::Disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite":"ehdb-rag-selfcheck",
+                "ehdb":"disabled",
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let mut steps = Vec::new();
+    let mut ok = true;
+
+    let document = rag::RagDocument {
+        document_id: document_id.clone(),
+        source_uri: format!("artifact://{document_id}/source.md"),
+        content_type: "text/markdown".to_string(),
+        chunks: vec![
+            rag::RagChunk {
+                chunk_id: format!("{document_id}-0"),
+                ordinal: 0,
+                text: "retrieval retrieval retrieval alpha lineage".to_string(),
+                checksum: "c0".to_string(),
+            },
+            rag::RagChunk {
+                chunk_id: format!("{document_id}-1"),
+                ordinal: 1,
+                text: "retrieval retrieval beta".to_string(),
+                checksum: "c1".to_string(),
+            },
+            rag::RagChunk {
+                chunk_id: format!("{document_id}-2"),
+                ordinal: 2,
+                text: "retrieval gamma".to_string(),
+                checksum: "c2".to_string(),
+            },
+        ],
+    };
+
+    let ing = rag::ingest(env, &document, &rag_opts(flags), true);
+    ok &= ing.outcome == rag::RagOutcome::Ingested;
+    steps.push(
+        serde_json::json!({"step":"ingest","outcome": ing.outcome.as_str(),
+        "chunks": ing.ingest.as_ref().map(|x| x.chunk_count)}),
+    );
+
+    // Retrieve with a small top-k to exercise the top-k truncation bound.
+    let hit = rag::retrieve(
+        env,
+        &rag::RagQuery {
+            query: "retrieval".to_string(),
+            top_k: 2,
+            max_chunk_bytes: 0,
+            time_budget_ms: 0,
+        },
+        &rag_opts(flags),
+        true,
+    );
+    let hit_ro = hit.retrieve.as_ref();
+    ok &= hit.outcome == rag::RagOutcome::Hit
+        && hit_ro.map(|x| x.returned).unwrap_or(0) == 2
+        && hit_ro.map(|x| x.truncated_by_top_k).unwrap_or(false);
+    steps.push(
+        serde_json::json!({"step":"retrieve_hit","outcome": hit.outcome.as_str(),
+        "returned": hit_ro.map(|x| x.returned),
+        "candidate_count": hit_ro.map(|x| x.candidate_count),
+        "truncated_by_top_k": hit_ro.map(|x| x.truncated_by_top_k)}),
+    );
+
+    let empty = rag::retrieve(
+        env,
+        &rag::RagQuery {
+            query: "nonexistentterm".to_string(),
+            top_k: 0,
+            max_chunk_bytes: 0,
+            time_budget_ms: 0,
+        },
+        &rag_opts(flags),
+        true,
+    );
+    ok &= empty.outcome == rag::RagOutcome::Empty;
+    steps.push(serde_json::json!({"step":"retrieve_empty","outcome": empty.outcome.as_str()}));
+
+    // Over-ceiling top-k ⇒ Rejected (no search).
+    let rejected = rag::retrieve(
+        env,
+        &rag::RagQuery {
+            query: "retrieval".to_string(),
+            top_k: 65,
+            max_chunk_bytes: 0,
+            time_budget_ms: 0,
+        },
+        &rag_opts(flags),
+        true,
+    );
+    ok &= rejected.outcome == rag::RagOutcome::Rejected;
+    steps
+        .push(serde_json::json!({"step":"retrieve_rejected","outcome": rejected.outcome.as_str()}));
+
+    let metrics = render_metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite":"ehdb-rag-selfcheck",
+            "ehdb":"enabled",
+            "role": pre.role.map(|x| x.as_str()),
+            "ok": ok,
+            "steps": steps,
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+
+    if ok && metrics_is_secret_free(&metrics) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn dp_opts(flags: &Flags) -> dataplane::DataPlaneOptions {
@@ -615,6 +854,16 @@ fn systemstore_exit(outcome: systemstore::SystemStoreOutcome) -> ExitCode {
     }
 }
 
+fn rag_exit(outcome: rag::RagOutcome) -> ExitCode {
+    use rag::RagOutcome as O;
+    match outcome {
+        O::GuardRefused | O::Invalid => ExitCode::from(4),
+        O::Rejected => ExitCode::from(3),
+        O::Unavailable => ExitCode::from(5),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 fn usage_exit() -> ExitCode {
     eprintln!("{}", usage());
     ExitCode::from(2)
@@ -635,6 +884,9 @@ fn usage() -> &'static str {
      bind-system     --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:..>\n  \
      resolve-system  --environment <env> --channel <chan> --path <lib>\n  \
      system-suite    [--path <lib>] [--environment <env>] [--channel <chan>]\n  \
+     ingest-rag      --document-id <id> --chunks <text1||text2||...> [--source-uri <uri>] [--content-type <ct>]\n  \
+     retrieve-rag    --query <text> [--top-k <n>] [--max-chunk-bytes <n>] [--time-budget-ms <n>]\n  \
+     rag-suite       [--document-id <id>]\n  \
      common:  [--tenant <t>] [--namespace <n>] [--transaction-id <id>]"
 }
 

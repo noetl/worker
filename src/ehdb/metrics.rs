@@ -46,6 +46,7 @@ struct EhdbMetricsState {
     dataplane: FamilyState,
     eventstream: FamilyState,
     systemstore: FamilyState,
+    rag: FamilyState,
 }
 
 fn state() -> &'static Mutex<EhdbMetricsState> {
@@ -138,6 +139,24 @@ pub fn record_systemstore(
     );
 }
 
+/// Record one bounded RAG retrieval/ingest op (EHDB Phase E).  `disabled`
+/// outcomes are not recorded, preserving the byte-identical `/metrics` invariant.
+pub fn record_rag(operation: &str, outcome: &str, ok: bool, degraded: bool, duration_seconds: f64) {
+    if outcome == "disabled" {
+        return;
+    }
+    let mut s = state().lock().expect("ehdb metrics lock");
+    s.rag.record(
+        vec![
+            ("operation".to_string(), operation.to_string()),
+            ("outcome".to_string(), outcome.to_string()),
+        ],
+        ok,
+        degraded,
+        duration_seconds,
+    );
+}
+
 /// Render all EHDB metric families as Prometheus text lines.  Returns an empty
 /// vec when no non-disabled EHDB op has run (the disabled/no-op case), so the
 /// worker `/metrics` output stays byte-identical.
@@ -198,6 +217,12 @@ pub fn render_lines() -> Vec<String> {
         &s.systemstore,
         "systemstore",
         "EHDB system WASM library store operations by operation and outcome",
+    );
+    render_op_family(
+        &mut lines,
+        &s.rag,
+        "rag",
+        "EHDB RAG retrieval/ingest operations by operation and outcome",
     );
 
     lines
@@ -266,6 +291,7 @@ mod tests {
         record_dataplane("append", "disabled", true, false, 0.0);
         record_eventstream("project", "disabled", true, false, 0.0);
         record_systemstore("publish", "disabled", true, false, 0.0);
+        record_rag("retrieve", "disabled", true, false, 0.0);
         assert!(render_lines().is_empty());
     }
 
