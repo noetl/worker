@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.57.0](https://github.com/noetl/worker/compare/v5.56.0...v5.57.0) (2026-07-05)
+
+### Features
+
+* **ehdb:** disabled-by-default projection read-model SHADOW wiring (Phase 7) ([#157](https://github.com/noetl/worker/issues/157)) ([eadc3a5](https://github.com/noetl/worker/commit/eadc3a5bd995f3d5f0aa7c38b960434dd12cb84b)), closes [noetl/ehdb#241](https://github.com/noetl/ehdb/issues/241) [ehdb#243](https://github.com/noetl/ehdb/issues/243) [ehdb#243](https://github.com/noetl/ehdb/issues/243) [#243](https://github.com/noetl/worker/issues/243) [noetl/ehdb#241](https://github.com/noetl/ehdb/issues/241)
+
 ## [5.56.0](https://github.com/noetl/worker/compare/v5.55.0...v5.56.0) (2026-07-05)
 
 ### Features
