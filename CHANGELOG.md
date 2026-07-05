@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.55.0](https://github.com/noetl/worker/compare/v5.54.0...v5.55.0) (2026-07-05)
+
+### Features
+
+* **ehdb:** in-process bounded RAG retrieval (Phase E) ([#234](https://github.com/noetl/worker/issues/234)) ([#155](https://github.com/noetl/worker/issues/155)) ([d1ebaf2](https://github.com/noetl/worker/commit/d1ebaf262bd7bf41fa86d8420c235491cd8dc828)), closes [noetl/ehdb#240](https://github.com/noetl/ehdb/issues/240)
+
 ## [5.54.0](https://github.com/noetl/worker/compare/v5.53.0...v5.54.0) (2026-07-05)
 
 ### Features
