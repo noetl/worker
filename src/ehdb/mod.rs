@@ -36,6 +36,7 @@ pub mod eventstream;
 pub mod guard;
 pub mod kv;
 pub mod metrics;
+pub mod object;
 pub mod projection;
 pub mod rag;
 pub mod readiness;

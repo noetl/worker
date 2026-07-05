@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 
 use noetl_worker::ehdb::{
-    self, dataplane, eventlog, eventstream, kv, projection, rag, readiness, systemstore,
+    self, dataplane, eventlog, eventstream, kv, object, projection, rag, readiness, systemstore,
 };
 
 fn main() -> ExitCode {
@@ -54,6 +54,8 @@ fn main() -> ExitCode {
         Some("projection-suite") => run_projection_suite(&env, &flags),
         Some("mirror-kv") => run_mirror_kv(&env, &flags),
         Some("kv-suite") => run_kv_suite(&env, &flags),
+        Some("mirror-object") => run_mirror_object(&env, &flags),
+        Some("object-suite") => run_object_suite(&env, &flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -1196,6 +1198,103 @@ fn kv_exit(outcome: kv::KvOutcome) -> ExitCode {
     }
 }
 
+// --- object / blob shadow (EHDB Phase 8) -----------------------------------
+
+fn object_opts(flags: &Flags) -> object::ObjectOptions {
+    object::ObjectOptions {
+        tenant: flags.get("tenant"),
+        namespace: flags.get("namespace"),
+        transaction_id: flags.get("transaction-id"),
+    }
+}
+
+fn run_mirror_object(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let (Some(key), Some(value)) = (flags.req("key"), flags.req("value")) else {
+        return usage_exit();
+    };
+    let r = object::mirror_put(env, &key, value.as_bytes(), &object_opts(flags), true);
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "mirror-object",
+            "mode": r.mode.as_str(),
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "version": r.version,
+            "digest": r.digest,
+            "content_deduplicated": r.content_deduplicated,
+            "parity": r.parity,
+        })
+    );
+    print_metrics_footer();
+    object_exit(r.outcome)
+}
+
+/// Deterministic one-process object shadow drive: put / get-parity / content-dedup
+/// / list / locate / delete against a fresh registry log + blob store.  Off /
+/// disabled ⇒ byte-identical no-op proof (disabled + empty metrics), same shape as
+/// `kv-suite`.  Enabled ⇒ every engine capability holds.
+fn run_object_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let report = object::shadow_suite(env, &object_opts(flags), true);
+    if report.disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-object-selfcheck",
+                "ehdb": "disabled",
+                "mode": report.mode.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let metrics = render_metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-object-selfcheck",
+            "ehdb": "enabled",
+            "mode": report.mode.as_str(),
+            "role": report.role.map(|x| x.as_str()),
+            "ok": report.ok,
+            "guard_refused": report.guard_refused,
+            "primary_unavailable": report.primary_unavailable,
+            "steps": report.steps.iter().map(|s| serde_json::json!({
+                "step": s.step, "outcome": s.outcome, "detail": s.detail,
+            })).collect::<Vec<_>>(),
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+
+    if report.guard_refused || report.primary_unavailable {
+        return ExitCode::from(4);
+    }
+    if report.ok && metrics_is_secret_free(&metrics) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn object_exit(outcome: object::ObjectOutcome) -> ExitCode {
+    use object::ObjectOutcome as O;
+    match outcome {
+        O::GuardRefused | O::Invalid | O::PrimaryUnavailable => ExitCode::from(4),
+        O::Rejected => ExitCode::from(3),
+        O::Unavailable | O::ParityMismatch => ExitCode::from(5),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn dp_opts(flags: &Flags) -> dataplane::DataPlaneOptions {
@@ -1326,6 +1425,8 @@ fn usage() -> &'static str {
      projection-suite  [--execution-id <id>] [--consumer <c>]\n  \
      mirror-kv       --bucket <b> --key <k> --value <text> [--expires-at-ms <n>]\n  \
      kv-suite\n  \
+     mirror-object   --key <k> --value <text>\n  \
+     object-suite\n  \
      common:  [--tenant <t>] [--namespace <n>] [--transaction-id <id>]"
 }
 
