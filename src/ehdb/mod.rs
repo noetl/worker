@@ -35,6 +35,7 @@ pub mod eventstream;
 pub mod guard;
 pub mod metrics;
 pub mod readiness;
+pub mod systemstore;
 
 /// A snapshot of environment variables.  Functions take an explicit `&EnvMap`
 /// (rather than reading `std::env` directly) so tests can inject a fixed env

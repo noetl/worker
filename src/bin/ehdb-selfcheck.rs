@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-use noetl_worker::ehdb::{self, dataplane, eventstream, readiness};
+use noetl_worker::ehdb::{self, dataplane, eventstream, readiness, systemstore};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,6 +39,10 @@ fn main() -> ExitCode {
         Some("consume") => run_consume(&env, &flags),
         Some("ack") => run_ack(&env, &flags),
         Some("suite") => run_suite(&env, &flags),
+        Some("publish-system") => run_publish_system(&env, &flags),
+        Some("bind-system") => run_bind_system(&env, &flags),
+        Some("resolve-system") => run_resolve_system(&env, &flags),
+        Some("system-suite") => run_system_suite(&env, &flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -286,6 +290,240 @@ fn run_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
     }
 }
 
+// --- system WASM library store (EHDB Phase E) ------------------------------
+
+fn ss_opts(flags: &Flags) -> systemstore::SystemStoreOptions {
+    systemstore::SystemStoreOptions {
+        tenant: flags.get("tenant"),
+        namespace: flags.get("namespace"),
+        transaction_id: flags.get("transaction-id"),
+    }
+}
+
+fn manifest_from_flags(flags: &Flags) -> Option<systemstore::ModuleManifest> {
+    Some(systemstore::ModuleManifest {
+        path: flags.req("path")?,
+        revision: flags.parse_u64("revision")? as u32,
+        digest: flags.req("digest")?,
+        entry: flags.req("entry")?,
+        target: flags.req("target")?,
+        object_path: flags.req("object-path")?,
+        byte_len: flags.parse_u64("byte-len")?,
+        capabilities: flags
+            .req("capabilities")?
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect(),
+    })
+}
+
+fn run_publish_system(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let Some(manifest) = manifest_from_flags(flags) else {
+        return usage_exit();
+    };
+    let r = systemstore::publish_module(env, &manifest, &ss_opts(flags), true);
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "publish-system",
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "publish": r.publish,
+        })
+    );
+    print_metrics_footer();
+    systemstore_exit(r.outcome)
+}
+
+fn run_bind_system(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let (Some(environment), Some(channel), Some(path), Some(revision), Some(digest)) = (
+        flags.req("environment"),
+        flags.req("channel"),
+        flags.req("path"),
+        flags.parse_u64("revision"),
+        flags.req("digest"),
+    ) else {
+        return usage_exit();
+    };
+    let r = systemstore::bind_channel(
+        env,
+        &systemstore::ChannelBinding {
+            environment,
+            channel,
+            path,
+            revision: revision as u32,
+            digest,
+        },
+        &ss_opts(flags),
+        true,
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "bind-system",
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "bind": r.bind,
+        })
+    );
+    print_metrics_footer();
+    systemstore_exit(r.outcome)
+}
+
+fn run_resolve_system(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let (Some(environment), Some(channel), Some(path)) = (
+        flags.req("environment"),
+        flags.req("channel"),
+        flags.req("path"),
+    ) else {
+        return usage_exit();
+    };
+    let r = systemstore::resolve_module(env, &environment, &channel, &path, &ss_opts(flags), true);
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "resolve-system",
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "resolve": r.resolve,
+        })
+    );
+    print_metrics_footer();
+    systemstore_exit(r.outcome)
+}
+
+/// Run a full deterministic Phase-E drive in ONE process:
+/// resolve(absent) → publish rev1 → bind → resolve(rev1) → publish rev2 →
+/// rebind rev2 → resolve(rev2).  Proves publish/bind/resolve, the absent probe,
+/// and the hot-replace-on-rebind semantic.  Disabled ⇒ byte-identical no-op
+/// proof (resolve=disabled + empty metrics), same shape as `suite`.
+fn run_system_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let path = flags
+        .get("path")
+        .unwrap_or_else(|| "system/selfcheck_render".to_string());
+    let environment = flags
+        .get("environment")
+        .unwrap_or_else(|| "prod".to_string());
+    let channel = flags.get("channel").unwrap_or_else(|| "stable".to_string());
+    let digest1 = format!("sha256:{:064x}", 1);
+    let digest2 = format!("sha256:{:064x}", 2);
+    let mk = |revision: u32, digest: &str| systemstore::ModuleManifest {
+        path: path.clone(),
+        revision,
+        digest: digest.to_string(),
+        entry: "render".to_string(),
+        target: "wasm32-wasi-preview1".to_string(),
+        object_path: format!("{path}/{revision}.wasm"),
+        byte_len: 512,
+        capabilities: vec!["event_publish".to_string()],
+    };
+
+    // Disabled short-circuit: prove the byte-identical no-op.
+    let pre =
+        systemstore::resolve_module(env, &environment, &channel, &path, &ss_opts(flags), true);
+    if pre.outcome == systemstore::SystemStoreOutcome::Disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite":"ehdb-system-selfcheck",
+                "ehdb":"disabled",
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let mut steps = Vec::new();
+    let mut ok = true;
+
+    // Resolve before any bind is the absent probe.
+    ok &= pre.outcome == systemstore::SystemStoreOutcome::Absent;
+    steps.push(serde_json::json!({"step":"resolve_absent","outcome": pre.outcome.as_str()}));
+
+    let p1 = systemstore::publish_module(env, &mk(1, &digest1), &ss_opts(flags), true);
+    ok &= p1.outcome == systemstore::SystemStoreOutcome::Published;
+    steps.push(serde_json::json!({"step":"publish_rev1","outcome": p1.outcome.as_str()}));
+
+    let b1 = systemstore::bind_channel(
+        env,
+        &systemstore::ChannelBinding {
+            environment: environment.clone(),
+            channel: channel.clone(),
+            path: path.clone(),
+            revision: 1,
+            digest: digest1.clone(),
+        },
+        &ss_opts(flags),
+        true,
+    );
+    ok &= b1.outcome == systemstore::SystemStoreOutcome::Bound;
+    steps.push(serde_json::json!({"step":"bind_rev1","outcome": b1.outcome.as_str()}));
+
+    let r1 = systemstore::resolve_module(env, &environment, &channel, &path, &ss_opts(flags), true);
+    let rev1 = r1.resolve.as_ref().and_then(|x| x.revision);
+    ok &= r1.outcome == systemstore::SystemStoreOutcome::Resolved && rev1 == Some(1);
+    steps.push(
+        serde_json::json!({"step":"resolve_rev1","outcome": r1.outcome.as_str(),"revision": rev1}),
+    );
+
+    let p2 = systemstore::publish_module(env, &mk(2, &digest2), &ss_opts(flags), true);
+    ok &= p2.outcome == systemstore::SystemStoreOutcome::Published;
+    steps.push(serde_json::json!({"step":"publish_rev2","outcome": p2.outcome.as_str()}));
+
+    let b2 = systemstore::bind_channel(
+        env,
+        &systemstore::ChannelBinding {
+            environment: environment.clone(),
+            channel: channel.clone(),
+            path: path.clone(),
+            revision: 2,
+            digest: digest2.clone(),
+        },
+        &ss_opts(flags),
+        true,
+    );
+    ok &= b2.outcome == systemstore::SystemStoreOutcome::Bound;
+    steps.push(serde_json::json!({"step":"rebind_rev2","outcome": b2.outcome.as_str()}));
+
+    // Rebind hot-replaces the active module: resolve now returns rev2.
+    let r2 = systemstore::resolve_module(env, &environment, &channel, &path, &ss_opts(flags), true);
+    let rev2 = r2.resolve.as_ref().and_then(|x| x.revision);
+    ok &= r2.outcome == systemstore::SystemStoreOutcome::Resolved && rev2 == Some(2);
+    steps.push(
+        serde_json::json!({"step":"resolve_rev2","outcome": r2.outcome.as_str(),"revision": rev2}),
+    );
+
+    let metrics = render_metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite":"ehdb-system-selfcheck",
+            "ehdb":"enabled",
+            "role": pre.role.map(|x| x.as_str()),
+            "ok": ok,
+            "steps": steps,
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+
+    if ok && metrics_is_secret_free(&metrics) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn dp_opts(flags: &Flags) -> dataplane::DataPlaneOptions {
@@ -367,19 +605,36 @@ fn eventstream_exit(outcome: eventstream::EventStreamOutcome) -> ExitCode {
     }
 }
 
+fn systemstore_exit(outcome: systemstore::SystemStoreOutcome) -> ExitCode {
+    use systemstore::SystemStoreOutcome as O;
+    match outcome {
+        O::GuardRefused | O::Invalid => ExitCode::from(4),
+        O::Rejected => ExitCode::from(3),
+        O::Unavailable => ExitCode::from(5),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 fn usage_exit() -> ExitCode {
     eprintln!("{}", usage());
     ExitCode::from(2)
 }
 
 fn usage() -> &'static str {
-    "usage: ehdb-selfcheck <readiness|append|read|project|consume|ack|suite|metrics> [--flag value ...]\n  \
-     append   --stream <s> --subject <sub> --payload <text>\n  \
-     read     --stream <s> [--limit <n>] [--after <seq>]\n  \
-     project  --stream <s> --subject <sub> --payload <text>\n  \
-     consume  --stream <s> --consumer <c> [--limit <n>]\n  \
-     ack      --stream <s> --consumer <c> --sequence <seq>\n  \
-     suite    [--stream <s>] [--consumer <c>]\n  \
+    "usage: ehdb-selfcheck <readiness|append|read|project|consume|ack|suite|\
+     publish-system|bind-system|resolve-system|system-suite|metrics> [--flag value ...]\n  \
+     append          --stream <s> --subject <sub> --payload <text>\n  \
+     read            --stream <s> [--limit <n>] [--after <seq>]\n  \
+     project         --stream <s> --subject <sub> --payload <text>\n  \
+     consume         --stream <s> --consumer <c> [--limit <n>]\n  \
+     ack             --stream <s> --consumer <c> --sequence <seq>\n  \
+     suite           [--stream <s>] [--consumer <c>]\n  \
+     publish-system  --path <lib> --revision <n> --digest <sha256:..> --entry <e> \
+     --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <p> \
+     --byte-len <n> --capabilities <c1,c2,..>\n  \
+     bind-system     --environment <env> --channel <chan> --path <lib> --revision <n> --digest <sha256:..>\n  \
+     resolve-system  --environment <env> --channel <chan> --path <lib>\n  \
+     system-suite    [--path <lib>] [--environment <env>] [--channel <chan>]\n  \
      common:  [--tenant <t>] [--namespace <n>] [--transaction-id <id>]"
 }
 
