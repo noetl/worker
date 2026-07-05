@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.54.0](https://github.com/noetl/worker/compare/v5.53.0...v5.54.0) (2026-07-05)
+
+### Features
+
+* **ehdb:** in-process system WASM library store (Phase E) ([#154](https://github.com/noetl/worker/issues/154)) ([3162b1d](https://github.com/noetl/worker/commit/3162b1d88659eab99e371c98bd3c03e3908731e5)), closes [noetl/ehdb#239](https://github.com/noetl/ehdb/issues/239) [noetl/ehdb#234](https://github.com/noetl/ehdb/issues/234) [noetl/ehdb#234](https://github.com/noetl/ehdb/issues/234) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [5.53.0](https://github.com/noetl/worker/compare/v5.52.0...v5.53.0) (2026-07-05)
 
 ### Features
