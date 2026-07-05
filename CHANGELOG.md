@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.58.0](https://github.com/noetl/worker/compare/v5.57.0...v5.58.0) (2026-07-05)
+
+### Features
+
+* **ehdb:** disabled-by-default KV/state SHADOW wiring (Phase 8) ([#158](https://github.com/noetl/worker/issues/158)) ([7876be0](https://github.com/noetl/worker/commit/7876be060185b0301ff8ba312b62894ef3a43461)), closes [ehdb#244](https://github.com/noetl/ehdb/issues/244) [noetl/ai-meta#234](https://github.com/noetl/ai-meta/issues/234) [noetl/ehdb#241](https://github.com/noetl/ehdb/issues/241)
+
 ## [5.57.0](https://github.com/noetl/worker/compare/v5.56.0...v5.57.0) (2026-07-05)
 
 ### Features
