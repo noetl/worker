@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 
 use noetl_worker::ehdb::{
-    self, dataplane, eventlog, eventstream, projection, rag, readiness, systemstore,
+    self, dataplane, eventlog, eventstream, kv, projection, rag, readiness, systemstore,
 };
 
 fn main() -> ExitCode {
@@ -52,6 +52,8 @@ fn main() -> ExitCode {
         Some("eventlog-suite") => run_eventlog_suite(&env, &flags),
         Some("mirror-projection") => run_mirror_projection(&env, &flags),
         Some("projection-suite") => run_projection_suite(&env, &flags),
+        Some("mirror-kv") => run_mirror_kv(&env, &flags),
+        Some("kv-suite") => run_kv_suite(&env, &flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -1087,6 +1089,113 @@ fn projection_exit(outcome: projection::ProjectionOutcome) -> ExitCode {
     }
 }
 
+// --- KV / platform-state shadow (EHDB Phase 8) -----------------------------
+
+fn kv_opts(flags: &Flags) -> kv::KvOptions {
+    kv::KvOptions {
+        tenant: flags.get("tenant"),
+        namespace: flags.get("namespace"),
+        transaction_id: flags.get("transaction-id"),
+    }
+}
+
+fn run_mirror_kv(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let (Some(bucket), Some(key), Some(value)) =
+        (flags.req("bucket"), flags.req("key"), flags.req("value"))
+    else {
+        return usage_exit();
+    };
+    let expires_at_ms = flags.parse_u64("expires-at-ms");
+    let r = kv::mirror_put(
+        env,
+        &bucket,
+        &key,
+        &value,
+        expires_at_ms,
+        &kv_opts(flags),
+        true,
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "mirror-kv",
+            "mode": r.mode.as_str(),
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "version": r.version,
+            "parity": r.parity,
+        })
+    );
+    print_metrics_footer();
+    kv_exit(r.outcome)
+}
+
+/// Deterministic one-process KV shadow drive: put / get-parity / CAS-conflict /
+/// CAS-swap / delete / TTL-expiry / scan against a fresh log.  Off / disabled ⇒
+/// byte-identical no-op proof (disabled + empty metrics), same shape as
+/// `eventlog-suite` / `projection-suite`.  Enabled ⇒ every engine capability
+/// holds.
+fn run_kv_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let report = kv::shadow_suite(env, &kv_opts(flags), true);
+    if report.disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-kv-selfcheck",
+                "ehdb": "disabled",
+                "mode": report.mode.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let metrics = render_metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-kv-selfcheck",
+            "ehdb": "enabled",
+            "mode": report.mode.as_str(),
+            "role": report.role.map(|x| x.as_str()),
+            "ok": report.ok,
+            "guard_refused": report.guard_refused,
+            "primary_unavailable": report.primary_unavailable,
+            "steps": report.steps.iter().map(|s| serde_json::json!({
+                "step": s.step, "outcome": s.outcome, "detail": s.detail,
+            })).collect::<Vec<_>>(),
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+
+    if report.guard_refused || report.primary_unavailable {
+        return ExitCode::from(4);
+    }
+    if report.ok && metrics_is_secret_free(&metrics) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn kv_exit(outcome: kv::KvOutcome) -> ExitCode {
+    use kv::KvOutcome as O;
+    match outcome {
+        O::GuardRefused | O::Invalid | O::PrimaryUnavailable => ExitCode::from(4),
+        O::Rejected => ExitCode::from(3),
+        O::Unavailable | O::ParityMismatch => ExitCode::from(5),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn dp_opts(flags: &Flags) -> dataplane::DataPlaneOptions {
@@ -1215,6 +1324,8 @@ fn usage() -> &'static str {
      eventlog-suite  [--execution-id <id>]\n  \
      mirror-projection --execution-id <id> [--events <n>] [--consumer <c>]\n  \
      projection-suite  [--execution-id <id>] [--consumer <c>]\n  \
+     mirror-kv       --bucket <b> --key <k> --value <text> [--expires-at-ms <n>]\n  \
+     kv-suite\n  \
      common:  [--tenant <t>] [--namespace <n>] [--transaction-id <id>]"
 }
 

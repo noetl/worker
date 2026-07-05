@@ -34,6 +34,7 @@ pub mod dataplane;
 pub mod eventlog;
 pub mod eventstream;
 pub mod guard;
+pub mod kv;
 pub mod metrics;
 pub mod projection;
 pub mod rag;
