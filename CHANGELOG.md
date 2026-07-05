@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.53.0](https://github.com/noetl/worker/compare/v5.52.0...v5.53.0) (2026-07-05)
+
+### Features
+
+* **ehdb:** in-process EHDB integration (readiness + data-plane + event-stream) ([#153](https://github.com/noetl/worker/issues/153)) ([d6226a2](https://github.com/noetl/worker/commit/d6226a2be071ea6f75b9f952a528e36439db3ec1)), closes [noetl/ehdb#234](https://github.com/noetl/ehdb/issues/234) [noetl/ehdb#234](https://github.com/noetl/ehdb/issues/234)
+
 ## [5.52.0](https://github.com/noetl/worker/compare/v5.51.0...v5.52.0) (2026-07-04)
 
 ### Features
