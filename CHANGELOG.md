@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.56.0](https://github.com/noetl/worker/compare/v5.55.0...v5.56.0) (2026-07-05)
+
+### Features
+
+* **ehdb:** disabled-by-default event-log SHADOW wiring (Phase 6) ([#156](https://github.com/noetl/worker/issues/156)) ([43c8f0f](https://github.com/noetl/worker/commit/43c8f0f733e76de4ea3364e28c90054719d844d8)), closes [noetl/ehdb#242](https://github.com/noetl/ehdb/issues/242) [noetl/ehdb#241](https://github.com/noetl/ehdb/issues/241)
+
 ## [5.55.0](https://github.com/noetl/worker/compare/v5.54.0...v5.55.0) (2026-07-05)
 
 ### Features
