@@ -430,6 +430,9 @@ name = "arrow-schema"
 version = "53.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35b0f9c0c3582dd55db0f136d3b44bfa0189df07adcf7dc7f2f2e74db0f52eb8"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "arrow-schema"
@@ -1514,6 +1517,97 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "ehdb-catalog"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=3cefba916e661d976924ad0a8d8f070fcc3c4d62#3cefba916e661d976924ad0a8d8f070fcc3c4d62"
+dependencies = [
+ "ehdb-core",
+ "ehdb-storage",
+ "serde",
+]
+
+[[package]]
+name = "ehdb-core"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=3cefba916e661d976924ad0a8d8f070fcc3c4d62#3cefba916e661d976924ad0a8d8f070fcc3c4d62"
+dependencies = [
+ "arrow-schema 53.4.1",
+ "serde",
+]
+
+[[package]]
+name = "ehdb-reference"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=3cefba916e661d976924ad0a8d8f070fcc3c4d62#3cefba916e661d976924ad0a8d8f070fcc3c4d62"
+dependencies = [
+ "arrow-array 53.4.1",
+ "arrow-ipc",
+ "arrow-schema 53.4.1",
+ "ehdb-catalog",
+ "ehdb-core",
+ "ehdb-retrieval",
+ "ehdb-storage",
+ "ehdb-stream",
+ "ehdb-system",
+ "ehdb-transaction",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ehdb-retrieval"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=3cefba916e661d976924ad0a8d8f070fcc3c4d62#3cefba916e661d976924ad0a8d8f070fcc3c4d62"
+dependencies = [
+ "ehdb-core",
+ "serde",
+]
+
+[[package]]
+name = "ehdb-storage"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=3cefba916e661d976924ad0a8d8f070fcc3c4d62#3cefba916e661d976924ad0a8d8f070fcc3c4d62"
+dependencies = [
+ "ehdb-core",
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "ehdb-stream"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=3cefba916e661d976924ad0a8d8f070fcc3c4d62#3cefba916e661d976924ad0a8d8f070fcc3c4d62"
+dependencies = [
+ "ehdb-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ehdb-system"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=3cefba916e661d976924ad0a8d8f070fcc3c4d62#3cefba916e661d976924ad0a8d8f070fcc3c4d62"
+dependencies = [
+ "ehdb-core",
+ "ehdb-storage",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ehdb-transaction"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=3cefba916e661d976924ad0a8d8f070fcc3c4d62#3cefba916e661d976924ad0a8d8f070fcc3c4d62"
+dependencies = [
+ "ehdb-core",
+ "ehdb-storage",
+ "ehdb-stream",
+ "ehdb-system",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3104,6 +3198,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "dotenvy",
+ "ehdb-reference",
  "futures",
  "hkdf",
  "hostname",

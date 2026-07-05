@@ -64,8 +64,18 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
 
 /// `GET /metrics` — encode the global registry and return as
 /// Prometheus text format.
+///
+/// The EHDB integration's process-local metric families
+/// ([`crate::ehdb::metrics`]) are appended after the registry snapshot.  They
+/// render nothing until a non-disabled EHDB op has run, so a disabled EHDB
+/// build (the default) produces byte-identical output.
 async fn metrics_handler() -> impl IntoResponse {
-    let body = WorkerMetrics::global().encode();
+    let mut body = WorkerMetrics::global().encode();
+    let ehdb_lines = crate::ehdb::metrics::render_lines();
+    if !ehdb_lines.is_empty() {
+        body.extend_from_slice(ehdb_lines.join("\n").as_bytes());
+        body.push(b'\n');
+    }
     (
         StatusCode::OK,
         [(

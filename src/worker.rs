@@ -299,6 +299,14 @@ impl Worker {
         // unreachable at boot).
         crate::metrics::set_worker_ready(true);
 
+        // EHDB in-process readiness preflight (noetl/ehdb#234).  Bounded,
+        // stateless, and NON-FATAL: EHDB is auxiliary storage, so a degraded or
+        // unavailable EHDB must never block worker startup.  When EHDB is
+        // disabled (the default) this is a strict no-op that records no metric,
+        // so the worker's behaviour + `/metrics` output are byte-identical to a
+        // build without EHDB.  Control-plane roles never perform the read.
+        crate::ehdb::readiness::run_preflight(&self.config.worker_id);
+
         // Process commands
         let result = self.process_commands().await;
 
