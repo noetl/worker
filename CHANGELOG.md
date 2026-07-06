@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.66.0](https://github.com/noetl/worker/compare/v5.65.0...v5.66.0) (2026-07-06)
+
+### Features
+
+* **ehdb:** tunable per-tier backend-selection resolution + config verb (Phase 10) ([#166](https://github.com/noetl/worker/issues/166)) ([8e247bb](https://github.com/noetl/worker/commit/8e247bb2a5345dda2dc88a10e70b63f2218d8348)), closes [ehdb#252](https://github.com/noetl/ehdb/issues/252) [noetl/ehdb#241](https://github.com/noetl/ehdb/issues/241)
+
 ## [5.65.0](https://github.com/noetl/worker/compare/v5.64.0...v5.65.0) (2026-07-06)
 
 ### Features
