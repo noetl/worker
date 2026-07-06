@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.63.0](https://github.com/noetl/worker/compare/v5.62.0...v5.63.0) (2026-07-06)
+
+### Features
+
+* **ehdb:** activate reversible KV/state primary-serve (Phase 9 tier 3) ([#163](https://github.com/noetl/worker/issues/163)) ([ba9f829](https://github.com/noetl/worker/commit/ba9f8290af6c5709ebf679678602b39bbbf49749)), closes [#115](https://github.com/noetl/worker/issues/115) [#161](https://github.com/noetl/worker/issues/161) [#162](https://github.com/noetl/worker/issues/162) [noetl/ehdb#249](https://github.com/noetl/ehdb/issues/249) [noetl/ai-meta#234](https://github.com/noetl/ai-meta/issues/234)
+
 ## [5.62.0](https://github.com/noetl/worker/compare/v5.61.0...v5.62.0) (2026-07-06)
 
 ### Features
