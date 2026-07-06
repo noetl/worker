@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.65.0](https://github.com/noetl/worker/compare/v5.64.0...v5.65.0) (2026-07-06)
+
+### Features
+
+* **ehdb:** activate reversible vector primary-serve (Phase 9 tier 5) ([#165](https://github.com/noetl/worker/issues/165)) ([681782c](https://github.com/noetl/worker/commit/681782c30628f860d4073f8753740d4c91beeb38)), closes [#161](https://github.com/noetl/worker/issues/161) [#162](https://github.com/noetl/worker/issues/162) [#163](https://github.com/noetl/worker/issues/163) [#164](https://github.com/noetl/worker/issues/164) [noetl/ehdb#251](https://github.com/noetl/ehdb/issues/251) [noetl/ai-meta#234](https://github.com/noetl/ai-meta/issues/234)
+
 ## [5.64.0](https://github.com/noetl/worker/compare/v5.63.0...v5.64.0) (2026-07-06)
 
 ### Features
