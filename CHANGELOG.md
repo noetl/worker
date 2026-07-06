@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.61.0](https://github.com/noetl/worker/compare/v5.60.0...v5.61.0) (2026-07-06)
+
+### Features
+
+* **ehdb:** activate reversible event-log primary-serve (Phase 9 tier 1) ([#161](https://github.com/noetl/worker/issues/161)) ([ddf41de](https://github.com/noetl/worker/commit/ddf41dedcb6e4602cb8b69e973446b242d898c41)), closes [#247](https://github.com/noetl/worker/issues/247) [noetl/ai-meta#234](https://github.com/noetl/ai-meta/issues/234) [noetl/ehdb#241](https://github.com/noetl/ehdb/issues/241)
+
 ## [5.60.0](https://github.com/noetl/worker/compare/v5.59.0...v5.60.0) (2026-07-06)
 
 ### Features
