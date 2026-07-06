@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.60.0](https://github.com/noetl/worker/compare/v5.59.0...v5.60.0) (2026-07-06)
+
+### Features
+
+* **ehdb:** disabled-by-default vector SHADOW wiring (Phase 8, slice 3) ([#160](https://github.com/noetl/worker/issues/160)) ([c7b8872](https://github.com/noetl/worker/commit/c7b8872d97ccd090ae177e61710735ffe675b9da)), closes [worker#159](https://github.com/noetl/worker/issues/159) [ehdb#246](https://github.com/noetl/ehdb/issues/246) [ehdb#246](https://github.com/noetl/ehdb/issues/246) [noetl/ehdb#241](https://github.com/noetl/ehdb/issues/241)
+
 ## [5.59.0](https://github.com/noetl/worker/compare/v5.58.0...v5.59.0) (2026-07-05)
 
 ### Features
