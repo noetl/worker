@@ -20,6 +20,7 @@ use std::process::ExitCode;
 
 use noetl_worker::ehdb::{
     self, dataplane, eventlog, eventstream, kv, object, projection, rag, readiness, systemstore,
+    vector,
 };
 
 fn main() -> ExitCode {
@@ -56,6 +57,8 @@ fn main() -> ExitCode {
         Some("kv-suite") => run_kv_suite(&env, &flags),
         Some("mirror-object") => run_mirror_object(&env, &flags),
         Some("object-suite") => run_object_suite(&env, &flags),
+        Some("mirror-vector") => run_mirror_vector(&env, &flags),
+        Some("vector-suite") => run_vector_suite(&env, &flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -1295,6 +1298,125 @@ fn object_exit(outcome: object::ObjectOutcome) -> ExitCode {
     }
 }
 
+// --- vector shadow (EHDB Phase 8, slice 3) ---------------------------------
+
+fn vector_opts(flags: &Flags) -> vector::VectorOptions {
+    vector::VectorOptions {
+        tenant: flags.get("tenant"),
+        namespace: flags.get("namespace"),
+        transaction_id: flags.get("transaction-id"),
+    }
+}
+
+/// Parse a `--vector` flag of comma-separated floats (e.g. `1.0,0.0,0.5`).
+fn parse_vector(flags: &Flags) -> Option<Vec<f32>> {
+    let raw = flags.get("vector")?;
+    raw.split(',')
+        .map(|t| t.trim().parse::<f32>().ok())
+        .collect()
+}
+
+fn run_mirror_vector(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let (Some(collection), Some(point), Some(model), Some(vec)) = (
+        flags.req("collection"),
+        flags.req("point-id"),
+        flags.req("model-id"),
+        parse_vector(flags),
+    ) else {
+        return usage_exit();
+    };
+    let r = vector::mirror_upsert(
+        env,
+        &collection,
+        &point,
+        &model,
+        &vec,
+        flags.get("payload").as_deref(),
+        &vector_opts(flags),
+        true,
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "mirror-vector",
+            "mode": r.mode.as_str(),
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "detail": r.detail,
+            "version": r.version,
+            "candidate_count": r.candidate_count,
+            "returned": r.returned,
+            "parity": r.parity,
+        })
+    );
+    print_metrics_footer();
+    vector_exit(r.outcome)
+}
+
+/// Deterministic one-process vector shadow drive: upsert / query-parity /
+/// top-k-truncate / delete against a fresh index log.  Off / disabled ⇒
+/// byte-identical no-op proof (disabled + empty metrics), same shape as
+/// `object-suite`.  Enabled ⇒ every engine capability holds.
+fn run_vector_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let report = vector::shadow_suite(env, &vector_opts(flags), true);
+    if report.disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-vector-selfcheck",
+                "ehdb": "disabled",
+                "mode": report.mode.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let metrics = render_metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-vector-selfcheck",
+            "ehdb": "enabled",
+            "mode": report.mode.as_str(),
+            "role": report.role.map(|x| x.as_str()),
+            "ok": report.ok,
+            "guard_refused": report.guard_refused,
+            "primary_unavailable": report.primary_unavailable,
+            "steps": report.steps.iter().map(|s| serde_json::json!({
+                "step": s.step, "outcome": s.outcome, "detail": s.detail,
+            })).collect::<Vec<_>>(),
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+
+    if report.guard_refused || report.primary_unavailable {
+        return ExitCode::from(4);
+    }
+    if report.ok && metrics_is_secret_free(&metrics) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn vector_exit(outcome: vector::VectorOutcome) -> ExitCode {
+    use vector::VectorOutcome as O;
+    match outcome {
+        O::GuardRefused | O::Invalid | O::PrimaryUnavailable => ExitCode::from(4),
+        O::Rejected => ExitCode::from(3),
+        O::Unavailable | O::ParityMismatch => ExitCode::from(5),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn dp_opts(flags: &Flags) -> dataplane::DataPlaneOptions {
@@ -1427,6 +1549,8 @@ fn usage() -> &'static str {
      kv-suite\n  \
      mirror-object   --key <k> --value <text>\n  \
      object-suite\n  \
+     mirror-vector   --collection <c> --point-id <id> --model-id <m> --vector <f1,f2,..> [--payload <text>]\n  \
+     vector-suite\n  \
      common:  [--tenant <t>] [--namespace <n>] [--transaction-id <id>]"
 }
 
