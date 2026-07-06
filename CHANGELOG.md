@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.64.0](https://github.com/noetl/worker/compare/v5.63.0...v5.64.0) (2026-07-06)
+
+### Features
+
+* **ehdb:** activate reversible object/blob primary-serve (Phase 9 tier 4) ([#164](https://github.com/noetl/worker/issues/164)) ([#164](https://github.com/noetl/worker/issues/164)) ([a100adf](https://github.com/noetl/worker/commit/a100adf9a73b2da4f154fd0ddf2b8d3cc5809681)), closes [#166](https://github.com/noetl/worker/issues/166) [#104](https://github.com/noetl/worker/issues/104) [#161](https://github.com/noetl/worker/issues/161) [#162](https://github.com/noetl/worker/issues/162) [#163](https://github.com/noetl/worker/issues/163) [noetl/ehdb#250](https://github.com/noetl/ehdb/issues/250) [noetl/ai-meta#234](https://github.com/noetl/ai-meta/issues/234)
+
 ## [5.63.0](https://github.com/noetl/worker/compare/v5.62.0...v5.63.0) (2026-07-06)
 
 ### Features
