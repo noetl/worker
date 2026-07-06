@@ -1,4 +1,5 @@
-//! Disabled-by-default projection / read-model SHADOW wiring (EHDB Phase 7).
+//! Projection / read-model SHADOW wiring + PRIMARY-serve cutover (EHDB Phase 7
+//! shadow, Phase 9 tier-2 primary).
 //!
 //! EHDB's projection core engine (the `ehdb_reference::projection` driver,
 //! ehdb#243) is the read-model builder that Phase 7 puts *on top of* the Phase-6
@@ -17,12 +18,29 @@
 //!   and the EHDB read-models are compared against the materializer's observed
 //!   output for key / value / ordering parity + checkpoint lag.  Reads are
 //!   **never** served from EHDB and the authoritative materializer is untouched.
-//! * `primary` — recognised but **NOT activated this session**.  Cutover to
-//!   serving read-models from EHDB (retiring the Postgres materializer read path)
-//!   is a later gated step; requesting `primary` here is refused with a distinct
-//!   outcome and the worker stays on the existing path.
-//!   [`PRIMARY_SERVE_ACTIVATED`] is a compile-time `false` so it is structurally
-//!   impossible for this build to serve primary.
+//! * `primary` — **EHDB serves the read-models authoritatively** (Phase 9 tier
+//!   2): the read-model queries the control plane makes (`list_executions`,
+//!   per-execution `read_execution_state`, `read_event`) are served by the EHDB
+//!   engine in place of the PostgreSQL materializer, while the served read-models
+//!   are dual-run parity-checked against the incumbent.  [`PRIMARY_SERVE_ACTIVATED`]
+//!   is now `true` so this build *can* serve primary; whether it *does* is a pure
+//!   runtime choice of the `NOETL_EHDB_PROJECTION` flag (see reversibility).
+//!
+//! ## Reversibility (the cutover safety property)
+//!
+//! The cutover is reversible with **two independent levers**:
+//!
+//! 1. **Runtime flag (operational, instant, no redeploy)** — flip
+//!    `NOETL_EHDB_PROJECTION` from `primary` back to `shadow`/`off` and the
+//!    incumbent (PostgreSQL materializer) is the authoritative read path again
+//!    immediately.  Zero data loss: the primary path only ever materializes into
+//!    the derived EHDB `KeepAll` projection store by consuming already-authored
+//!    events and never mutates/deletes anything the incumbent owns, so the
+//!    incumbent read-models are exactly as they were, and the EHDB store stays
+//!    whole on disk for a later re-enable.
+//! 2. **Compile-time kill switch (structural, belt-and-suspenders)** — set
+//!    [`PRIMARY_SERVE_ACTIVATED`] back to `false` and it is structurally
+//!    impossible for the build to serve primary regardless of config.
 //!
 //! ## Boundaries (mirror the rest of `src/ehdb`)
 //!
@@ -37,10 +55,12 @@
 //!   materializer (structurally asserted — it only touches the derived EHDB
 //!   projection fabric via `ehdb_reference`).
 
+use ehdb_reference::projection::exercise_primary_serve;
 use ehdb_reference::{
     compare_projection_parity, AuthoritativeExecutionState, ExecutionStateView,
     LocalReferenceProjectionEngine, ProjectionApplyRequest, ProjectionDriver, ProjectionEventInput,
-    ProjectionParityReport, DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
+    ProjectionParityReport, ProjectionPrimaryInput, ProjectionPrimaryServeReport,
+    DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
 use super::contract::{contract_from_env, EhdbClientRole, EhdbContract, EHDB_ENABLED_ENV};
@@ -63,11 +83,15 @@ const DEFAULT_CONSUMER: &str = "noetl-projection-shadow";
 /// comparison — the projection read is bounded like every other EHDB op.
 const READBACK_LIMIT: usize = 4_096;
 
-/// Compile-time guard: this build never serves read-models from EHDB.  Phase 7
-/// ships the shadow only; flipping this to `true` is the later, separately-gated
-/// primary read-cutover off Postgres and is intentionally not reachable from
-/// config.
-pub const PRIMARY_SERVE_ACTIVATED: bool = false;
+/// Compile-time kill switch for primary-serve.  Phase 9 tier 2 activates it
+/// (`true`): this build *can* serve the projection read-models authoritatively
+/// from EHDB.  Whether it *does* is the pure runtime choice of
+/// `NOETL_EHDB_PROJECTION` (`primary` serves; `shadow`/`off` keep the PostgreSQL
+/// materializer authoritative), so the cutover stays reversible without a
+/// redeploy.  Setting this back to `false` is the belt-and-suspenders structural
+/// rollback — it makes primary-serve unreachable regardless of config (the
+/// `primary` flag then degrades to [`ProjectionOutcome::PrimaryUnavailable`]).
+pub const PRIMARY_SERVE_ACTIVATED: bool = true;
 
 /// Which projection engine the tier is driven by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +137,14 @@ pub enum ProjectionOutcome {
     /// Events materialized but the EHDB read-models diverged from the
     /// authoritative materializer.
     ParityMismatch,
-    /// `primary` requested but primary-serve is not activated this session.
+    /// `primary` served the read-models authoritatively from EHDB + dual-run
+    /// parity against the incumbent materializer held.
+    ServedPrimary,
+    /// `primary` served the read-models from EHDB but the dual-run parity against
+    /// the incumbent diverged (degraded — surfaces on `last_degraded`).
+    PrimaryDivergence,
+    /// `primary` requested but primary-serve is not activated this build (the
+    /// compile-time kill switch is off).
     PrimaryUnavailable,
     /// Empty batch or a batch over the count cap.
     Rejected,
@@ -131,6 +162,8 @@ impl ProjectionOutcome {
             ProjectionOutcome::Disabled => "disabled",
             ProjectionOutcome::Materialized => "materialized",
             ProjectionOutcome::ParityMismatch => "parity_mismatch",
+            ProjectionOutcome::ServedPrimary => "served_primary",
+            ProjectionOutcome::PrimaryDivergence => "primary_divergence",
             ProjectionOutcome::PrimaryUnavailable => "primary_unavailable",
             ProjectionOutcome::Rejected => "rejected",
             ProjectionOutcome::GuardRefused => "guard_refused",
@@ -142,7 +175,9 @@ impl ProjectionOutcome {
     pub fn ok(&self) -> bool {
         matches!(
             self,
-            ProjectionOutcome::Disabled | ProjectionOutcome::Materialized
+            ProjectionOutcome::Disabled
+                | ProjectionOutcome::Materialized
+                | ProjectionOutcome::ServedPrimary
         )
     }
 
@@ -152,7 +187,9 @@ impl ProjectionOutcome {
     fn degraded(&self) -> bool {
         matches!(
             self,
-            ProjectionOutcome::ParityMismatch | ProjectionOutcome::Unavailable
+            ProjectionOutcome::ParityMismatch
+                | ProjectionOutcome::PrimaryDivergence
+                | ProjectionOutcome::Unavailable
         )
     }
 }
@@ -339,12 +376,11 @@ pub fn shadow_project(
         );
     }
 
-    // Primary is recognised but not activated this session — refuse before any
-    // engine opens.  The compile-time guard makes serving structurally
-    // impossible; this is the config-time refusal.
+    // Primary with the compile-time kill switch off — refuse before any engine
+    // opens (the belt-and-suspenders structural rollback).  Still resolve the
+    // contract so a control-plane role is refused as a guard, not silently
+    // treated as "primary unavailable".
     if mode == ProjectionMode::Primary && !PRIMARY_SERVE_ACTIVATED {
-        // Still resolve the contract so a control-plane role is refused as a
-        // guard, not silently treated as "primary unavailable".
         let contract = match resolve_contract(env, mode, started, record_metrics) {
             Ok(c) => c,
             Err(result) => return *result,
@@ -359,7 +395,11 @@ pub fn shadow_project(
         );
     }
 
-    // Shadow mode.
+    // Shadow (dual-materialize + compare) OR primary (EHDB serves the read-models
+    // authoritatively).  The engine op is identical — an apply + read-back +
+    // parity compare; the mode only changes which read path is authoritative and
+    // how the outcome is labelled.
+    let serving_primary = mode == ProjectionMode::Primary;
     let contract = match resolve_contract(env, mode, started, record_metrics) {
         Ok(c) => c,
         Err(result) => return *result,
@@ -451,10 +491,13 @@ pub fn shadow_project(
         authoritative_offset,
     );
 
-    let result_outcome = if report.holds() {
-        ProjectionOutcome::Materialized
-    } else {
-        ProjectionOutcome::ParityMismatch
+    let result_outcome = match (serving_primary, report.holds()) {
+        // Primary: EHDB served the read-models authoritatively.
+        (true, true) => ProjectionOutcome::ServedPrimary,
+        (true, false) => ProjectionOutcome::PrimaryDivergence,
+        // Shadow: EHDB materialized alongside the authoritative incumbent.
+        (false, true) => ProjectionOutcome::Materialized,
+        (false, false) => ProjectionOutcome::ParityMismatch,
     };
     let mut result = make_result(
         mode,
@@ -468,6 +511,276 @@ pub fn shadow_project(
     result.checkpoint = Some(apply.checkpoint.applied_through_sequence);
     result.parity = Some(report);
     result
+}
+
+/// How many events the built-in primary-serve cycle drives through the engine
+/// (materializing 2 executions: "100" completed/2, "200" running/1).
+pub const PRIMARY_SERVE_CYCLE_EVENTS: usize = 3;
+/// Execution rows served after the reversibility flip-back (the 2 cycle
+/// executions + the 1 fresh execution the shadow flip-back materializes).
+const PRIMARY_SERVE_ROWS_AFTER_REVERT: usize = 3;
+
+fn cycle_event(
+    global_sequence: u64,
+    event_id: i64,
+    exec: &str,
+    event_type: &str,
+    node: &str,
+    status: &str,
+) -> ProjectionEventInput {
+    ProjectionEventInput {
+        global_sequence,
+        event_id,
+        execution_id: exec.to_string(),
+        event_type: event_type.to_string(),
+        node_name: Some(node.to_string()),
+        status: Some(status.to_string()),
+        prev_event_id: None,
+    }
+}
+
+fn cycle_auth(
+    exec: &str,
+    status: &str,
+    event_count: usize,
+    terminal: bool,
+) -> AuthoritativeExecutionState {
+    AuthoritativeExecutionState {
+        execution_id: exec.to_string(),
+        status: status.to_string(),
+        event_count,
+        terminal,
+    }
+}
+
+/// Secret-free result of the authoritative projection primary-serve cycle
+/// (Phase 9 tier 2) plus the operational reversibility demonstration.
+#[derive(Debug, Clone)]
+pub struct ProjectionServeResult {
+    pub mode: ProjectionMode,
+    pub outcome: ProjectionOutcome,
+    pub role: Option<EhdbClientRole>,
+    pub duration_seconds: f64,
+    /// The EHDB engine served the whole cycle with the incumbent materializer's
+    /// query contracts preserved and dual-run parity intact.
+    pub served_by_ehdb: bool,
+    /// The full served-by-EHDB proof (present once the cycle ran).
+    pub report: Option<ProjectionPrimaryServeReport>,
+    /// After serving primary, flipping `NOETL_EHDB_PROJECTION` back to `shadow`
+    /// over the same store materialized a further execution and the read-models
+    /// replayed whole — the incumbent read path is restored with zero data loss
+    /// (rollback lever 1 demonstrated operationally).
+    pub reversible: bool,
+    /// The execution-row count served after the flip-back (== cycle executions + 1).
+    pub rows_after_revert: usize,
+    pub detail: Option<String>,
+}
+
+/// Drive the authoritative projection primary-serve cycle through the EHDB engine
+/// and demonstrate operational reversibility.
+///
+/// In `primary` mode (and with [`PRIMARY_SERVE_ACTIVATED`]) this:
+///
+/// 1. runs [`exercise_primary_serve`] — apply (materialize) + the three
+///    read-model query contracts (`list_executions`, per-execution
+///    `read_execution_state`, `read_event`) + durable checkpoint + idempotent
+///    re-apply + fresh-engine replay, all served authoritatively by EHDB,
+///    dual-run parity-checked against the incumbent materializer; then
+/// 2. flips `NOETL_EHDB_PROJECTION` back to `shadow` in a cloned env and
+///    materializes a further execution over the SAME store, proving the
+///    incumbent/shadow read path is restored and the store stays whole (zero data
+///    loss on rollback).
+///
+/// Off/disabled ⇒ strict no-op (byte-identical `/metrics`).  Control-plane roles
+/// are guard-refused before any engine opens.  Never authors a NoETL event or
+/// writes the incumbent materializer — it only exercises the derived EHDB
+/// projection fabric.
+pub fn serve_primary_cycle(
+    env: &EnvMap,
+    opts: &ProjectionOptions,
+    record_metrics: bool,
+) -> ProjectionServeResult {
+    let started = std::time::Instant::now();
+    let mode = ProjectionMode::from_env(env);
+
+    // Early-exit builder (no cycle report) that records the `primary_serve`
+    // metric — `disabled` outcomes are skipped by `record_projection`, preserving
+    // the byte-identical no-op invariant.
+    let early = |outcome: ProjectionOutcome,
+                 role: Option<EhdbClientRole>,
+                 detail: Option<String>|
+     -> ProjectionServeResult {
+        let duration_seconds = started.elapsed().as_secs_f64();
+        if record_metrics {
+            metrics::record_projection(
+                "primary_serve",
+                outcome.as_str(),
+                outcome.ok(),
+                outcome.degraded(),
+                duration_seconds,
+            );
+        }
+        ProjectionServeResult {
+            mode,
+            outcome,
+            role,
+            duration_seconds,
+            served_by_ehdb: false,
+            report: None,
+            reversible: false,
+            rows_after_revert: 0,
+            detail,
+        }
+    };
+
+    // Off mode OR the umbrella EHDB switch disabled ⇒ strict no-op.
+    if mode == ProjectionMode::Off || !truthy(env, EHDB_ENABLED_ENV) {
+        return early(ProjectionOutcome::Disabled, None, None);
+    }
+
+    // Resolve the contract (guards control-plane / disabled).  Pass
+    // `record_metrics = false` so the only metric recorded here is the
+    // `primary_serve`-labelled one from `early` / the final path.
+    let contract = match resolve_contract(env, mode, started, false) {
+        Ok(c) => c,
+        Err(result) => {
+            let r = *result;
+            return early(r.outcome, r.role, r.detail);
+        }
+    };
+
+    // Compile-time kill switch off ⇒ primary unavailable (structural rollback).
+    if !PRIMARY_SERVE_ACTIVATED {
+        return early(
+            ProjectionOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("projection primary read-serving is not activated in this build".to_string()),
+        );
+    }
+    // The cycle only serves under the `primary` flag; `shadow` stays materialize-only.
+    if mode != ProjectionMode::Primary {
+        return early(
+            ProjectionOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("primary-serve cycle requires NOETL_EHDB_PROJECTION=primary".to_string()),
+        );
+    }
+
+    let log = contract.local_reference_log.clone().expect("log present");
+    let tenant = opts
+        .tenant
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = opts
+        .namespace
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    let engine = LocalReferenceProjectionEngine::new(log, tenant, namespace);
+    let consumer = opts
+        .consumer
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CONSUMER.to_string());
+
+    // Deterministic cycle: exec "100" runs to a terminal completed (2 events),
+    // exec "200" one running event — a scope + fold + parity ground truth with a
+    // matching authoritative snapshot so the dual-run parity check is exact.
+    let input = ProjectionPrimaryInput {
+        events: vec![
+            cycle_event(1, 10, "100", "playbook_started", "start", "running"),
+            cycle_event(2, 20, "200", "playbook_started", "start", "running"),
+            cycle_event(3, 11, "100", "playbook.completed", "finish", "completed"),
+        ],
+        authoritative: vec![
+            cycle_auth("100", "completed", 2, true),
+            cycle_auth("200", "running", 1, false),
+        ],
+        authoritative_offset: Some(3),
+    };
+
+    let report = match exercise_primary_serve(&engine, &input, &consumer, &new_transaction_id()) {
+        Ok(r) => r,
+        Err(err) => {
+            return early(
+                classify_helper_error(&err),
+                Some(contract.role),
+                Some(err.to_string()),
+            )
+        }
+    };
+    let served = report.served_by_ehdb();
+
+    // Reversibility (rollback lever 1): flip the flag back to `shadow` in a cloned
+    // env and materialize one more execution over the SAME store.  A clean shadow
+    // materialize plus a whole-store read-back proves the incumbent/shadow read
+    // path is restored with zero data loss and the store grew.
+    let mut shadow_env = env.clone();
+    shadow_env.insert(PROJECTION_MODE_ENV.to_string(), "shadow".to_string());
+    let revert_events = vec![cycle_event(
+        4,
+        30,
+        "300",
+        "playbook_started",
+        "start",
+        "running",
+    )];
+    let revert_auth = vec![
+        cycle_auth("100", "completed", 2, true),
+        cycle_auth("200", "running", 1, false),
+        cycle_auth("300", "running", 1, false),
+    ];
+    let revert = shadow_project(
+        &shadow_env,
+        &revert_events,
+        &revert_auth,
+        Some(4),
+        opts,
+        false,
+    );
+    let rows_after_revert = engine
+        .list_executions(PRIMARY_SERVE_CYCLE_EVENTS + 8)
+        .map(|l| l.total)
+        .unwrap_or(0);
+    let reversible = revert.outcome == ProjectionOutcome::Materialized
+        && rows_after_revert == PRIMARY_SERVE_ROWS_AFTER_REVERT;
+
+    let outcome = if served && reversible {
+        ProjectionOutcome::ServedPrimary
+    } else {
+        ProjectionOutcome::PrimaryDivergence
+    };
+    let detail = if served && reversible {
+        None
+    } else if !served {
+        report.divergence.clone()
+    } else {
+        Some(format!(
+            "reversibility flip-back failed: revert={} rows={}",
+            revert.outcome.as_str(),
+            rows_after_revert
+        ))
+    };
+
+    let duration_seconds = started.elapsed().as_secs_f64();
+    if record_metrics {
+        metrics::record_projection(
+            "primary_serve",
+            outcome.as_str(),
+            outcome.ok(),
+            outcome.degraded(),
+            duration_seconds,
+        );
+    }
+    ProjectionServeResult {
+        mode,
+        outcome,
+        role: Some(contract.role),
+        duration_seconds,
+        served_by_ehdb: served,
+        report: Some(report),
+        reversible,
+        rows_after_revert,
+        detail,
+    }
 }
 
 #[cfg(test)]
@@ -744,9 +1057,11 @@ mod tests {
     }
 
     #[test]
-    fn primary_is_recognised_but_not_activated() {
+    fn primary_serves_authoritatively() {
         let (log, dir) = tmp_log("primary");
         let e = worker_env(log.to_str().unwrap(), "primary");
+        // Phase 9 tier 2: primary is activated, so a primary apply serves the
+        // read-models authoritatively from EHDB (not refused).  Parity holds.
         let r = shadow_project(
             &e,
             &drive_events(),
@@ -756,9 +1071,43 @@ mod tests {
             false,
         );
         assert_eq!(r.mode, ProjectionMode::Primary);
-        assert_eq!(r.outcome, ProjectionOutcome::PrimaryUnavailable);
-        // Structurally impossible to serve primary in this build.
-        assert!(!PRIMARY_SERVE_ACTIVATED);
+        assert_eq!(
+            r.outcome,
+            ProjectionOutcome::ServedPrimary,
+            "{:?}",
+            r.detail
+        );
+        assert_eq!(r.applied, Some(3));
+        assert_eq!(r.checkpoint, Some(3));
+        assert!(r.parity.as_ref().unwrap().holds());
+        // ServedPrimary is only reachable with PRIMARY_SERVE_ACTIVATED == true.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_flags_divergence_on_divergent_authoritative() {
+        let (log, dir) = tmp_log("primary-diverge");
+        let e = worker_env(log.to_str().unwrap(), "primary");
+        // Incumbent claims running/2 but EHDB folds completed/3 → served but the
+        // dual-run parity diverged (degraded).
+        let auth = vec![AuthoritativeExecutionState {
+            execution_id: "100".to_string(),
+            status: "running".to_string(),
+            event_count: 2,
+            terminal: false,
+        }];
+        let r = shadow_project(
+            &e,
+            &drive_events(),
+            &auth,
+            Some(3),
+            &Default::default(),
+            false,
+        );
+        assert_eq!(r.outcome, ProjectionOutcome::PrimaryDivergence);
+        assert!(!r.parity.as_ref().unwrap().holds());
+        // The read-models were still materialized — divergence is a parity verdict.
+        assert_eq!(r.applied, Some(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -814,6 +1163,69 @@ mod tests {
         assert_eq!(second.outcome, ProjectionOutcome::Materialized);
         assert_eq!(second.checkpoint, Some(3));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_served_by_ehdb_and_reversible() {
+        let (log, dir) = tmp_log("cycle");
+        let e = worker_env(log.to_str().unwrap(), "primary");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.mode, ProjectionMode::Primary);
+        assert_eq!(
+            r.outcome,
+            ProjectionOutcome::ServedPrimary,
+            "{:?}",
+            r.detail
+        );
+        assert!(r.served_by_ehdb);
+        let report = r.report.as_ref().unwrap();
+        assert!(report.served_by_ehdb());
+        assert_eq!(report.applied, PRIMARY_SERVE_CYCLE_EVENTS);
+        assert!(
+            report.list_ok && report.scope_ok && report.read_event_ok && report.replay_idempotent
+        );
+        assert!(report.replay_matches && report.dual_run_holds);
+        // Reversibility: flip back to shadow materialized one more execution; the
+        // store is whole and serves the 2 cycle execs + the 1 revert exec.
+        assert!(r.reversible);
+        assert_eq!(r.rows_after_revert, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_off_is_noop() {
+        let e = worker_env("/tmp/unused-proj-cycle.jsonl", "off");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, ProjectionOutcome::Disabled);
+        assert!(r.report.is_none());
+        assert!(!r.served_by_ehdb);
+    }
+
+    #[test]
+    fn primary_serve_cycle_shadow_is_primary_unavailable() {
+        let (log, dir) = tmp_log("cycle-shadow");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        // The cycle only serves under the `primary` flag.
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, ProjectionOutcome::PrimaryUnavailable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_control_plane_guard_refused() {
+        let e: EnvMap = [
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "server"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+            ("NOETL_EHDB_PROJECTION", "primary"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, ProjectionOutcome::GuardRefused);
+        assert!(r.report.is_none());
     }
 
     /// Read-model-derived invariant, asserted structurally: this module must
