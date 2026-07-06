@@ -1,4 +1,5 @@
-//! Disabled-by-default object / blob SHADOW wiring (EHDB Phase 8).
+//! Object / blob SHADOW wiring + PRIMARY-serve cutover (EHDB Phase 8 shadow,
+//! Phase 9 tier-4 primary).
 //!
 //! EHDB's object/blob core engine (the `ehdb_reference::object` driver, ehdb#245)
 //! is the durable content-addressed object engine that Phase 8 puts *underneath*
@@ -17,11 +18,30 @@
 //!   external-store path, then read back and compared for presence / digest /
 //!   length / retrievability parity.  Reads are **never** served from EHDB and the
 //!   authoritative object-store path is untouched.
-//! * `primary` — recognised but **NOT activated this session**.  Cutover to
-//!   serving objects from EHDB is a later gated step; requesting `primary` here is
-//!   refused with a distinct outcome and the worker stays on the external store.
-//!   [`PRIMARY_SERVE_ACTIVATED`] is a compile-time `false` so it is structurally
-//!   impossible for this build to serve primary.
+//! * `primary` — **EHDB serves the platform object tier authoritatively** (Phase 9
+//!   tier 4): the object ops the worker makes (put / get / list / locate / delete)
+//!   are served by the EHDB engine in place of the internal external object store,
+//!   while the served results are dual-run digest-parity-checked against the
+//!   external store.  [`PRIMARY_SERVE_ACTIVATED`] is now `true` so this build *can*
+//!   serve primary; whether it *does* is a pure runtime choice of the
+//!   `NOETL_EHDB_OBJECT` flag (see reversibility).
+//!
+//! ## Reversibility (the cutover safety property)
+//!
+//! The cutover is reversible with **two independent levers**:
+//!
+//! 1. **Runtime flag (operational, instant, no redeploy)** — flip
+//!    `NOETL_EHDB_OBJECT` from `primary` back to `shadow`/`off` and the incumbent
+//!    external object store is the authoritative object tier again immediately.
+//!    Zero data loss: the primary path only ever appends to the derived EHDB
+//!    `KeepAll` object registry + content-addressed blob store and never
+//!    mutates/deletes anything the external store owns, so the external store is
+//!    exactly as it was and the EHDB store stays whole on disk for a later
+//!    re-enable.
+//! 2. **Compile-time kill switch (structural, belt-and-suspenders)** — set
+//!    [`PRIMARY_SERVE_ACTIVATED`] back to `false` and it is structurally
+//!    impossible for the build to serve primary regardless of config (the
+//!    `primary` flag then degrades to [`ObjectOutcome::PrimaryUnavailable`]).
 //!
 //! ## Boundaries (mirror the rest of `src/ehdb`)
 //!
@@ -32,15 +52,18 @@
 //! * **Event-log-authoritative** — an object is a derived platform artifact, not
 //!   an event; this module never authors a NoETL event and never reaches
 //!   `noetl.event` / `POST /api/events` (structurally asserted).  It only touches
-//!   the derived EHDB object fabric via `ehdb_reference`.
+//!   the derived EHDB object fabric via `ehdb_reference`.  **Platform object tier
+//!   only** — tenant/domain (business) object buckets stay external, reached by
+//!   playbook connectors.
 
 use std::path::PathBuf;
 
+use ehdb_reference::object::exercise_primary_serve;
 use ehdb_reference::{
     compare_object_parity, AuthoritativeObject, LocalReferenceObjectBlobDriver, ObjectBlobDriver,
     ObjectDeleteRequest, ObjectGetRequest, ObjectListRequest, ObjectLocateRequest,
-    ObjectParityReport, ObjectPutRequest, DEFAULT_LOCAL_REFERENCE_NAMESPACE,
-    DEFAULT_LOCAL_REFERENCE_TENANT,
+    ObjectParityReport, ObjectPrimaryInput, ObjectPrimaryServeReport, ObjectPutRequest,
+    DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
 use super::contract::{contract_from_env, EhdbClientRole, EhdbContract, EHDB_ENABLED_ENV};
@@ -62,10 +85,15 @@ const MAX_OBJECT_BYTES_CEILING: usize = 16 * 1024 * 1024;
 /// are cleaned up together.
 const OBJECT_STORE_DIRNAME: &str = "ehdb_object_store";
 
-/// Compile-time guard: this build never serves objects from EHDB.  Phase 8 ships
-/// the shadow only; flipping this to `true` is the later, separately-gated primary
-/// cutover and is intentionally not reachable from config.
-pub const PRIMARY_SERVE_ACTIVATED: bool = false;
+/// Compile-time kill switch for primary-serve.  Phase 9 tier 4 activates it
+/// (`true`): this build *can* serve the platform object tier authoritatively from
+/// EHDB.  Whether it *does* is the pure runtime choice of `NOETL_EHDB_OBJECT`
+/// (`primary` serves; `shadow`/`off` keep the internal external object store
+/// authoritative), so the cutover stays reversible without a redeploy.  Setting
+/// this back to `false` is the belt-and-suspenders structural rollback — it makes
+/// primary-serve unreachable regardless of config (the `primary` flag then
+/// degrades to [`ObjectOutcome::PrimaryUnavailable`]).
+pub const PRIMARY_SERVE_ACTIVATED: bool = true;
 
 /// Which object engine the tier is driven by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +102,7 @@ pub enum ObjectMode {
     Off,
     /// Dual-write into EHDB + compare; never serve reads from it.
     Shadow,
-    /// Serve objects from EHDB — recognised but not activated this session.
+    /// Serve objects from EHDB authoritatively (Phase 9 tier 4).
     Primary,
 }
 
@@ -110,7 +138,14 @@ pub enum ObjectOutcome {
     Mirrored,
     /// Object mirrored but the EHDB engine diverged from the authoritative view.
     ParityMismatch,
-    /// `primary` requested but primary-serve is not activated this session.
+    /// `primary` served the object op authoritatively from EHDB + dual-run parity
+    /// against the incumbent external-store path held.
+    ServedPrimary,
+    /// `primary` served the object op from EHDB but the dual-run parity against the
+    /// incumbent diverged (degraded — surfaces on `last_degraded`).
+    PrimaryDivergence,
+    /// `primary` requested but primary-serve is not activated this build (the
+    /// compile-time kill switch is off).
     PrimaryUnavailable,
     /// Blob over the byte cap.
     Rejected,
@@ -128,6 +163,8 @@ impl ObjectOutcome {
             ObjectOutcome::Disabled => "disabled",
             ObjectOutcome::Mirrored => "mirrored",
             ObjectOutcome::ParityMismatch => "parity_mismatch",
+            ObjectOutcome::ServedPrimary => "served_primary",
+            ObjectOutcome::PrimaryDivergence => "primary_divergence",
             ObjectOutcome::PrimaryUnavailable => "primary_unavailable",
             ObjectOutcome::Rejected => "rejected",
             ObjectOutcome::GuardRefused => "guard_refused",
@@ -137,7 +174,10 @@ impl ObjectOutcome {
     }
 
     pub fn ok(&self) -> bool {
-        matches!(self, ObjectOutcome::Disabled | ObjectOutcome::Mirrored)
+        matches!(
+            self,
+            ObjectOutcome::Disabled | ObjectOutcome::Mirrored | ObjectOutcome::ServedPrimary
+        )
     }
 
     /// A degraded (but non-fatal) outcome — surfaces on the `last_degraded` gauge
@@ -146,7 +186,9 @@ impl ObjectOutcome {
     fn degraded(&self) -> bool {
         matches!(
             self,
-            ObjectOutcome::ParityMismatch | ObjectOutcome::Unavailable
+            ObjectOutcome::ParityMismatch
+                | ObjectOutcome::PrimaryDivergence
+                | ObjectOutcome::Unavailable
         )
     }
 }
@@ -456,10 +498,16 @@ pub fn mirror_put(
         byte_len: put.byte_len,
     };
     let report = compare_object_parity(Some(&authoritative), &get);
-    let result_outcome = if report.holds() {
-        ObjectOutcome::Mirrored
-    } else {
-        ObjectOutcome::ParityMismatch
+    // Under `primary` EHDB served the op authoritatively; under `shadow` it
+    // mirrored alongside the authoritative external-store path.  The engine op is
+    // identical — the mode only changes which path is authoritative and how the
+    // outcome is labelled.
+    let serving_primary = mode == ObjectMode::Primary;
+    let result_outcome = match (serving_primary, report.holds()) {
+        (true, true) => ObjectOutcome::ServedPrimary,
+        (true, false) => ObjectOutcome::PrimaryDivergence,
+        (false, true) => ObjectOutcome::Mirrored,
+        (false, false) => ObjectOutcome::ParityMismatch,
     };
     let mut result = make_result(
         "mirror",
@@ -649,6 +697,223 @@ fn step(name: &str, ok: bool, detail: Option<String>) -> ObjectSuiteStep {
     }
 }
 
+/// The logical-key prefix the built-in primary-serve cycle drives.
+const PRIMARY_SERVE_PREFIX: &str = "noetl/env=primary_serve/execution=exec-p/";
+/// How many entries the built-in primary-serve cycle seeds (delete on the last).
+pub const PRIMARY_SERVE_CYCLE_ENTRIES: usize = 3;
+/// Live keys served after the reversibility flip-back: the 2 surviving cycle keys
+/// (last deleted) plus the 1 fresh key the shadow flip-back mirrors.
+const PRIMARY_SERVE_KEYS_AFTER_REVERT: usize = 3;
+
+/// Secret-free result of the authoritative object primary-serve cycle (Phase 9
+/// tier 4) plus the operational reversibility demonstration.
+#[derive(Debug, Clone)]
+pub struct ObjectServeResult {
+    pub mode: ObjectMode,
+    pub outcome: ObjectOutcome,
+    pub role: Option<EhdbClientRole>,
+    pub duration_seconds: f64,
+    /// The EHDB engine served the whole cycle with the external-store semantics
+    /// preserved and dual-run digest-parity intact.
+    pub served_by_ehdb: bool,
+    /// The full served-by-EHDB proof (present once the cycle ran).
+    pub report: Option<ObjectPrimaryServeReport>,
+    /// After serving primary, flipping `NOETL_EHDB_OBJECT` back to `shadow` over the
+    /// same store mirrored a further object and the store served the whole live set
+    /// — the incumbent external object store is restored with zero data loss
+    /// (rollback lever 1 demonstrated operationally).
+    pub reversible: bool,
+    /// The live-key count served after the flip-back (== surviving cycle keys + 1).
+    pub keys_after_revert: usize,
+    pub detail: Option<String>,
+}
+
+/// Drive the authoritative object primary-serve cycle through the EHDB engine and
+/// demonstrate operational reversibility.
+///
+/// In `primary` mode (and with [`PRIMARY_SERVE_ACTIVATED`]) this:
+///
+/// 1. runs [`exercise_primary_serve`] — put + per-key digest-verified served get +
+///    prefix list + in-cluster locate + tombstone delete + fresh-driver replay, all
+///    served authoritatively by EHDB, dual-run digest-parity-checked against an
+///    external-store mirror; then
+/// 2. flips `NOETL_EHDB_OBJECT` back to `shadow` in a cloned env and mirrors a
+///    further object over the SAME store, proving the incumbent/shadow path is
+///    restored and the store stays whole (zero data loss on rollback).
+///
+/// Off/disabled ⇒ strict no-op (byte-identical `/metrics`).  Control-plane roles
+/// are guard-refused before any engine opens.  Never authors a NoETL event and
+/// never writes the external object store — it only exercises the derived EHDB
+/// object fabric.
+pub fn serve_primary_cycle(
+    env: &EnvMap,
+    opts: &ObjectOptions,
+    record_metrics: bool,
+) -> ObjectServeResult {
+    let started = std::time::Instant::now();
+    let mode = ObjectMode::from_env(env);
+
+    // Early-exit builder (no cycle report) that records the `primary_serve`
+    // metric — `disabled` outcomes are skipped by `record_object`, preserving the
+    // byte-identical no-op invariant.
+    let early = |outcome: ObjectOutcome,
+                 role: Option<EhdbClientRole>,
+                 detail: Option<String>|
+     -> ObjectServeResult {
+        let duration_seconds = started.elapsed().as_secs_f64();
+        if record_metrics {
+            metrics::record_object(
+                "primary_serve",
+                outcome.as_str(),
+                outcome.ok(),
+                outcome.degraded(),
+                duration_seconds,
+            );
+        }
+        ObjectServeResult {
+            mode,
+            outcome,
+            role,
+            duration_seconds,
+            served_by_ehdb: false,
+            report: None,
+            reversible: false,
+            keys_after_revert: 0,
+            detail,
+        }
+    };
+
+    // Off mode OR the umbrella EHDB switch disabled ⇒ strict no-op.
+    if mode == ObjectMode::Off || !truthy(env, EHDB_ENABLED_ENV) {
+        return early(ObjectOutcome::Disabled, None, None);
+    }
+
+    // Resolve the contract (guards control-plane / disabled).  Pass
+    // `record_metrics = false` so the only metric recorded here is the
+    // `primary_serve`-labelled one from `early` / the final path.
+    let contract = match resolve_contract("primary_serve", env, mode, started, false) {
+        Ok(c) => c,
+        Err(result) => {
+            let r = *result;
+            return early(r.outcome, r.role, r.detail);
+        }
+    };
+
+    // Compile-time kill switch off ⇒ primary unavailable (structural rollback).
+    if !PRIMARY_SERVE_ACTIVATED {
+        return early(
+            ObjectOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("object primary serve is not activated in this build".to_string()),
+        );
+    }
+    // The cycle only serves under the `primary` flag; `shadow` stays mirror-only.
+    if mode != ObjectMode::Primary {
+        return early(
+            ObjectOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("primary-serve cycle requires NOETL_EHDB_OBJECT=primary".to_string()),
+        );
+    }
+
+    let driver = driver_from(&contract, opts);
+
+    // Deterministic cycle: three distinct platform-artifact keys under one
+    // execution prefix (delete on the last state shard), each with distinct bytes —
+    // a scope + list + locate + delete ground truth with an in-lockstep
+    // external-store mirror so the dual-run digest-parity is exact.
+    let input = ObjectPrimaryInput {
+        prefix: Some(PRIMARY_SERVE_PREFIX.to_string()),
+        entries: vec![
+            (
+                format!("{PRIMARY_SERVE_PREFIX}state/open.feather"),
+                b"arrow-ipc-state-open".to_vec(),
+            ),
+            (
+                format!("{PRIMARY_SERVE_PREFIX}results/s/f/r/a.feather"),
+                b"arrow-ipc-result-frame".to_vec(),
+            ),
+            (
+                format!("{PRIMARY_SERVE_PREFIX}state/sealed.feather"),
+                b"arrow-ipc-state-sealed".to_vec(),
+            ),
+        ],
+    };
+
+    let report = match exercise_primary_serve(&driver, &input, &new_transaction_id()) {
+        Ok(r) => r,
+        Err(err) => {
+            return early(
+                classify_helper_error(&err),
+                Some(contract.role),
+                Some(err.to_string()),
+            )
+        }
+    };
+    let served = report.served_by_ehdb();
+
+    // Reversibility (rollback lever 1): flip the flag back to `shadow` in a cloned
+    // env and mirror one more object over the SAME store.  A clean mirror plus a
+    // whole-store live list proves the incumbent/shadow path is restored with zero
+    // data loss and the store grew.
+    let mut shadow_env = env.clone();
+    shadow_env.insert(OBJECT_MODE_ENV.to_string(), "shadow".to_string());
+    let revert = mirror_put(
+        &shadow_env,
+        &format!("{PRIMARY_SERVE_PREFIX}results/s/f/r/revert.feather"),
+        b"arrow-ipc-revert-frame",
+        opts,
+        false,
+    );
+    let keys_after_revert = driver
+        .list(&ObjectListRequest {
+            prefix: Some(PRIMARY_SERVE_PREFIX.to_string()),
+            limit: 4_096,
+        })
+        .map(|l| l.match_count)
+        .unwrap_or(0);
+    let reversible = revert.outcome == ObjectOutcome::Mirrored
+        && keys_after_revert == PRIMARY_SERVE_KEYS_AFTER_REVERT;
+
+    let outcome = if served && reversible {
+        ObjectOutcome::ServedPrimary
+    } else {
+        ObjectOutcome::PrimaryDivergence
+    };
+    let detail = if served && reversible {
+        None
+    } else if !served {
+        report.divergence.clone()
+    } else {
+        Some(format!(
+            "reversibility flip-back failed: revert={} keys={keys_after_revert}",
+            revert.outcome.as_str(),
+        ))
+    };
+
+    let duration_seconds = started.elapsed().as_secs_f64();
+    if record_metrics {
+        metrics::record_object(
+            "primary_serve",
+            outcome.as_str(),
+            outcome.ok(),
+            outcome.degraded(),
+            duration_seconds,
+        );
+    }
+    ObjectServeResult {
+        mode,
+        outcome,
+        role: Some(contract.role),
+        duration_seconds,
+        served_by_ehdb: served,
+        report: Some(report),
+        reversible,
+        keys_after_revert,
+        detail,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,14 +1047,76 @@ mod tests {
     }
 
     #[test]
-    fn primary_is_recognised_but_not_activated() {
+    fn primary_serves_authoritatively() {
         let (log, dir) = tmp_log("primary");
         let e = worker_env(log.to_str().unwrap(), "primary");
-        let r = mirror_put(&e, STATE_KEY, b"v", &Default::default(), false);
+        // Phase 9 tier 4: primary is activated, so a primary put serves the object
+        // op authoritatively from EHDB (not refused).  Parity holds.
+        let r = mirror_put(&e, STATE_KEY, b"arrow-ipc-bytes", &Default::default(), false);
         assert_eq!(r.mode, ObjectMode::Primary);
-        assert_eq!(r.outcome, ObjectOutcome::PrimaryUnavailable);
-        assert!(!PRIMARY_SERVE_ACTIVATED);
+        assert_eq!(r.outcome, ObjectOutcome::ServedPrimary, "{:?}", r.detail);
+        assert_eq!(r.version, Some(1));
+        assert!(r.parity.as_ref().unwrap().holds());
+        // ServedPrimary is only reachable with PRIMARY_SERVE_ACTIVATED == true.
+        assert!(PRIMARY_SERVE_ACTIVATED);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_served_by_ehdb_and_reversible() {
+        let (log, dir) = tmp_log("cycle");
+        let e = worker_env(log.to_str().unwrap(), "primary");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.mode, ObjectMode::Primary);
+        assert_eq!(r.outcome, ObjectOutcome::ServedPrimary, "{:?}", r.detail);
+        assert!(r.served_by_ehdb);
+        let report = r.report.as_ref().unwrap();
+        assert!(report.served_by_ehdb());
+        assert_eq!(report.put_count, PRIMARY_SERVE_CYCLE_ENTRIES);
+        assert!(report.put_ok && report.get_ok && report.list_ok);
+        assert!(report.locate_ok && report.delete_ok);
+        assert!(report.replay_matches && report.dual_run_holds);
+        // Reversibility: flip back to shadow mirrored one more object; the store is
+        // whole and serves the 2 surviving cycle keys + the 1 revert key.
+        assert!(r.reversible);
+        assert_eq!(r.keys_after_revert, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_off_is_noop() {
+        let e = worker_env("/tmp/unused-object-cycle.jsonl", "off");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, ObjectOutcome::Disabled);
+        assert!(r.report.is_none());
+        assert!(!r.served_by_ehdb);
+    }
+
+    #[test]
+    fn primary_serve_cycle_shadow_is_primary_unavailable() {
+        let (log, dir) = tmp_log("cycle-shadow");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        // The cycle only serves under the `primary` flag.
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, ObjectOutcome::PrimaryUnavailable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_control_plane_guard_refused() {
+        let e: EnvMap = [
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "server"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+            ("NOETL_EHDB_OBJECT", "primary"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, ObjectOutcome::GuardRefused);
+        assert!(r.report.is_none());
     }
 
     #[test]
