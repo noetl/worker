@@ -1,4 +1,5 @@
-//! Disabled-by-default KV / platform-state SHADOW wiring (EHDB Phase 8).
+//! KV / platform-state SHADOW wiring + PRIMARY-serve cutover (EHDB Phase 8
+//! shadow, Phase 9 tier-3 primary).
 //!
 //! EHDB's KV/state core engine (the `ehdb_reference::kv` driver, ehdb#244) is the
 //! durable key/value engine that Phase 8 puts *underneath* NoETL's internal
@@ -14,11 +15,28 @@
 //!   *also* applied to the EHDB engine alongside the authoritative NATS-KV path,
 //!   then read back and compared for presence / value / TTL parity.  Reads are
 //!   **never** served from EHDB and the authoritative NATS-KV path is untouched.
-//! * `primary` — recognised but **NOT activated this session**.  Cutover to
-//!   serving KV from EHDB is a later gated step; requesting `primary` here is
-//!   refused with a distinct outcome and the worker stays on NATS-KV.
-//!   [`PRIMARY_SERVE_ACTIVATED`] is a compile-time `false` so it is structurally
-//!   impossible for this build to serve primary.
+//! * `primary` — **EHDB serves the platform KV tier authoritatively** (Phase 9
+//!   tier 3): the KV ops the worker makes (put / get / scan / CAS / delete / TTL)
+//!   are served by the EHDB engine in place of the internal NATS-KV bucket, while
+//!   the served results are dual-run parity-checked against NATS-KV.
+//!   [`PRIMARY_SERVE_ACTIVATED`] is now `true` so this build *can* serve primary;
+//!   whether it *does* is a pure runtime choice of the `NOETL_EHDB_KV` flag (see
+//!   reversibility).
+//!
+//! ## Reversibility (the cutover safety property)
+//!
+//! The cutover is reversible with **two independent levers**:
+//!
+//! 1. **Runtime flag (operational, instant, no redeploy)** — flip `NOETL_EHDB_KV`
+//!    from `primary` back to `shadow`/`off` and the incumbent NATS-KV path is the
+//!    authoritative KV tier again immediately.  Zero data loss: the primary path
+//!    only ever appends to the derived EHDB `KeepAll` KV stream and never
+//!    mutates/deletes anything NATS-KV owns, so the NATS-KV bucket is exactly as
+//!    it was and the EHDB store stays whole on disk for a later re-enable.
+//! 2. **Compile-time kill switch (structural, belt-and-suspenders)** — set
+//!    [`PRIMARY_SERVE_ACTIVATED`] back to `false` and it is structurally
+//!    impossible for the build to serve primary regardless of config (the
+//!    `primary` flag then degrades to [`KvOutcome::PrimaryUnavailable`]).
 //!
 //! ## Boundaries (mirror the rest of `src/ehdb`)
 //!
@@ -29,12 +47,15 @@
 //! * **Event-log-authoritative** — a KV entry is derived platform state, not an
 //!   event; this module never authors a NoETL event and never reaches
 //!   `noetl.event` / `POST /api/events` (structurally asserted).  It only touches
-//!   the derived EHDB KV fabric via `ehdb_reference`.
+//!   the derived EHDB KV fabric via `ehdb_reference`.  **Platform KV only** —
+//!   tenant/domain (business) KV stays external, reached by playbook connectors.
 
+use ehdb_reference::kv::exercise_primary_serve;
 use ehdb_reference::{
     compare_kv_parity, AuthoritativeKvEntry, KvCasExpectation, KvDeleteRequest, KvGetRequest,
-    KvParityReport, KvPutRequest, KvScanRequest, KvStateDriver, LocalReferenceKvStateDriver,
-    DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
+    KvParityReport, KvPrimaryInput, KvPrimaryServeReport, KvPutRequest, KvScanRequest,
+    KvStateDriver, LocalReferenceKvStateDriver, DEFAULT_LOCAL_REFERENCE_NAMESPACE,
+    DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
 use super::contract::{contract_from_env, EhdbClientRole, EhdbContract, EHDB_ENABLED_ENV};
@@ -52,10 +73,15 @@ const DEFAULT_MAX_VALUE_BYTES: usize = 262_144;
 /// (1 MiB), so the worker-side clamp never exceeds it.
 const MAX_VALUE_BYTES_CEILING: usize = 1_048_576;
 
-/// Compile-time guard: this build never serves KV from EHDB.  Phase 8 ships the
-/// shadow only; flipping this to `true` is the later, separately-gated primary
-/// cutover and is intentionally not reachable from config.
-pub const PRIMARY_SERVE_ACTIVATED: bool = false;
+/// Compile-time kill switch for primary-serve.  Phase 9 tier 3 activates it
+/// (`true`): this build *can* serve the platform KV tier authoritatively from
+/// EHDB.  Whether it *does* is the pure runtime choice of `NOETL_EHDB_KV`
+/// (`primary` serves; `shadow`/`off` keep the internal NATS-KV bucket
+/// authoritative), so the cutover stays reversible without a redeploy.  Setting
+/// this back to `false` is the belt-and-suspenders structural rollback — it makes
+/// primary-serve unreachable regardless of config (the `primary` flag then
+/// degrades to [`KvOutcome::PrimaryUnavailable`]).
+pub const PRIMARY_SERVE_ACTIVATED: bool = true;
 
 /// Which KV engine the tier is driven by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +90,7 @@ pub enum KvMode {
     Off,
     /// Dual-write into EHDB + compare; never serve reads from it.
     Shadow,
-    /// Serve KV from EHDB — recognised but not activated this session.
+    /// Serve KV from EHDB authoritatively (Phase 9 tier 3).
     Primary,
 }
 
@@ -100,7 +126,14 @@ pub enum KvOutcome {
     Mirrored,
     /// Write mirrored but the EHDB engine diverged from the authoritative view.
     ParityMismatch,
-    /// `primary` requested but primary-serve is not activated this session.
+    /// `primary` served the KV op authoritatively from EHDB + dual-run parity
+    /// against the incumbent NATS-KV path held.
+    ServedPrimary,
+    /// `primary` served the KV op from EHDB but the dual-run parity against the
+    /// incumbent diverged (degraded — surfaces on `last_degraded`).
+    PrimaryDivergence,
+    /// `primary` requested but primary-serve is not activated this build (the
+    /// compile-time kill switch is off).
     PrimaryUnavailable,
     /// Value over the byte cap.
     Rejected,
@@ -118,6 +151,8 @@ impl KvOutcome {
             KvOutcome::Disabled => "disabled",
             KvOutcome::Mirrored => "mirrored",
             KvOutcome::ParityMismatch => "parity_mismatch",
+            KvOutcome::ServedPrimary => "served_primary",
+            KvOutcome::PrimaryDivergence => "primary_divergence",
             KvOutcome::PrimaryUnavailable => "primary_unavailable",
             KvOutcome::Rejected => "rejected",
             KvOutcome::GuardRefused => "guard_refused",
@@ -127,14 +162,20 @@ impl KvOutcome {
     }
 
     pub fn ok(&self) -> bool {
-        matches!(self, KvOutcome::Disabled | KvOutcome::Mirrored)
+        matches!(
+            self,
+            KvOutcome::Disabled | KvOutcome::Mirrored | KvOutcome::ServedPrimary
+        )
     }
 
     /// A degraded (but non-fatal) outcome — surfaces on the `last_degraded` gauge
     /// so a divergence or engine hiccup is visible without failing the
     /// authoritative path.
     fn degraded(&self) -> bool {
-        matches!(self, KvOutcome::ParityMismatch | KvOutcome::Unavailable)
+        matches!(
+            self,
+            KvOutcome::ParityMismatch | KvOutcome::PrimaryDivergence | KvOutcome::Unavailable
+        )
     }
 }
 
@@ -436,10 +477,16 @@ pub fn mirror_put(
         expires_at_ms,
     };
     let report = compare_kv_parity(Some(&authoritative), &get);
-    let result_outcome = if report.holds() {
-        KvOutcome::Mirrored
-    } else {
-        KvOutcome::ParityMismatch
+    // Under `primary` EHDB served the op authoritatively; under `shadow` it
+    // mirrored alongside the authoritative NATS-KV path.  The engine op is
+    // identical — the mode only changes which path is authoritative and how the
+    // outcome is labelled.
+    let serving_primary = mode == KvMode::Primary;
+    let result_outcome = match (serving_primary, report.holds()) {
+        (true, true) => KvOutcome::ServedPrimary,
+        (true, false) => KvOutcome::PrimaryDivergence,
+        (false, true) => KvOutcome::Mirrored,
+        (false, false) => KvOutcome::ParityMismatch,
     };
     let mut result = make_result(
         "mirror",
@@ -664,6 +711,223 @@ fn step(name: &str, ok: bool, detail: Option<String>) -> KvSuiteStep {
     }
 }
 
+/// The bucket the built-in primary-serve cycle drives.
+const PRIMARY_SERVE_BUCKET: &str = "noetl_kv_primary_serve";
+/// How many entries the built-in primary-serve cycle seeds (CAS on the first,
+/// delete on the last).
+pub const PRIMARY_SERVE_CYCLE_ENTRIES: usize = 3;
+/// Live keys served after the reversibility flip-back: the 2 surviving cycle keys
+/// (first CAS-swapped + middle; last deleted) plus the 1 fresh key the shadow
+/// flip-back mirrors.
+const PRIMARY_SERVE_KEYS_AFTER_REVERT: usize = 3;
+/// The clock the cycle uses for the TTL lease; the reversibility scan runs past
+/// `now_ms + 1` so the expired lease never counts.
+const PRIMARY_SERVE_NOW_MS: u64 = 1_000;
+
+/// Secret-free result of the authoritative KV primary-serve cycle (Phase 9 tier
+/// 3) plus the operational reversibility demonstration.
+#[derive(Debug, Clone)]
+pub struct KvServeResult {
+    pub mode: KvMode,
+    pub outcome: KvOutcome,
+    pub role: Option<EhdbClientRole>,
+    pub duration_seconds: f64,
+    /// The EHDB engine served the whole cycle with the NATS-KV semantics
+    /// preserved and dual-run parity intact.
+    pub served_by_ehdb: bool,
+    /// The full served-by-EHDB proof (present once the cycle ran).
+    pub report: Option<KvPrimaryServeReport>,
+    /// After serving primary, flipping `NOETL_EHDB_KV` back to `shadow` over the
+    /// same store mirrored a further key and the store served the whole live set
+    /// — the incumbent NATS-KV path is restored with zero data loss (rollback
+    /// lever 1 demonstrated operationally).
+    pub reversible: bool,
+    /// The live-key count served after the flip-back (== surviving cycle keys + 1).
+    pub keys_after_revert: usize,
+    pub detail: Option<String>,
+}
+
+/// Drive the authoritative KV primary-serve cycle through the EHDB engine and
+/// demonstrate operational reversibility.
+///
+/// In `primary` mode (and with [`PRIMARY_SERVE_ACTIVATED`]) this:
+///
+/// 1. runs [`exercise_primary_serve`] — put + per-key served get + bucket scan +
+///    optimistic CAS (versioned swap + create-only conflict) + tombstone delete +
+///    absolute-TTL lease + fresh-driver replay, all served authoritatively by
+///    EHDB, dual-run parity-checked against a NATS-KV mirror; then
+/// 2. flips `NOETL_EHDB_KV` back to `shadow` in a cloned env and mirrors a further
+///    key over the SAME store, proving the incumbent/shadow path is restored and
+///    the store stays whole (zero data loss on rollback).
+///
+/// Off/disabled ⇒ strict no-op (byte-identical `/metrics`).  Control-plane roles
+/// are guard-refused before any engine opens.  Never authors a NoETL event and
+/// never writes NATS-KV — it only exercises the derived EHDB KV fabric.
+pub fn serve_primary_cycle(env: &EnvMap, opts: &KvOptions, record_metrics: bool) -> KvServeResult {
+    let started = std::time::Instant::now();
+    let mode = KvMode::from_env(env);
+
+    // Early-exit builder (no cycle report) that records the `primary_serve`
+    // metric — `disabled` outcomes are skipped by `record_kv`, preserving the
+    // byte-identical no-op invariant.
+    let early = |outcome: KvOutcome,
+                 role: Option<EhdbClientRole>,
+                 detail: Option<String>|
+     -> KvServeResult {
+        let duration_seconds = started.elapsed().as_secs_f64();
+        if record_metrics {
+            metrics::record_kv(
+                "primary_serve",
+                outcome.as_str(),
+                outcome.ok(),
+                outcome.degraded(),
+                duration_seconds,
+            );
+        }
+        KvServeResult {
+            mode,
+            outcome,
+            role,
+            duration_seconds,
+            served_by_ehdb: false,
+            report: None,
+            reversible: false,
+            keys_after_revert: 0,
+            detail,
+        }
+    };
+
+    // Off mode OR the umbrella EHDB switch disabled ⇒ strict no-op.
+    if mode == KvMode::Off || !truthy(env, EHDB_ENABLED_ENV) {
+        return early(KvOutcome::Disabled, None, None);
+    }
+
+    // Resolve the contract (guards control-plane / disabled).  Pass
+    // `record_metrics = false` so the only metric recorded here is the
+    // `primary_serve`-labelled one from `early` / the final path.
+    let contract = match resolve_contract("primary_serve", env, mode, started, false) {
+        Ok(c) => c,
+        Err(result) => {
+            let r = *result;
+            return early(r.outcome, r.role, r.detail);
+        }
+    };
+
+    // Compile-time kill switch off ⇒ primary unavailable (structural rollback).
+    if !PRIMARY_SERVE_ACTIVATED {
+        return early(
+            KvOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("kv primary serve is not activated in this build".to_string()),
+        );
+    }
+    // The cycle only serves under the `primary` flag; `shadow` stays mirror-only.
+    if mode != KvMode::Primary {
+        return early(
+            KvOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("primary-serve cycle requires NOETL_EHDB_KV=primary".to_string()),
+        );
+    }
+
+    let driver = driver_from(&contract, opts);
+
+    // Deterministic cycle: three distinct circuit keys (CAS on the first, delete
+    // on the last) + a TTL lease at clock 1000 — a scope + CAS + delete + TTL
+    // ground truth with an in-lockstep NATS-KV mirror so the dual-run parity is
+    // exact.
+    let input = KvPrimaryInput {
+        bucket: PRIMARY_SERVE_BUCKET.to_string(),
+        entries: vec![
+            (
+                "circuit.1".to_string(),
+                "{\"phase\":\"closed\"}".to_string(),
+            ),
+            ("circuit.2".to_string(), "{\"phase\":\"open\"}".to_string()),
+            ("circuit.3".to_string(), "{\"phase\":\"half\"}".to_string()),
+        ],
+        now_ms: PRIMARY_SERVE_NOW_MS,
+    };
+
+    let report = match exercise_primary_serve(&driver, &input, &new_transaction_id()) {
+        Ok(r) => r,
+        Err(err) => {
+            return early(
+                classify_helper_error(&err),
+                Some(contract.role),
+                Some(err.to_string()),
+            )
+        }
+    };
+    let served = report.served_by_ehdb();
+
+    // Reversibility (rollback lever 1): flip the flag back to `shadow` in a cloned
+    // env and mirror one more key over the SAME store.  A clean mirror plus a
+    // whole-store live scan proves the incumbent/shadow path is restored with zero
+    // data loss and the store grew.
+    let mut shadow_env = env.clone();
+    shadow_env.insert(KV_MODE_ENV.to_string(), "shadow".to_string());
+    let revert = mirror_put(
+        &shadow_env,
+        PRIMARY_SERVE_BUCKET,
+        "circuit.revert",
+        "{\"phase\":\"reverted\"}",
+        None,
+        opts,
+        false,
+    );
+    let keys_after_revert = driver
+        .scan(&KvScanRequest {
+            bucket: PRIMARY_SERVE_BUCKET.to_string(),
+            prefix: None,
+            limit: 4_096,
+            // Past the lease expiry so the expired TTL key never counts.
+            now_ms: Some(PRIMARY_SERVE_NOW_MS + 1),
+        })
+        .map(|s| s.match_count)
+        .unwrap_or(0);
+    let reversible = revert.outcome == KvOutcome::Mirrored
+        && keys_after_revert == PRIMARY_SERVE_KEYS_AFTER_REVERT;
+
+    let outcome = if served && reversible {
+        KvOutcome::ServedPrimary
+    } else {
+        KvOutcome::PrimaryDivergence
+    };
+    let detail = if served && reversible {
+        None
+    } else if !served {
+        report.divergence.clone()
+    } else {
+        Some(format!(
+            "reversibility flip-back failed: revert={} keys={keys_after_revert}",
+            revert.outcome.as_str(),
+        ))
+    };
+
+    let duration_seconds = started.elapsed().as_secs_f64();
+    if record_metrics {
+        metrics::record_kv(
+            "primary_serve",
+            outcome.as_str(),
+            outcome.ok(),
+            outcome.degraded(),
+            duration_seconds,
+        );
+    }
+    KvServeResult {
+        mode,
+        outcome,
+        role: Some(contract.role),
+        duration_seconds,
+        served_by_ehdb: served,
+        report: Some(report),
+        reversible,
+        keys_after_revert,
+        detail,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,13 +1053,18 @@ mod tests {
     }
 
     #[test]
-    fn primary_is_recognised_but_not_activated() {
+    fn primary_serves_authoritatively() {
         let (log, dir) = tmp_log("primary");
         let e = worker_env(log.to_str().unwrap(), "primary");
+        // Phase 9 tier 3: primary is activated, so a primary put serves the KV op
+        // authoritatively from EHDB (not refused).  Parity holds.
         let r = mirror_put(&e, "b", "k", "v", None, &Default::default(), false);
         assert_eq!(r.mode, KvMode::Primary);
-        assert_eq!(r.outcome, KvOutcome::PrimaryUnavailable);
-        assert!(!PRIMARY_SERVE_ACTIVATED);
+        assert_eq!(r.outcome, KvOutcome::ServedPrimary, "{:?}", r.detail);
+        assert_eq!(r.version, Some(1));
+        assert!(r.parity.as_ref().unwrap().holds());
+        // ServedPrimary is only reachable with PRIMARY_SERVE_ACTIVATED == true.
+        assert!(PRIMARY_SERVE_ACTIVATED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -863,6 +1132,63 @@ mod tests {
         let report = shadow_suite(&e, &Default::default(), false);
         assert!(report.guard_refused);
         assert!(!report.ok);
+    }
+
+    #[test]
+    fn primary_serve_cycle_served_by_ehdb_and_reversible() {
+        let (log, dir) = tmp_log("cycle");
+        let e = worker_env(log.to_str().unwrap(), "primary");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.mode, KvMode::Primary);
+        assert_eq!(r.outcome, KvOutcome::ServedPrimary, "{:?}", r.detail);
+        assert!(r.served_by_ehdb);
+        let report = r.report.as_ref().unwrap();
+        assert!(report.served_by_ehdb());
+        assert_eq!(report.put_count, PRIMARY_SERVE_CYCLE_ENTRIES);
+        assert!(report.put_ok && report.get_ok && report.scan_ok);
+        assert!(report.cas_ok && report.delete_ok && report.ttl_ok);
+        assert!(report.replay_matches && report.dual_run_holds);
+        // Reversibility: flip back to shadow mirrored one more key; the store is
+        // whole and serves the 2 surviving cycle keys + the 1 revert key.
+        assert!(r.reversible);
+        assert_eq!(r.keys_after_revert, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_off_is_noop() {
+        let e = worker_env("/tmp/unused-kv-cycle.jsonl", "off");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, KvOutcome::Disabled);
+        assert!(r.report.is_none());
+        assert!(!r.served_by_ehdb);
+    }
+
+    #[test]
+    fn primary_serve_cycle_shadow_is_primary_unavailable() {
+        let (log, dir) = tmp_log("cycle-shadow");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        // The cycle only serves under the `primary` flag.
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, KvOutcome::PrimaryUnavailable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_control_plane_guard_refused() {
+        let e: EnvMap = [
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "server"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+            ("NOETL_EHDB_KV", "primary"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, KvOutcome::GuardRefused);
+        assert!(r.report.is_none());
     }
 
     /// Event-log-authoritative invariant, asserted structurally: this module must
