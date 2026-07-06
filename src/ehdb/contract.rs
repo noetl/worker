@@ -154,6 +154,14 @@ fn non_empty<'a>(env: &'a EnvMap, key: &str) -> Option<&'a String> {
     env.get(key).filter(|v| !v.trim().is_empty())
 }
 
+/// Whether the umbrella EHDB integration is enabled (`NOETL_EHDB_ENABLED`
+/// truthy).  The single umbrella gate every tier sits under; the Phase-10
+/// backend-config resolver reads it to reject `shadow`/`primary` tiers while the
+/// integration is disabled.
+pub fn enabled_from_env(env: &EnvMap) -> bool {
+    truthy(env.get(EHDB_ENABLED_ENV))
+}
+
 /// Resolve the client role from the env, tolerating an unknown value (used by
 /// readiness to classify).  `None` = unset/unknown.
 pub fn safe_client_role(env: &EnvMap) -> Option<EhdbClientRole> {
