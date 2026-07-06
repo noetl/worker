@@ -347,7 +347,7 @@ pub fn render_lines() -> Vec<String> {
         &mut lines,
         &s.eventlog,
         "eventlog",
-        "EHDB event-log shadow operations by operation and outcome",
+        "EHDB event-log operations (shadow mirror + Phase-9 primary serve) by operation and outcome",
     );
     render_op_family(
         &mut lines,
