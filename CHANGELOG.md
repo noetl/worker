@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.62.0](https://github.com/noetl/worker/compare/v5.61.0...v5.62.0) (2026-07-06)
+
+### Features
+
+* **ehdb:** Phase 9 tier-2 projection primary-serve activation ([#162](https://github.com/noetl/worker/issues/162)) ([a56583c](https://github.com/noetl/worker/commit/a56583cd2db3d3fcbc0a987156d056576dbeba7e)), closes [worker#161](https://github.com/noetl/worker/issues/161) [ehdb#248](https://github.com/noetl/ehdb/issues/248) [noetl/ai-meta#234](https://github.com/noetl/ai-meta/issues/234) [ehdb#248](https://github.com/noetl/ehdb/issues/248)
+
 ## [5.61.0](https://github.com/noetl/worker/compare/v5.60.0...v5.61.0) (2026-07-06)
 
 ### Features
