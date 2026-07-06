@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 
+pub mod backends;
 pub mod contract;
 pub mod dataplane;
 pub mod eventlog;

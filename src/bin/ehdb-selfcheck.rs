@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 
 use noetl_worker::ehdb::{
-    self, dataplane, eventlog, eventstream, kv, object, projection, rag, readiness, systemstore,
-    vector,
+    self, backends, dataplane, eventlog, eventstream, kv, object, projection, rag, readiness,
+    systemstore, vector,
 };
 
 fn main() -> ExitCode {
@@ -35,6 +35,7 @@ fn main() -> ExitCode {
     let env = ehdb::process_env();
 
     match args.first().map(String::as_str) {
+        Some("config") | Some("backends") => run_backends(&env),
         Some("readiness") => run_readiness(&env),
         Some("append") => run_append(&env, &flags),
         Some("read") => run_read(&env, &flags),
@@ -73,6 +74,51 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Phase 10 — print the resolved per-tier backend+mode matrix (secret-free) so
+/// an operator can verify which engine serves each of the five platform tiers.
+/// Read-only: opens no engine, so no control-plane guard applies.  Exit 0 when
+/// the config is coherent, 4 when it is incoherent (a `shadow`/`primary` tier
+/// without `NOETL_EHDB_ENABLED`, or a data-plane tier on a control-plane role).
+fn run_backends(env: &ehdb::EnvMap) -> ExitCode {
+    let resolved = backends::resolve(env);
+    let matrix = resolved.to_json();
+    let rendered = serde_json::to_string(&matrix).unwrap_or_default();
+    let secret_free = backends_is_secret_free(&rendered, env);
+    println!(
+        "{}",
+        serde_json::json!({
+            "op": "config",
+            "coherent": resolved.is_coherent(),
+            "errors": resolved.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            "secret_free": secret_free,
+            "matrix": matrix,
+        })
+    );
+    if resolved.is_coherent() && secret_free {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(4)
+    }
+}
+
+/// Defensive secret-free assertion for the rendered matrix: no value of any
+/// sensitive-keyed env var (SECRET/TOKEN/PASSWORD/KEY/CREDENTIAL) may appear in
+/// the output.  The matrix is secret-free by construction (it reflects only tier
+/// keys/modes/backends + the role token, never an env value), so this always
+/// holds; the check is belt-and-suspenders.
+fn backends_is_secret_free(rendered: &str, env: &ehdb::EnvMap) -> bool {
+    env.iter().all(|(k, v)| {
+        let ku = k.to_ascii_uppercase();
+        let sensitive = ku.contains("SECRET")
+            || ku.contains("TOKEN")
+            || ku.contains("PASSWORD")
+            || ku.contains("KEY")
+            || ku.contains("CREDENTIAL");
+        let val = v.trim();
+        !(sensitive && !val.is_empty() && rendered.contains(val))
+    })
 }
 
 fn run_readiness(env: &ehdb::EnvMap) -> ExitCode {
@@ -1845,8 +1891,9 @@ fn usage_exit() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: ehdb-selfcheck <readiness|append|read|project|consume|ack|suite|\
+    "usage: ehdb-selfcheck <config|readiness|append|read|project|consume|ack|suite|\
      publish-system|bind-system|resolve-system|system-suite|metrics> [--flag value ...]\n  \
+     config          (Phase 10: print resolved per-tier backend+mode matrix, secret-free)\n  \
      append          --stream <s> --subject <sub> --payload <text>\n  \
      read            --stream <s> [--limit <n>] [--after <seq>]\n  \
      project         --stream <s> --subject <sub> --payload <text>\n  \
