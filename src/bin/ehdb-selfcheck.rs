@@ -57,6 +57,7 @@ fn main() -> ExitCode {
         Some("projection-primary-serve") => run_projection_primary_serve(&env, &flags),
         Some("mirror-kv") => run_mirror_kv(&env, &flags),
         Some("kv-suite") => run_kv_suite(&env, &flags),
+        Some("kv-primary-serve") => run_kv_primary_serve(&env, &flags),
         Some("mirror-object") => run_mirror_object(&env, &flags),
         Some("object-suite") => run_object_suite(&env, &flags),
         Some("mirror-vector") => run_mirror_vector(&env, &flags),
@@ -1326,8 +1327,68 @@ fn kv_exit(outcome: kv::KvOutcome) -> ExitCode {
     match outcome {
         O::GuardRefused | O::Invalid | O::PrimaryUnavailable => ExitCode::from(4),
         O::Rejected => ExitCode::from(3),
-        O::Unavailable | O::ParityMismatch => ExitCode::from(5),
+        O::Unavailable | O::ParityMismatch | O::PrimaryDivergence => ExitCode::from(5),
         _ => ExitCode::SUCCESS,
+    }
+}
+
+/// Phase 9 tier-3 primary cutover: serve the platform KV tier authoritatively
+/// from EHDB and prove it in one process.  Off / disabled ⇒ byte-identical no-op
+/// (served=false + empty metrics).  Enabled + `NOETL_EHDB_KV=primary` ⇒ the full
+/// authoritative cycle (put → get → scan → CAS → delete → TTL → replay) is
+/// served-by-EHDB with dual-run parity, AND flipping back to `shadow` restores the
+/// incumbent NATS-KV path over the same store with zero data loss (reversibility).
+/// Exit 0 only when served-by-EHDB AND reversible AND metrics stay secret-free.
+fn run_kv_primary_serve(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let r = kv::serve_primary_cycle(env, &kv_opts(flags), true);
+
+    // Off / disabled probe: byte-identical no-op, same shape as `kv-suite`.
+    if r.outcome == kv::KvOutcome::Disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-kv-primary-serve",
+                "ehdb": "disabled",
+                "mode": r.mode.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let metrics = render_metrics();
+    let secret_free = metrics_is_secret_free(&metrics);
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-kv-primary-serve",
+            "ehdb": "enabled",
+            "op": "kv-primary-serve",
+            "mode": r.mode.as_str(),
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "served_by_ehdb": r.served_by_ehdb,
+            "reversible": r.reversible,
+            "keys_after_revert": r.keys_after_revert,
+            "duration_seconds": round6(r.duration_seconds),
+            "detail": r.detail,
+            "report": r.report,
+            "metrics_secret_free": secret_free,
+        })
+    );
+    print!("{metrics}");
+
+    if r.outcome == kv::KvOutcome::ServedPrimary && r.served_by_ehdb && r.reversible && secret_free
+    {
+        ExitCode::SUCCESS
+    } else {
+        kv_exit(r.outcome)
     }
 }
 
@@ -1679,6 +1740,7 @@ fn usage() -> &'static str {
      projection-primary-serve  (Phase 9 tier 2: serve read-models from EHDB + reversibility)\n  \
      mirror-kv       --bucket <b> --key <k> --value <text> [--expires-at-ms <n>]\n  \
      kv-suite\n  \
+     kv-primary-serve  (Phase 9 tier 3: serve platform KV from EHDB + reversibility)\n  \
      mirror-object   --key <k> --value <text>\n  \
      object-suite\n  \
      mirror-vector   --collection <c> --point-id <id> --model-id <m> --vector <f1,f2,..> [--payload <text>]\n  \
