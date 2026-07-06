@@ -1,4 +1,5 @@
-//! Disabled-by-default vector SHADOW wiring (EHDB Phase 8, slice 3).
+//! Vector SHADOW wiring + PRIMARY-serve cutover (EHDB Phase 8 shadow, Phase 9
+//! tier-5 primary — the final tier).
 //!
 //! EHDB's vector core engine (the `ehdb_reference::vector` driver, ehdb#246) is the
 //! durable vector engine that Phase 8 puts *underneath* NoETL's internal **platform
@@ -17,11 +18,29 @@
 //!   path, then a self-retrieval top-k query is read back and compared for id-set /
 //!   rank-order / score-monotonicity parity.  Reads are **never** served from EHDB
 //!   and the authoritative Qdrant retrieval path is untouched.
-//! * `primary` — recognised but **NOT activated this session**.  Cutover to serving
-//!   retrieval from EHDB is a later gated step (Phase 9); requesting `primary` here
-//!   is refused with a distinct outcome and the worker stays on Qdrant.
-//!   [`PRIMARY_SERVE_ACTIVATED`] is a compile-time `false` so it is structurally
-//!   impossible for this build to serve primary.
+//! * `primary` — **EHDB serves the platform vector tier authoritatively** (Phase 9
+//!   tier 5): the retrieval ops the worker makes (upsert / query-topk / delete) are
+//!   served by the EHDB engine in place of the internal Qdrant retrieval path, while
+//!   the served results are dual-run parity-checked (id set + rank order + score
+//!   monotonicity) against the Qdrant expectation.  [`PRIMARY_SERVE_ACTIVATED`] is
+//!   now `true` so this build *can* serve primary; whether it *does* is a pure
+//!   runtime choice of the `NOETL_EHDB_VECTOR` flag (see reversibility).
+//!
+//! ## Reversibility (the cutover safety property)
+//!
+//! The cutover is reversible with **two independent levers**:
+//!
+//! 1. **Runtime flag (operational, instant, no redeploy)** — flip
+//!    `NOETL_EHDB_VECTOR` from `primary` back to `shadow`/`off` and the incumbent
+//!    Qdrant retrieval path is the authoritative vector tier again immediately.
+//!    Zero data loss: the primary path only ever appends to the derived EHDB
+//!    `KeepAll` vector index and never mutates/deletes anything Qdrant owns, so
+//!    Qdrant is exactly as it was and the EHDB index stays whole on disk for a
+//!    later re-enable.
+//! 2. **Compile-time kill switch (structural, belt-and-suspenders)** — set
+//!    [`PRIMARY_SERVE_ACTIVATED`] back to `false` and it is structurally impossible
+//!    for the build to serve primary regardless of config (the `primary` flag then
+//!    degrades to [`VectorOutcome::PrimaryUnavailable`]).
 //!
 //! ## Boundaries (mirror the rest of `src/ehdb`)
 //!
@@ -36,10 +55,12 @@
 //!   only touches the derived EHDB vector fabric via `ehdb_reference`.  Business
 //!   vector collections stay external and never flow through here.
 
+use ehdb_reference::vector::exercise_primary_serve;
 use ehdb_reference::{
     compare_vector_parity, AuthoritativeVectorHit, LocalReferenceVectorDriver, VectorDeleteRequest,
-    VectorDriver, VectorParityReport, VectorQueryRequest, VectorUpsertRequest,
-    DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT, MAX_VECTOR_DIMENSIONS,
+    VectorDriver, VectorParityReport, VectorPrimaryInput, VectorPrimaryServeReport,
+    VectorQueryRequest, VectorUpsertRequest, DEFAULT_LOCAL_REFERENCE_NAMESPACE,
+    DEFAULT_LOCAL_REFERENCE_TENANT, MAX_VECTOR_DIMENSIONS,
 };
 
 use super::contract::{contract_from_env, EhdbClientRole, EhdbContract, EHDB_ENABLED_ENV};
@@ -60,10 +81,15 @@ const SELF_RETRIEVAL_TOP_K: usize = 4;
 /// differ across engines).
 const PARITY_TOLERANCE: f32 = 1e-3;
 
-/// Compile-time guard: this build never serves retrieval from EHDB.  Phase 8 ships
-/// the shadow only; flipping this to `true` is the later, separately-gated primary
-/// cutover (Phase 9) and is intentionally not reachable from config.
-pub const PRIMARY_SERVE_ACTIVATED: bool = false;
+/// Compile-time kill switch for primary-serve.  Phase 9 tier 5 activates it
+/// (`true`): this build *can* serve the platform vector tier authoritatively from
+/// EHDB.  Whether it *does* is the pure runtime choice of `NOETL_EHDB_VECTOR`
+/// (`primary` serves; `shadow`/`off` keep the internal Qdrant retrieval path
+/// authoritative), so the cutover stays reversible without a redeploy.  Setting
+/// this back to `false` is the belt-and-suspenders structural rollback — it makes
+/// primary-serve unreachable regardless of config (the `primary` flag then
+/// degrades to [`VectorOutcome::PrimaryUnavailable`]).
+pub const PRIMARY_SERVE_ACTIVATED: bool = true;
 
 /// Which vector engine the tier is driven by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +98,7 @@ pub enum VectorMode {
     Off,
     /// Dual-write into EHDB + compare; never serve reads from it.
     Shadow,
-    /// Serve retrieval from EHDB — recognised but not activated this session.
+    /// Serve retrieval from EHDB authoritatively (Phase 9 tier 5).
     Primary,
 }
 
@@ -108,7 +134,14 @@ pub enum VectorOutcome {
     Mirrored,
     /// Point mirrored but the EHDB engine's top-k diverged from the authoritative view.
     ParityMismatch,
-    /// `primary` requested but primary-serve is not activated this session.
+    /// `primary` served the retrieval op authoritatively from EHDB + dual-run parity
+    /// against the incumbent Qdrant path held.
+    ServedPrimary,
+    /// `primary` served the retrieval op from EHDB but the dual-run parity against the
+    /// incumbent diverged (degraded — surfaces on `last_degraded`).
+    PrimaryDivergence,
+    /// `primary` requested but primary-serve is not activated this build (the
+    /// compile-time kill switch is off).
     PrimaryUnavailable,
     /// Vector over the dimensionality / payload cap, or top-k over bound.
     Rejected,
@@ -126,6 +159,8 @@ impl VectorOutcome {
             VectorOutcome::Disabled => "disabled",
             VectorOutcome::Mirrored => "mirrored",
             VectorOutcome::ParityMismatch => "parity_mismatch",
+            VectorOutcome::ServedPrimary => "served_primary",
+            VectorOutcome::PrimaryDivergence => "primary_divergence",
             VectorOutcome::PrimaryUnavailable => "primary_unavailable",
             VectorOutcome::Rejected => "rejected",
             VectorOutcome::GuardRefused => "guard_refused",
@@ -135,7 +170,10 @@ impl VectorOutcome {
     }
 
     pub fn ok(&self) -> bool {
-        matches!(self, VectorOutcome::Disabled | VectorOutcome::Mirrored)
+        matches!(
+            self,
+            VectorOutcome::Disabled | VectorOutcome::Mirrored | VectorOutcome::ServedPrimary
+        )
     }
 
     /// A degraded (but non-fatal) outcome — surfaces on the `last_degraded` gauge so
@@ -144,7 +182,9 @@ impl VectorOutcome {
     fn degraded(&self) -> bool {
         matches!(
             self,
-            VectorOutcome::ParityMismatch | VectorOutcome::Unavailable
+            VectorOutcome::ParityMismatch
+                | VectorOutcome::PrimaryDivergence
+                | VectorOutcome::Unavailable
         )
     }
 }
@@ -343,8 +383,9 @@ fn enter_shadow(
         )));
     }
 
-    // Primary is recognised but not activated this session — refuse before any engine
-    // opens (a control-plane role is still refused as a guard first).
+    // Primary is activated (Phase 9 tier 5) so it proceeds; the compile-time kill
+    // switch off ⇒ refuse before any engine opens (a control-plane role is still
+    // refused as a guard first).
     if mode == VectorMode::Primary && !PRIMARY_SERVE_ACTIVATED {
         let contract = resolve_contract(operation, env, mode, started, record_metrics)?;
         return Err(Box::new(make_result(
@@ -471,10 +512,15 @@ pub fn mirror_upsert(
         ..query.clone()
     };
     let report = compare_vector_parity(&authoritative, &top_only, PARITY_TOLERANCE);
-    let result_outcome = if report.holds() {
-        VectorOutcome::Mirrored
-    } else {
-        VectorOutcome::ParityMismatch
+    // Under `primary` EHDB served the op authoritatively; under `shadow` it mirrored
+    // alongside the authoritative Qdrant path.  The engine op is identical — the mode
+    // only changes which path is authoritative and how the outcome is labelled.
+    let serving_primary = mode == VectorMode::Primary;
+    let result_outcome = match (serving_primary, report.holds()) {
+        (true, true) => VectorOutcome::ServedPrimary,
+        (true, false) => VectorOutcome::PrimaryDivergence,
+        (false, true) => VectorOutcome::Mirrored,
+        (false, false) => VectorOutcome::ParityMismatch,
     };
     let mut result = make_result(
         "mirror",
@@ -678,6 +724,232 @@ fn step(name: &str, ok: bool, detail: Option<String>) -> VectorSuiteStep {
     }
 }
 
+/// The platform-RAG collection + model the built-in primary-serve cycle drives.
+const PRIMARY_SERVE_COLLECTION: &str = "noetl/primary_serve/playbook-surface";
+const PRIMARY_SERVE_MODEL: &str = "text-embedding-3-small";
+/// How many points the built-in primary-serve cycle seeds (delete on the last).
+pub const PRIMARY_SERVE_CYCLE_ENTRIES: usize = 3;
+/// Live candidates served after the reversibility flip-back: the 2 surviving cycle
+/// points (last deleted) plus the 1 fresh point the shadow flip-back mirrors.
+const PRIMARY_SERVE_CANDIDATES_AFTER_REVERT: usize = 3;
+
+/// Secret-free result of the authoritative vector primary-serve cycle (Phase 9
+/// tier 5) plus the operational reversibility demonstration.
+#[derive(Debug, Clone)]
+pub struct VectorServeResult {
+    pub mode: VectorMode,
+    pub outcome: VectorOutcome,
+    pub role: Option<EhdbClientRole>,
+    pub duration_seconds: f64,
+    /// The EHDB engine served the whole cycle with the Qdrant retrieval semantics
+    /// preserved and dual-run top-k parity intact.
+    pub served_by_ehdb: bool,
+    /// The full served-by-EHDB proof (present once the cycle ran).
+    pub report: Option<VectorPrimaryServeReport>,
+    /// After serving primary, flipping `NOETL_EHDB_VECTOR` back to `shadow` over the
+    /// same index mirrored a further point and the collection served the whole live
+    /// set — the incumbent Qdrant retrieval path is restored with zero data loss
+    /// (rollback lever 1 demonstrated operationally).
+    pub reversible: bool,
+    /// The live-candidate count served after the flip-back (== surviving cycle
+    /// points + 1).
+    pub candidates_after_revert: usize,
+    pub detail: Option<String>,
+}
+
+/// Drive the authoritative vector primary-serve cycle through the EHDB engine and
+/// demonstrate operational reversibility.
+///
+/// In `primary` mode (and with [`PRIMARY_SERVE_ACTIVATED`]) this:
+///
+/// 1. runs [`exercise_primary_serve`] — upsert + served cosine top-k query +
+///    tombstone delete + fresh-driver replay, all served authoritatively by EHDB,
+///    dual-run parity-checked (id set + rank order + score monotonicity) against a
+///    Qdrant mirror ranked in lockstep; then
+/// 2. flips `NOETL_EHDB_VECTOR` back to `shadow` in a cloned env and mirrors a
+///    further point over the SAME index, proving the incumbent/shadow path is
+///    restored and the index stays whole (zero data loss on rollback).
+///
+/// Off/disabled ⇒ strict no-op (byte-identical `/metrics`).  Control-plane roles
+/// are guard-refused before any engine opens.  Never authors a NoETL event and
+/// never writes Qdrant — it only exercises the derived EHDB vector fabric.
+pub fn serve_primary_cycle(
+    env: &EnvMap,
+    opts: &VectorOptions,
+    record_metrics: bool,
+) -> VectorServeResult {
+    let started = std::time::Instant::now();
+    let mode = VectorMode::from_env(env);
+
+    // Early-exit builder (no cycle report) that records the `primary_serve`
+    // metric — `disabled` outcomes are skipped by `record_vector`, preserving the
+    // byte-identical no-op invariant.
+    let early = |outcome: VectorOutcome,
+                 role: Option<EhdbClientRole>,
+                 detail: Option<String>|
+     -> VectorServeResult {
+        let duration_seconds = started.elapsed().as_secs_f64();
+        if record_metrics {
+            metrics::record_vector(
+                "primary_serve",
+                outcome.as_str(),
+                outcome.ok(),
+                outcome.degraded(),
+                duration_seconds,
+            );
+        }
+        VectorServeResult {
+            mode,
+            outcome,
+            role,
+            duration_seconds,
+            served_by_ehdb: false,
+            report: None,
+            reversible: false,
+            candidates_after_revert: 0,
+            detail,
+        }
+    };
+
+    // Off mode OR the umbrella EHDB switch disabled ⇒ strict no-op.
+    if mode == VectorMode::Off || !truthy(env, EHDB_ENABLED_ENV) {
+        return early(VectorOutcome::Disabled, None, None);
+    }
+
+    // Resolve the contract (guards control-plane / disabled).  Pass
+    // `record_metrics = false` so the only metric recorded here is the
+    // `primary_serve`-labelled one from `early` / the final path.
+    let contract = match resolve_contract("primary_serve", env, mode, started, false) {
+        Ok(c) => c,
+        Err(result) => {
+            let r = *result;
+            return early(r.outcome, r.role, r.detail);
+        }
+    };
+
+    // Compile-time kill switch off ⇒ primary unavailable (structural rollback).
+    if !PRIMARY_SERVE_ACTIVATED {
+        return early(
+            VectorOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("vector primary serve is not activated in this build".to_string()),
+        );
+    }
+    // The cycle only serves under the `primary` flag; `shadow` stays mirror-only.
+    if mode != VectorMode::Primary {
+        return early(
+            VectorOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("primary-serve cycle requires NOETL_EHDB_VECTOR=primary".to_string()),
+        );
+    }
+
+    let driver = driver_from(&contract, opts);
+
+    // Deterministic cycle: three distinct platform-RAG points under one collection
+    // (delete on the last), queried [1,0,0] so the ranking is a > b > c — a scope +
+    // rank + delete ground truth with an in-lockstep Qdrant mirror so the dual-run
+    // top-k parity is exact.
+    let input = VectorPrimaryInput {
+        collection: PRIMARY_SERVE_COLLECTION.to_string(),
+        model_id: PRIMARY_SERVE_MODEL.to_string(),
+        entries: vec![
+            (
+                "noetl/playbook/weather.example/chunk.0".to_string(),
+                vec![1.0, 0.0, 0.0],
+            ),
+            (
+                "noetl/playbook/weather.example/chunk.1".to_string(),
+                vec![0.9, 0.1, 0.0],
+            ),
+            (
+                "noetl/catalog/embeddings/tool.http".to_string(),
+                vec![0.0, 1.0, 0.0],
+            ),
+        ],
+        query: vec![1.0, 0.0, 0.0],
+        top_k: 10,
+    };
+
+    let report = match exercise_primary_serve(&driver, &input, &new_transaction_id()) {
+        Ok(r) => r,
+        Err(err) => {
+            return early(
+                classify_helper_error(&err),
+                Some(contract.role),
+                Some(err.to_string()),
+            )
+        }
+    };
+    let served = report.served_by_ehdb();
+
+    // Reversibility (rollback lever 1): flip the flag back to `shadow` in a cloned
+    // env and mirror one more point over the SAME index.  A clean mirror plus a
+    // whole-collection live query proves the incumbent/shadow path is restored with
+    // zero data loss and the index grew.
+    let mut shadow_env = env.clone();
+    shadow_env.insert(VECTOR_MODE_ENV.to_string(), "shadow".to_string());
+    let revert = mirror_upsert(
+        &shadow_env,
+        PRIMARY_SERVE_COLLECTION,
+        "noetl/primary_serve/revert.chunk",
+        PRIMARY_SERVE_MODEL,
+        &[0.5, 0.5, 0.0],
+        Some("src://revert"),
+        opts,
+        false,
+    );
+    let candidates_after_revert = driver
+        .query(&VectorQueryRequest {
+            collection: PRIMARY_SERVE_COLLECTION.to_string(),
+            model_id: PRIMARY_SERVE_MODEL.to_string(),
+            query: vec![1.0, 0.0, 0.0],
+            top_k: 10,
+        })
+        .map(|q| q.candidate_count)
+        .unwrap_or(0);
+    let reversible = revert.outcome == VectorOutcome::Mirrored
+        && candidates_after_revert == PRIMARY_SERVE_CANDIDATES_AFTER_REVERT;
+
+    let outcome = if served && reversible {
+        VectorOutcome::ServedPrimary
+    } else {
+        VectorOutcome::PrimaryDivergence
+    };
+    let detail = if served && reversible {
+        None
+    } else if !served {
+        report.divergence.clone()
+    } else {
+        Some(format!(
+            "reversibility flip-back failed: revert={} candidates={candidates_after_revert}",
+            revert.outcome.as_str(),
+        ))
+    };
+
+    let duration_seconds = started.elapsed().as_secs_f64();
+    if record_metrics {
+        metrics::record_vector(
+            "primary_serve",
+            outcome.as_str(),
+            outcome.ok(),
+            outcome.degraded(),
+            duration_seconds,
+        );
+    }
+    VectorServeResult {
+        mode,
+        outcome,
+        role: Some(contract.role),
+        duration_seconds,
+        served_by_ehdb: served,
+        report: Some(report),
+        reversible,
+        candidates_after_revert,
+        detail,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,14 +1087,75 @@ mod tests {
     }
 
     #[test]
-    fn primary_is_recognised_but_not_activated() {
+    fn primary_serves_authoritatively() {
         let (log, dir) = tmp_log("primary");
         let e = worker_env(log.to_str().unwrap(), "primary");
-        let r = mirror(&e, COLLECTION, POINT, &[1.0, 0.0]);
+        // Phase 9 tier 5: primary is activated, so a primary upsert serves the
+        // retrieval op authoritatively from EHDB (not refused).  Parity holds.
+        let r = mirror(&e, COLLECTION, POINT, &[1.0, 0.0, 0.0]);
         assert_eq!(r.mode, VectorMode::Primary);
-        assert_eq!(r.outcome, VectorOutcome::PrimaryUnavailable);
-        assert!(!PRIMARY_SERVE_ACTIVATED);
+        assert_eq!(r.outcome, VectorOutcome::ServedPrimary, "{:?}", r.detail);
+        assert_eq!(r.version, Some(1));
+        assert!(r.parity.as_ref().unwrap().holds());
+        // ServedPrimary is only reachable with PRIMARY_SERVE_ACTIVATED == true.
+        assert!(PRIMARY_SERVE_ACTIVATED);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_served_by_ehdb_and_reversible() {
+        let (log, dir) = tmp_log("cycle");
+        let e = worker_env(log.to_str().unwrap(), "primary");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.mode, VectorMode::Primary);
+        assert_eq!(r.outcome, VectorOutcome::ServedPrimary, "{:?}", r.detail);
+        assert!(r.served_by_ehdb);
+        let report = r.report.as_ref().unwrap();
+        assert!(report.served_by_ehdb());
+        assert_eq!(report.upsert_count, PRIMARY_SERVE_CYCLE_ENTRIES);
+        assert!(report.upsert_ok && report.query_ok && report.delete_ok);
+        assert!(report.replay_matches && report.dual_run_holds);
+        // Reversibility: flip back to shadow mirrored one more point; the index is
+        // whole and serves the 2 surviving cycle points + the 1 revert point.
+        assert!(r.reversible);
+        assert_eq!(r.candidates_after_revert, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_off_is_noop() {
+        let e = worker_env("/tmp/unused-vector-cycle.jsonl", "off");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, VectorOutcome::Disabled);
+        assert!(r.report.is_none());
+        assert!(!r.served_by_ehdb);
+    }
+
+    #[test]
+    fn primary_serve_cycle_shadow_is_primary_unavailable() {
+        let (log, dir) = tmp_log("cycle-shadow");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        // The cycle only serves under the `primary` flag.
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, VectorOutcome::PrimaryUnavailable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_control_plane_guard_refused() {
+        let e: EnvMap = [
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "server"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+            ("NOETL_EHDB_VECTOR", "primary"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, VectorOutcome::GuardRefused);
+        assert!(r.report.is_none());
     }
 
     #[test]

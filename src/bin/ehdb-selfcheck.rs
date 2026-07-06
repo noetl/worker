@@ -63,6 +63,7 @@ fn main() -> ExitCode {
         Some("object-primary-serve") => run_object_primary_serve(&env, &flags),
         Some("mirror-vector") => run_mirror_vector(&env, &flags),
         Some("vector-suite") => run_vector_suite(&env, &flags),
+        Some("vector-primary-serve") => run_vector_primary_serve(&env, &flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -1668,8 +1669,72 @@ fn vector_exit(outcome: vector::VectorOutcome) -> ExitCode {
     match outcome {
         O::GuardRefused | O::Invalid | O::PrimaryUnavailable => ExitCode::from(4),
         O::Rejected => ExitCode::from(3),
-        O::Unavailable | O::ParityMismatch => ExitCode::from(5),
+        O::Unavailable | O::ParityMismatch | O::PrimaryDivergence => ExitCode::from(5),
         _ => ExitCode::SUCCESS,
+    }
+}
+
+/// Phase 9 tier-5 primary cutover (the final tier): serve the platform vector tier
+/// authoritatively from EHDB and prove it in one process.  Off / disabled ⇒
+/// byte-identical no-op (served=false + empty metrics).  Enabled +
+/// `NOETL_EHDB_VECTOR=primary` ⇒ the full authoritative cycle (upsert → query-topk
+/// → delete → replay) is served-by-EHDB with dual-run parity, AND flipping back to
+/// `shadow` restores the incumbent Qdrant path over the same index with zero data
+/// loss (reversibility).  Exit 0 only when served-by-EHDB AND reversible AND metrics
+/// stay secret-free.
+fn run_vector_primary_serve(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let r = vector::serve_primary_cycle(env, &vector_opts(flags), true);
+
+    // Off / disabled probe: byte-identical no-op, same shape as `vector-suite`.
+    if r.outcome == vector::VectorOutcome::Disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-vector-primary-serve",
+                "ehdb": "disabled",
+                "mode": r.mode.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let metrics = render_metrics();
+    let secret_free = metrics_is_secret_free(&metrics);
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-vector-primary-serve",
+            "ehdb": "enabled",
+            "op": "vector-primary-serve",
+            "mode": r.mode.as_str(),
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "served_by_ehdb": r.served_by_ehdb,
+            "reversible": r.reversible,
+            "candidates_after_revert": r.candidates_after_revert,
+            "duration_seconds": round6(r.duration_seconds),
+            "detail": r.detail,
+            "report": r.report,
+            "metrics_secret_free": secret_free,
+        })
+    );
+    print!("{metrics}");
+
+    if r.outcome == vector::VectorOutcome::ServedPrimary
+        && r.served_by_ehdb
+        && r.reversible
+        && secret_free
+    {
+        ExitCode::SUCCESS
+    } else {
+        vector_exit(r.outcome)
     }
 }
 
@@ -1811,6 +1876,7 @@ fn usage() -> &'static str {
      object-primary-serve  (Phase 9 tier 4: serve platform objects from EHDB + reversibility)\n  \
      mirror-vector   --collection <c> --point-id <id> --model-id <m> --vector <f1,f2,..> [--payload <text>]\n  \
      vector-suite\n  \
+     vector-primary-serve  (Phase 9 tier 5: serve platform vectors from EHDB + reversibility)\n  \
      common:  [--tenant <t>] [--namespace <n>] [--transaction-id <id>]"
 }
 
