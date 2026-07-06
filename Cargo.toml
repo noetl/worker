@@ -259,10 +259,14 @@ arrow = "53"
 # (ehdb#246, `LocalReferenceVectorDriver` / `VectorDriver` /
 # `compare_vector_parity`) that `src/ehdb/vector.rs` binds (dual-write platform
 # vectors + top-k parity vs Qdrant, never serve reads from EHDB).
+# Phase 9 tier 1 (ehdb#247) adds the event-log primary-serve helper
+# (`exercise_primary_serve` / `EventLogPrimaryEvent` / `EventLogPrimaryServeReport`)
+# that `src/ehdb/eventlog.rs` binds to serve the platform event log
+# authoritatively from EHDB under `NOETL_EHDB_EVENTLOG=primary` (reversible).
 # arrow 53 matches the worker's own arrow pin.  Disabled by default: no code path
 # opens a runtime unless NOETL_EHDB_ENABLED is truthy AND the role is a data-plane
 # role, so the dependency is inert at rest.
-ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "f6c5a6ffb898371fa42217ec449450165b57f536" }
+ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "7f014c99755e594b3718d41ec28e3ae0ded5d64c" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

@@ -1,4 +1,5 @@
-//! Disabled-by-default event-log SHADOW wiring (EHDB Phase 6).
+//! Event-log SHADOW wiring + PRIMARY-serve cutover (EHDB Phase 6 shadow,
+//! Phase 9 tier-1 primary).
 //!
 //! EHDB's event-log core engine (the `ehdb_reference::eventlog` driver) is the
 //! durable persistence + ordering + serving layer that Phase 6 puts underneath
@@ -15,26 +16,45 @@
 //!   authoritative log for sequence parity, count parity, and monotonic
 //!   ordering.  Reads are **never** served from EHDB and the authoritative
 //!   producer path is untouched.
-//! * `primary` — recognised but **NOT activated this session**.  Cutover to
-//!   serving the log from EHDB is a later gated step; requesting `primary` here
-//!   is refused with a distinct outcome and the worker stays on the existing
-//!   path.  [`PRIMARY_SERVE_ACTIVATED`] is a compile-time `false` so it is
-//!   structurally impossible for this build to serve primary.
+//! * `primary` — **EHDB serves the event log authoritatively** (Phase 9 tier 1):
+//!   append + read + tail + ack + replay are served by the EHDB engine in place
+//!   of the JetStream+Postgres incumbent, while each append is dual-run
+//!   parity-checked against the incumbent sequence.  [`PRIMARY_SERVE_ACTIVATED`]
+//!   is now `true` so this build *can* serve primary; whether it *does* is a
+//!   pure runtime choice of the `NOETL_EHDB_EVENTLOG` flag (see reversibility).
+//!
+//! ## Reversibility (the cutover safety property)
+//!
+//! The cutover is reversible with **two independent levers**:
+//!
+//! 1. **Runtime flag (operational, instant, no redeploy)** — flip
+//!    `NOETL_EHDB_EVENTLOG` from `primary` back to `shadow`/`off` and the
+//!    incumbent (JetStream+Postgres) is authoritative again immediately.  Zero
+//!    data loss: the primary path only ever *appends* to the EHDB `KeepAll` log
+//!    and never mutates/deletes anything the incumbent owns, so the incumbent's
+//!    store is exactly as it was, and the EHDB log stays whole on disk for a
+//!    later re-enable.
+//! 2. **Compile-time kill switch (structural, belt-and-suspenders)** — set
+//!    [`PRIMARY_SERVE_ACTIVATED`] back to `false` and it is structurally
+//!    impossible for the build to serve primary regardless of config.
 //!
 //! ## Boundaries (mirror the rest of `src/ehdb`)
 //!
 //! * Disabled-by-default no-op (byte-identical `/metrics`).
 //! * Control-plane roles (`gateway`/`api`/`server`) refused before any engine
 //!   opens — the gateway never touches the data plane.
-//! * Bounded (payload cap) + stateless (engine opened + dropped per mirror).
-//! * **Event-log-authoritative** — mirroring persists an already-authored event
-//!   into the *derived* EHDB fabric; it never authors a NoETL event and never
-//!   reaches `noetl.event` / `POST /api/events` (structurally asserted).
+//! * Bounded (payload cap) + stateless (engine opened + dropped per op).
+//! * **Event-log-authoritative** — shadow mirroring AND primary serving persist
+//!   already-authored events into the *derived* EHDB fabric; neither authors a
+//!   NoETL event nor reaches `noetl.event` / `POST /api/events` (structurally
+//!   asserted).  Primary changes the *serving engine* underneath, not event
+//!   authorship — the gateway/server stay the gatekeeper of what is appended.
 
 use std::sync::OnceLock;
 
 use ehdb_reference::{
-    compare_shadow_parity, EventLogAppendRequest, EventLogDriver, EventLogParityReport,
+    compare_shadow_parity, exercise_primary_serve, EventLogAppendRequest, EventLogDriver,
+    EventLogParityReport, EventLogPrimaryEvent, EventLogPrimaryServeReport, EventLogScanRequest,
     LocalReferenceEventLogDriver, DEFAULT_LOCAL_REFERENCE_NAMESPACE,
     DEFAULT_LOCAL_REFERENCE_TENANT,
 };
@@ -51,10 +71,15 @@ pub const MAX_PAYLOAD_BYTES_ENV: &str = "NOETL_EHDB_EVENTLOG_MAX_PAYLOAD_BYTES";
 const DEFAULT_MAX_PAYLOAD_BYTES: usize = 262_144;
 const MAX_PAYLOAD_BYTES_CEILING: usize = 1_048_576;
 
-/// Compile-time guard: this build never serves the log from EHDB.  Phase 6 ships
-/// the shadow only; flipping this to `true` is the later, separately-gated
-/// primary cutover and is intentionally not reachable from config.
-pub const PRIMARY_SERVE_ACTIVATED: bool = false;
+/// Compile-time kill switch for primary-serve.  Phase 9 tier 1 activates it
+/// (`true`): this build *can* serve the event log authoritatively from EHDB.
+/// Whether it *does* is the pure runtime choice of `NOETL_EHDB_EVENTLOG`
+/// (`primary` serves; `shadow`/`off` keep the incumbent authoritative), so the
+/// cutover stays reversible without a redeploy.  Setting this back to `false`
+/// is the belt-and-suspenders structural rollback — it makes primary-serve
+/// unreachable regardless of config (the `primary` flag then degrades to
+/// [`EventLogOutcome::PrimaryUnavailable`]).
+pub const PRIMARY_SERVE_ACTIVATED: bool = true;
 
 /// Which event-log engine the tier is driven by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +124,14 @@ pub enum EventLogOutcome {
     Mirrored,
     /// Event mirrored but the EHDB engine diverged from the authoritative log.
     ParityMismatch,
-    /// `primary` requested but primary-serve is not activated this session.
+    /// `primary` served the append authoritatively from EHDB + dual-run parity
+    /// against the incumbent held.
+    ServedPrimary,
+    /// `primary` served the append from EHDB but the dual-run parity against the
+    /// incumbent diverged (degraded — surfaces on `last_degraded`).
+    PrimaryDivergence,
+    /// `primary` requested but primary-serve is not activated this build (the
+    /// compile-time kill switch is off).
     PrimaryUnavailable,
     /// Payload empty or over the byte cap.
     Rejected,
@@ -117,6 +149,8 @@ impl EventLogOutcome {
             EventLogOutcome::Disabled => "disabled",
             EventLogOutcome::Mirrored => "mirrored",
             EventLogOutcome::ParityMismatch => "parity_mismatch",
+            EventLogOutcome::ServedPrimary => "served_primary",
+            EventLogOutcome::PrimaryDivergence => "primary_divergence",
             EventLogOutcome::PrimaryUnavailable => "primary_unavailable",
             EventLogOutcome::Rejected => "rejected",
             EventLogOutcome::GuardRefused => "guard_refused",
@@ -126,7 +160,10 @@ impl EventLogOutcome {
     }
 
     pub fn ok(&self) -> bool {
-        matches!(self, EventLogOutcome::Disabled | EventLogOutcome::Mirrored)
+        matches!(
+            self,
+            EventLogOutcome::Disabled | EventLogOutcome::Mirrored | EventLogOutcome::ServedPrimary
+        )
     }
 
     /// A degraded (but non-fatal) outcome — surfaces on the `last_degraded`
@@ -135,7 +172,9 @@ impl EventLogOutcome {
     fn degraded(&self) -> bool {
         matches!(
             self,
-            EventLogOutcome::ParityMismatch | EventLogOutcome::Unavailable
+            EventLogOutcome::ParityMismatch
+                | EventLogOutcome::PrimaryDivergence
+                | EventLogOutcome::Unavailable
         )
     }
 }
@@ -307,12 +346,11 @@ pub fn mirror_event(
         );
     }
 
-    // Primary is recognised but not activated this session — refuse before any
-    // engine opens.  The compile-time guard makes serving structurally
-    // impossible; this is the config-time refusal.
+    // Primary with the compile-time kill switch off — refuse before any engine
+    // opens (the belt-and-suspenders structural rollback).  Still resolve the
+    // contract so a control-plane role is refused as a guard, not silently
+    // treated as "primary unavailable".
     if mode == EventLogMode::Primary && !PRIMARY_SERVE_ACTIVATED {
-        // Still resolve the contract so a control-plane role is refused as a
-        // guard, not silently treated as "primary unavailable".
         let contract = match resolve_contract(env, mode, started, record_metrics) {
             Ok(c) => c,
             Err(result) => return *result,
@@ -327,7 +365,10 @@ pub fn mirror_event(
         );
     }
 
-    // Shadow mode.
+    // Shadow (dual-write + compare) OR primary (EHDB serves authoritatively).
+    // The engine op is identical — an append + parity compare; the mode only
+    // changes which log is authoritative and how the outcome is labelled.
+    let serving_primary = mode == EventLogMode::Primary;
     let contract = match resolve_contract(env, mode, started, record_metrics) {
         Ok(c) => c,
         Err(result) => return *result,
@@ -397,10 +438,13 @@ pub fn mirror_event(
                 expected_count,
             );
 
-            let result_outcome = if report.holds() {
-                EventLogOutcome::Mirrored
-            } else {
-                EventLogOutcome::ParityMismatch
+            let result_outcome = match (serving_primary, report.holds()) {
+                // Primary: EHDB served the append authoritatively.
+                (true, true) => EventLogOutcome::ServedPrimary,
+                (true, false) => EventLogOutcome::PrimaryDivergence,
+                // Shadow: EHDB mirrored alongside the authoritative incumbent.
+                (false, true) => EventLogOutcome::Mirrored,
+                (false, false) => EventLogOutcome::ParityMismatch,
             };
             let mut result = make_result(
                 mode,
@@ -422,6 +466,216 @@ pub fn mirror_event(
             Some(err.to_string()),
             record_metrics,
         ),
+    }
+}
+
+/// How many events the built-in primary-serve cycle drives through the engine.
+pub const PRIMARY_SERVE_CYCLE_EVENTS: usize = 3;
+
+/// Secret-free result of the authoritative primary-serve cycle (Phase 9 tier 1)
+/// plus the operational reversibility demonstration.
+#[derive(Debug, Clone)]
+pub struct EventLogServeResult {
+    pub mode: EventLogMode,
+    pub outcome: EventLogOutcome,
+    pub role: Option<EhdbClientRole>,
+    pub duration_seconds: f64,
+    /// The EHDB engine served the whole cycle with the incumbent's semantics
+    /// preserved and dual-run parity intact.
+    pub served_by_ehdb: bool,
+    /// The full served-by-EHDB proof (present once the cycle ran).
+    pub report: Option<EventLogPrimaryServeReport>,
+    /// After serving primary, flipping `NOETL_EHDB_EVENTLOG` back to `shadow`
+    /// over the same log mirrored a further event and the log replayed whole —
+    /// the incumbent path is restored with zero data loss (rollback lever 1
+    /// demonstrated operationally).
+    pub reversible: bool,
+    /// The log record count after the flip-back append (== cycle events + 1).
+    pub records_after_revert: usize,
+    pub detail: Option<String>,
+}
+
+/// Drive the authoritative event-log primary-serve cycle through the EHDB engine
+/// and demonstrate operational reversibility.
+///
+/// In `primary` mode (and with [`PRIMARY_SERVE_ACTIVATED`]) this:
+///
+/// 1. runs [`exercise_primary_serve`] — append + global scan + per-execution
+///    read + durable tail + ack + fresh-driver replay, all served
+///    authoritatively by EHDB, dual-run parity-checked against the incumbent
+///    sequence; then
+/// 2. flips `NOETL_EHDB_EVENTLOG` back to `shadow` in a cloned env and mirrors a
+///    further event over the SAME log, proving the incumbent/shadow path is
+///    restored and the log stays whole (zero data loss on rollback).
+///
+/// Off/disabled ⇒ strict no-op (byte-identical `/metrics`).  Control-plane roles
+/// are guard-refused before any engine opens.  Never authors a NoETL event — it
+/// only exercises the derived EHDB fabric.
+pub fn serve_primary_cycle(
+    env: &EnvMap,
+    opts: &EventLogOptions,
+    record_metrics: bool,
+) -> EventLogServeResult {
+    let started = std::time::Instant::now();
+    let mode = EventLogMode::from_env(env);
+
+    // Early-exit builder (no cycle report) that records the `primary_serve`
+    // metric — `disabled` outcomes are skipped by `record_eventlog`, preserving
+    // the byte-identical no-op invariant.
+    let early = |outcome: EventLogOutcome,
+                 role: Option<EhdbClientRole>,
+                 detail: Option<String>|
+     -> EventLogServeResult {
+        let duration_seconds = started.elapsed().as_secs_f64();
+        if record_metrics {
+            metrics::record_eventlog(
+                "primary_serve",
+                outcome.as_str(),
+                outcome.ok(),
+                outcome.degraded(),
+                duration_seconds,
+            );
+        }
+        EventLogServeResult {
+            mode,
+            outcome,
+            role,
+            duration_seconds,
+            served_by_ehdb: false,
+            report: None,
+            reversible: false,
+            records_after_revert: 0,
+            detail,
+        }
+    };
+
+    // Off mode OR the umbrella EHDB switch disabled ⇒ strict no-op.
+    if mode == EventLogMode::Off || !truthy(env, EHDB_ENABLED_ENV) {
+        return early(EventLogOutcome::Disabled, None, None);
+    }
+
+    // Resolve the contract (guards control-plane / disabled).  Pass
+    // `record_metrics = false` so the only metric recorded here is the
+    // `primary_serve`-labelled one from `early` / the final path.
+    let contract = match resolve_contract(env, mode, started, false) {
+        Ok(c) => c,
+        Err(result) => {
+            let r = *result;
+            return early(r.outcome, r.role, r.detail);
+        }
+    };
+
+    // Compile-time kill switch off ⇒ primary unavailable (structural rollback).
+    if !PRIMARY_SERVE_ACTIVATED {
+        return early(
+            EventLogOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("event-log primary serve is not activated in this build".to_string()),
+        );
+    }
+    // The cycle only serves under the `primary` flag; `shadow` stays mirror-only.
+    if mode != EventLogMode::Primary {
+        return early(
+            EventLogOutcome::PrimaryUnavailable,
+            Some(contract.role),
+            Some("primary-serve cycle requires NOETL_EHDB_EVENTLOG=primary".to_string()),
+        );
+    }
+
+    let log = contract.local_reference_log.clone().expect("log present");
+    let tenant = opts
+        .tenant
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string());
+    let namespace = opts
+        .namespace
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string());
+    let driver = LocalReferenceEventLogDriver::new(log, tenant, namespace);
+
+    // Deterministic cycle: two executions interleaved, known 1-based
+    // authoritative sequences so the dual-run parity check is exact.
+    let events: Vec<EventLogPrimaryEvent> = [("100", 1u64), ("200", 2), ("100", 3)]
+        .into_iter()
+        .map(|(exec, seq)| EventLogPrimaryEvent {
+            execution_id: exec.to_string(),
+            transaction_id: format!("primary-{exec}-{seq}"),
+            payload: format!("{{\"exec\":\"{exec}\",\"seq\":{seq}}}"),
+            authoritative_sequence: Some(seq),
+        })
+        .collect();
+
+    let report = match exercise_primary_serve(
+        &driver,
+        &events,
+        "primary-serve-projector",
+        &new_transaction_id(),
+    ) {
+        Ok(r) => r,
+        Err(err) => {
+            return early(
+                classify_helper_error(&err),
+                Some(contract.role),
+                Some(err.to_string()),
+            )
+        }
+    };
+    let served = report.served_by_ehdb();
+
+    // Reversibility (rollback lever 1): flip the flag back to `shadow` in a
+    // cloned env and mirror one more event over the SAME log.  A clean mirror
+    // plus a whole-log replay proves the incumbent/shadow path is restored with
+    // zero data loss.
+    let mut shadow_env = env.clone();
+    shadow_env.insert(EVENTLOG_MODE_ENV.to_string(), "shadow".to_string());
+    let revert = mirror_event(&shadow_env, "100", None, "{\"revert\":true}", opts, false);
+    let records_after_revert = driver
+        .scan_global(&EventLogScanRequest {
+            after: None,
+            limit: events.len() + 8,
+        })
+        .map(|s| s.record_count)
+        .unwrap_or(0);
+    let reversible =
+        revert.outcome == EventLogOutcome::Mirrored && records_after_revert == events.len() + 1;
+
+    let outcome = if served && reversible {
+        EventLogOutcome::ServedPrimary
+    } else {
+        EventLogOutcome::PrimaryDivergence
+    };
+    let detail = if served && reversible {
+        None
+    } else if !served {
+        report.divergence.clone()
+    } else {
+        Some(format!(
+            "reversibility flip-back failed: revert={} records={}",
+            revert.outcome.as_str(),
+            records_after_revert
+        ))
+    };
+
+    let duration_seconds = started.elapsed().as_secs_f64();
+    if record_metrics {
+        metrics::record_eventlog(
+            "primary_serve",
+            outcome.as_str(),
+            outcome.ok(),
+            outcome.degraded(),
+            duration_seconds,
+        );
+    }
+    EventLogServeResult {
+        mode,
+        outcome,
+        role: Some(contract.role),
+        duration_seconds,
+        served_by_ehdb: served,
+        report: Some(report),
+        reversible,
+        records_after_revert,
+        detail,
     }
 }
 
@@ -551,15 +805,85 @@ mod tests {
     }
 
     #[test]
-    fn primary_is_recognised_but_not_activated() {
+    fn primary_serves_authoritatively() {
         let (log, dir) = tmp_log("primary");
         let e = worker_env(log.to_str().unwrap(), "primary");
+        // Phase 9 tier 1: primary is activated, so a primary append is served
+        // authoritatively by EHDB (not refused).  Global seq 1, parity holds.
         let r = mirror_event(&e, "100", Some(1), "evt", &Default::default(), false);
         assert_eq!(r.mode, EventLogMode::Primary);
-        assert_eq!(r.outcome, EventLogOutcome::PrimaryUnavailable);
-        // Structurally impossible to serve primary in this build.
-        assert!(!PRIMARY_SERVE_ACTIVATED);
+        assert_eq!(r.outcome, EventLogOutcome::ServedPrimary);
+        assert_eq!(r.global_sequence, Some(1));
+        assert!(r.parity.as_ref().unwrap().holds());
+        assert!(PRIMARY_SERVE_ACTIVATED);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_flags_divergence_on_wrong_authoritative_sequence() {
+        let (log, dir) = tmp_log("primary-diverge");
+        let e = worker_env(log.to_str().unwrap(), "primary");
+        // Incumbent claims 99 but EHDB assigns 1 → served but dual-run diverged.
+        let r = mirror_event(&e, "100", Some(99), "evt", &Default::default(), false);
+        assert_eq!(r.outcome, EventLogOutcome::PrimaryDivergence);
+        assert!(!r.parity.as_ref().unwrap().holds());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_served_by_ehdb_and_reversible() {
+        let (log, dir) = tmp_log("cycle");
+        let e = worker_env(log.to_str().unwrap(), "primary");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.mode, EventLogMode::Primary);
+        assert_eq!(r.outcome, EventLogOutcome::ServedPrimary, "{:?}", r.detail);
+        assert!(r.served_by_ehdb);
+        let report = r.report.as_ref().unwrap();
+        assert!(report.served_by_ehdb());
+        assert_eq!(report.appended, PRIMARY_SERVE_CYCLE_EVENTS);
+        assert!(
+            report.scan_ordered && report.scope_ok && report.ack_advanced && report.replay_matches
+        );
+        // Reversibility: flip back to shadow appended one more; log is whole.
+        assert!(r.reversible);
+        assert_eq!(r.records_after_revert, PRIMARY_SERVE_CYCLE_EVENTS + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_off_is_noop() {
+        let e = worker_env("/tmp/unused-cycle.jsonl", "off");
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, EventLogOutcome::Disabled);
+        assert!(r.report.is_none());
+        assert!(!r.served_by_ehdb);
+    }
+
+    #[test]
+    fn primary_serve_cycle_shadow_is_primary_unavailable() {
+        let (log, dir) = tmp_log("cycle-shadow");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        // The cycle only serves under the `primary` flag.
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, EventLogOutcome::PrimaryUnavailable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_serve_cycle_control_plane_guard_refused() {
+        let e: EnvMap = [
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "server"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+            ("NOETL_EHDB_EVENTLOG", "primary"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let r = serve_primary_cycle(&e, &Default::default(), false);
+        assert_eq!(r.outcome, EventLogOutcome::GuardRefused);
+        assert!(r.report.is_none());
     }
 
     #[test]
