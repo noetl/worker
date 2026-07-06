@@ -54,6 +54,7 @@ fn main() -> ExitCode {
         Some("eventlog-primary-serve") => run_eventlog_primary_serve(&env, &flags),
         Some("mirror-projection") => run_mirror_projection(&env, &flags),
         Some("projection-suite") => run_projection_suite(&env, &flags),
+        Some("projection-primary-serve") => run_projection_primary_serve(&env, &flags),
         Some("mirror-kv") => run_mirror_kv(&env, &flags),
         Some("kv-suite") => run_kv_suite(&env, &flags),
         Some("mirror-object") => run_mirror_object(&env, &flags),
@@ -1153,8 +1154,73 @@ fn projection_exit(outcome: projection::ProjectionOutcome) -> ExitCode {
     match outcome {
         O::GuardRefused | O::Invalid | O::PrimaryUnavailable => ExitCode::from(4),
         O::Rejected => ExitCode::from(3),
-        O::Unavailable | O::ParityMismatch => ExitCode::from(5),
+        O::Unavailable | O::ParityMismatch | O::PrimaryDivergence => ExitCode::from(5),
         _ => ExitCode::SUCCESS,
+    }
+}
+
+/// Phase 9 tier-2 primary cutover: serve the projection read-models
+/// authoritatively from EHDB and prove it in one process.  Off / disabled ⇒
+/// byte-identical no-op (served=false + empty metrics).  Enabled +
+/// `NOETL_EHDB_PROJECTION=primary` ⇒ the full authoritative cycle (apply → list →
+/// per-execution read → event lookup → checkpoint → idempotent re-apply → replay)
+/// is served-by-EHDB with dual-run parity, AND flipping back to `shadow` restores
+/// the incumbent materializer read path over the same store with zero data loss
+/// (reversibility).  Exit 0 only when served-by-EHDB AND reversible AND metrics
+/// stay secret-free.
+fn run_projection_primary_serve(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let r = projection::serve_primary_cycle(env, &pr_opts(flags), true);
+
+    // Off / disabled probe: byte-identical no-op, same shape as `projection-suite`.
+    if r.outcome == projection::ProjectionOutcome::Disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-projection-primary-serve",
+                "ehdb": "disabled",
+                "mode": r.mode.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    let metrics = render_metrics();
+    let secret_free = metrics_is_secret_free(&metrics);
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-projection-primary-serve",
+            "ehdb": "enabled",
+            "op": "projection-primary-serve",
+            "mode": r.mode.as_str(),
+            "outcome": r.outcome.as_str(),
+            "role": r.role.map(|x| x.as_str()),
+            "served_by_ehdb": r.served_by_ehdb,
+            "reversible": r.reversible,
+            "rows_after_revert": r.rows_after_revert,
+            "duration_seconds": round6(r.duration_seconds),
+            "detail": r.detail,
+            "report": r.report,
+            "metrics_secret_free": secret_free,
+        })
+    );
+    print!("{metrics}");
+
+    if r.outcome == projection::ProjectionOutcome::ServedPrimary
+        && r.served_by_ehdb
+        && r.reversible
+        && secret_free
+    {
+        ExitCode::SUCCESS
+    } else {
+        projection_exit(r.outcome)
     }
 }
 
@@ -1610,6 +1676,7 @@ fn usage() -> &'static str {
      eventlog-primary-serve  (Phase 9 tier 1: serve log from EHDB + reversibility)\n  \
      mirror-projection --execution-id <id> [--events <n>] [--consumer <c>]\n  \
      projection-suite  [--execution-id <id>] [--consumer <c>]\n  \
+     projection-primary-serve  (Phase 9 tier 2: serve read-models from EHDB + reversibility)\n  \
      mirror-kv       --bucket <b> --key <k> --value <text> [--expires-at-ms <n>]\n  \
      kv-suite\n  \
      mirror-object   --key <k> --value <text>\n  \
