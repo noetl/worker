@@ -41,6 +41,7 @@ pub mod projection;
 pub mod rag;
 pub mod readiness;
 pub mod systemstore;
+pub mod vector;
 
 /// A snapshot of environment variables.  Functions take an explicit `&EnvMap`
 /// (rather than reading `std::env` directly) so tests can inject a fixed env
