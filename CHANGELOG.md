@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.69.0](https://github.com/noetl/worker/compare/v5.68.1...v5.69.0) (2026-07-07)
+
+### Features
+
+* **ehdb:** wire projection shadow via windowed drain hook; ready vector hook ([#234](https://github.com/noetl/worker/issues/234)) ([#170](https://github.com/noetl/worker/issues/170)) ([fa64e0a](https://github.com/noetl/worker/commit/fa64e0a9ef1d1d58dfba02c1f7288407416b3aad)), closes [noetl/ai-meta#241](https://github.com/noetl/ai-meta/issues/241)
+
 ## [5.68.1](https://github.com/noetl/worker/compare/v5.68.0...v5.68.1) (2026-07-07)
 
 ### Bug Fixes
