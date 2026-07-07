@@ -275,7 +275,7 @@ arrow = "53"
 # arrow 53 matches the worker's own arrow pin.  Disabled by default: no code path
 # opens a runtime unless NOETL_EHDB_ENABLED is truthy AND the role is a data-plane
 # role, so the dependency is inert at rest.
-ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "4c0df81b3026f3f5e655d0e25f51dc065757e36b" }
+ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "bbc5047630dbffcd54cdb284bf2c6ada6e1adb0a" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
