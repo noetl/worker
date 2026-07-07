@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.67.0](https://github.com/noetl/worker/compare/v5.66.0...v5.67.0) (2026-07-07)
+
+### Features
+
+* **ehdb:** wire event-log shadow mirror into the live event-emit path ([#234](https://github.com/noetl/worker/issues/234)) ([#167](https://github.com/noetl/worker/issues/167)) ([d310c7b](https://github.com/noetl/worker/commit/d310c7bb53d323f4895f6309e60f60467f4af9fb)), closes [noetl/ehdb#241](https://github.com/noetl/ehdb/issues/241)
+
 ## [5.66.0](https://github.com/noetl/worker/compare/v5.65.0...v5.66.0) (2026-07-06)
 
 ### Features
