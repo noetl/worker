@@ -33,9 +33,10 @@
 use ehdb_reference::backends::{
     Backend, BackendConfigError, BackendMatrix, PlatformTier, TierMode, TierSelection,
 };
+use ehdb_reference::EventLogStorageBackend;
 
 use super::contract::{contract_from_env, enabled_from_env, safe_client_role, EHDB_MODE_ENV};
-use super::{eventlog, kv, object, projection, vector, EnvMap};
+use super::{eventlog, eventlog_backend, kv, object, projection, vector, EnvMap};
 
 /// Map a worker event-log mode to the shared crate vocabulary.
 fn eventlog_mode(env: &EnvMap) -> TierMode {
@@ -94,6 +95,11 @@ fn mode_for_tier(env: &EnvMap, tier: PlatformTier) -> TierMode {
 pub struct ResolvedBackends {
     /// The resolved per-tier backend matrix.
     pub matrix: BackendMatrix,
+    /// The event-log tier's **storage-backend** selection
+    /// (`local_reference` default | `durable_segment`) — orthogonal to the
+    /// tier's `off`/`shadow`/`primary` mode in the matrix above.  Resolved from
+    /// `NOETL_EHDB_EVENTLOG_BACKEND` (durable event-log backend, slice 4).
+    pub eventlog_storage_backend: EventLogStorageBackend,
     /// Every coherence violation (empty ⇒ coherent).  Includes matrix-level
     /// incoherence and any umbrella contract error.
     pub errors: Vec<BackendConfigError>,
@@ -118,9 +124,19 @@ impl ResolvedBackends {
         self.errors.is_empty()
     }
 
-    /// Secret-free JSON render of the resolved 5-tier matrix.
+    /// Secret-free JSON render of the resolved 5-tier matrix, augmented with the
+    /// event-log tier's storage-backend selection (durable event-log backend,
+    /// slice 4).  The storage backend is orthogonal to the mode axis, so it is a
+    /// top-level field rather than a matrix column.
     pub fn to_json(&self) -> serde_json::Value {
-        self.matrix.to_json()
+        let mut json = self.matrix.to_json();
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "eventlog_storage_backend".to_string(),
+                serde_json::Value::String(self.eventlog_storage_backend.as_str().to_string()),
+            );
+        }
+        json
     }
 }
 
@@ -177,7 +193,11 @@ pub fn resolve(env: &EnvMap) -> ResolvedBackends {
         });
     }
 
-    ResolvedBackends { matrix, errors }
+    ResolvedBackends {
+        matrix,
+        eventlog_storage_backend: eventlog_backend::selected_backend(env),
+        errors,
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +365,37 @@ mod tests {
         assert_eq!(tiers.len(), 5);
         assert_eq!(tiers[0]["tier"], "eventlog");
         assert_eq!(tiers[0]["backend"], "ehdb");
+    }
+
+    #[test]
+    fn eventlog_storage_backend_defaults_to_local_reference() {
+        // Unset → the config matrix reports the incumbent JSONL backend.
+        let r = resolve(&env(&[]));
+        assert_eq!(
+            r.eventlog_storage_backend,
+            EventLogStorageBackend::LocalReference
+        );
+        assert_eq!(r.to_json()["eventlog_storage_backend"], "local_reference");
+    }
+
+    #[test]
+    fn eventlog_storage_backend_surfaces_durable_segment_when_selected() {
+        let e = env(&[
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "worker"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+            ("NOETL_EHDB_EVENTLOG", "shadow"),
+            ("NOETL_EHDB_EVENTLOG_BACKEND", "durable_segment"),
+        ]);
+        let r = resolve(&e);
+        assert_eq!(
+            r.eventlog_storage_backend,
+            EventLogStorageBackend::DurableSegment
+        );
+        assert_eq!(r.to_json()["eventlog_storage_backend"], "durable_segment");
+        // The storage backend is orthogonal to the mode: eventlog stays shadow.
+        assert_eq!(r.mode_for(PlatformTier::EventLog), TierMode::Shadow);
     }
 
     #[test]
