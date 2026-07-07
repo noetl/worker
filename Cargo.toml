@@ -272,10 +272,17 @@ arrow = "53"
 # (`ehdb_reference::backends`: `PlatformTier` / `TierMode` / `Backend` /
 # `BackendMatrix`) that `src/ehdb/backends.rs` resolves the process env into for
 # the consolidated per-tier backend+mode matrix (EHDB default, not lock-in).
+# Durable event-log backend slices 1-3 (ehdb#253/#255/#258) add the production
+# disk substrate under the event-log tier — the segmented, CRC-framed,
+# crash-recoverable `DurableEventLogDriver` (slice 1), execution-affinity
+# single-writer routing `AffinityRoutedEventLog` (slice 2), and the
+# shared/object-store segment tier `SharedTierEventLog` + `FilesystemSharedBackend`
+# (slice 3) — plus the `EventLogStorageBackend` selector.  `src/ehdb/eventlog_backend.rs`
+# (slice 4) constructs that stack behind `NOETL_EHDB_EVENTLOG_BACKEND=durable_segment`.
 # arrow 53 matches the worker's own arrow pin.  Disabled by default: no code path
 # opens a runtime unless NOETL_EHDB_ENABLED is truthy AND the role is a data-plane
 # role, so the dependency is inert at rest.
-ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "bbc5047630dbffcd54cdb284bf2c6ada6e1adb0a" }
+ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "cca0d0d25459444d9f89562e1e03116410f070c8" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

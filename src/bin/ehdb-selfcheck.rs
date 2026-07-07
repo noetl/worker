@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 
 use noetl_worker::ehdb::{
-    self, backends, dataplane, eventlog, eventstream, kv, object, projection, rag, readiness,
-    systemstore, vector,
+    self, backends, contract, dataplane, eventlog, eventlog_backend, eventstream, kv, object,
+    projection, rag, readiness, systemstore, vector,
 };
 
 fn main() -> ExitCode {
@@ -52,6 +52,7 @@ fn main() -> ExitCode {
         Some("rag-suite") => run_rag_suite(&env, &flags),
         Some("mirror-eventlog") => run_mirror_eventlog(&env, &flags),
         Some("eventlog-suite") => run_eventlog_suite(&env, &flags),
+        Some("durable-eventlog") => run_durable_eventlog(&env, &flags),
         Some("eventlog-primary-serve") => run_eventlog_primary_serve(&env, &flags),
         Some("mirror-projection") => run_mirror_projection(&env, &flags),
         Some("projection-suite") => run_projection_suite(&env, &flags),
@@ -945,6 +946,120 @@ fn run_eventlog_suite(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
     print!("{metrics}");
 
     if ok && metrics_is_secret_free(&metrics) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Durable event-log backend drive (durable-backend slice 4): mirror events
+/// through whichever storage backend `NOETL_EHDB_EVENTLOG_BACKEND` selects and,
+/// when `durable_segment` is selected, prove the appends landed in durable
+/// segments by independently reopening the shard store read-only (crash-recovery
+/// replay).  Off / disabled ⇒ byte-identical no-op proof (same shape as
+/// `eventlog-suite`).  With `durable_segment` + enabled + shadow ⇒ every mirror
+/// holds parity AND the reopened durable store replays exactly the appended
+/// count.  With the default `local_reference` backend it behaves like the
+/// eventlog suite and reports `storage_backend=local_reference` (no segment
+/// read-back).
+fn run_durable_eventlog(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let execution_id = flags
+        .get("execution-id")
+        .unwrap_or_else(|| "100".to_string());
+    let backend = eventlog_backend::selected_backend(env);
+
+    // First mirror doubles as the disabled probe.
+    let first = eventlog::mirror_event(
+        env,
+        &execution_id,
+        Some(1),
+        "{\"seq\":1}",
+        &el_opts(flags),
+        true,
+    );
+    if first.outcome == eventlog::EventLogOutcome::Disabled {
+        let metrics = render_metrics();
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-durable-eventlog-selfcheck",
+                "ehdb": "disabled",
+                "mode": first.mode.as_str(),
+                "storage_backend": backend.as_str(),
+                "metrics_empty": metrics.is_empty(),
+            })
+        );
+        print!("{metrics}");
+        return if metrics.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    // Mirror two more events (seq 2, 3) so the durable store holds three.
+    let mut ok = first.outcome == eventlog::EventLogOutcome::Mirrored;
+    let mut steps = vec![serde_json::json!({"step":"mirror_1",
+        "outcome": first.outcome.as_str(), "global_sequence": first.global_sequence})];
+    for seq in [2u64, 3] {
+        let r = eventlog::mirror_event(
+            env,
+            &execution_id,
+            Some(seq),
+            &format!("{{\"seq\":{seq}}}"),
+            &el_opts(flags),
+            true,
+        );
+        ok &= r.outcome == eventlog::EventLogOutcome::Mirrored
+            && r.parity.as_ref().map(|p| p.holds()).unwrap_or(false);
+        steps.push(serde_json::json!({"step": format!("mirror_{seq}"),
+            "outcome": r.outcome.as_str(), "global_sequence": r.global_sequence,
+            "parity_holds": r.parity.as_ref().map(|p| p.holds())}));
+    }
+
+    // When the durable backend is selected, independently reopen the shard store
+    // read-only and prove the three events replayed from durable segments alone.
+    let mut replay_records: Option<usize> = None;
+    let mut replay_ok = true;
+    if backend.as_str() == "durable_segment" {
+        match contract::contract_from_env(env) {
+            Ok(c) => match eventlog_backend::durable_shard_record_count(env, &c, &execution_id) {
+                Ok(count) => {
+                    replay_records = Some(count);
+                    replay_ok = count == 3;
+                }
+                Err(e) => {
+                    replay_ok = false;
+                    steps.push(serde_json::json!({"step":"durable_replay","error": e}));
+                }
+            },
+            Err(e) => {
+                replay_ok = false;
+                steps.push(serde_json::json!({"step":"durable_replay","error": e.0}));
+            }
+        }
+    }
+
+    let metrics = render_metrics();
+    let pass = ok && replay_ok && metrics_is_secret_free(&metrics);
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-durable-eventlog-selfcheck",
+            "ehdb": "enabled",
+            "mode": first.mode.as_str(),
+            "role": first.role.map(|x| x.as_str()),
+            "storage_backend": backend.as_str(),
+            "ok": ok,
+            "durable_replay_records": replay_records,
+            "durable_replay_ok": replay_ok,
+            "steps": steps,
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+
+    if pass {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -1911,6 +2026,7 @@ fn usage() -> &'static str {
      rag-suite       [--document-id <id>]\n  \
      mirror-eventlog --execution-id <id> --payload <text> [--authoritative-sequence <n>]\n  \
      eventlog-suite  [--execution-id <id>]\n  \
+     durable-eventlog  [--execution-id <id>]  (slice 4: mirror via NOETL_EHDB_EVENTLOG_BACKEND; durable_segment ⇒ reopen + replay proof)\n  \
      eventlog-primary-serve  (Phase 9 tier 1: serve log from EHDB + reversibility)\n  \
      mirror-projection --execution-id <id> [--events <n>] [--consumer <c>]\n  \
      projection-suite  [--execution-id <id>] [--consumer <c>]\n  \

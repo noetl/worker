@@ -133,6 +133,12 @@ pub enum EventLogOutcome {
     /// `primary` requested but primary-serve is not activated this build (the
     /// compile-time kill switch is off).
     PrimaryUnavailable,
+    /// The `durable_segment` backend refused the append because this replica
+    /// does not own the execution's shard (execution-affinity single-writer
+    /// routing). Correct behaviour, not an error: the owning replica mirrors it.
+    /// Never fires on the default `local_reference` backend nor under the
+    /// single-owner default.
+    RoutedAway,
     /// Payload empty or over the byte cap.
     Rejected,
     /// A control-plane role reached the data-plane engine — refused.
@@ -152,6 +158,7 @@ impl EventLogOutcome {
             EventLogOutcome::ServedPrimary => "served_primary",
             EventLogOutcome::PrimaryDivergence => "primary_divergence",
             EventLogOutcome::PrimaryUnavailable => "primary_unavailable",
+            EventLogOutcome::RoutedAway => "routed_away",
             EventLogOutcome::Rejected => "rejected",
             EventLogOutcome::GuardRefused => "guard_refused",
             EventLogOutcome::Invalid => "invalid",
@@ -399,16 +406,6 @@ pub fn mirror_event(
         );
     }
 
-    let driver = LocalReferenceEventLogDriver::new(
-        contract.local_reference_log.clone().expect("log present"),
-        opts.tenant
-            .clone()
-            .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_TENANT.to_string()),
-        opts.namespace
-            .clone()
-            .unwrap_or_else(|| DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string()),
-    );
-
     let request = EventLogAppendRequest {
         execution_id: execution_id.to_string(),
         transaction_id: opts
@@ -418,8 +415,17 @@ pub fn mirror_event(
         payload: payload.to_string(),
     };
 
-    match driver.append(&request) {
-        Ok(outcome) => {
+    // Storage-backend selection (durable event-log backend, slice 4): the
+    // default `local_reference` backend appends byte-identically to the JSONL
+    // log the worker has always used; `NOETL_EHDB_EVENTLOG_BACKEND=durable_segment`
+    // routes the append through the durable segment + execution-affinity
+    // single-writer + shared-tier stack instead.  Orthogonal to the mode axis
+    // above (mode decides *whether* EHDB serves; backend decides *which* durable
+    // engine does the append).  Both backends yield the same
+    // `EventLogAppendOutcome` shape, so the parity path below is backend-agnostic.
+    let backend = super::eventlog_backend::selected_backend(env);
+    match super::eventlog_backend::append_selected(env, &contract, &request, opts, backend) {
+        Ok(super::eventlog_backend::AppendDispatch::Served(outcome)) => {
             // Concurrency-safe parity: the canonical event-log stream is gapless
             // from 1, so the engine's own invariant `global_sequence ==
             // log_record_count` proves no gap and no double-write for THIS
@@ -458,12 +464,26 @@ pub fn mirror_event(
             result.parity = Some(report);
             result
         }
+        // `durable_segment` refused: this replica does not own the execution's
+        // shard (single-writer routing).  Correct behaviour — the owning replica
+        // mirrors it — recorded as a neutral (non-ok, non-degraded) outcome.
+        Ok(super::eventlog_backend::AppendDispatch::RoutedAway { owner_shard }) => make_result(
+            mode,
+            EventLogOutcome::RoutedAway,
+            Some(contract.role),
+            started,
+            Some(format!(
+                "execution routed to shard {owner_shard} owner (backend={})",
+                backend.as_str()
+            )),
+            record_metrics,
+        ),
         Err(err) => make_result(
             mode,
             classify_helper_error(&err),
             Some(contract.role),
             started,
-            Some(err.to_string()),
+            Some(err),
             record_metrics,
         ),
     }
@@ -825,6 +845,42 @@ mod tests {
             assert_eq!(r.global_sequence, Some(*seq));
             assert!(r.parity.as_ref().unwrap().holds());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shadow_mirror_durable_backend_lands_in_segments() {
+        // Full mirror_event path with the durable segment backend selected: each
+        // event mirrors + holds parity, and the events land in durable segments
+        // (not the JSONL log), independently reopened via the backend module.
+        let (log, dir) = tmp_log("shadow-durable");
+        let mut e = worker_env(log.to_str().unwrap(), "shadow");
+        e.insert(
+            "NOETL_EHDB_EVENTLOG_BACKEND".to_string(),
+            "durable_segment".to_string(),
+        );
+        for (i, seq) in [1u64, 2, 3].iter().enumerate() {
+            let r = mirror_event(
+                &e,
+                "100",
+                Some(*seq),
+                &format!("evt-{i}"),
+                &Default::default(),
+                false,
+            );
+            assert_eq!(r.outcome, EventLogOutcome::Mirrored, "{:?}", r.detail);
+            assert_eq!(r.global_sequence, Some(*seq));
+            assert!(r.parity.as_ref().unwrap().holds());
+        }
+        // The durable segments hold all three; the JSONL log was never written.
+        let contract = contract_from_env(&e).unwrap();
+        let count = crate::ehdb::eventlog_backend::durable_shard_record_count(&e, &contract, "100")
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "durable segments replay all three appended events"
+        );
+        assert!(!log.exists(), "durable backend never writes the JSONL log");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
