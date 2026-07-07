@@ -914,6 +914,67 @@ pub fn serve_primary_cycle(
     }
 }
 
+/// Resolve the once-per-process env snapshot that arms the **live platform-object
+/// mirror hook** (noetl/ehdb#234 runtime integration, object tier).  This is the
+/// twin of [`eventlog::runtime_hook_env`][elh] for the object tier: the worker's
+/// authoritative platform-object write chokepoint
+/// (`ControlPlaneClient::object_put` → `PUT /api/internal/objects/{key}`, which
+/// every object tier — result-tier, state-shard, plugin — funnels through)
+/// resolves it exactly once at client construction, so the per-put path does
+/// *zero* work when the hook is inactive.
+///
+/// Returns `Some(env)` — meaning "mirror every live platform-object put" — ONLY
+/// when all of:
+///
+/// * the umbrella switch `NOETL_EHDB_ENABLED` is truthy, AND
+/// * the object tier `NOETL_EHDB_OBJECT` is `shadow` (this slice wires the live
+///   path for **shadow** only; `off`/`primary` return `None`), AND
+/// * the resolved contract is a data-plane role (`worker`/`playbook`/`system`)
+///   running the bounded `local_reference` runtime with a log configured.
+///
+/// Every other case (disabled, tier off/primary, control-plane role, malformed
+/// contract) returns `None` — a strict no-op hook, so a worker without EHDB is
+/// byte-identical.
+///
+/// [elh]: super::eventlog::runtime_hook_env
+pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
+    if !truthy(env, EHDB_ENABLED_ENV) {
+        return None;
+    }
+    if ObjectMode::from_env(env) != ObjectMode::Shadow {
+        return None;
+    }
+    let contract = contract_from_env(env).ok()?;
+    if !contract.role.is_data_plane() {
+        return None;
+    }
+    if !contract.uses_local_reference_runtime() || contract.local_reference_log.is_none() {
+        return None;
+    }
+    Some(env.clone())
+}
+
+/// Live platform-object mirror hook: mirror one already-written platform object
+/// (the authoritative object-store put the worker just performed) into the EHDB
+/// object shadow fabric with digest-parity verification.
+///
+/// This calls the SAME [`mirror_put`] shadow dual-write + read-back digest-parity
+/// path the `ehdb-selfcheck mirror-object` drive exercises, but on the real
+/// object puts the worker performs, so a live drive advances the
+/// `noetl_ehdb_object_*` metrics instead of only the selfcheck.
+///
+/// **Best-effort + isolated.**  Shadow is auxiliary: this NEVER affects the
+/// authoritative object path.  Engine-error cases surface as non-`ok` outcomes
+/// (recorded to the degraded metric), and an unexpected panic is caught here and
+/// returned as [`ObjectOutcome::Unavailable`] rather than unwinding into the
+/// caller.  The caller discards the return; the metric carries the signal.
+pub fn mirror_live_put(env: &EnvMap, key: &str, bytes: &[u8]) -> ObjectOutcome {
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mirror_put(env, key, bytes, &ObjectOptions::default(), true).outcome
+    }));
+    guarded.unwrap_or(ObjectOutcome::Unavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1203,6 +1264,99 @@ mod tests {
                 "forbidden NoETL event-writer reference `{forbidden}` in object.rs"
             );
         }
+    }
+
+    // --- Live platform-object mirror hook (runtime integration, noetl/ehdb#234) ---
+
+    #[test]
+    fn runtime_hook_env_arms_only_for_enabled_shadow_data_plane() {
+        let armed = runtime_hook_env(&worker_env("/tmp/obj-hook.jsonl", "shadow"));
+        assert!(armed.is_some(), "shadow+enabled worker must arm the object hook");
+    }
+
+    #[test]
+    fn runtime_hook_env_noop_when_disabled() {
+        let e: EnvMap = [("NOETL_EHDB_OBJECT", "shadow")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert!(runtime_hook_env(&e).is_none());
+    }
+
+    #[test]
+    fn runtime_hook_env_noop_when_tier_off_or_primary() {
+        assert!(runtime_hook_env(&worker_env("/tmp/obj-hook.jsonl", "off")).is_none());
+        assert!(runtime_hook_env(&worker_env("/tmp/obj-hook.jsonl", "primary")).is_none());
+    }
+
+    #[test]
+    fn runtime_hook_env_skips_control_plane_role() {
+        for role in ["server", "gateway", "api"] {
+            let e: EnvMap = [
+                ("NOETL_EHDB_ENABLED", "true"),
+                ("NOETL_EHDB_MODE", "local_reference"),
+                ("NOETL_EHDB_CLIENT_ROLE", role),
+                ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+                ("NOETL_EHDB_OBJECT", "shadow"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            assert!(
+                runtime_hook_env(&e).is_none(),
+                "control-plane role {role} must not arm the object hook"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_live_put_fires_on_shadow_enabled() {
+        let (log, dir) = tmp_log("live-obj-fire");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        let outcome = mirror_live_put(
+            &e,
+            "exec/478775660589088776/state/shard-0.feather",
+            b"\x00arrow-feather-bytes\x01",
+        );
+        assert_eq!(outcome, ObjectOutcome::Mirrored);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_live_put_is_noop_when_disabled() {
+        let e: EnvMap = EnvMap::new();
+        let outcome = mirror_live_put(&e, "k", b"bytes");
+        assert_eq!(outcome, ObjectOutcome::Disabled);
+    }
+
+    #[test]
+    fn mirror_live_put_skipped_for_control_plane_role() {
+        let e: EnvMap = [
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "server"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+            ("NOETL_EHDB_OBJECT", "shadow"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let outcome = mirror_live_put(&e, "k", b"bytes");
+        assert_eq!(outcome, ObjectOutcome::GuardRefused);
+    }
+
+    #[test]
+    fn mirror_live_put_isolates_engine_error_without_propagating() {
+        let (file_as_dir, dir) = tmp_log("obj-iso");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let bad_log = file_as_dir.join("nested").join("log.jsonl");
+        let e = worker_env(bad_log.to_str().unwrap(), "shadow");
+        let outcome = mirror_live_put(&e, "k", b"bytes");
+        assert!(
+            matches!(outcome, ObjectOutcome::Unavailable | ObjectOutcome::Invalid),
+            "engine error must be contained as an outcome, got {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn code_lines(src: &str) -> String {

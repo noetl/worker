@@ -68,6 +68,11 @@ pub enum Routing {
     Dropped,
 }
 
+/// NATS-KV bucket holding per-subscription circuit-breaker state — the only
+/// live platform NATS-KV write path in the worker, and the seam the EHDB KV-tier
+/// shadow mirror hooks (noetl/ehdb#234).
+const CIRCUIT_KV_BUCKET: &str = "noetl_subscription_circuit";
+
 /// Per-subscription spool + circuit runtime.
 pub struct SpoolRuntime {
     engine: SpoolEngine,
@@ -84,6 +89,13 @@ pub struct SpoolRuntime {
     probe_interval_ms: u64,
     last_probe_ms: u64,
     recv_seq: u64,
+    /// Once-resolved arming state for the EHDB KV-tier **live-put hook**
+    /// (noetl/ehdb#234).  `Some(env)` when the process is a data-plane role
+    /// running `NOETL_EHDB_KV=shadow` with EHDB enabled — then every circuit
+    /// snapshot persisted to NATS-KV is mirrored into the EHDB KV shadow fabric.
+    /// `None` (disabled / tier off/primary / control-plane role) makes the mirror
+    /// a strict no-op.  Resolved once in [`Self::build`].
+    ehdb_kv_hook: Option<crate::ehdb::EnvMap>,
 }
 
 impl SpoolRuntime {
@@ -218,6 +230,12 @@ impl SpoolRuntime {
         let probe_interval_ms = spec.circuit.probe_interval_ms;
         let engine = SpoolEngine::new(spec.clone(), backend, dlq);
 
+        // Resolve the EHDB KV-tier live-put hook once (noetl/ehdb#234).  `None`
+        // for a disabled / non-shadow / control-plane process, so `persist_circuit`
+        // does zero mirror work unless the shadow tier is armed for a data-plane
+        // role.
+        let ehdb_kv_hook = crate::ehdb::kv::runtime_hook_env(&crate::ehdb::process_env());
+
         tracing::info!(
             subscription_id,
             mode = spec.mode.as_str(),
@@ -242,6 +260,7 @@ impl SpoolRuntime {
             probe_interval_ms,
             last_probe_ms: 0,
             recv_seq: 0,
+            ehdb_kv_hook,
         }))
     }
 
@@ -688,10 +707,25 @@ impl SpoolRuntime {
     async fn persist_circuit(&self) {
         let Some(store) = &self.kv else { return };
         let snapshot = self.circuits.snapshot();
-        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-            if let Err(e) = store.put(&self.kv_key, bytes.into()).await {
-                tracing::debug!(error = %e, "circuit KV persist failed (non-fatal)");
-            }
+        let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+            return;
+        };
+        // Snapshot the value for the EHDB shadow mirror only when the hook is
+        // armed (the common disabled path never clones).
+        let mirror_value = self
+            .ehdb_kv_hook
+            .as_ref()
+            .and_then(|_| String::from_utf8(bytes.clone()).ok());
+        if let Err(e) = store.put(&self.kv_key, bytes.into()).await {
+            tracing::debug!(error = %e, "circuit KV persist failed (non-fatal)");
+            return;
+        }
+        // EHDB KV-tier live-put mirror (noetl/ehdb#234): mirror the platform
+        // NATS-KV write we just performed into the EHDB KV shadow fabric.
+        // Best-effort + isolated: `mirror_live_put` swallows and meters any
+        // failure so the authoritative NATS-KV path is never affected.
+        if let (Some(env), Some(value)) = (&self.ehdb_kv_hook, mirror_value) {
+            let _ = crate::ehdb::kv::mirror_live_put(env, CIRCUIT_KV_BUCKET, &self.kv_key, &value);
         }
     }
 
@@ -791,7 +825,7 @@ async fn open_circuit_kv(
     js: &async_nats::jetstream::Context,
     subscription_id: i64,
 ) -> Option<async_nats::jetstream::kv::Store> {
-    let bucket = "noetl_subscription_circuit";
+    let bucket = CIRCUIT_KV_BUCKET;
     match js.get_key_value(bucket).await {
         Ok(s) => Some(s),
         Err(_) => js

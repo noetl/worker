@@ -220,6 +220,15 @@ pub struct ControlPlaneClient {
     /// shared (Arc) across [`with_server_url`] dispatch clones — the env is
     /// immutable for the worker's lifetime.
     ehdb_eventlog_hook: Arc<Option<crate::ehdb::EnvMap>>,
+    /// Once-resolved arming state for the EHDB object-tier **live-put hook**
+    /// (noetl/ehdb#234 runtime integration).  `Some(env)` when the process is a
+    /// data-plane role running `NOETL_EHDB_OBJECT=shadow` with EHDB enabled —
+    /// then every object durably accepted by `object_put` is mirrored (with
+    /// digest parity) into the EHDB object shadow fabric.  `None` (disabled, tier
+    /// off/primary, or a control-plane role) makes the hook a strict per-put
+    /// no-op.  Resolved once in [`new`] and shared (Arc) across [`with_server_url`]
+    /// dispatch clones — the env is immutable for the worker's lifetime.
+    ehdb_object_hook: Arc<Option<crate::ehdb::EnvMap>>,
 }
 
 impl ControlPlaneClient {
@@ -237,6 +246,7 @@ impl ControlPlaneClient {
             server_url: server_url.trim_end_matches('/').to_string(),
             sealing_sk: Arc::clone(&self.sealing_sk),
             ehdb_eventlog_hook: Arc::clone(&self.ehdb_eventlog_hook),
+            ehdb_object_hook: Arc::clone(&self.ehdb_object_hook),
         }
     }
 
@@ -264,15 +274,19 @@ impl ControlPlaneClient {
         // `None` for a disabled / non-shadow / control-plane process, so the
         // per-event path in `emit_event` does zero work unless the shadow tier
         // is explicitly armed for a data-plane role.
-        let ehdb_eventlog_hook = Arc::new(crate::ehdb::eventlog::runtime_hook_env(
-            &crate::ehdb::process_env(),
-        ));
+        let process_env = crate::ehdb::process_env();
+        let ehdb_eventlog_hook = Arc::new(crate::ehdb::eventlog::runtime_hook_env(&process_env));
+        // Object-tier live-put hook (noetl/ehdb#234): `Some` only for a
+        // data-plane role running `NOETL_EHDB_OBJECT=shadow` with EHDB enabled,
+        // so `object_put` does zero work unless the shadow tier is armed.
+        let ehdb_object_hook = Arc::new(crate::ehdb::object::runtime_hook_env(&process_env));
 
         Self {
             client,
             server_url: server_url.trim_end_matches('/').to_string(),
             sealing_sk: Arc::new(sealing_sk),
             ehdb_eventlog_hook,
+            ehdb_object_hook,
         }
     }
 
@@ -732,6 +746,17 @@ impl ControlPlaneClient {
     /// directly (data-access boundary). `key` may contain slashes (the §7 key);
     /// they pass through to the server's `{*key}` catch-all.
     pub async fn object_put(&self, key: &str, bytes: Vec<u8>, media_type: &str) -> Result<()> {
+        // EHDB object-tier live-put hook (noetl/ehdb#234).  Snapshot the bytes
+        // for the shadow mirror ONLY when the hook is armed — the common
+        // disabled path never clones.  `object_put` is the single chokepoint
+        // every platform object tier (result-tier, state-shard, plugin intent)
+        // funnels through, so hooking here mirrors ALL live object puts.
+        let mirror_bytes = if self.ehdb_object_hook.is_some() {
+            Some(bytes.clone())
+        } else {
+            None
+        };
+
         let response = self
             .client
             .put(format!("{}/api/internal/objects/{}", self.server_url, key))
@@ -744,6 +769,14 @@ impl ControlPlaneClient {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("object_put failed: HTTP {} {}", status.as_u16(), body);
+        }
+
+        // Mirror only after the object is durably accepted by the server (the
+        // authoritative digest authority).  Best-effort + isolated:
+        // `mirror_live_put` swallows and meters any failure so the authoritative
+        // object path is never affected.
+        if let (Some(env), Some(mb)) = (self.ehdb_object_hook.as_ref(), mirror_bytes) {
+            let _ = crate::ehdb::object::mirror_live_put(env, key, &mb);
         }
         Ok(())
     }

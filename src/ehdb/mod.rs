@@ -26,6 +26,52 @@
 //! The env contract this reads is rendered by the ops Helm charts
 //! (`automation/helm/*/templates/_ehdb.tpl`, disabled by default) and mirrored
 //! by [`contract`].
+//!
+//! ## Live runtime-hook wiring status (noetl/ehdb#234)
+//!
+//! Each tier's shadow/mirror engine exists in this module; a tier is
+//! *live-wired* once its `mirror_live_*` hook is invoked from the worker's real
+//! runtime path (not just `ehdb-selfcheck`).  Every hook is env-armed
+//! (`NOETL_EHDB_ENABLED` + `NOETL_EHDB_<TIER>=shadow` + data-plane role), a
+//! strict no-op otherwise, and error-isolated so the authoritative path is never
+//! affected.
+//!
+//! | Tier | Live-wired | Seam |
+//! | :-- | :-- | :-- |
+//! | eventlog | ✅ | [`client::ControlPlaneClient::emit_event`][ee] → [`eventlog::mirror_live_event`] |
+//! | kv | ✅ | `spool_runtime::SpoolRuntime::persist_circuit` (NATS-KV circuit put) → [`kv::mirror_live_put`] |
+//! | object | ✅ | [`client::ControlPlaneClient::object_put`][op] (all object tiers funnel through it) → [`object::mirror_live_put`] |
+//! | projection | ⏳ deferred | see below |
+//! | vector | ⏳ deferred | see below |
+//!
+//! **projection — deferred (no clean per-event live seam).**
+//! [`projection::shadow_project`] is a *batch* materialize that reads back the
+//! **whole accumulating** projection log ([`ehdb_reference`]'s
+//! `list_executions`) and compares it against a **full** authoritative
+//! execution-state fold + committed offset.  A long-running worker's log
+//! accumulates unboundedly, so a naive per-event hook (at `emit_event` or the
+//! off-server state builder's `WalEventIndex::apply`, `state_builder.rs`) would
+//! report persistent false key-divergence — that is "a hook that fires but lies",
+//! not a shadow.  The faithful seam is a bounded, windowed batch materialization
+//! that also supplies the incumbent materializer's fold for the same window
+//! (either a scheduled tail-window drive, or a per-execution-scoped readback on
+//! the engine side) — a larger change than a call-site hook.  Exact remaining
+//! seam: `state_builder.rs` `run_drain_loop` after `idx.apply(&payload)` (where
+//! `payload` + `execution_id` are in hand), feeding the `WalEventIndex`
+//! per-execution fold as `shadow_project`'s `authoritative` argument, once the
+//! engine can scope its readback to the touched executions.
+//!
+//! **vector — deferred (no live write site exists yet).**
+//! There is no platform vector-upsert in the worker's live loop today: platform
+//! RAG retrieval is in-process and read-only ([`rag`]), and
+//! [`vector::mirror_upsert`] is exercised only by `ehdb-selfcheck`.  Wiring a
+//! hook now would create one that never fires.  Exact remaining seam: a future
+//! platform-RAG *ingest/embed* path (would live in `executor/command.rs` when a
+//! step embeds + upserts platform vectors), which does not exist yet — the hook
+//! lands with that write site, not before.
+//!
+//! [ee]: crate::client::ControlPlaneClient::emit_event
+//! [op]: crate::client::ControlPlaneClient::object_put
 
 use std::collections::HashMap;
 
