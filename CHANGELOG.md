@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.68.1](https://github.com/noetl/worker/compare/v5.68.0...v5.68.1) (2026-07-07)
+
+### Bug Fixes
+
+* **ehdb:** bump ehdb-reference pin to bbc5047 (object subject digest fix) ([#169](https://github.com/noetl/worker/issues/169)) ([056bcfb](https://github.com/noetl/worker/commit/056bcfbba1e57532902be64d466de2f76b166473)), closes [#166](https://github.com/noetl/worker/issues/166) [#104](https://github.com/noetl/worker/issues/104) [noetl/ehdb#256](https://github.com/noetl/ehdb/issues/256) [noetl/ehdb#257](https://github.com/noetl/ehdb/issues/257) [noetl/ai-meta#241](https://github.com/noetl/ai-meta/issues/241)
+
 ## [5.68.0](https://github.com/noetl/worker/compare/v5.67.0...v5.68.0) (2026-07-07)
 
 ### Features
