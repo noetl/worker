@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.70.0](https://github.com/noetl/worker/compare/v5.69.0...v5.70.0) (2026-07-07)
+
+### Features
+
+* **ehdb:** select durable event-log backend in worker (durable slice 4) ([#234](https://github.com/noetl/worker/issues/234)) ([#171](https://github.com/noetl/worker/issues/171)) ([9947d9b](https://github.com/noetl/worker/commit/9947d9b7e22b5c175d2e2d05d92892a47fe7b77c))
+
 ## [5.69.0](https://github.com/noetl/worker/compare/v5.68.1...v5.69.0) (2026-07-07)
 
 ### Features
