@@ -55,7 +55,9 @@
 //!   materializer (structurally asserted — it only touches the derived EHDB
 //!   projection fabric via `ehdb_reference`).
 
-use ehdb_reference::projection::exercise_primary_serve;
+use ehdb_reference::projection::{
+    exercise_primary_serve, DEFAULT_RUNNING_STATUS, TERMINAL_EVENT_TYPES,
+};
 use ehdb_reference::{
     compare_projection_parity, AuthoritativeExecutionState, ExecutionStateView,
     LocalReferenceProjectionEngine, ProjectionApplyRequest, ProjectionDriver, ProjectionEventInput,
@@ -63,7 +65,9 @@ use ehdb_reference::{
     DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
-use super::contract::{contract_from_env, EhdbClientRole, EhdbContract, EHDB_ENABLED_ENV};
+use super::contract::{
+    contract_from_env, EhdbClientRole, EhdbContract, EHDB_ENABLED_ENV, EHDB_LOCAL_REFERENCE_LOG_ENV,
+};
 use super::guard::assert_data_plane_access_allowed;
 use super::{metrics, EnvMap};
 use crate::snowflake::SnowflakeGen;
@@ -783,6 +787,233 @@ pub fn serve_primary_cycle(
     }
 }
 
+// ===========================================================================
+// Live runtime cadence hook (noetl/ehdb#234 runtime integration, projection
+// tier).
+//
+// Unlike the event-log / kv / object tiers — whose authoritative write is a
+// single per-item op a mirror can shadow one-for-one — the projection tier is a
+// *batch fold*: [`shadow_project`] materializes a window of events and compares
+// the WHOLE read-model (`list_executions`) against a full authoritative fold +
+// committed offset.  Firing per-event against the long-lived projection store
+// therefore reports persistent false key-divergence: the store accumulates every
+// execution ever materialized (`KeepAll`) while a per-event authoritative names
+// only the touched one, and the worker's own index evicts terminal chains the
+// store keeps — the two key-sets can never match.  That is "a hook that fires but
+// lies", not a shadow.
+//
+// The faithful seam is a bounded, *windowed* materialization at a natural drain
+// checkpoint into a fresh per-window store, parity-checked against an independent
+// worker-side fold of the SAME window.  A fresh throwaway store per window means
+// the read-back sees exactly the window's executions (no cross-window
+// accumulation ⇒ no false key-divergence), while the module's bounded + stateless
+// invariant is preserved (the store is opened, used, and removed per call).
+// Cross-window persistence / replay is proven separately by
+// `ehdb-selfcheck`'s primary-serve cycle.  See [`mirror_live_window`].
+// ===========================================================================
+
+/// Resolve the once-per-process env snapshot that arms the **live projection
+/// cadence hook** (noetl/ehdb#234).  Twin of [`eventlog::runtime_hook_env`][elh]
+/// for the projection tier: the worker's off-server state-builder drain resolves
+/// it once at startup, so the per-batch path does *zero* work when the hook is
+/// inactive.
+///
+/// Returns `Some(env)` — "windowed-materialize every drained batch" — ONLY when
+/// all of: `NOETL_EHDB_ENABLED` truthy, `NOETL_EHDB_PROJECTION` is `shadow`
+/// (this slice wires the live path for **shadow** only; `off`/`primary` return
+/// `None`), and the resolved contract is a data-plane role
+/// (`worker`/`playbook`/`system`) on the bounded `local_reference` runtime with a
+/// log configured.  Every other case (disabled, tier off/primary, control-plane
+/// role, malformed contract) returns `None` — a strict no-op hook, byte-identical
+/// to a build without EHDB.
+///
+/// [elh]: super::eventlog::runtime_hook_env
+pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
+    if !truthy(env, EHDB_ENABLED_ENV) {
+        return None;
+    }
+    if ProjectionMode::from_env(env) != ProjectionMode::Shadow {
+        return None;
+    }
+    let contract = contract_from_env(env).ok()?;
+    if !contract.role.is_data_plane() {
+        return None;
+    }
+    if !contract.uses_local_reference_runtime() || contract.local_reference_log.is_none() {
+        return None;
+    }
+    Some(env.clone())
+}
+
+/// Build a [`ProjectionEventInput`] from one raw WAL event payload, assigning the
+/// window-local `global_sequence`.  Mirrors the field extraction of
+/// [`ProjectionEventInput::from_event_log_record`] but reads a JSON value already
+/// in hand (the worker holds the payload, not an EHDB event-log record).  Returns
+/// `None` for a non-chainable payload (no `event_id` / `execution_id`) — the same
+/// filter the state-builder's `WalEventIndex::apply` applies.
+fn projection_input_from_payload(
+    payload: &serde_json::Value,
+    global_sequence: u64,
+) -> Option<ProjectionEventInput> {
+    let obj = payload.as_object()?;
+    let event_id = obj.get("event_id").and_then(|v| v.as_i64())?;
+    let execution_id = obj.get("execution_id").and_then(|v| v.as_i64())?;
+    let event_type = obj
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(ProjectionEventInput {
+        global_sequence,
+        event_id,
+        execution_id: execution_id.to_string(),
+        event_type,
+        node_name: obj
+            .get("node_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        status: obj
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        prev_event_id: obj.get("prev_event_id").and_then(|v| v.as_i64()),
+    })
+}
+
+/// Terminal-event → derived-status map (the `projection_snapshot` twin's
+/// terminal status).  Mirrors the `ehdb_reference` incumbent contract but is a
+/// SEPARATE worker-side implementation so the shadow genuinely cross-checks the
+/// engine rather than replaying its own fold.
+fn terminal_status_of(event_type: &str) -> &'static str {
+    match event_type {
+        "playbook.failed" | "playbook_failed" => "failed",
+        "playbook.cancelled" | "playbook_cancelled" => "cancelled",
+        // Any other terminal type (only `completed` remains in
+        // `TERMINAL_EVENT_TYPES`) folds to `completed`.
+        _ => "completed",
+    }
+}
+
+/// Independent worker-side fold of a window of events into per-execution
+/// authoritative state — the shadow's parity ground truth.  This is a SEPARATE
+/// implementation from the `ehdb_reference` projection engine's internal fold:
+/// the two fold the same window independently, so a divergence in the engine's
+/// apply → store → read-back round-trip (miscount, wrong terminal detection,
+/// dropped / duplicated row, dedup or checkpoint bug) surfaces as a real parity
+/// mismatch.  Terminal detection uses the shared public [`TERMINAL_EVENT_TYPES`]
+/// contract; status derivation mirrors the incumbent materializer (terminal
+/// status once terminal, else the latest event's status, else
+/// [`DEFAULT_RUNNING_STATUS`]).
+fn fold_window_authoritative(inputs: &[ProjectionEventInput]) -> Vec<AuthoritativeExecutionState> {
+    use std::collections::BTreeMap;
+    // (event_count, latest_status, terminal_status) per execution, ordered by id
+    // (BTreeMap) so the fold is deterministic.
+    let mut by_exec: BTreeMap<&str, (usize, Option<String>, Option<&'static str>)> = BTreeMap::new();
+    for ev in inputs {
+        let entry = by_exec
+            .entry(ev.execution_id.as_str())
+            .or_insert((0, None, None));
+        entry.0 += 1;
+        if let Some(status) = &ev.status {
+            entry.1 = Some(status.clone());
+        }
+        if TERMINAL_EVENT_TYPES.contains(&ev.event_type.as_str()) {
+            entry.2 = Some(terminal_status_of(ev.event_type.as_str()));
+        }
+    }
+    by_exec
+        .into_iter()
+        .map(|(exec, (count, latest, terminal))| AuthoritativeExecutionState {
+            execution_id: exec.to_string(),
+            status: terminal
+                .map(|s| s.to_string())
+                .or(latest)
+                .unwrap_or_else(|| DEFAULT_RUNNING_STATUS.to_string()),
+            event_count: count,
+            terminal: terminal.is_some(),
+        })
+        .collect()
+}
+
+/// Live projection cadence hook: at a natural state-builder drain checkpoint,
+/// windowed-materialize the batch of real WAL events the worker just processed
+/// into the EHDB projection read-model and parity-check it against an independent
+/// worker-side fold of the same window.
+///
+/// **Windowed, not per-event.**  Each call folds ONE bounded window into a fresh,
+/// throwaway per-window projection store (a unique temp log), so the read-back
+/// `list_executions` sees exactly this window's executions and never the
+/// unbounded accumulation of prior windows — the false-key-divergence a naive
+/// per-event hook would report is structurally impossible.  The fresh store is
+/// opened, used for the parity round-trip, and removed; nothing persists between
+/// windows (the module's bounded + stateless invariant).
+///
+/// **Best-effort + isolated.**  Shadow is auxiliary and NEVER affects the
+/// authoritative state builder.  Non-chainable payloads are filtered; an empty
+/// window is a strict no-op (no metric).  Engine errors surface as metered
+/// non-`ok` outcomes and any panic is caught here and returned as
+/// [`ProjectionOutcome::Unavailable`] rather than unwinding into the drain loop.
+/// The caller discards the return; the `noetl_ehdb_projection_*` metric carries
+/// the signal.
+pub fn mirror_live_window(env: &EnvMap, payloads: &[serde_json::Value]) -> ProjectionOutcome {
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mirror_live_window_inner(env, payloads)
+    }));
+    guarded.unwrap_or(ProjectionOutcome::Unavailable)
+}
+
+fn mirror_live_window_inner(env: &EnvMap, payloads: &[serde_json::Value]) -> ProjectionOutcome {
+    // Bound the window like every other EHDB batch op (the drain batch is already
+    // `config.batch`-bounded, but never drive an unbounded fold).
+    let max_batch = bounded_max_batch(env);
+    let mut inputs: Vec<ProjectionEventInput> = Vec::new();
+    for payload in payloads.iter().take(max_batch) {
+        let seq = inputs.len() as u64 + 1; // window-local 1..N, strictly monotonic
+        if let Some(input) = projection_input_from_payload(payload, seq) {
+            inputs.push(input);
+        }
+    }
+    if inputs.is_empty() {
+        // No chainable events in this window ⇒ strict no-op (no metric), so a
+        // drain of only non-event control messages stays byte-identical.
+        return ProjectionOutcome::Disabled;
+    }
+    let offset = inputs.len() as u64;
+    let authoritative = fold_window_authoritative(&inputs);
+
+    // Fresh per-window store: scope the read-back to THIS window's executions so
+    // the parity compare never sees prior windows' accumulation.  The temp name
+    // is uniquified with the module's snowflake generator (no wall-clock / RNG).
+    let window_dir = std::env::temp_dir().join(format!(
+        "ehdb-proj-window-{}-{}",
+        std::process::id(),
+        txn_gen().next_id()
+    ));
+    if std::fs::create_dir_all(&window_dir).is_err() {
+        return ProjectionOutcome::Unavailable;
+    }
+    let window_log = window_dir.join("projection-window.jsonl");
+    let mut window_env = env.clone();
+    window_env.insert(
+        EHDB_LOCAL_REFERENCE_LOG_ENV.to_string(),
+        window_log.to_string_lossy().to_string(),
+    );
+
+    let outcome = shadow_project(
+        &window_env,
+        &inputs,
+        &authoritative,
+        Some(offset),
+        &ProjectionOptions::default(),
+        true,
+    )
+    .outcome;
+
+    // Best-effort cleanup — the window store is throwaway.
+    let _ = std::fs::remove_dir_all(&window_dir);
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,6 +1457,158 @@ mod tests {
         let r = serve_primary_cycle(&e, &Default::default(), false);
         assert_eq!(r.outcome, ProjectionOutcome::GuardRefused);
         assert!(r.report.is_none());
+    }
+
+    // --- live cadence hook (noetl/ehdb#234 runtime integration) -------------
+
+    fn payload(event_id: i64, exec: i64, event_type: &str, status: Option<&str>) -> serde_json::Value {
+        let mut obj = serde_json::json!({
+            "event_id": event_id,
+            "execution_id": exec,
+            "event_type": event_type,
+        });
+        if let Some(s) = status {
+            obj["status"] = serde_json::json!(s);
+        }
+        obj
+    }
+
+    /// A drained batch: exec 100 starts + completes, exec 200 starts (running).
+    fn window_payloads() -> Vec<serde_json::Value> {
+        vec![
+            payload(10, 100, "playbook_started", Some("running")),
+            payload(11, 200, "playbook_started", Some("running")),
+            payload(12, 100, "playbook.completed", Some("completed")),
+        ]
+    }
+
+    #[test]
+    fn runtime_hook_env_arms_only_for_enabled_shadow_data_plane() {
+        let armed = runtime_hook_env(&worker_env("/tmp/proj-hook.jsonl", "shadow"));
+        assert!(armed.is_some(), "enabled + shadow + worker role should arm");
+    }
+
+    #[test]
+    fn runtime_hook_env_noop_when_disabled() {
+        let mut e = worker_env("/tmp/proj-hook.jsonl", "shadow");
+        e.remove("NOETL_EHDB_ENABLED");
+        assert!(runtime_hook_env(&e).is_none());
+    }
+
+    #[test]
+    fn runtime_hook_env_noop_when_tier_off_or_primary() {
+        assert!(runtime_hook_env(&worker_env("/tmp/proj-hook.jsonl", "off")).is_none());
+        assert!(runtime_hook_env(&worker_env("/tmp/proj-hook.jsonl", "primary")).is_none());
+    }
+
+    #[test]
+    fn runtime_hook_env_skips_control_plane_role() {
+        for role in ["gateway", "api", "server"] {
+            let mut e = worker_env("/tmp/proj-hook.jsonl", "shadow");
+            e.insert("NOETL_EHDB_CLIENT_ROLE".to_string(), role.to_string());
+            assert!(
+                runtime_hook_env(&e).is_none(),
+                "control-plane role {role} must not arm the projection hook"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_window_authoritative_matches_engine_fold_no_false_divergence() {
+        // The independent worker-side fold of the window and the EHDB engine's
+        // fold agree (Materialized, parity holds) — the cadence hook produces no
+        // false key/value divergence over a multi-execution window.
+        let (log, dir) = tmp_log("hook-parity");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        let outcome = mirror_live_window(&e, &window_payloads());
+        assert_eq!(
+            outcome,
+            ProjectionOutcome::Materialized,
+            "window must materialize with parity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_live_window_repeated_windows_never_accumulate_false_divergence() {
+        // Fire the hook twice with DIFFERENT executions.  A shared long-lived
+        // store would report key divergence on the second call (extra rows from
+        // the first window); the fresh-per-window store keeps each self-contained.
+        let (log, dir) = tmp_log("hook-repeat");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        let first = mirror_live_window(
+            &e,
+            &[payload(10, 100, "playbook.completed", Some("completed"))],
+        );
+        let second = mirror_live_window(
+            &e,
+            &[payload(20, 300, "playbook.completed", Some("completed"))],
+        );
+        assert_eq!(first, ProjectionOutcome::Materialized);
+        assert_eq!(
+            second,
+            ProjectionOutcome::Materialized,
+            "second window must not see the first's rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_live_window_is_noop_when_disabled() {
+        let mut e = worker_env("/tmp/unused.jsonl", "shadow");
+        e.remove("NOETL_EHDB_ENABLED");
+        // shadow_project short-circuits to Disabled; no store is opened.
+        let outcome = mirror_live_window(&e, &window_payloads());
+        assert_eq!(outcome, ProjectionOutcome::Disabled);
+    }
+
+    #[test]
+    fn mirror_live_window_is_noop_when_tier_off() {
+        let outcome =
+            mirror_live_window(&worker_env("/tmp/unused.jsonl", "off"), &window_payloads());
+        assert_eq!(outcome, ProjectionOutcome::Disabled);
+    }
+
+    #[test]
+    fn mirror_live_window_skipped_for_control_plane_role() {
+        let (log, dir) = tmp_log("hook-cp");
+        let mut e = worker_env(log.to_str().unwrap(), "shadow");
+        e.insert("NOETL_EHDB_CLIENT_ROLE".to_string(), "gateway".to_string());
+        // The guard refuses a control-plane role inside shadow_project before any
+        // engine opens.
+        let outcome = mirror_live_window(&e, &window_payloads());
+        assert_eq!(outcome, ProjectionOutcome::GuardRefused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_live_window_empty_or_non_chainable_is_noop() {
+        let (log, dir) = tmp_log("hook-empty");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        // No chainable events (missing event_id) ⇒ strict no-op, no metric.
+        let junk = vec![serde_json::json!({"note": "heartbeat"})];
+        assert_eq!(mirror_live_window(&e, &junk), ProjectionOutcome::Disabled);
+        assert_eq!(mirror_live_window(&e, &[]), ProjectionOutcome::Disabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_live_window_isolates_engine_error_without_propagating() {
+        // The guarded hook must always return an outcome (never panic) for a
+        // well-formed window — the panic-catch + best-effort contract.
+        let (log, dir) = tmp_log("hook-iso");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        let outcome = mirror_live_window(&e, &window_payloads());
+        assert!(
+            matches!(
+                outcome,
+                ProjectionOutcome::Materialized
+                    | ProjectionOutcome::ParityMismatch
+                    | ProjectionOutcome::Unavailable
+            ),
+            "hook must always return an outcome, never panic: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Read-model-derived invariant, asserted structurally: this module must

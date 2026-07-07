@@ -950,6 +950,101 @@ pub fn serve_primary_cycle(
     }
 }
 
+// ===========================================================================
+// Live runtime hook (noetl/ehdb#234 runtime integration, vector tier).
+//
+// **Reachability — honest status (2026-07-07).**  Unlike event-log / kv / object
+// / projection, the vector tier has **no live platform vector-upsert site in the
+// worker process today**, so the `mirror_live_upsert` pair below is READY but is
+// NOT invoked from any live path — wiring it into a fabricated site would create
+// a hook that fires but never mirrors a real upsert (or, worse, mirrors non-vector
+// data), which is exactly the "hook that lies" this integration refuses to ship.
+//
+// What exists in the worker:
+//   * platform RAG *retrieval* ([`super::rag::retrieve`]) — read-only, no upsert.
+//   * platform RAG *ingest* ([`super::rag::ingest`]) — writes a **lexical**
+//     retrieval fabric ([`super::rag::RagChunk`] carries `text` + `checksum`, NOT
+//     an embedding vector), so it is not a vector-embedding upsert to mirror.
+//   * [`mirror_upsert`] / [`shadow_suite`] / [`serve_primary_cycle`] — exercised
+//     only by the `ehdb-selfcheck` diagnostic binary and tests.
+//
+// The precise remaining seam: a future platform-RAG *embed + upsert* write site —
+// when a worker step (a `tool`/system playbook) computes embeddings and upserts
+// platform vectors (e.g. in `executor/command.rs` at the embed-and-upsert
+// dispatch, or wherever the SLM/RAG ingest path lands its vectors) — that write
+// site, once it exists, calls [`mirror_live_upsert`] right after the authoritative
+// Qdrant upsert.  The hook lands WITH that write site, not before.  Everything
+// below is the ready, tested machinery so that future wire-up is a one-line call.
+// ===========================================================================
+
+/// Resolve the once-per-process env snapshot that would arm the **live platform
+/// vector-upsert mirror hook** (noetl/ehdb#234, vector tier).  Twin of
+/// [`eventlog::runtime_hook_env`][elh] for the vector tier.
+///
+/// Returns `Some(env)` ONLY when `NOETL_EHDB_ENABLED` is truthy, `NOETL_EHDB_VECTOR`
+/// is `shadow`, and the contract is a data-plane role on the bounded
+/// `local_reference` runtime with a log configured; `None` otherwise (a strict
+/// no-op).  **Note:** no live worker path resolves this yet — see the module
+/// reachability note above.
+///
+/// [elh]: super::eventlog::runtime_hook_env
+pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
+    if !truthy(env, EHDB_ENABLED_ENV) {
+        return None;
+    }
+    if VectorMode::from_env(env) != VectorMode::Shadow {
+        return None;
+    }
+    let contract = contract_from_env(env).ok()?;
+    if !contract.role.is_data_plane() {
+        return None;
+    }
+    if !contract.uses_local_reference_runtime() || contract.local_reference_log.is_none() {
+        return None;
+    }
+    Some(env.clone())
+}
+
+/// Live platform vector-upsert mirror hook: mirror one already-written platform
+/// vector (the authoritative Qdrant upsert the caller just performed) into the
+/// EHDB vector shadow fabric.  Calls the SAME [`mirror_upsert`] shadow
+/// dual-write plus self-retrieval parity path the `ehdb-selfcheck mirror-vector`
+/// drive exercises.
+///
+/// **Not yet wired to a live site** (see module reachability note): this is the
+/// ready seam for the future platform-RAG embed+upsert path.  It is exercised by
+/// unit tests so it stays correct until the write site exists.
+///
+/// **Best-effort + isolated.**  Shadow is auxiliary: this NEVER affects the
+/// authoritative vector path.  Engine-error cases surface as non-`ok` outcomes
+/// (recorded to the degraded metric); an unexpected panic is caught here and
+/// returned as [`VectorOutcome::Unavailable`] rather than unwinding into the
+/// caller.  The caller discards the return; the `noetl_ehdb_vector_*` metric
+/// carries the signal.
+pub fn mirror_live_upsert(
+    env: &EnvMap,
+    collection: &str,
+    point_id: &str,
+    model_id: &str,
+    vector: &[f32],
+    payload: Option<&str>,
+) -> VectorOutcome {
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mirror_upsert(
+            env,
+            collection,
+            point_id,
+            model_id,
+            vector,
+            payload,
+            &VectorOptions::default(),
+            true,
+        )
+        .outcome
+    }));
+    guarded.unwrap_or(VectorOutcome::Unavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1213,6 +1308,85 @@ mod tests {
         let report = shadow_suite(&e, &Default::default(), false);
         assert!(report.guard_refused);
         assert!(!report.ok);
+    }
+
+    // --- live runtime hook (noetl/ehdb#234; ready but not yet live-wired) ----
+
+    #[test]
+    fn runtime_hook_env_arms_only_for_enabled_shadow_data_plane() {
+        let armed = runtime_hook_env(&worker_env("/tmp/vec-hook.jsonl", "shadow"));
+        assert!(armed.is_some(), "enabled + shadow + worker role should arm");
+    }
+
+    #[test]
+    fn runtime_hook_env_noop_when_disabled() {
+        let mut e = worker_env("/tmp/vec-hook.jsonl", "shadow");
+        e.remove("NOETL_EHDB_ENABLED");
+        assert!(runtime_hook_env(&e).is_none());
+    }
+
+    #[test]
+    fn runtime_hook_env_noop_when_tier_off_or_primary() {
+        assert!(runtime_hook_env(&worker_env("/tmp/vec-hook.jsonl", "off")).is_none());
+        assert!(runtime_hook_env(&worker_env("/tmp/vec-hook.jsonl", "primary")).is_none());
+    }
+
+    #[test]
+    fn runtime_hook_env_skips_control_plane_role() {
+        for role in ["gateway", "api", "server"] {
+            let mut e = worker_env("/tmp/vec-hook.jsonl", "shadow");
+            e.insert("NOETL_EHDB_CLIENT_ROLE".to_string(), role.to_string());
+            assert!(
+                runtime_hook_env(&e).is_none(),
+                "control-plane role {role} must not arm the vector hook"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_live_upsert_fires_on_shadow_enabled() {
+        let (log, dir) = tmp_log("live-upsert");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        let outcome = mirror_live_upsert(&e, COLLECTION, POINT, MODEL, &[1.0, 0.0, 0.0], None);
+        assert_eq!(outcome, VectorOutcome::Mirrored);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_live_upsert_is_noop_when_disabled() {
+        let mut e = worker_env("/tmp/unused.jsonl", "shadow");
+        e.remove("NOETL_EHDB_ENABLED");
+        let outcome = mirror_live_upsert(&e, COLLECTION, POINT, MODEL, &[1.0, 0.0, 0.0], None);
+        assert_eq!(outcome, VectorOutcome::Disabled);
+    }
+
+    #[test]
+    fn mirror_live_upsert_is_noop_when_tier_off() {
+        let e = worker_env("/tmp/unused.jsonl", "off");
+        let outcome = mirror_live_upsert(&e, COLLECTION, POINT, MODEL, &[1.0, 0.0, 0.0], None);
+        assert_eq!(outcome, VectorOutcome::Disabled);
+    }
+
+    #[test]
+    fn mirror_live_upsert_skipped_for_control_plane_role() {
+        let (log, dir) = tmp_log("live-cp");
+        let mut e = worker_env(log.to_str().unwrap(), "shadow");
+        e.insert("NOETL_EHDB_CLIENT_ROLE".to_string(), "gateway".to_string());
+        let outcome = mirror_live_upsert(&e, COLLECTION, POINT, MODEL, &[1.0, 0.0, 0.0], None);
+        assert_eq!(outcome, VectorOutcome::GuardRefused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_live_upsert_isolates_engine_error_without_propagating() {
+        // An over-cap dimensionality drives a metered non-ok outcome; the guarded
+        // hook returns it instead of unwinding into the caller.
+        let (log, dir) = tmp_log("live-iso");
+        let mut e = worker_env(log.to_str().unwrap(), "shadow");
+        e.insert(MAX_DIMENSIONS_ENV.to_string(), "1".to_string());
+        let outcome = mirror_live_upsert(&e, COLLECTION, POINT, MODEL, &[1.0, 0.0, 0.0], None);
+        assert_eq!(outcome, VectorOutcome::Rejected);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Event-log-authoritative invariant, asserted structurally: this module must
