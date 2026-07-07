@@ -1454,6 +1454,16 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
     let mut last_sweep = Instant::now();
     let sweep_interval = Duration::from_secs(env_u64("NOETL_STATE_INDEX_SWEEP_SECS", 15));
 
+    // noetl/ehdb#234 projection tier — live cadence hook.  Resolved ONCE: `Some`
+    // only when EHDB is enabled + `NOETL_EHDB_PROJECTION=shadow` + this is a
+    // data-plane role on the bounded local_reference runtime; `None` (the prod
+    // default) makes the per-batch path below a strict no-op with zero cost.  The
+    // drain is the natural projection checkpoint: it is the worker's live
+    // event-tail materializer, so one windowed shadow-project per drained batch
+    // parity-checks the EHDB projection engine against the worker's own fold
+    // without the false key-divergence a per-event hook would report.
+    let projection_hook = crate::ehdb::projection::runtime_hook_env(&crate::ehdb::process_env());
+
     // Initial connect: retry with backoff until NATS is reachable and the
     // consumer is created (a NATS bounce at boot must not kill the drain task).
     let (mut _client, mut consumer) =
@@ -1533,6 +1543,10 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         let mut touched: Vec<i64> = Vec::new();
         let mut consumed = 0u64;
         let mut terminals: Vec<i64> = Vec::new();
+        // noetl/ehdb#234: when the projection shadow hook is armed, collect the
+        // batch's raw event payloads for the post-batch windowed shadow-project.
+        // Empty (and never allocated) when the hook is inactive.
+        let mut projection_window: Vec<serde_json::Value> = Vec::new();
         // Set when a dead-consumer signal surfaces mid-drain (noetl/ai-meta#161)
         // so the post-batch handler can decide rebuild-vs-retry once the batch
         // stops; the events consumed before it are already indexed.
@@ -1596,6 +1610,13 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
                 }
                 if is_terminal {
                     terminals.push(execution_id);
+                }
+                // noetl/ehdb#234: buffer the just-indexed event for the post-batch
+                // projection shadow window.  Only when the hook is armed (prod
+                // default off ⇒ this branch never runs); bounded by the pull's
+                // `max_messages` batch size.
+                if projection_hook.is_some() {
+                    projection_window.push(payload.clone());
                 }
                 // Wake any drive build-retry loop waiting on this execution the
                 // instant the event is indexed — not after the whole batch drains.
@@ -1690,6 +1711,25 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
             continue;
         }
         crate::metrics::record_state_builder_wal_events(consumed);
+
+        // noetl/ehdb#234 projection tier — post-batch cadence checkpoint.  A
+        // drained batch is a natural projection window: windowed-materialize the
+        // batch's real events into a fresh throwaway EHDB projection store and
+        // parity-check against the worker's own fold (advances
+        // `noetl_ehdb_projection_*`).  Best-effort + isolated: run it on a blocking
+        // thread so the sync engine I/O never stalls the drain reactor, and never
+        // let a shadow error touch the authoritative index.  No-op unless the hook
+        // is armed (prod default).
+        if let Some(hook_env) = &projection_hook {
+            if !projection_window.is_empty() {
+                let hook_env = hook_env.clone();
+                let window = std::mem::take(&mut projection_window);
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::ehdb::projection::mirror_live_window(&hook_env, &window)
+                })
+                .await;
+            }
+        }
 
         // Shadow: advance each touched execution's cached spine here — the cache
         // mechanics under observation.  Authoritative: the command-dispatch

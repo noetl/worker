@@ -41,34 +41,46 @@
 //! | eventlog | ✅ | [`client::ControlPlaneClient::emit_event`][ee] → [`eventlog::mirror_live_event`] |
 //! | kv | ✅ | `spool_runtime::SpoolRuntime::persist_circuit` (NATS-KV circuit put) → [`kv::mirror_live_put`] |
 //! | object | ✅ | [`client::ControlPlaneClient::object_put`][op] (all object tiers funnel through it) → [`object::mirror_live_put`] |
-//! | projection | ⏳ deferred | see below |
-//! | vector | ⏳ deferred | see below |
+//! | projection | ✅ | `state_builder::run_drain_loop` post-batch checkpoint → [`projection::mirror_live_window`] (windowed, not per-event) |
+//! | vector | ⏳ ready, no live site | [`vector::mirror_live_upsert`] exists + tested; no live platform vector-upsert path exists in the worker to call it — see below |
 //!
-//! **projection — deferred (no clean per-event live seam).**
+//! **projection — live-wired via a windowed cadence hook (not per-event).**
 //! [`projection::shadow_project`] is a *batch* materialize that reads back the
-//! **whole accumulating** projection log ([`ehdb_reference`]'s
-//! `list_executions`) and compares it against a **full** authoritative
-//! execution-state fold + committed offset.  A long-running worker's log
-//! accumulates unboundedly, so a naive per-event hook (at `emit_event` or the
-//! off-server state builder's `WalEventIndex::apply`, `state_builder.rs`) would
-//! report persistent false key-divergence — that is "a hook that fires but lies",
-//! not a shadow.  The faithful seam is a bounded, windowed batch materialization
-//! that also supplies the incumbent materializer's fold for the same window
-//! (either a scheduled tail-window drive, or a per-execution-scoped readback on
-//! the engine side) — a larger change than a call-site hook.  Exact remaining
-//! seam: `state_builder.rs` `run_drain_loop` after `idx.apply(&payload)` (where
-//! `payload` + `execution_id` are in hand), feeding the `WalEventIndex`
-//! per-execution fold as `shadow_project`'s `authoritative` argument, once the
-//! engine can scope its readback to the touched executions.
+//! projection log ([`ehdb_reference`]'s `list_executions`) and compares it
+//! against a **full** authoritative execution-state fold + committed offset.  A
+//! naive per-event hook against the long-lived, unboundedly-accumulating
+//! projection store would report persistent false key-divergence (the store
+//! keeps every execution `KeepAll` while a per-event authoritative names only the
+//! touched one) — "a hook that fires but lies", not a shadow.  The faithful seam
+//! shipped here: the off-server state builder's drain loop
+//! (`state_builder.rs::run_drain_loop`) buffers each drained batch's real events
+//! and, at the natural post-batch checkpoint, calls
+//! [`projection::mirror_live_window`] once per batch.  That windows the batch into
+//! a **fresh, throwaway per-window projection store** (unique temp log) so the
+//! read-back sees exactly the window's executions — no cross-window accumulation
+//! ⇒ no false key-divergence — and parity-checks the EHDB engine's fold against an
+//! **independent worker-side fold** of the same window
+//! ([`projection::fold_window_authoritative`]).  Bounded + stateless (store
+//! opened, used, removed per window); runs on a blocking thread so the sync engine
+//! I/O never stalls the drain reactor; best-effort + isolated.  Cross-window
+//! persistence / replay is proven separately by `ehdb-selfcheck`'s primary-serve
+//! cycle.
 //!
-//! **vector — deferred (no live write site exists yet).**
-//! There is no platform vector-upsert in the worker's live loop today: platform
-//! RAG retrieval is in-process and read-only ([`rag`]), and
-//! [`vector::mirror_upsert`] is exercised only by `ehdb-selfcheck`.  Wiring a
-//! hook now would create one that never fires.  Exact remaining seam: a future
-//! platform-RAG *ingest/embed* path (would live in `executor/command.rs` when a
-//! step embeds + upserts platform vectors), which does not exist yet — the hook
-//! lands with that write site, not before.
+//! **vector — ready hook, no live write site (documented-unreachable).**
+//! There is **no platform vector-upsert in the worker's live loop today**:
+//! platform RAG retrieval is in-process and read-only ([`rag`]); platform RAG
+//! *ingest* ([`rag::ingest`]) writes a **lexical** retrieval fabric
+//! ([`rag::RagChunk`] carries `text` + `checksum`, not an embedding vector), so it
+//! is not a vector-embedding upsert to mirror; and [`vector::mirror_upsert`] is
+//! exercised only by `ehdb-selfcheck`.  The ready-but-unwired
+//! [`vector::mirror_live_upsert`] + [`vector::runtime_hook_env`] pair (tested to
+//! the same discipline as the other tiers) is provided so the future wire-up is a
+//! one-line call, but it is deliberately **not** invoked from any live path —
+//! fabricating a call site would create a hook that never mirrors a real upsert.
+//! Exact remaining seam: a future platform-RAG *embed + upsert* write site (would
+//! live in `executor/command.rs` when a step computes embeddings and upserts
+//! platform vectors) calls `mirror_live_upsert` right after the authoritative
+//! Qdrant upsert — the hook lands with that write site, not before.
 //!
 //! [ee]: crate::client::ControlPlaneClient::emit_event
 //! [op]: crate::client::ControlPlaneClient::object_put
