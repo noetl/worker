@@ -210,6 +210,16 @@ pub struct ControlPlaneClient {
     /// every sealed credential the server addresses to this pool unseals
     /// with the same secret.
     sealing_sk: Arc<StaticSecret>,
+    /// Once-resolved arming state for the EHDB event-log **live-append hook**
+    /// (noetl/ehdb#234 runtime integration).  `Some(env)` when the process is a
+    /// data-plane role running `NOETL_EHDB_EVENTLOG=shadow` with EHDB enabled —
+    /// then every successfully-emitted event is mirrored into the EHDB shadow
+    /// fabric by [`emit_event`].  `None` (the default: disabled, tier off/primary,
+    /// or a control-plane role) makes the hook a strict per-event no-op, so a
+    /// worker without EHDB is byte-identical.  Resolved once in [`new`] and
+    /// shared (Arc) across [`with_server_url`] dispatch clones — the env is
+    /// immutable for the worker's lifetime.
+    ehdb_eventlog_hook: Arc<Option<crate::ehdb::EnvMap>>,
 }
 
 impl ControlPlaneClient {
@@ -226,6 +236,7 @@ impl ControlPlaneClient {
             client: self.client.clone(),
             server_url: server_url.trim_end_matches('/').to_string(),
             sealing_sk: Arc::clone(&self.sealing_sk),
+            ehdb_eventlog_hook: Arc::clone(&self.ehdb_eventlog_hook),
         }
     }
 
@@ -249,10 +260,19 @@ impl ControlPlaneClient {
             .unwrap_or_else(|e| panic!("control-plane HTTP client init failed: {e:#}"));
         let sealing_sk = StaticSecret::random_from_rng(rand_core::OsRng);
 
+        // Resolve the EHDB event-log live-append hook once from the process env.
+        // `None` for a disabled / non-shadow / control-plane process, so the
+        // per-event path in `emit_event` does zero work unless the shadow tier
+        // is explicitly armed for a data-plane role.
+        let ehdb_eventlog_hook = Arc::new(crate::ehdb::eventlog::runtime_hook_env(
+            &crate::ehdb::process_env(),
+        ));
+
         Self {
             client,
             server_url: server_url.trim_end_matches('/').to_string(),
             sealing_sk: Arc::new(sealing_sk),
+            ehdb_eventlog_hook,
         }
     }
 
@@ -400,6 +420,25 @@ impl ControlPlaneClient {
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("Failed to emit event: {}", body);
+        }
+
+        // EHDB event-log live-append hook (noetl/ehdb#234 runtime integration).
+        // This is the authoritative event-emit chokepoint every worker path
+        // funnels through, so hooking here mirrors ALL live events (emitter,
+        // retry loop, spool, subscription, plugin) into the EHDB shadow fabric
+        // once the event is durably accepted by the control plane.  The hook is
+        // armed only when `ehdb_eventlog_hook` is `Some` (EHDB enabled + tier
+        // `shadow` + data-plane role, resolved once in `new`); otherwise this is
+        // a no-op.  Best-effort + isolated: `mirror_live_event` swallows and
+        // meters any failure so the authoritative event path is never affected.
+        if let Some(env) = self.ehdb_eventlog_hook.as_ref() {
+            if let Ok(payload) = serde_json::to_string(&event) {
+                let _ = crate::ehdb::eventlog::mirror_live_event(
+                    env,
+                    &event.execution_id.to_string(),
+                    &payload,
+                );
+            }
         }
 
         Ok(())
