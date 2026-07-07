@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.68.0](https://github.com/noetl/worker/compare/v5.67.0...v5.68.0) (2026-07-07)
+
+### Features
+
+* **ehdb:** wire KV + object shadow mirrors into the live worker runtime paths ([#234](https://github.com/noetl/worker/issues/234)) ([#168](https://github.com/noetl/worker/issues/168)) ([2ec2e2b](https://github.com/noetl/worker/commit/2ec2e2b30f3f7b7a215b4e8ac684fe37eaade270)), closes [#167](https://github.com/noetl/worker/issues/167) [noetl/ai-meta#241](https://github.com/noetl/ai-meta/issues/241)
+
 ## [5.67.0](https://github.com/noetl/worker/compare/v5.66.0...v5.67.0) (2026-07-07)
 
 ### Features
