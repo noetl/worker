@@ -469,6 +469,84 @@ pub fn mirror_event(
     }
 }
 
+/// Resolve the once-per-process env snapshot that arms the **live event-append
+/// hook** (noetl/ehdb#234 runtime integration).  This is the gate the worker's
+/// authoritative event path (`ControlPlaneClient::emit_event`) calls exactly
+/// once at client construction, so the per-event path does *zero* work when the
+/// hook is inactive.
+///
+/// Returns `Some(env)` — meaning "mirror every live event" — ONLY when all of:
+///
+/// * the umbrella switch `NOETL_EHDB_ENABLED` is truthy, AND
+/// * the event-log tier `NOETL_EHDB_EVENTLOG` is `shadow` (this slice wires the
+///   live path for **shadow** only; `off`/`primary` return `None` so a live
+///   drive never dual-writes under them — primary live-serve is a separate
+///   follow-up, and `off` stays byte-identical), AND
+/// * the resolved contract is a data-plane role (`worker`/`playbook`/`system`)
+///   running the bounded `local_reference` runtime with a log configured.
+///
+/// Every other case (disabled, tier off/primary, control-plane role, malformed
+/// contract) returns `None` — a strict no-op hook.  The env is snapshotted (the
+/// process env is immutable for the worker's lifetime) so the per-event mirror
+/// reuses it without re-collecting `std::env::vars()` on the hot path.
+pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
+    // Umbrella switch off ⇒ no hook (byte-identical to a build without EHDB).
+    if !truthy(env, EHDB_ENABLED_ENV) {
+        return None;
+    }
+    // Shadow-only for the live path this slice.  `off` and `primary` do not
+    // arm the live mirror.
+    if EventLogMode::from_env(env) != EventLogMode::Shadow {
+        return None;
+    }
+    // A control-plane role carrying a data-plane env fails contract validation;
+    // `.ok()?` drops it (the gateway never mirrors).  Defense-in-depth: also
+    // require an explicit data-plane role + a live local-reference log.
+    let contract = contract_from_env(env).ok()?;
+    if !contract.role.is_data_plane() {
+        return None;
+    }
+    if !contract.uses_local_reference_runtime() || contract.local_reference_log.is_none() {
+        return None;
+    }
+    Some(env.clone())
+}
+
+/// Live event-append hook: mirror one already-authored, just-emitted platform
+/// event into the EHDB event-log shadow fabric.
+///
+/// This is the runtime counterpart of the `ehdb-selfcheck mirror-eventlog`
+/// drive — it calls the SAME [`mirror_event`] shadow dual-write + parity path,
+/// but on the real events the worker emits to the control plane, so a live drive
+/// advances the `noetl_ehdb_eventlog_*` metrics instead of only the selfcheck.
+///
+/// `authoritative_sequence` is passed as `None`: the worker does not know the
+/// server-assigned global log sequence at emit time, so parity relies on the
+/// engine's own count + monotonic-order invariant (the safe default documented
+/// on [`mirror_event`]).
+///
+/// **Best-effort + isolated.**  Shadow is auxiliary: this NEVER affects the
+/// authoritative event path.  Any failure inside the mirror is contained — the
+/// engine-error cases already surface as non-`ok` outcomes (recorded to the
+/// degraded metric), and an unexpected panic is caught here and returned as
+/// [`EventLogOutcome::Unavailable`] rather than unwinding into the caller's
+/// event-emit path.  The caller discards the return; the metric carries the
+/// signal.
+pub fn mirror_live_event(env: &EnvMap, execution_id: &str, payload: &str) -> EventLogOutcome {
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mirror_event(
+            env,
+            execution_id,
+            None,
+            payload,
+            &EventLogOptions::default(),
+            true,
+        )
+        .outcome
+    }));
+    guarded.unwrap_or(EventLogOutcome::Unavailable)
+}
+
 /// How many events the built-in primary-serve cycle drives through the engine.
 pub const PRIMARY_SERVE_CYCLE_EVENTS: usize = 3;
 
@@ -901,6 +979,109 @@ mod tests {
         let r = mirror_event(&e, "100", Some(1), "evt", &Default::default(), false);
         // Config error (control-plane role + data-plane env) → guard refused.
         assert_eq!(r.outcome, EventLogOutcome::GuardRefused);
+    }
+
+    // --- Live event-append hook (runtime integration, noetl/ehdb#234) ---
+
+    #[test]
+    fn runtime_hook_env_arms_only_for_enabled_shadow_data_plane() {
+        // Enabled + shadow + worker role + log ⇒ armed.
+        let armed = runtime_hook_env(&worker_env("/tmp/hook.jsonl", "shadow"));
+        assert!(armed.is_some(), "shadow+enabled worker must arm the hook");
+    }
+
+    #[test]
+    fn runtime_hook_env_noop_when_disabled() {
+        // Umbrella switch off ⇒ no hook even though the tier says shadow.
+        let e: EnvMap = [("NOETL_EHDB_EVENTLOG", "shadow")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert!(runtime_hook_env(&e).is_none());
+    }
+
+    #[test]
+    fn runtime_hook_env_noop_when_tier_off_or_primary() {
+        // `off` and `primary` do not arm the live mirror this slice.
+        assert!(runtime_hook_env(&worker_env("/tmp/hook.jsonl", "off")).is_none());
+        assert!(runtime_hook_env(&worker_env("/tmp/hook.jsonl", "primary")).is_none());
+    }
+
+    #[test]
+    fn runtime_hook_env_skips_control_plane_role() {
+        // A control-plane role must never arm the live mirror.
+        for role in ["server", "gateway", "api"] {
+            let e: EnvMap = [
+                ("NOETL_EHDB_ENABLED", "true"),
+                ("NOETL_EHDB_MODE", "local_reference"),
+                ("NOETL_EHDB_CLIENT_ROLE", role),
+                ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+                ("NOETL_EHDB_EVENTLOG", "shadow"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            assert!(
+                runtime_hook_env(&e).is_none(),
+                "control-plane role {role} must not arm the hook"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_live_event_fires_on_shadow_enabled() {
+        let (log, dir) = tmp_log("live-fire");
+        let e = worker_env(log.to_str().unwrap(), "shadow");
+        // A real (long) numeric execution id, mirrored via the runtime hook.
+        let outcome = mirror_live_event(&e, "478775660589088776", "{\"event_type\":\"call.done\"}");
+        assert_eq!(outcome, EventLogOutcome::Mirrored);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_live_event_is_noop_when_disabled() {
+        // No EHDB env at all ⇒ Disabled (records no metric, real path untouched).
+        let e: EnvMap = EnvMap::new();
+        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}");
+        assert_eq!(outcome, EventLogOutcome::Disabled);
+    }
+
+    #[test]
+    fn mirror_live_event_skipped_for_control_plane_role() {
+        let e: EnvMap = [
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "server"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", "/tmp/x.jsonl"),
+            ("NOETL_EHDB_EVENTLOG", "shadow"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        // Even if the hook were called directly, the guard refuses the write.
+        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}");
+        assert_eq!(outcome, EventLogOutcome::GuardRefused);
+    }
+
+    #[test]
+    fn mirror_live_event_isolates_engine_error_without_propagating() {
+        // Point the log at a path whose parent is a *file*, so the engine cannot
+        // create/append the log.  The mirror must return an outcome (Unavailable)
+        // rather than panicking / propagating — proving the real event path is
+        // never broken by a mirror failure.
+        let (file_as_dir, dir) = tmp_log("iso");
+        std::fs::write(&file_as_dir, b"x").unwrap(); // now a regular file
+        let bad_log = file_as_dir.join("nested").join("log.jsonl");
+        let e = worker_env(bad_log.to_str().unwrap(), "shadow");
+        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}");
+        assert!(
+            matches!(
+                outcome,
+                EventLogOutcome::Unavailable | EventLogOutcome::Invalid
+            ),
+            "engine error must be contained as an outcome, got {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Event-log-authoritative invariant, asserted structurally: this module
