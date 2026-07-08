@@ -1601,7 +1601,24 @@ async fn build_call_done_result(
             // result.  A future server-side `output.output_select` could
             // declare exactly which fields land here, but the structural
             // summary covers the common navigation paths today.
-            let inline_data = serde_json::json!({ "_ref": durable.r#ref });
+            // noetl/ai-meta#104 — pick the accessor `_ref` that a downstream
+            // `artifact get` (`result_ref: '{{ step._ref }}'`) can actually
+            // resolve.  Under the dual-write-retired regime
+            // (`NOETL_RESULT_MINT_AUTHORITATIVE=true`) the legacy
+            // `noetl.result_store` row is never written — the #104 object tier is
+            // the authoritative byte source — so the legacy `durable.r#ref`
+            // (`noetl://execution/…`) 404s at `/api/result/resolve`.  Expose the
+            // canonical logical URI instead (the same URI `stamp_logical_uri`
+            // records on `reference.uri` and the producer-stage keys the tier
+            // object by), which the server resolves from the tier.  When the tier
+            // is NOT authoritative, keep the legacy ref so the summary is
+            // byte-identical to the pre-#104 emit path.
+            let ref_accessor = if crate::result_resolver::mint_authoritative() {
+                cycle_logical_uri(execution_id, step, render_context)
+            } else {
+                durable.r#ref.clone()
+            };
+            let inline_data = serde_json::json!({ "_ref": ref_accessor });
             Ok(serde_json::json!({
                 "status": status,
                 "context": { "data": inline_data },
