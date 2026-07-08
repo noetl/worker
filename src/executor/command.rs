@@ -476,6 +476,23 @@ impl CommandExecutor {
         let template_src = serde_json::to_string(&command.input).unwrap_or_default();
         resolve_context_references(&mut ctx.variables, &template_src, &dispatch_client).await;
 
+        // Populate the `keychain.<alias>.<field>` template namespace for any
+        // `{{ keychain.* }}` reference the tool's templates carry
+        // (noetl/ai-meta#151).  The orchestrator can't seed this — keychain
+        // resolution is a boundary call — so without it the reference renders
+        // empty and the downstream auth/HTTP step sends an empty credential
+        // → 401.  Resolves each referenced alias via the control-plane
+        // credentials API (the same boundary `auth:` uses) and injects it
+        // under `ctx.variables["keychain"]`.  No-op + no HTTP calls when the
+        // templates reference no keychain aliases.
+        super::keychain_namespace::inject_keychain_namespace(
+            &mut ctx.variables,
+            &template_src,
+            &dispatch_client,
+            command.execution_id,
+        )
+        .await;
+
         // Emit command.started event.  R-1.2 PR-EE-3: `step` +
         // `worker_id` are top-level fields on the `ExecutorEvent`
         // shape, so the context payload only carries the
@@ -536,6 +553,20 @@ impl CommandExecutor {
             }
             cfg
         };
+
+        // Resolve the DEFERRED `{{ keychain.<alias>.<field> }}` templates the
+        // orchestrator left verbatim in the tool config (noetl/ai-meta#151).
+        // `inject_keychain_namespace` (above) has already populated
+        // `ctx.variables["keychain"]` from the control-plane credentials API;
+        // substitute those values into the config now, transiently, right
+        // before dispatch — the secret reaches the tool but never the drive's
+        // persisted command.  No-op when the config carries no keychain refs.
+        if let Some(serde_json::Value::Object(keychain_ns)) = ctx.variables.get("keychain") {
+            super::keychain_namespace::render_keychain_in_config(
+                &mut tool_config_value,
+                keychain_ns,
+            );
+        }
 
         // Resolve string `auth:` values (keychain aliases) into either
         // the noetl-tools `AuthConfig` shape or the tool's flat
