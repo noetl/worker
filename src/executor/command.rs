@@ -476,6 +476,20 @@ impl CommandExecutor {
         let template_src = serde_json::to_string(&command.input).unwrap_or_default();
         resolve_context_references(&mut ctx.variables, &template_src, &dispatch_client).await;
 
+        // NEVER resolve keychain for the off-server orchestrate drive command
+        // (noetl/ai-meta#151 leak fix).  The `__orchestrate__` wasm drive's
+        // `input` embeds the whole playbook — including *follow-up* steps whose
+        // tool configs carry `{{ keychain.* }}` templates.  If we inject the
+        // resolved secret here, it lands in the drive's context and the drive
+        // renders it into the follow-up step's `command.issued` — persisting the
+        // secret in the immutable `noetl.event` log.  The drive MUST operate on
+        // deferred placeholders only; keychain resolves transiently at the
+        // *terminal user-pool tool dispatch* (the actual http/auth step, whose
+        // `step` is never `__orchestrate__`).  A first-step keychain tool built
+        // server-side already defers; this closes the follow-up (drive-built)
+        // path.  See `keychain_namespace` + the leak repro in ai-meta#151.
+        let is_drive = command.step == ORCHESTRATE_STEP_NAME;
+
         // Populate the `keychain.<alias>.<field>` template namespace for any
         // `{{ keychain.* }}` reference the tool's templates carry
         // (noetl/ai-meta#151).  The orchestrator can't seed this — keychain
@@ -484,14 +498,17 @@ impl CommandExecutor {
         // → 401.  Resolves each referenced alias via the control-plane
         // credentials API (the same boundary `auth:` uses) and injects it
         // under `ctx.variables["keychain"]`.  No-op + no HTTP calls when the
-        // templates reference no keychain aliases.
-        super::keychain_namespace::inject_keychain_namespace(
-            &mut ctx.variables,
-            &template_src,
-            &dispatch_client,
-            command.execution_id,
-        )
-        .await;
+        // templates reference no keychain aliases.  Skipped entirely for the
+        // orchestrate drive so no secret ever enters the drive's context.
+        if !is_drive {
+            super::keychain_namespace::inject_keychain_namespace(
+                &mut ctx.variables,
+                &template_src,
+                &dispatch_client,
+                command.execution_id,
+            )
+            .await;
+        }
 
         // Emit command.started event.  R-1.2 PR-EE-3: `step` +
         // `worker_id` are top-level fields on the `ExecutorEvent`
@@ -561,11 +578,16 @@ impl CommandExecutor {
         // substitute those values into the config now, transiently, right
         // before dispatch — the secret reaches the tool but never the drive's
         // persisted command.  No-op when the config carries no keychain refs.
-        if let Some(serde_json::Value::Object(keychain_ns)) = ctx.variables.get("keychain") {
-            super::keychain_namespace::render_keychain_in_config(
-                &mut tool_config_value,
-                keychain_ns,
-            );
+        // Skipped for the orchestrate drive: `is_drive` short-circuits injection
+        // above so no keychain namespace exists, and the drive's `tool_config`
+        // (the wasm invocation) must never carry a resolved secret.
+        if !is_drive {
+            if let Some(serde_json::Value::Object(keychain_ns)) = ctx.variables.get("keychain") {
+                super::keychain_namespace::render_keychain_in_config(
+                    &mut tool_config_value,
+                    keychain_ns,
+                );
+            }
         }
 
         // Resolve string `auth:` values (keychain aliases) into either
@@ -2819,6 +2841,21 @@ fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
     use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
+
+    #[test]
+    fn orchestrate_drive_step_is_recognised_for_keychain_skip() {
+        // Regression lock for the noetl/ai-meta#151 event-log leak: keychain
+        // resolution MUST be skipped for the off-server orchestrate drive
+        // command (`step == ORCHESTRATE_STEP_NAME`) so no resolved secret ever
+        // enters the drive's context and gets persisted into a follow-up
+        // step's `command.issued`.  A normal tool step (e.g. `get_token`) still
+        // resolves keychain transiently at dispatch.
+        assert_eq!(ORCHESTRATE_STEP_NAME, "__orchestrate__");
+        let is_drive = |step: &str| step == ORCHESTRATE_STEP_NAME;
+        assert!(is_drive("__orchestrate__"));
+        assert!(!is_drive("get_token"));
+        assert!(!is_drive("openai_triage"));
+    }
 
     #[test]
     fn reference_locators_extracts_legacy_and_canonical() {
