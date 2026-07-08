@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.70.1](https://github.com/noetl/worker/compare/v5.70.0...v5.70.1) (2026-07-08)
+
+### Bug Fixes
+
+* **ehdb:** bump ehdb-reference pin cca0d0d → 52120a7 (KV+vector subject digest-token fix) ([#172](https://github.com/noetl/worker/issues/172)) ([93363d4](https://github.com/noetl/worker/commit/93363d49d352fa5075f99be64a9d487e5b113e3c)), closes [noetl/ehdb#259](https://github.com/noetl/ehdb/issues/259) [#256](https://github.com/noetl/worker/issues/256) [noetl/ai-meta#241](https://github.com/noetl/ai-meta/issues/241) [noetl/ehdb#259](https://github.com/noetl/ehdb/issues/259)
+
 ## [5.70.0](https://github.com/noetl/worker/compare/v5.69.0...v5.70.0) (2026-07-07)
 
 ### Features
