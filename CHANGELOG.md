@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.70.2](https://github.com/noetl/worker/compare/v5.70.1...v5.70.2) (2026-07-08)
+
+### Bug Fixes
+
+* **result:** expose canonical _ref when the result tier is authoritative ([#173](https://github.com/noetl/worker/issues/173)) ([f5c1581](https://github.com/noetl/worker/commit/f5c158170ce50059b13ca5842d31ea8abc3c73f6)), closes [#104](https://github.com/noetl/worker/issues/104) [pre-#104](https://github.com/noetl/pre-/issues/104) [noetl/ai-meta#179](https://github.com/noetl/ai-meta/issues/179)
+
 ## [5.70.1](https://github.com/noetl/worker/compare/v5.70.0...v5.70.1) (2026-07-08)
 
 ### Bug Fixes
