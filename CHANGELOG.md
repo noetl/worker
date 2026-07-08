@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.70.3](https://github.com/noetl/worker/compare/v5.70.2...v5.70.3) (2026-07-08)
+
+### Bug Fixes
+
+* **keychain:** populate + render the keychain.* template namespace ([#151](https://github.com/noetl/worker/issues/151)) ([#174](https://github.com/noetl/worker/issues/174)) ([2031a8b](https://github.com/noetl/worker/commit/2031a8b4a5a43a696767433c977a6e2f7db5c047))
+
 ## [5.70.2](https://github.com/noetl/worker/compare/v5.70.1...v5.70.2) (2026-07-08)
 
 ### Bug Fixes
