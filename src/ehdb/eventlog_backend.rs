@@ -247,7 +247,10 @@ pub fn durable_shard_record_count(
     let paths = DurablePaths::resolve(env, contract);
     let shard = ownership_from_env(env).shard_of(execution_id);
     let shard_dir = paths.local_root.join(format!("shard-{shard:04}"));
-    let store = DurableSegmentStore::open_read_only(&shard_dir).map_err(|e| e.to_string())?;
+    // `mut`: the ehdb read methods take `&mut self` since ehdb#267 (a
+    // checkpoint-trust open defers the offset-index rebuild to the first read;
+    // a read-only cold-load loads it eagerly at open, so this read is O(1)).
+    let mut store = DurableSegmentStore::open_read_only(&shard_dir).map_err(|e| e.to_string())?;
     let scan = store
         .scan_global(&EventLogScanRequest {
             after: None,
@@ -467,7 +470,7 @@ mod tests {
         let paths = DurablePaths::resolve(&e, &contract);
         // Single-owner default → shard 0.
         let shard0 = paths.local_root.join("shard-0000");
-        let store = DurableSegmentStore::open_read_only(&shard0).unwrap();
+        let mut store = DurableSegmentStore::open_read_only(&shard0).unwrap();
         let scan = store
             .scan_global(&EventLogScanRequest {
                 after: None,
