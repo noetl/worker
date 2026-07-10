@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.71.0](https://github.com/noetl/worker/compare/v5.70.3...v5.71.0) (2026-07-10)
+
+### Features
+
+* **ehdb:** periodic durable event-log segment GC + per-shard write lock + selfcheck ([#177](https://github.com/noetl/worker/issues/177)) ([bca3e25](https://github.com/noetl/worker/commit/bca3e25f45010272002dbcbdc1de939d64cc5254))
+
 ## [5.70.3](https://github.com/noetl/worker/compare/v5.70.2...v5.70.3) (2026-07-08)
 
 ### Bug Fixes
