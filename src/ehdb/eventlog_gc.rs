@@ -65,10 +65,15 @@ impl GcConfig {
         if eventlog_backend::selected_backend(&env) != EventLogStorageBackend::DurableSegment {
             return None;
         }
-        // 2. The reclaim policy must be enabled (fail-safe parse).
+        // 2. The reclaim policy must be enabled (fail-safe parse). The optional
+        //    limits-based retention knob (MAX_RETAINED) lets a store with no
+        //    durable consumer — e.g. a shadow mirror — self-bound; unset ⇒
+        //    interest-only (the pre-retention behaviour).
         let policy = SegmentGcPolicy::from_raw(
             env.get(SegmentGcPolicy::ENV_VAR).map(|s| s.as_str()),
             env.get(SegmentGcPolicy::MIN_RETAINED_ENV_VAR)
+                .map(|s| s.as_str()),
+            env.get(SegmentGcPolicy::MAX_RETAINED_ENV_VAR)
                 .map(|s| s.as_str()),
         );
         if !policy.enabled {
