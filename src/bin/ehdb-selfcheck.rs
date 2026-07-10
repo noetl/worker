@@ -53,6 +53,7 @@ fn main() -> ExitCode {
         Some("mirror-eventlog") => run_mirror_eventlog(&env, &flags),
         Some("eventlog-suite") => run_eventlog_suite(&env, &flags),
         Some("durable-eventlog") => run_durable_eventlog(&env, &flags),
+        Some("durable-eventlog-gc") => run_durable_eventlog_gc(&env, &flags),
         Some("eventlog-primary-serve") => run_eventlog_primary_serve(&env, &flags),
         Some("mirror-projection") => run_mirror_projection(&env, &flags),
         Some("projection-suite") => run_projection_suite(&env, &flags),
@@ -1066,6 +1067,168 @@ fn run_durable_eventlog(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
     }
 }
 
+/// Drive one **segment-GC pass** over the live durable store's owned shards and
+/// report the per-shard reclamation — the in-cluster GC exercise for
+/// [noetl/ehdb#254]. Requires `NOETL_EHDB_EVENTLOG_BACKEND=durable_segment`;
+/// forces an enabled reclaim policy (`--min-retained`, default 2) so a manual
+/// drive can prove reclamation on demand regardless of the periodic
+/// `NOETL_EHDB_EVENTLOG_GC_INTERVAL_SECS` knob. Reclamation only fires for
+/// segments a durable consumer has acked past (the interest watermark), so a
+/// real drive + a projector that acks must precede this for it to reclaim.
+/// Exit 0 when no shard errored.
+fn run_durable_eventlog_gc(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    use ehdb_reference::SegmentGcPolicy;
+
+    // `--drive`: a self-contained shared-tier GC cycle on the REAL durable volume
+    // (a `gc-soak/` subdir under the configured durable dir, on the PVC), proving
+    // the deployed binary reclaims local + shared on real storage — append +
+    // rotate + consumer-ack + reclaim + cold-load/hydrate coherence — without a
+    // wired durable consumer on the live shadow store. This is the in-cluster GC
+    // exercise for the shadow topology, where nothing else acks the event log.
+    if flags.get("drive").is_some() {
+        return run_durable_eventlog_gc_drive(env, flags);
+    }
+
+    let backend = eventlog_backend::selected_backend(env);
+    if backend.as_str() != "durable_segment" {
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-durable-eventlog-gc-selfcheck",
+                "storage_backend": backend.as_str(),
+                "ran": false,
+                "note": "segment GC applies only to the durable_segment backend",
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
+    let min_retained = flags
+        .get("min-retained")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(2);
+    let policy = SegmentGcPolicy::enabled(min_retained);
+    let contract = match contract::contract_from_env(env) {
+        Ok(c) => c,
+        Err(e) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "suite": "ehdb-durable-eventlog-gc-selfcheck",
+                    "ran": false,
+                    "error": e.0,
+                })
+            );
+            return ExitCode::from(4);
+        }
+    };
+
+    let results = eventlog_backend::reclaim_owned_shards(env, &contract, &policy);
+    let mut shards = Vec::new();
+    let mut errored = false;
+    let mut total_segments = 0usize;
+    let mut total_objects = 0usize;
+    for r in &results {
+        match r {
+            Ok(o) => {
+                total_segments += o.local_segments_reclaimed;
+                total_objects += o.shared_objects_deleted;
+                shards.push(serde_json::json!({
+                    "shard": o.shard,
+                    "reclaim_watermark_seq": o.reclaim_watermark_seq,
+                    "reclaimed_through_segment": o.reclaimed_through_segment,
+                    "local_segments_reclaimed": o.local_segments_reclaimed,
+                    "shared_objects_deleted": o.shared_objects_deleted,
+                    "note": o.note,
+                }));
+            }
+            Err(e) => {
+                errored = true;
+                shards.push(serde_json::json!({"error": e}));
+            }
+        }
+    }
+    let metrics = render_metrics();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-durable-eventlog-gc-selfcheck",
+            "storage_backend": backend.as_str(),
+            "ran": true,
+            "min_retained_segments": min_retained,
+            "owned_shards": results.len(),
+            "total_local_segments_reclaimed": total_segments,
+            "total_shared_objects_deleted": total_objects,
+            "shards": shards,
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+    if errored {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `durable-eventlog-gc --drive`: a self-contained shared-tier GC cycle on the
+/// real durable volume (a `gc-soak/` subdir under the configured durable dir),
+/// proving the deployed binary reclaims local + shared on real storage with
+/// cold-load / hydrate coherence. Exit 0 only when the cycle holds.
+fn run_durable_eventlog_gc_drive(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    use ehdb_reference::exercise_shared_tier_gc;
+
+    let shard_count = flags
+        .get("shard-count")
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(2)
+        .max(2);
+    // Root the drive on the real durable volume (the PVC) so this exercises real
+    // storage, not a pod-ephemeral tmpfs. Falls back to a temp dir if unset.
+    let base = env
+        .get(eventlog_backend::DURABLE_DIR_ENV)
+        .filter(|s| !s.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "/tmp/ehdb-durable".to_string());
+    let root = std::path::PathBuf::from(base).join("gc-soak");
+    // Fresh each run so repeated soaks start clean.
+    let _ = std::fs::remove_dir_all(&root);
+
+    match exercise_shared_tier_gc(&root, shard_count) {
+        Ok(report) => {
+            let holds = report.holds();
+            let metrics = render_metrics();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "suite": "ehdb-durable-eventlog-gc-drive",
+                    "root": root.display().to_string(),
+                    "shard_count": report.shard_count,
+                    "gc_holds": holds,
+                    "report": report,
+                    "metrics_secret_free": metrics_is_secret_free(&metrics),
+                })
+            );
+            print!("{metrics}");
+            if holds {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "suite": "ehdb-durable-eventlog-gc-drive",
+                    "root": root.display().to_string(),
+                    "error": e.to_string(),
+                })
+            );
+            ExitCode::from(5)
+        }
+    }
+}
+
 fn eventlog_exit(outcome: eventlog::EventLogOutcome) -> ExitCode {
     use eventlog::EventLogOutcome as O;
     match outcome {
@@ -2027,6 +2190,7 @@ fn usage() -> &'static str {
      mirror-eventlog --execution-id <id> --payload <text> [--authoritative-sequence <n>]\n  \
      eventlog-suite  [--execution-id <id>]\n  \
      durable-eventlog  [--execution-id <id>]  (slice 4: mirror via NOETL_EHDB_EVENTLOG_BACKEND; durable_segment ⇒ reopen + replay proof)\n  \
+     durable-eventlog-gc  [--min-retained <n>]  (drive one segment-GC pass over owned shards; reports per-shard reclamation)\n  \
      eventlog-primary-serve  (Phase 9 tier 1: serve log from EHDB + reversibility)\n  \
      mirror-projection --execution-id <id> [--events <n>] [--consumer <c>]\n  \
      projection-suite  [--execution-id <id>] [--consumer <c>]\n  \

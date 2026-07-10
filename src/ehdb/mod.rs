@@ -92,6 +92,7 @@ pub mod contract;
 pub mod dataplane;
 pub mod eventlog;
 pub mod eventlog_backend;
+pub mod eventlog_gc;
 pub mod eventstream;
 pub mod guard;
 pub mod kv;
