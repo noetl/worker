@@ -94,6 +94,7 @@ pub mod eventlog;
 pub mod eventlog_backend;
 pub mod eventlog_gc;
 pub mod eventstream;
+pub mod flight_sql_endpoint;
 pub mod guard;
 pub mod kv;
 pub mod metrics;
