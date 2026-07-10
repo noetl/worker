@@ -175,10 +175,27 @@ fn durable_base_from_log(log: Option<&Path>) -> PathBuf {
     }
 }
 
+/// The per-shard segment rollover threshold. Optional — defaults to the engine's
+/// 8 MiB ([`ehdb_reference::DEFAULT_SEGMENT_MAX_BYTES`]). A smaller value rotates
+/// segments more often (useful to exercise / observe segment GC without driving
+/// 8 MiB of events per rotation); changing it is safe on an existing store (it
+/// only affects new rotations — replay is size-agnostic).
+pub const SEGMENT_MAX_BYTES_ENV: &str = "NOETL_EHDB_EVENTLOG_SEGMENT_MAX_BYTES";
+
+/// Resolve the segment rollover threshold from [`SEGMENT_MAX_BYTES_ENV`], falling
+/// back to the engine default. A non-numeric / zero value uses the default.
+fn segment_max_bytes(env: &EnvMap) -> u64 {
+    env.get(SEGMENT_MAX_BYTES_ENV)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(ehdb_reference::DEFAULT_SEGMENT_MAX_BYTES)
+}
+
 /// Construct the full durable stack: [`SharedTierEventLog`] = shared-tier
 /// (slice 3) over affinity single-writer routing (slice 2) over per-shard
 /// [`DurableEventLogDriver`] segment stores (slice 1), pinned to this replica's
-/// [`ownership_from_env`] and pointed at [`DurablePaths`].
+/// [`ownership_from_env`] and pointed at [`DurablePaths`], with the segment
+/// rollover threshold from [`SEGMENT_MAX_BYTES_ENV`].
 pub fn build_durable_stack(
     env: &EnvMap,
     contract: &EhdbContract,
@@ -187,8 +204,14 @@ pub fn build_durable_stack(
     let ownership = ownership_from_env(env);
     let shared: Arc<dyn SharedSegmentBackend> =
         Arc::new(FilesystemSharedBackend::open(&paths.shared_root).map_err(|e| e.to_string())?);
-    SharedTierEventLog::open(&paths.local_root, ownership, shared, &paths.coldload_root)
-        .map_err(|e| e.to_string())
+    SharedTierEventLog::open_with_segment_size(
+        &paths.local_root,
+        ownership,
+        shared,
+        &paths.coldload_root,
+        segment_max_bytes(env),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// The append dispatch outcome, normalized so the caller's parity path is
