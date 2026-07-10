@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.72.0](https://github.com/noetl/worker/compare/v5.71.0...v5.72.0) (2026-07-10)
+
+### Features
+
+* **ehdb:** limits-based retention knob + tunable segment size for eventlog GC ([#178](https://github.com/noetl/worker/issues/178)) ([ae6dca0](https://github.com/noetl/worker/commit/ae6dca07b802ecc54fd12d81d529c3fc900813f9))
+
 ## [5.71.0](https://github.com/noetl/worker/compare/v5.70.3...v5.71.0) (2026-07-10)
 
 ### Features
