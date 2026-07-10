@@ -307,6 +307,16 @@ impl Worker {
         // build without EHDB.  Control-plane roles never perform the read.
         crate::ehdb::readiness::run_preflight(&self.config.worker_id);
 
+        // EHDB durable event-log periodic segment-GC (noetl/ehdb#254).  Spawns
+        // ONLY when the operator has opted in on every axis (durable_segment
+        // backend + GC policy enabled + a positive interval + a data-plane
+        // durable contract); otherwise `from_env` returns None and nothing is
+        // spawned, so a default worker is byte-identical.  Reclaims each owned
+        // shard's consumed sealed segments (local + shared) on a blocking thread,
+        // serialized against appends per shard.
+        let eventlog_gc_handle = crate::ehdb::eventlog_gc::GcConfig::from_env()
+            .map(|cfg| crate::ehdb::eventlog_gc::spawn(cfg, self.config.worker_id.clone()));
+
         // Process commands
         let result = self.process_commands().await;
 
@@ -324,6 +334,9 @@ impl Worker {
             h.abort();
         }
         if let Some(h) = state_builder_handle {
+            h.abort();
+        }
+        if let Some(h) = eventlog_gc_handle {
             h.abort();
         }
 

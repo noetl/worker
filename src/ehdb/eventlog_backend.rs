@@ -43,19 +43,43 @@
 //! EHDB event-log engine. The event-log-authoritative boundary the rest of
 //! `src/ehdb/eventlog.rs` asserts is preserved.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ehdb_reference::{
     DurableSegmentStore, EventLogAppendOutcome, EventLogAppendRequest, EventLogDriver,
     EventLogScanRequest, EventLogStorageBackend, FilesystemSharedBackend,
-    LocalReferenceEventLogDriver, Routed, ShardOwnership, SharedSegmentBackend, SharedTierEventLog,
-    DEFAULT_LOCAL_REFERENCE_NAMESPACE, DEFAULT_LOCAL_REFERENCE_TENANT,
+    LocalReferenceEventLogDriver, Routed, SegmentGcPolicy, ShardOwnership, SharedSegmentBackend,
+    SharedShardGcOutcome, SharedTierEventLog, DEFAULT_LOCAL_REFERENCE_NAMESPACE,
+    DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 
 use super::contract::EhdbContract;
 use super::eventlog::EventLogOptions;
 use super::EnvMap;
+
+/// Process-global per-shard advisory lock registry. The durable backend's
+/// single-writer invariant is enforced *across replicas* by execution-affinity,
+/// but **within** a replica the durable append path and the periodic segment-GC
+/// path are two writers to the same shard's segment files (GC write-forwards
+/// consumer state + unlinks sealed segments; an append writes the active
+/// segment). Both acquire this per-shard lock so they never interleave — GC's
+/// reclamation is serialized against appends on the *same* shard, while appends
+/// (and GC) on *other* shards run unblocked. A side benefit: it also closes a
+/// latent intra-replica append↔append race on one shard's active segment.
+///
+/// Only the `durable_segment` backend touches this; the default `local_reference`
+/// path is unchanged.
+fn shard_lock(shard: u32) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<u32, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .entry(shard)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Base directory for the durable per-shard segment stores + derived
 /// shared/cold-load roots. Optional — when unset the base is derived from the
@@ -221,6 +245,11 @@ pub fn append_selected(
                 .map_err(|e| e.to_string())
         }
         EventLogStorageBackend::DurableSegment => {
+            // Serialize against the periodic segment-GC path (and any concurrent
+            // append) on this shard — see `shard_lock`.
+            let shard = ownership_from_env(env).shard_of(&request.execution_id);
+            let lock = shard_lock(shard);
+            let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             let stack = build_durable_stack(env, contract)?;
             match stack.append(request).map_err(|e| e.to_string())? {
                 Routed::Served(outcome) => Ok(AppendDispatch::Served(outcome)),
@@ -228,6 +257,52 @@ pub fn append_selected(
             }
         }
     }
+}
+
+/// The shards this replica owns, ascending, from its
+/// [`ownership_from_env`] (`0..shard_count` filtered by ownership).
+pub fn owned_shards(env: &EnvMap) -> Vec<u32> {
+    let ownership = ownership_from_env(env);
+    (0..ownership.shard_count())
+        .filter(|s| ownership.owns_shard(*s))
+        .collect()
+}
+
+/// Run one segment-GC pass over every shard this replica owns — the periodic
+/// reclaim the worker's GC task invokes (and the `ehdb-selfcheck` GC verb drives
+/// once). For each owned shard it acquires the per-shard [`shard_lock`] (so it
+/// never interleaves with a durable append on that shard), builds the durable
+/// stack (per-op, stateless — matching the append path), and calls
+/// [`SharedTierEventLog::reclaim_shard`], which reclaims local **and** shared
+/// segments watermark-first. Returns one outcome per owned shard actually served
+/// (a shard the replica doesn't own is skipped; a `RoutedAway` never happens
+/// since we only iterate owned shards).
+///
+/// A per-shard error is collected as `Err` and does not abort the other shards —
+/// GC is best-effort maintenance, never fatal.
+pub fn reclaim_owned_shards(
+    env: &EnvMap,
+    contract: &EhdbContract,
+    policy: &SegmentGcPolicy,
+) -> Vec<Result<SharedShardGcOutcome, String>> {
+    let mut out = Vec::new();
+    for shard in owned_shards(env) {
+        let lock = shard_lock(shard);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let result = build_durable_stack(env, contract).and_then(|stack| {
+            match stack.reclaim_shard(shard, policy) {
+                Ok(Routed::Served(outcome)) => Ok(outcome),
+                // Never happens (we only iterate owned shards), but map it
+                // defensively rather than panic.
+                Ok(Routed::NotOwner { owner_shard }) => Err(format!(
+                    "reclaim_shard refused: shard {shard} owned by {owner_shard}"
+                )),
+                Err(e) => Err(e.to_string()),
+            }
+        });
+        out.push(result);
+    }
+    out
 }
 
 /// Read-back proof primitive for the durable backend: how many records the

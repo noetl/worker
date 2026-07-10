@@ -48,6 +48,7 @@ struct EhdbMetricsState {
     systemstore: FamilyState,
     rag: FamilyState,
     eventlog: FamilyState,
+    eventlog_gc: FamilyState,
     projection: FamilyState,
     kv: FamilyState,
     object: FamilyState,
@@ -178,6 +179,24 @@ pub fn record_eventlog(
     s.eventlog.record(
         vec![
             ("operation".to_string(), operation.to_string()),
+            ("outcome".to_string(), outcome.to_string()),
+        ],
+        ok,
+        degraded,
+        duration_seconds,
+    );
+}
+
+/// Record one durable event-log **segment-GC** pass (the periodic reclaim).
+/// `outcome` is `reclaimed` (segments/objects freed), `noop` (nothing eligible),
+/// or `error`. Never recorded when GC is disabled, preserving the byte-identical
+/// `/metrics` invariant. Aggregate + last-op only — no shard id, path, or error
+/// text reaches a label.
+pub fn record_eventlog_gc(outcome: &str, ok: bool, degraded: bool, duration_seconds: f64) {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    s.eventlog_gc.record(
+        vec![
+            ("operation".to_string(), "reclaim".to_string()),
             ("outcome".to_string(), outcome.to_string()),
         ],
         ok,
@@ -348,6 +367,12 @@ pub fn render_lines() -> Vec<String> {
         &s.eventlog,
         "eventlog",
         "EHDB event-log operations (shadow mirror + Phase-9 primary serve) by operation and outcome",
+    );
+    render_op_family(
+        &mut lines,
+        &s.eventlog_gc,
+        "eventlog_gc",
+        "EHDB durable event-log segment-GC passes by outcome (reclaimed/noop/error)",
     );
     render_op_family(
         &mut lines,
