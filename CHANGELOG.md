@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.73.0](https://github.com/noetl/worker/compare/v5.72.0...v5.73.0) (2026-07-11)
+
+### Features
+
+* **ehdb:** worker-side data-plane tier query handler ([#178](https://github.com/noetl/worker/issues/178)) ([#181](https://github.com/noetl/worker/issues/181)) ([a001d8d](https://github.com/noetl/worker/commit/a001d8d75df79e8a50dcd13a83762f83ed07dfd0))
+
 ## [5.72.0](https://github.com/noetl/worker/compare/v5.71.0...v5.72.0) (2026-07-10)
 
 ### Features
