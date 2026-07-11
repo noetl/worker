@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.74.0](https://github.com/noetl/worker/compare/v5.73.0...v5.74.0) (2026-07-11)
+
+### Features
+
+* **ehdb:** dedicated external Flight SQL projection endpoint ([#184](https://github.com/noetl/worker/issues/184)) ([#180](https://github.com/noetl/worker/issues/180)) ([1014fc8](https://github.com/noetl/worker/commit/1014fc89fb42eb671061a438ee206e3b3f40a9e6)), closes [noetl/ehdb#272](https://github.com/noetl/ehdb/issues/272) [#178](https://github.com/noetl/worker/issues/178) [noetl/ehdb#272](https://github.com/noetl/ehdb/issues/272) [noetl/ehdb#272](https://github.com/noetl/ehdb/issues/272) [noetl/ehdb#272](https://github.com/noetl/ehdb/issues/272) [#181](https://github.com/noetl/worker/issues/181)
+
 ## [5.73.0](https://github.com/noetl/worker/compare/v5.72.0...v5.73.0) (2026-07-11)
 
 ### Features
