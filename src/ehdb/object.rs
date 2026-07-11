@@ -362,7 +362,10 @@ fn resolve_contract(
     Ok(contract)
 }
 
-fn driver_from(contract: &EhdbContract, opts: &ObjectOptions) -> LocalReferenceObjectBlobDriver {
+pub(crate) fn driver_from(
+    contract: &EhdbContract,
+    opts: &ObjectOptions,
+) -> LocalReferenceObjectBlobDriver {
     let log = contract.local_reference_log.clone().expect("log present");
     let object_root = object_root_from(&log);
     LocalReferenceObjectBlobDriver::new(log, object_root, tenant_of(opts), namespace_of(opts))

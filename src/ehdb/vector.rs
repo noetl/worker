@@ -354,7 +354,10 @@ fn resolve_contract(
     Ok(contract)
 }
 
-fn driver_from(contract: &EhdbContract, opts: &VectorOptions) -> LocalReferenceVectorDriver {
+pub(crate) fn driver_from(
+    contract: &EhdbContract,
+    opts: &VectorOptions,
+) -> LocalReferenceVectorDriver {
     let log = contract.local_reference_log.clone().expect("log present");
     LocalReferenceVectorDriver::new(log, tenant_of(opts), namespace_of(opts))
 }

@@ -99,6 +99,7 @@ pub mod kv;
 pub mod metrics;
 pub mod object;
 pub mod projection;
+pub mod query;
 pub mod rag;
 pub mod readiness;
 pub mod systemstore;

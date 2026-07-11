@@ -53,6 +53,7 @@ struct EhdbMetricsState {
     kv: FamilyState,
     object: FamilyState,
     vector: FamilyState,
+    query: FamilyState,
 }
 
 fn state() -> &'static Mutex<EhdbMetricsState> {
@@ -295,6 +296,35 @@ pub fn record_vector(
     );
 }
 
+/// Record one read-only tier **query** op (EHDB Data Query Interface,
+/// noetl/ai-meta#178).  `disabled` outcomes are not recorded, preserving the
+/// byte-identical `/metrics` invariant.  Labelled by tier + operation + outcome;
+/// `execution_id` is deliberately NOT a label (cardinality) — it rides the query
+/// span instead.
+pub fn record_query(
+    tier: &str,
+    operation: &str,
+    outcome: &str,
+    ok: bool,
+    degraded: bool,
+    duration_seconds: f64,
+) {
+    if outcome == "disabled" {
+        return;
+    }
+    let mut s = state().lock().expect("ehdb metrics lock");
+    s.query.record(
+        vec![
+            ("tier".to_string(), tier.to_string()),
+            ("operation".to_string(), operation.to_string()),
+            ("outcome".to_string(), outcome.to_string()),
+        ],
+        ok,
+        degraded,
+        duration_seconds,
+    );
+}
+
 /// Render all EHDB metric families as Prometheus text lines.  Returns an empty
 /// vec when no non-disabled EHDB op has run (the disabled/no-op case), so the
 /// worker `/metrics` output stays byte-identical.
@@ -398,6 +428,49 @@ pub fn render_lines() -> Vec<String> {
         "vector",
         "EHDB vector shadow operations by operation and outcome",
     );
+
+    // The read-only tier-query family uses the `noetl_worker_ehdb_query_*` name
+    // shape (worker-scoped, distinct from the shadow-mirror `noetl_ehdb_*`
+    // families), so it renders with a bespoke block rather than
+    // `render_op_family`. Emits the ops counter + last-op gauges, including the
+    // `noetl_worker_ehdb_query_duration_seconds` gauge the query interface
+    // advertises (observability.md Principle 1).
+    if !s.query.is_empty() {
+        lines.push(
+            "# HELP noetl_worker_ehdb_query_ops_total EHDB read-only tier queries by tier, operation, outcome"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_worker_ehdb_query_ops_total counter".to_string());
+        for (labels, count) in &s.query.counts {
+            lines.push(format!(
+                "noetl_worker_ehdb_query_ops_total{} {count}",
+                render_labels(labels)
+            ));
+        }
+        lines.push(
+            "# HELP noetl_worker_ehdb_query_last_ok Last EHDB tier-query result (1=ok)".to_string(),
+        );
+        lines.push("# TYPE noetl_worker_ehdb_query_last_ok gauge".to_string());
+        lines.push(format!("noetl_worker_ehdb_query_last_ok {}", s.query.last_a));
+        lines.push(
+            "# HELP noetl_worker_ehdb_query_last_degraded Last EHDB tier-query degraded flag"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_worker_ehdb_query_last_degraded gauge".to_string());
+        lines.push(format!(
+            "noetl_worker_ehdb_query_last_degraded {}",
+            s.query.last_degraded
+        ));
+        lines.push(
+            "# HELP noetl_worker_ehdb_query_duration_seconds Last EHDB tier-query duration"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_worker_ehdb_query_duration_seconds gauge".to_string());
+        lines.push(format!(
+            "noetl_worker_ehdb_query_duration_seconds {:.6}",
+            s.query.last_duration_seconds
+        ));
+    }
 
     lines
 }
