@@ -21,14 +21,17 @@
 
 use anyhow::Result;
 use axum::{
+    extract::{Path, Query},
     http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
-    Router,
+    Json, Router,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::task::JoinHandle;
 
+use crate::ehdb::query::{run_query, QueryParams, QueryTier};
 use crate::metrics::{WorkerMetrics, METRICS_CONTENT_TYPE};
 
 /// Spawn the metrics HTTP server in a background task.
@@ -43,7 +46,12 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz_handler))
         .route("/readyz", get(readyz_handler))
-        .route("/livez", get(livez_handler));
+        .route("/livez", get(livez_handler))
+        // EHDB Data Query Interface — the data-plane read handler the server
+        // relays raw tier queries to (noetl/ai-meta#178).  Read-only, disabled by
+        // default (no-op until `NOETL_EHDB_ENABLED`), reachable in-cluster via
+        // the existing worker metrics/query service on :9090.
+        .route("/ehdb/tiers/{tier}", get(ehdb_tier_query_handler));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -84,6 +92,50 @@ async fn metrics_handler() -> impl IntoResponse {
         )],
         body,
     )
+}
+
+/// `GET /ehdb/tiers/{tier}` — read-only EHDB data-plane tier query.
+///
+/// The worker-side half of the EHDB Data Query Interface (noetl/ai-meta#178).
+/// The server (control plane) makes a synchronous read request straight here
+/// rather than enqueuing on the NATS drive — a query is a data-plane read, not a
+/// unit of playbook work.  The handler resolves + guards the data-plane contract
+/// from the process env, dispatches to the tier driver's read method, and returns
+/// the tier `*Outcome` (already `Serialize` + secret-free).  Disabled by default:
+/// with `NOETL_EHDB_ENABLED` unset it returns a `disabled` no-op body.
+async fn ehdb_tier_query_handler(
+    Path(tier): Path<String>,
+    Query(raw): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(tier) = QueryTier::parse(&tier) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "action": "ehdb.tier.query",
+                "error": "unknown tier",
+                "known_tiers": ["eventlog", "kv", "object", "vector"],
+            })),
+        );
+    };
+    let params = QueryParams::from_pairs(raw.iter());
+    // The driver reads are synchronous, bounded, filesystem-backed opens; run
+    // them on the blocking pool so a scan never stalls the metrics reactor.
+    let env = crate::ehdb::process_env();
+    let result = tokio::task::spawn_blocking(move || run_query(&env, tier, &params))
+        .await
+        .map(|r| (r.outcome.http_status(), r.body))
+        .unwrap_or_else(|e| {
+            (
+                500,
+                serde_json::json!({
+                    "action": "ehdb.tier.query",
+                    "outcome": "unavailable",
+                    "error": format!("query task join error: {e}"),
+                }),
+            )
+        });
+    let status = StatusCode::from_u16(result.0).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(result.1))
 }
 
 /// `GET /healthz` — liveness check.  Returns 200 OK whenever the

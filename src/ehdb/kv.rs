@@ -331,7 +331,7 @@ fn resolve_contract(
     Ok(contract)
 }
 
-fn driver_from(contract: &EhdbContract, opts: &KvOptions) -> LocalReferenceKvStateDriver {
+pub(crate) fn driver_from(contract: &EhdbContract, opts: &KvOptions) -> LocalReferenceKvStateDriver {
     LocalReferenceKvStateDriver::new(
         contract.local_reference_log.clone().expect("log present"),
         tenant_of(opts),
