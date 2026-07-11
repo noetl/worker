@@ -321,14 +321,21 @@ version = "53.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e3a40b6ef36f4c17d1fae5af3438c3d6c660401f9ac8a4d921c27d368b8dee"
 dependencies = [
+ "arrow-arith 53.4.1",
  "arrow-array 53.4.1",
  "arrow-buffer 53.4.1",
  "arrow-cast 53.4.1",
+ "arrow-data 53.4.1",
  "arrow-ipc",
+ "arrow-ord 53.4.1",
+ "arrow-row 53.4.1",
  "arrow-schema 53.4.1",
+ "arrow-select 53.4.1",
+ "arrow-string 53.4.1",
  "base64 0.22.1",
  "bytes",
  "futures",
+ "once_cell",
  "paste",
  "prost",
  "prost-types",
@@ -1522,7 +1529,7 @@ dependencies = [
 [[package]]
 name = "ehdb-catalog"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49db503f940a4cd01d5bc20d1a4ff85560c41816#49db503f940a4cd01d5bc20d1a4ff85560c41816"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1532,7 +1539,7 @@ dependencies = [
 [[package]]
 name = "ehdb-core"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49db503f940a4cd01d5bc20d1a4ff85560c41816#49db503f940a4cd01d5bc20d1a4ff85560c41816"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
 dependencies = [
  "arrow-schema 53.4.1",
  "serde",
@@ -1541,7 +1548,7 @@ dependencies = [
 [[package]]
 name = "ehdb-reference"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49db503f940a4cd01d5bc20d1a4ff85560c41816#49db503f940a4cd01d5bc20d1a4ff85560c41816"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
 dependencies = [
  "arrow-array 53.4.1",
  "arrow-ipc",
@@ -1561,16 +1568,40 @@ dependencies = [
 [[package]]
 name = "ehdb-retrieval"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49db503f940a4cd01d5bc20d1a4ff85560c41816#49db503f940a4cd01d5bc20d1a4ff85560c41816"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
 dependencies = [
  "ehdb-core",
  "serde",
 ]
 
 [[package]]
+name = "ehdb-service"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
+dependencies = [
+ "arrow-array 53.4.1",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema 53.4.1",
+ "ehdb-core",
+ "ehdb-reference",
+ "ehdb-retrieval",
+ "ehdb-storage",
+ "ehdb-stream",
+ "futures-util",
+ "prost",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "ehdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49db503f940a4cd01d5bc20d1a4ff85560c41816#49db503f940a4cd01d5bc20d1a4ff85560c41816"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1580,7 +1611,7 @@ dependencies = [
 [[package]]
 name = "ehdb-stream"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49db503f940a4cd01d5bc20d1a4ff85560c41816#49db503f940a4cd01d5bc20d1a4ff85560c41816"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1590,7 +1621,7 @@ dependencies = [
 [[package]]
 name = "ehdb-system"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49db503f940a4cd01d5bc20d1a4ff85560c41816#49db503f940a4cd01d5bc20d1a4ff85560c41816"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1601,7 +1632,7 @@ dependencies = [
 [[package]]
 name = "ehdb-transaction"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49db503f940a4cd01d5bc20d1a4ff85560c41816#49db503f940a4cd01d5bc20d1a4ff85560c41816"
+source = "git+https://github.com/noetl/ehdb?rev=9b36d15fc9f763a0df4b1eaccbbc770b68557224#9b36d15fc9f763a0df4b1eaccbbc770b68557224"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1671,7 +1702,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2515,15 +2546,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3200,6 +3222,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "ehdb-reference",
+ "ehdb-service",
  "futures",
  "hkdf",
  "hostname",
@@ -3235,7 +3258,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3740,7 +3763,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3879,7 +3902,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4238,7 +4261,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4791,6 +4814,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
 
 [[package]]
+name = "sqlparser"
+version = "0.51.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fe11944a61da0da3f592e19a45ebe5ab92dc14a779907ff1f08fbb797bfefc7"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4922,7 +4954,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6108,7 +6140,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

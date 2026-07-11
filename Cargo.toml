@@ -282,7 +282,17 @@ arrow = "53"
 # arrow 53 matches the worker's own arrow pin.  Disabled by default: no code path
 # opens a runtime unless NOETL_EHDB_ENABLED is truthy AND the role is a data-plane
 # role, so the dependency is inert at rest.
-ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "49db503f940a4cd01d5bc20d1a4ff85560c41816" }
+# NOTE (noetl/ai-meta#184): both ehdb crates are pinned to the SAME ehdb rev.
+# ehdb-service depends on ehdb-reference in-workspace, so a split pin would pull
+# two incompatible copies of ehdb-reference (its `ProjectionDriver` /
+# `ExecutionStateView` would be distinct types).  This rev is the merge SHA of
+# noetl/ehdb#272 on ehdb main (both pins move together on every ehdb bump).
+ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "9b36d15fc9f763a0df4b1eaccbbc770b68557224" }
+# ehdb-service: the Flight SQL projection-tier read surface the external
+# data-plane endpoint (src/ehdb/flight_sql_endpoint.rs) serves.  Inert at rest:
+# no listener binds unless NOETL_EHDB_FLIGHT_SQL is truthy AND the role is a
+# data-plane role.
+ehdb-service = { git = "https://github.com/noetl/ehdb", rev = "9b36d15fc9f763a0df4b1eaccbbc770b68557224" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

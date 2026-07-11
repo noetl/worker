@@ -317,6 +317,20 @@ impl Worker {
         let eventlog_gc_handle = crate::ehdb::eventlog_gc::GcConfig::from_env()
             .map(|cfg| crate::ehdb::eventlog_gc::spawn(cfg, self.config.worker_id.clone()));
 
+        // Dedicated external Flight SQL data-plane endpoint (noetl/ai-meta#184).
+        // Off unless NOETL_EHDB_FLIGHT_SQL is truthy AND a data-plane
+        // local-reference contract + an auth mode resolve; serves the
+        // projection tier read-only to external Flight SQL clients.
+        let flight_sql_handle = crate::ehdb::flight_sql_endpoint::FlightSqlConfig::from_env().map(
+            |cfg| {
+                crate::ehdb::flight_sql_endpoint::spawn(
+                    cfg,
+                    self.client.clone(),
+                    self.config.worker_id.clone(),
+                )
+            },
+        );
+
         // Process commands
         let result = self.process_commands().await;
 
@@ -337,6 +351,9 @@ impl Worker {
             h.abort();
         }
         if let Some(h) = eventlog_gc_handle {
+            h.abort();
+        }
+        if let Some(h) = flight_sql_handle {
             h.abort();
         }
 
