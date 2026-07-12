@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.74.1](https://github.com/noetl/worker/compare/v5.74.0...v5.74.1) (2026-07-12)
+
+### Bug Fixes
+
+* **worker:** in-process NATS reconnect for the main command loop ([#163](https://github.com/noetl/worker/issues/163) gap) ([#182](https://github.com/noetl/worker/issues/182)) ([a5fe22a](https://github.com/noetl/worker/commit/a5fe22a99d4426e674780e546742acf2d2b3b0e7))
+
 ## [5.74.0](https://github.com/noetl/worker/compare/v5.73.0...v5.74.0) (2026-07-11)
 
 ### Features
