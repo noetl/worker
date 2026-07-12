@@ -1256,9 +1256,10 @@ pub fn spawn_drain(config: DrainConfig, index: SharedWalIndex) -> tokio::task::J
 /// Backoff floor/ceiling for the state-builder consumer reconnect+rebuild path
 /// (noetl/ai-meta#161).  Starts at 250ms, doubles per failed attempt, caps at
 /// 10s — fast enough to recover from a NATS bounce in seconds, slow enough not
-/// to hammer a still-down server.
-const REBUILD_BACKOFF_MIN: Duration = Duration::from_millis(250);
-const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// to hammer a still-down server.  `pub(crate)` so the main command loop's
+/// in-process reconnect (noetl/ai-meta#163) shares the same backoff shape.
+pub(crate) const REBUILD_BACKOFF_MIN: Duration = Duration::from_millis(250);
+pub(crate) const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(10);
 
 /// How long the dead-consumer signature must persist before the drain tears the
 /// consumer down and recreates it.  Tolerates a single transient blip; a real
@@ -1282,7 +1283,7 @@ fn unhealthy_after() -> Duration {
 /// transiently busy — the noetl/ai-meta#161 wedge signature.  The orphaned
 /// consumer surfaces as a repeated `503 "no responders"` while pulling; a
 /// deleted consumer surfaces as "consumer not found"/"consumer deleted".
-fn is_consumer_dead<E: std::fmt::Display>(err: &E) -> bool {
+pub(crate) fn is_consumer_dead<E: std::fmt::Display>(err: &E) -> bool {
     let s = err.to_string().to_ascii_lowercase();
     s.contains("503")
         || s.contains("no responders")

@@ -166,6 +166,20 @@ impl NatsCommandSource {
     pub fn subscriber(&self) -> &NatsSubscriber {
         &self.subscriber
     }
+
+    /// Swap in a freshly-connected subscriber (noetl/ai-meta#163).  The main
+    /// command loop calls this after a hard NATS disconnect: it rebuilds a new
+    /// `NatsSubscriber` (fresh async-nats client + JetStream context + re-resolved
+    /// durable consumer) with bounded backoff and installs it here, so pulling
+    /// resumes in-process instead of the worker exiting and relying on a k8s
+    /// crash-restart.  The old subscriber (and its dead client) is dropped.  The
+    /// durable consumer's server-side cursor is unchanged by the swap — the fresh
+    /// subscriber re-binds the *same* durable consumer by name — so no message is
+    /// replayed or skipped across the reconnect.  `worker_id`, `segment`, and the
+    /// affinity policy are process-level and unaffected, so they are preserved.
+    pub fn replace_subscriber(&mut self, subscriber: NatsSubscriber) {
+        self.subscriber = subscriber;
+    }
 }
 
 /// Translate the worker's local `Command` into the executor's

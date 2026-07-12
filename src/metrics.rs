@@ -352,6 +352,16 @@ pub struct WorkerMetrics {
     /// from a NATS bounce on its own instead of wedging until a manual restart.
     pub state_builder_consumer_recreate_total: IntCounterVec,
 
+    /// Count of MAIN command-loop in-process NATS reconnects (noetl/ai-meta#163),
+    /// partitioned by `reason`: `pull` / `ack` / `nack` — a hard NATS disconnect
+    /// surfaced on that operation and the loop rebuilt the subscriber in-process
+    /// (instead of the pre-#163 behaviour: propagate the error → `exit(1)` → k8s
+    /// crash-restart + full WAL replay); `connect_error` — a rebuild attempt itself
+    /// failed and is being retried with backoff.  A rising `pull`/`ack`/`nack`
+    /// rate with the worker's `restart_count` staying flat is the fix working — the
+    /// command loop surviving a `nats-0` bounce without a pod restart.
+    pub command_loop_reconnect_total: IntCounterVec,
+
     // --- State materializer (noetl/ai-meta#166 Phase 2 — shadow state-shard tier) ---
     /// Events drained from `noetl_events` by the shadow state materializer.
     pub state_materializer_drained_total: IntCounter,
@@ -1141,6 +1151,18 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_consumer_recreate_total.clone()))
             .expect("register state_builder_consumer_recreate_total");
 
+        let command_loop_reconnect_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_command_loop_reconnect_total",
+                "Main command-loop in-process NATS reconnects — reason pull / ack / nack (a hard disconnect surfaced on that op and the subscriber was rebuilt in-process) or connect_error (a rebuild attempt failed, retrying) — the noetl/ai-meta#163 fix firing.",
+            ),
+            &["reason"],
+        )
+        .expect("command_loop_reconnect_total metric");
+        registry
+            .register(Box::new(command_loop_reconnect_total.clone()))
+            .expect("register command_loop_reconnect_total");
+
         // --- State materializer (noetl/ai-meta#166 Phase 2) ---
         let state_materializer_drained_total = IntCounter::new(
             "noetl_worker_state_materializer_drained_total",
@@ -1286,6 +1308,7 @@ impl WorkerMetrics {
             worker_ready,
             state_builder_healthy,
             state_builder_consumer_recreate_total,
+            command_loop_reconnect_total,
             state_materializer_drained_total,
             state_materializer_rows_total,
             state_materializer_shards_written_total,
@@ -1847,6 +1870,17 @@ pub fn state_builder_healthy() -> bool {
 pub fn record_state_builder_consumer_recreate(reason: &str) {
     WorkerMetrics::global()
         .state_builder_consumer_recreate_total
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record a MAIN command-loop in-process NATS reconnect (noetl/ai-meta#163).
+/// `reason` is `pull` / `ack` / `nack` (a hard disconnect surfaced on that op and
+/// the subscriber was rebuilt in-process) or `connect_error` (a rebuild attempt
+/// itself failed and is being retried with backoff).
+pub fn record_command_loop_reconnect(reason: &str) {
+    WorkerMetrics::global()
+        .command_loop_reconnect_total
         .with_label_values(&[reason])
         .inc();
 }

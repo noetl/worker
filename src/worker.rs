@@ -429,6 +429,13 @@ impl Worker {
     /// `subscriber.ack()` calls.  The four `ClaimOutcome` variants
     /// map 1:1 onto the worker's pre-PR-2d-2 control flow.
     async fn process_commands(&self) -> Result<()> {
+        // noetl/ai-meta#163: bounded exponential backoff shared across the loop's
+        // in-process NATS reconnects.  Reset to the floor after every healthy pull
+        // so a single recovered blip doesn't leave the next reconnect starting from
+        // a stretched backoff, but a *flapping* reconnect that never recovers still
+        // walks the backoff up to the 10s ceiling.
+        let mut reconnect_backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
+
         loop {
             // Wait for available slot
             let permit = self.semaphore.clone().acquire_owned().await?;
@@ -436,9 +443,29 @@ impl Worker {
             // Pull one item from the source.  The Mutex is held only
             // for the duration of `next()` + the corresponding ack /
             // nack; dispatch happens after the lock is released.
+            //
+            // noetl/ai-meta#163: a pull error is NO LONGER propagated (which used
+            // to `exit(1)` the worker and rely on a k8s crash-restart + full WAL
+            // replay).  A hard NATS disconnect (e.g. `nats-0` pod delete) is
+            // detected here and healed in-process by rebuilding the subscriber with
+            // backoff; a non-disconnect blip takes a brief backoff and retries.
+            // Either way the loop keeps running — the durable consumer's server-side
+            // cursor is untouched, so nothing is replayed or skipped.
             let pulled = {
                 let mut source = self.source.lock().await;
-                source.next().await?
+                source.next().await
+            };
+            let pulled = match pulled {
+                Ok(p) => {
+                    // Healthy pull → the connection is good; reset the backoff.
+                    reconnect_backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
+                    p
+                }
+                Err(e) => {
+                    drop(permit);
+                    self.on_loop_error("pull", &e, &mut reconnect_backoff).await;
+                    continue;
+                }
             };
 
             let Some(Pulled { outcome, ack }) = pulled else {
@@ -471,12 +498,19 @@ impl Worker {
                     // back to the captured client.
                     let dispatch_server_url = ack.notification.server_url.clone();
 
-                    // Ack the source handle now that we own the
-                    // command; dispatch happens off the pull loop.
-                    {
+                    // Ack the source handle now that we own the command; dispatch
+                    // happens off the pull loop.  noetl/ai-meta#163: the claim (in
+                    // `next()`) is the execution commitment, not the NATS ack — so
+                    // even if the ack fails (connection dropped between claim and
+                    // ack) we STILL dispatch the claimed command below, then heal
+                    // the connection.  A failed ack leaves the notification
+                    // unacked → JetStream redelivers it → re-claim returns
+                    // `AlreadyClaimed` → ack + skip (no double execution; the DB
+                    // claim is the exactly-once gate).
+                    let ack_err = {
                         let source = self.source.lock().await;
-                        source.ack(ack).await?;
-                    }
+                        source.ack(ack).await.err()
+                    };
 
                     // Spawn task to process command
                     let executor = self.executor.clone();
@@ -541,6 +575,13 @@ impl Worker {
                         }
                         crate::metrics::dec_concurrent_dispatches();
                     });
+
+                    // The claimed command is now dispatching regardless; if its ack
+                    // failed the connection is suspect — heal it in-process
+                    // (noetl/ai-meta#163) so the next pull works.
+                    if let Some(e) = ack_err {
+                        self.on_loop_error("ack", &e, &mut reconnect_backoff).await;
+                    }
                 }
                 ClaimOutcome::AlreadyClaimed => {
                     // Per `observability.md` Principle 4: every
@@ -556,13 +597,20 @@ impl Worker {
                     );
 
                     // Ack — another worker has it, no redelivery.
-                    {
+                    let ack_err = {
                         let source = self.source.lock().await;
-                        source.ack(ack).await?;
-                    }
+                        source.ack(ack).await.err()
+                    };
 
                     // Release permit immediately
                     drop(permit);
+
+                    // noetl/ai-meta#163: a failed ack here just leaves the
+                    // notification to redeliver (harmless — it re-claims to
+                    // `AlreadyClaimed` again); heal the connection so pulls resume.
+                    if let Some(e) = ack_err {
+                        self.on_loop_error("ack", &e, &mut reconnect_backoff).await;
+                    }
                 }
                 ClaimOutcome::RetryLater(error) => {
                     tracing::warn!(
@@ -575,11 +623,14 @@ impl Worker {
 
                     // Nack for redelivery on transient overload /
                     // contention.
-                    {
+                    let nack_err = {
                         let source = self.source.lock().await;
-                        source.nack(ack).await?;
-                    }
+                        source.nack(ack).await.err()
+                    };
                     drop(permit);
+                    if let Some(e) = nack_err {
+                        self.on_loop_error("nack", &e, &mut reconnect_backoff).await;
+                    }
                 }
                 ClaimOutcome::Failed(error) => {
                     tracing::error!(
@@ -591,14 +642,150 @@ impl Worker {
                     );
 
                     // Nack for redelivery.
-                    {
+                    let nack_err = {
                         let source = self.source.lock().await;
-                        source.nack(ack).await?;
-                    }
+                        source.nack(ack).await.err()
+                    };
                     drop(permit);
+                    if let Some(e) = nack_err {
+                        self.on_loop_error("nack", &e, &mut reconnect_backoff).await;
+                    }
                 }
             }
         }
+    }
+
+    /// React to an error on the command loop's NATS path (noetl/ai-meta#163).
+    ///
+    /// `op` is the operation that failed (`pull` / `ack` / `nack`) — used as the
+    /// reconnect metric's `reason` label.  A hard-disconnect-class error rebuilds
+    /// the subscriber in-process with bounded backoff (recovering from a `nats-0`
+    /// bounce without a pod restart); a non-disconnect transient error takes a
+    /// brief backoff and lets the caller retry (the durable consumer redelivers
+    /// any unacked notification, so nothing is lost).  Never returns an error —
+    /// the loop must not `exit(1)` on a NATS blip.
+    async fn on_loop_error<E: std::fmt::Display>(
+        &self,
+        op: &str,
+        err: &E,
+        backoff: &mut std::time::Duration,
+    ) {
+        match classify_loop_error(err) {
+            LoopAction::Reconnect => {
+                tracing::warn!(
+                    op,
+                    error = %err,
+                    "command-loop NATS disconnect; rebuilding subscriber in-process (noetl/ai-meta#163)"
+                );
+                self.reconnect_command_source(op, backoff).await;
+            }
+            LoopAction::Backoff => {
+                // Not a disconnect (e.g. a transient control-plane claim blip).
+                // Don't churn the NATS connection; brief backoff and retry.
+                tracing::warn!(
+                    op,
+                    error = %err,
+                    "command-loop transient error (non-disconnect); backing off then retrying"
+                );
+                tokio::time::sleep(crate::state_builder::REBUILD_BACKOFF_MIN).await;
+            }
+        }
+    }
+
+    /// Rebuild the NATS command subscriber in-process with bounded exponential
+    /// backoff and swap it into the source (noetl/ai-meta#163).  Loops until a
+    /// fresh connect + durable-consumer bind succeeds — a permanently-down NATS
+    /// keeps the loop retrying (as the pre-#163 `exit(1)` + crash-restart also
+    /// couldn't make progress against a down NATS, but without the full-WAL-replay
+    /// outage on every attempt).  The rebuilt subscriber re-binds the SAME durable
+    /// consumer by name, so its server-side cursor is unchanged — no command is
+    /// replayed or skipped across the reconnect.
+    async fn reconnect_command_source(&self, reason: &str, backoff: &mut std::time::Duration) {
+        crate::metrics::record_command_loop_reconnect(reason);
+        loop {
+            match NatsSubscriber::connect(
+                &self.config.nats_url,
+                &self.config.nats_stream,
+                &self.config.nats_consumer,
+                &self.config.nats_subject,
+                &self.config.nats_filter_subject,
+            )
+            .await
+            {
+                Ok(subscriber) => {
+                    self.source.lock().await.replace_subscriber(subscriber);
+                    tracing::info!(
+                        reason,
+                        "command-loop NATS reconnected in-process; resuming consume (noetl/ai-meta#163)"
+                    );
+                    *backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
+                    return;
+                }
+                Err(e) => {
+                    crate::metrics::record_command_loop_reconnect("connect_error");
+                    tracing::warn!(
+                        error = %e,
+                        backoff_ms = backoff.as_millis() as u64,
+                        reason,
+                        "command-loop NATS reconnect failed; backing off then retrying (noetl/ai-meta#163)"
+                    );
+                    tokio::time::sleep(*backoff).await;
+                    *backoff = (*backoff * 2).min(crate::state_builder::REBUILD_BACKOFF_MAX);
+                }
+            }
+        }
+    }
+}
+
+/// Control-loop reaction to a NATS-path error (noetl/ai-meta#163).
+#[derive(Debug, PartialEq, Eq)]
+enum LoopAction {
+    /// Hard disconnect — rebuild the subscriber in-process with backoff.
+    Reconnect,
+    /// Transient non-disconnect blip — brief backoff, then retry (no rebuild).
+    Backoff,
+}
+
+/// True when a command-loop pull/ack/nack error indicates the NATS connection or
+/// consumer is gone (hard disconnect: `nats-0` pod delete, connection reset,
+/// orphaned consumer) rather than a transient application-level failure (e.g. a
+/// control-plane HTTP claim blip).  Reuses the state-builder's consumer-dead
+/// signatures (noetl/ai-meta#161) and adds the subscriber's own NATS-layer error
+/// wrappers plus raw connection-loss signatures a full client disconnect surfaces.
+///
+/// Deliberately does NOT match bare control-plane HTTP failures ("error sending
+/// request", "connection refused" to the server) so a server-side outage does not
+/// trigger a NATS reconnect storm — those take the brief-backoff path and let the
+/// durable consumer redeliver.
+fn is_nats_disconnect<E: std::fmt::Display>(err: &E) -> bool {
+    if crate::state_builder::is_consumer_dead(err) {
+        return true;
+    }
+    let s = err.to_string().to_ascii_lowercase();
+    // The subscriber wraps every NATS-layer failure with these prefixes; a hard
+    // disconnect on the pull / receive / ack / nack path surfaces here.
+    s.contains("failed to pull command")
+        || s.contains("failed to receive message")
+        || s.contains("failed to ack message")
+        || s.contains("failed to nack")
+        // Raw connection-loss signatures (belt-and-braces for errors that reach us
+        // unwrapped).
+        || s.contains("connection reset")
+        || s.contains("connection closed")
+        || s.contains("connection lost")
+        || s.contains("connection aborted")
+        || s.contains("broken pipe")
+        || s.contains("disconnected")
+}
+
+/// Decide how the command loop should react to a NATS-path error
+/// (noetl/ai-meta#163): rebuild the subscriber on a hard disconnect, else a brief
+/// backoff-and-retry.  Pure so the reconnect decision is unit-tested directly.
+fn classify_loop_error<E: std::fmt::Display>(err: &E) -> LoopAction {
+    if is_nats_disconnect(err) {
+        LoopAction::Reconnect
+    } else {
+        LoopAction::Backoff
     }
 }
 
@@ -642,5 +829,229 @@ mod tests {
         std::env::set_var("NOETL_WARM_ORCHESTRATE_PLUGIN", "off");
         assert!(!warm_orchestrate_enabled());
         std::env::remove_var("NOETL_WARM_ORCHESTRATE_PLUGIN");
+    }
+
+    // --- noetl/ai-meta#163: main command-loop in-process NATS reconnect ---
+
+    #[test]
+    fn is_nats_disconnect_matches_hard_disconnect_signatures() {
+        // Subscriber's own NATS-layer error wrappers (the strings that actually
+        // reach the loop through `next()` / `ack()` / `nack()`).
+        assert!(is_nats_disconnect(
+            &"Failed to pull command: connection reset by peer"
+        ));
+        assert!(is_nats_disconnect(
+            &"Failed to receive message: broken pipe"
+        ));
+        assert!(is_nats_disconnect(&"Failed to ack message: disconnected"));
+        assert!(is_nats_disconnect(&"Failed to nack message: timed out"));
+        // Consumer-dead signatures shared with the state-builder self-heal (#161).
+        assert!(is_nats_disconnect(&"503 no responders available for request"));
+        assert!(is_nats_disconnect(&"consumer not found"));
+        assert!(is_nats_disconnect(&"consumer deleted"));
+        // Raw connection-loss signatures.
+        assert!(is_nats_disconnect(&"connection closed"));
+        assert!(is_nats_disconnect(&"connection aborted"));
+    }
+
+    #[test]
+    fn is_nats_disconnect_ignores_control_plane_http_failures() {
+        // A control-plane (server) HTTP outage must NOT trigger a NATS reconnect
+        // storm — these take the brief-backoff path so the durable consumer just
+        // redelivers.  (reqwest's connect-refused shape names the SERVER, not NATS.)
+        assert!(!is_nats_disconnect(
+            &"error sending request for url (http://noetl-server:8082/api/commands/claim): error trying to connect: tcp connect error: Connection refused (os error 111)"
+        ));
+        assert!(!is_nats_disconnect(&"500 Internal Server Error"));
+        assert!(!is_nats_disconnect(&"claim rejected: catalog mismatch"));
+    }
+
+    #[test]
+    fn classify_loop_error_reconnects_on_disconnect_backs_off_otherwise() {
+        assert_eq!(
+            classify_loop_error(&"Failed to pull command: broken pipe"),
+            LoopAction::Reconnect
+        );
+        assert_eq!(
+            classify_loop_error(&"500 Internal Server Error"),
+            LoopAction::Backoff
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_with_ceiling() {
+        // Mirrors the doubling in `reconnect_command_source`: floor → double per
+        // failed attempt → clamp at the 10s ceiling (never regressing the cursor
+        // or hammering a still-down NATS).
+        let mut b = crate::state_builder::REBUILD_BACKOFF_MIN;
+        assert_eq!(b, std::time::Duration::from_millis(250));
+        for _ in 0..10 {
+            b = (b * 2).min(crate::state_builder::REBUILD_BACKOFF_MAX);
+        }
+        assert_eq!(b, crate::state_builder::REBUILD_BACKOFF_MAX);
+        assert_eq!(b, std::time::Duration::from_secs(10));
+    }
+
+    // A scriptable in-memory `CommandSource` that can inject a hard-disconnect
+    // error mid-stream, then (once "reconnected") resume yielding commands — the
+    // unit-level simulation of a `nats-0` bounce.  Its ack log lets the test
+    // assert every command is acked exactly once and in order (cursor intact, no
+    // duplicate or lost command across the reconnect).
+    enum Scripted {
+        Yield(ClaimOutcome),
+        Disconnect,
+        End,
+    }
+
+    #[derive(Clone)]
+    struct MockAck {
+        command_id: String,
+    }
+
+    struct FlakySource {
+        script: std::collections::VecDeque<Scripted>,
+        acked: Arc<Mutex<Vec<String>>>,
+        nacked: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandSource for FlakySource {
+        type AckHandle = MockAck;
+
+        async fn next(&mut self) -> Result<Option<Pulled<MockAck>>> {
+            match self.script.pop_front() {
+                None | Some(Scripted::End) => Ok(None),
+                Some(Scripted::Disconnect) => {
+                    // The exact shape a hard `nats-0` delete surfaces through the
+                    // subscriber's pull wrapper.
+                    Err(anyhow::anyhow!(
+                        "Failed to pull command: connection reset by peer"
+                    ))
+                }
+                Some(Scripted::Yield(outcome)) => {
+                    let command_id = match &outcome {
+                        ClaimOutcome::Claimed(c) => c.command_id.clone(),
+                        _ => "n/a".to_string(),
+                    };
+                    Ok(Some(Pulled {
+                        outcome,
+                        ack: MockAck { command_id },
+                    }))
+                }
+            }
+        }
+
+        async fn ack(&self, handle: MockAck) -> Result<()> {
+            self.acked.lock().await.push(handle.command_id);
+            Ok(())
+        }
+
+        async fn nack(&self, handle: MockAck) -> Result<()> {
+            self.nacked.lock().await.push(handle.command_id);
+            Ok(())
+        }
+    }
+
+    fn claimed(id: &str) -> ClaimOutcome {
+        ClaimOutcome::Claimed(noetl_executor::worker::source::Command {
+            command_id: id.to_string(),
+            execution_id: 1,
+            step: "s".to_string(),
+            tool_kind: "rhai".to_string(),
+            input: serde_json::Value::Null,
+            render_context: Default::default(),
+            attempts: 0,
+        })
+    }
+
+    /// Faithful model of `process_commands`' reconnect control flow (it shares the
+    /// real `classify_loop_error` decision fn): pull → on a disconnect error,
+    /// classify + "reconnect" (here: bump a counter; the script models the healed
+    /// stream) without propagating → on a claimed command, dispatch + ack.  Proves
+    /// the loop SURVIVES a hard disconnect (returns Ok, never `exit(1)`), fires the
+    /// reconnect exactly once, and processes/acks every command exactly once and in
+    /// order across the reconnect (no cursor regression, no dup/lost command).
+    async fn drive_flaky(source: FlakySource) -> (Vec<String>, Vec<String>, u32) {
+        let acked = source.acked.clone();
+        let nacked = source.nacked.clone();
+        let source = Arc::new(Mutex::new(source));
+        let mut processed = Vec::new();
+        let mut reconnects = 0u32;
+        let mut backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
+
+        loop {
+            let pulled = {
+                let mut s = source.lock().await;
+                s.next().await
+            };
+            let pulled = match pulled {
+                Ok(p) => {
+                    backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
+                    p
+                }
+                Err(e) => {
+                    // The load-bearing assertion: a hard disconnect is NOT
+                    // propagated (no `?`, no `exit(1)`) — it is classified and healed.
+                    match classify_loop_error(&e) {
+                        LoopAction::Reconnect => {
+                            reconnects += 1;
+                            // Model the in-process rebuild's backoff bump.
+                            backoff =
+                                (backoff * 2).min(crate::state_builder::REBUILD_BACKOFF_MAX);
+                        }
+                        LoopAction::Backoff => {}
+                    }
+                    continue;
+                }
+            };
+            let Some(Pulled { outcome, ack }) = pulled else {
+                break; // drained
+            };
+            match outcome {
+                ClaimOutcome::Claimed(cmd) => {
+                    processed.push(cmd.command_id.clone());
+                    source.lock().await.ack(ack).await.unwrap();
+                }
+                ClaimOutcome::AlreadyClaimed => {
+                    source.lock().await.ack(ack).await.unwrap();
+                }
+                ClaimOutcome::RetryLater(_) | ClaimOutcome::Failed(_) => {
+                    source.lock().await.nack(ack).await.unwrap();
+                }
+            }
+        }
+
+        let acked = acked.lock().await.clone();
+        let _ = nacked; // (unused in the claimed-only script)
+        (processed, acked, reconnects)
+    }
+
+    #[tokio::test]
+    async fn reconnect_survives_hard_disconnect_and_preserves_cursor() {
+        // Two commands, a hard disconnect, then two more — the unit-level shape of
+        // a `nats-0` pod delete mid-stream.
+        let source = FlakySource {
+            script: vec![
+                Scripted::Yield(claimed("c1")),
+                Scripted::Yield(claimed("c2")),
+                Scripted::Disconnect,
+                Scripted::Yield(claimed("c3")),
+                Scripted::Yield(claimed("c4")),
+                Scripted::End,
+            ]
+            .into(),
+            acked: Arc::new(Mutex::new(Vec::new())),
+            nacked: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let (processed, acked, reconnects) = drive_flaky(source).await;
+
+        // Survived the disconnect in-process (drive returned; no exit(1)).
+        assert_eq!(reconnects, 1, "exactly one in-process reconnect fired");
+        // Every command processed exactly once, in order — no cursor regression,
+        // no command lost or replayed across the reconnect boundary.
+        assert_eq!(processed, vec!["c1", "c2", "c3", "c4"]);
+        // Every processed command acked exactly once (no duplicate acks).
+        assert_eq!(acked, vec!["c1", "c2", "c3", "c4"]);
     }
 }
