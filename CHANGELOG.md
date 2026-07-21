@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.75.0](https://github.com/noetl/worker/compare/v5.74.1...v5.75.0) (2026-07-21)
+
+### Features
+
+* **command-bus:** L1 T4 worker consume + writer-host wiring (NOETL_COMMAND_BUS) ([#184](https://github.com/noetl/worker/issues/184)) ([8596db7](https://github.com/noetl/worker/commit/8596db7661c6943669af83bd22e85a554fcd5534)), closes [#297](https://github.com/noetl/worker/issues/297) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194)
+
 ## [5.74.1](https://github.com/noetl/worker/compare/v5.74.0...v5.74.1) (2026-07-12)
 
 ### Bug Fixes
