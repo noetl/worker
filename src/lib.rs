@@ -9,20 +9,13 @@
 //! - Case/when/then evaluation
 
 pub mod client;
+pub mod command_bus;
 pub mod config;
 pub mod ehdb;
 pub mod events;
 pub mod executor;
 pub mod materializer;
-pub mod result_locator;
-pub mod result_materializer;
-pub mod result_producer_stage;
-pub mod result_resolver;
 pub mod metrics;
-pub mod state_builder;
-pub mod state_locator;
-pub mod state_materializer;
-pub mod state_reader;
 pub mod metrics_server;
 pub mod nats;
 /// WASM plug-in host for the system worker pool (noetl/ai-meta#105). Gated
@@ -30,10 +23,18 @@ pub mod nats;
 #[cfg(feature = "wasm-plugin")]
 pub mod plugin;
 pub mod ratelimit;
+pub mod result_locator;
+pub mod result_materializer;
+pub mod result_producer_stage;
+pub mod result_resolver;
 pub mod scrub;
 pub mod sharding;
 pub mod snowflake;
 pub mod spool_runtime;
+pub mod state_builder;
+pub mod state_locator;
+pub mod state_materializer;
+pub mod state_reader;
 pub mod subscription;
 pub mod worker;
 

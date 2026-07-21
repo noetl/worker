@@ -227,6 +227,29 @@ fn translate(worker: WorkerCommand) -> ExecutorCommand {
     }
 }
 
+/// Claim a command from the server that published it and map the result to a
+/// [`ClaimOutcome`].  Shared by every [`CommandSource`] (NATS + the EHDB command
+/// bus, noetl/ai-meta#194 L1 T4) so the claim + translate correctness lives in
+/// **one** place — only how the [`CommandNotification`] is *obtained* differs
+/// between sources.  Routes the claim (and downstream calls) to
+/// `notification.server_url` (noetl/ai-meta#53 Gap 1).
+pub(crate) async fn claim_outcome(
+    client: &ControlPlaneClient,
+    worker_id: &str,
+    notification: &CommandNotification,
+) -> Result<ClaimOutcome> {
+    let dispatch_client = client.with_server_url(&notification.server_url);
+    let claim = dispatch_client
+        .claim_command(notification.event_id, worker_id)
+        .await?;
+    Ok(match claim {
+        ClaimResult::Claimed(worker_cmd) => ClaimOutcome::Claimed(translate(worker_cmd)),
+        ClaimResult::AlreadyClaimed => ClaimOutcome::AlreadyClaimed,
+        ClaimResult::RetryLater(err) => ClaimOutcome::RetryLater(err),
+        ClaimResult::Failed(err) => ClaimOutcome::Failed(err),
+    })
+}
+
 #[async_trait]
 impl CommandSource for NatsCommandSource {
     /// Carries both the NATS message handle (for ack/nack) AND the
@@ -289,9 +312,9 @@ impl CommandSource for NatsCommandSource {
                 // the budget as exhausted (process locally) — never risk a
                 // NAK loop on an uninspectable message.
                 let delivered = msg.info().map(|info| info.delivered).unwrap_or(i64::MAX);
-                let decision =
-                    self.affinity
-                        .decide(true, notification.execution_id, delivered);
+                let decision = self
+                    .affinity
+                    .decide(true, notification.execution_id, delivered);
                 if let Some(label) = decision.metric_label() {
                     crate::metrics::record_affinity_decision(label);
                 }
@@ -348,18 +371,7 @@ impl CommandSource for NatsCommandSource {
         // server never fired, stalling multi-step playbooks at
         // the first `command.completed`.  The reqwest client is
         // internally Arc'd so this clone is cheap.
-        let dispatch_client = self.client.with_server_url(&notification.server_url);
-
-        let claim = dispatch_client
-            .claim_command(notification.event_id, &self.worker_id)
-            .await?;
-
-        let outcome = match claim {
-            ClaimResult::Claimed(worker_cmd) => ClaimOutcome::Claimed(translate(worker_cmd)),
-            ClaimResult::AlreadyClaimed => ClaimOutcome::AlreadyClaimed,
-            ClaimResult::RetryLater(err) => ClaimOutcome::RetryLater(err),
-            ClaimResult::Failed(err) => ClaimOutcome::Failed(err),
-        };
+        let outcome = claim_outcome(&self.client, &self.worker_id, &notification).await?;
 
         // Record the pull's outcome + duration before returning.
         // The metrics helpers are non-blocking + cheap so doing
@@ -391,9 +403,18 @@ mod tests {
 
     #[test]
     fn segment_parsed_from_filter_subject() {
-        assert_eq!(segment_from_filter("noetl.commands.system.>").as_deref(), Some("system"));
-        assert_eq!(segment_from_filter("noetl.commands.shared.>").as_deref(), Some("shared"));
-        assert_eq!(segment_from_filter("noetl.commands.subscription.>").as_deref(), Some("subscription"));
+        assert_eq!(
+            segment_from_filter("noetl.commands.system.>").as_deref(),
+            Some("system")
+        );
+        assert_eq!(
+            segment_from_filter("noetl.commands.shared.>").as_deref(),
+            Some("shared")
+        );
+        assert_eq!(
+            segment_from_filter("noetl.commands.subscription.>").as_deref(),
+            Some("subscription")
+        );
         // Bare / wildcard filters enforce no affinity (single-pool default).
         assert_eq!(segment_from_filter("noetl.commands.>"), None);
         assert_eq!(segment_from_filter("noetl.commands"), None);
@@ -403,7 +424,10 @@ mod tests {
     #[test]
     fn pool_mismatch_declines_only_a_different_targeted_pool() {
         // A `system` worker: declines a `shared`-targeted command; runs `system`.
-        assert_eq!(pool_mismatch(Some("system"), Some("shared")), Some("shared"));
+        assert_eq!(
+            pool_mismatch(Some("system"), Some("shared")),
+            Some("shared")
+        );
         assert_eq!(pool_mismatch(Some("system"), Some("system")), None);
         // Untagged command (legacy) → run it. Unenforced worker (bare filter) → run anything.
         assert_eq!(pool_mismatch(Some("system"), None), None);

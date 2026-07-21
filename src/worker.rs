@@ -25,11 +25,11 @@ pub struct Worker {
     /// Worker configuration.
     config: WorkerConfig,
 
-    /// Pull-model command source backed by NATS JetStream + the
-    /// control-plane HTTP API.  Behind a `Mutex` so
-    /// `process_commands` (which takes `&self`) can call `next()`
-    /// (which takes `&mut self`).
-    source: Arc<Mutex<NatsCommandSource>>,
+    /// Pull-model command source — NATS JetStream (default) or the EHDB command
+    /// bus (`NOETL_COMMAND_BUS=ehdb`, noetl/ai-meta#194 L1 T4).  Behind a `Mutex`
+    /// so `process_commands` (which takes `&self`) can call `next()` (which takes
+    /// `&mut self`).
+    source: Arc<Mutex<crate::command_bus::WorkerCommandSource>>,
 
     /// Control plane HTTP client — used by Worker for register /
     /// deregister / heartbeat / set_variable paths that aren't part
@@ -54,40 +54,58 @@ pub struct Worker {
 impl Worker {
     /// Create a new worker.
     pub async fn new(config: WorkerConfig) -> Result<Self> {
-        // Connect to NATS.  `nats_subject` is the base for the
-        // stream config; `nats_filter_subject` is the consumer-side
-        // filter — defaults to the bare subject in `WorkerConfig`
-        // unless `NATS_FILTER_SUBJECT` is set by the deployment env
-        // (PR-4 of noetl/ai-meta#42 ships the manifest change).
-        let subscriber = NatsSubscriber::connect(
-            &config.nats_url,
-            &config.nats_stream,
-            &config.nats_consumer,
-            &config.nats_subject,
-            &config.nats_filter_subject,
-        )
-        .await?;
-
         // Create HTTP client
         let client = ControlPlaneClient::new(&config.server_url);
 
-        // Wrap subscriber + client into the trait-conformant
-        // command source.  The source owns its own clone of the
-        // client for `claim_command` calls; Worker keeps a
-        // separate clone for register / deregister / heartbeat.
-        // noetl/ai-meta#166 Phase 4: resolve the execution-affinity routing
-        // policy from env. Default is behaviour-neutral (single-shard,
-        // `NOETL_STATE_AFFINITY_ROUTE` off) so a worker carrying this code
-        // steers nothing until an operator sets `NOETL_SHARD_COUNT > 1` and
-        // turns the flag on — on a stateful (system) pool only.
-        let affinity = crate::sharding::AffinityConfig::from_env();
-        let source = Arc::new(Mutex::new(NatsCommandSource::new(
-            subscriber,
-            client.clone(),
-            config.worker_id.clone(),
-            crate::nats::segment_from_filter(&config.nats_filter_subject),
-            affinity,
-        )));
+        // noetl/ai-meta#194 L1 T4 — the command-bus transport (default `nats`,
+        // path below unchanged). When `ehdb`/`shadow` AND this worker hosts its
+        // shard (the system-pool writer), open the shard's command-log writer and
+        // spawn its ingest (server publishes) + claim (replicas compete) +
+        // `/metrics` (lag) faces.
+        let cmdbus = crate::command_bus::CommandBusConfig::from_env();
+        if cmdbus.host && cmdbus.mode.hosts_relevant() {
+            crate::command_bus::spawn_writer_host(&cmdbus).await?;
+        }
+
+        // Select the command source by mode.  `ehdb` claims over the network from
+        // the shard coordinator (competing across replicas) and creates NO NATS
+        // subscriber (supports the NATS-deleted end state); every other mode is
+        // the unchanged NATS durable pull consumer.
+        let source = if cmdbus.mode.consumes_ehdb() {
+            let claim_addr = cmdbus.claim_addr.ok_or_else(|| {
+                anyhow::anyhow!("NOETL_COMMAND_BUS=ehdb requires NOETL_COMMAND_BUS_CLAIM_ADDR")
+            })?;
+            tracing::info!(%claim_addr, "worker consuming commands from the EHDB bus");
+            crate::command_bus::WorkerCommandSource::Ehdb(Box::new(
+                crate::command_bus::EhdbCommandSource::new(
+                    claim_addr,
+                    config.worker_id.clone(),
+                    client.clone(),
+                ),
+            ))
+        } else {
+            // Default NATS path.  `nats_subject` is the base for the stream
+            // config; `nats_filter_subject` is the consumer-side filter.
+            let subscriber = NatsSubscriber::connect(
+                &config.nats_url,
+                &config.nats_stream,
+                &config.nats_consumer,
+                &config.nats_subject,
+                &config.nats_filter_subject,
+            )
+            .await?;
+            // noetl/ai-meta#166 Phase 4: execution-affinity routing policy (env).
+            // Behaviour-neutral by default (single-shard, flag off).
+            let affinity = crate::sharding::AffinityConfig::from_env();
+            crate::command_bus::WorkerCommandSource::Nats(Box::new(NatsCommandSource::new(
+                subscriber,
+                client.clone(),
+                config.worker_id.clone(),
+                crate::nats::segment_from_filter(&config.nats_filter_subject),
+                affinity,
+            )))
+        };
+        let source = Arc::new(Mutex::new(source));
 
         // One snowflake generator per worker process — populates the
         // application-side `event_id` on every emitted envelope per
@@ -209,8 +227,9 @@ impl Worker {
         let state_materializer_lag_target = if crate::state_materializer::enabled() {
             let stream = std::env::var("NOETL_STATE_SHARD_STREAM")
                 .unwrap_or_else(|_| crate::materializer::EVENT_STREAM.to_string());
-            let consumer = std::env::var("NOETL_STATE_SHARD_CONSUMER")
-                .unwrap_or_else(|_| crate::state_materializer::STATE_MATERIALIZER_CONSUMER.to_string());
+            let consumer = std::env::var("NOETL_STATE_SHARD_CONSUMER").unwrap_or_else(|_| {
+                crate::state_materializer::STATE_MATERIALIZER_CONSUMER.to_string()
+            });
             Some((stream, consumer))
         } else {
             None
@@ -232,16 +251,16 @@ impl Worker {
         // and is the sole noetl.event writer under PUBLISH_ONLY — acking each
         // batch only after events/project durably inserts it, so a transient
         // failure redelivers instead of losing events.  Default off.
-        let materializer_handle = match crate::materializer::MaterializerConfig::from_env(&self.config)
-        {
-            Ok(Some(cfg)) => Some(crate::materializer::spawn(cfg)),
-            Ok(None) => None,
-            Err(e) => {
-                // Enabled-but-misconfigured: fail loud rather than silently
-                // not materializing under the sole-writer gate.
-                return Err(e);
-            }
-        };
+        let materializer_handle =
+            match crate::materializer::MaterializerConfig::from_env(&self.config) {
+                Ok(Some(cfg)) => Some(crate::materializer::spawn(cfg)),
+                Ok(None) => None,
+                Err(e) => {
+                    // Enabled-but-misconfigured: fail loud rather than silently
+                    // not materializing under the sole-writer gate.
+                    return Err(e);
+                }
+            };
 
         // Start the result materializer (noetl/ai-meta#104 Phase B/D) when
         // enabled (system worker pool only).  A SEPARATE noetl_events consumer
@@ -275,8 +294,9 @@ impl Worker {
         // command dispatch reads to build drive state off the WAL spine. Zero
         // noetl.event scans either way. Default off.
         let state_builder_handle =
-            crate::state_builder::DrainConfig::from_env(&self.config.nats_url)
-                .map(|cfg| crate::state_builder::spawn_drain(cfg, self.state_builder_index.clone()));
+            crate::state_builder::DrainConfig::from_env(&self.config.nats_url).map(|cfg| {
+                crate::state_builder::spawn_drain(cfg, self.state_builder_index.clone())
+            });
 
         // Boot warmup of the off-server orchestrate drive plug-in
         // (noetl/ai-meta#130 cold-start).  The first orchestrate hop otherwise
@@ -321,15 +341,14 @@ impl Worker {
         // Off unless NOETL_EHDB_FLIGHT_SQL is truthy AND a data-plane
         // local-reference contract + an auth mode resolve; serves the
         // projection tier read-only to external Flight SQL clients.
-        let flight_sql_handle = crate::ehdb::flight_sql_endpoint::FlightSqlConfig::from_env().map(
-            |cfg| {
+        let flight_sql_handle =
+            crate::ehdb::flight_sql_endpoint::FlightSqlConfig::from_env().map(|cfg| {
                 crate::ehdb::flight_sql_endpoint::spawn(
                     cfg,
                     self.client.clone(),
                     self.config.worker_id.clone(),
                 )
-            },
-        );
+            });
 
         // Process commands
         let result = self.process_commands().await;
@@ -846,7 +865,9 @@ mod tests {
         assert!(is_nats_disconnect(&"Failed to ack message: disconnected"));
         assert!(is_nats_disconnect(&"Failed to nack message: timed out"));
         // Consumer-dead signatures shared with the state-builder self-heal (#161).
-        assert!(is_nats_disconnect(&"503 no responders available for request"));
+        assert!(is_nats_disconnect(
+            &"503 no responders available for request"
+        ));
         assert!(is_nats_disconnect(&"consumer not found"));
         assert!(is_nats_disconnect(&"consumer deleted"));
         // Raw connection-loss signatures.
@@ -996,8 +1017,7 @@ mod tests {
                         LoopAction::Reconnect => {
                             reconnects += 1;
                             // Model the in-process rebuild's backoff bump.
-                            backoff =
-                                (backoff * 2).min(crate::state_builder::REBUILD_BACKOFF_MAX);
+                            backoff = (backoff * 2).min(crate::state_builder::REBUILD_BACKOFF_MAX);
                         }
                         LoopAction::Backoff => {}
                     }

@@ -20,8 +20,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 
-use crate::nats::NatsCommandSource;
-
 /// Default polling interval — `WORKER_NATS_LAG_POLL_INTERVAL` overrides.
 ///
 /// 5 seconds is a balance: long enough that the periodic JetStream
@@ -68,7 +66,7 @@ pub fn poll_interval_from_env() -> Duration {
 /// follow-up could expose a `noetl_worker_nats_lag_poll_errors_total`
 /// counter; today the WARN line is the alarm surface.
 pub fn spawn(
-    source: Arc<Mutex<NatsCommandSource>>,
+    source: Arc<Mutex<crate::command_bus::WorkerCommandSource>>,
     poll_interval: Duration,
     materializer: Option<(String, String)>,
     state_materializer: Option<(String, String)>,
@@ -80,38 +78,53 @@ pub fn spawn(
         ticker.tick().await;
         loop {
             // Snapshot every tracked consumer under a single mutex acquisition.
-            let (cmd, mat, state) = {
+            // On the EHDB command bus there is no NATS consumer to poll — the
+            // shard backlog is exported by the writer's own `/metrics` endpoint
+            // (noetl/ai-meta#194 L1 T4) — so `nats_subscriber()` is `None` and
+            // this poller idles.
+            #[allow(clippy::type_complexity)]
+            let snapshot: Option<(
+                (String, String, anyhow::Result<crate::nats::ConsumerLag>),
+                Option<(String, String, anyhow::Result<crate::nats::ConsumerLag>)>,
+                Option<(String, String, anyhow::Result<crate::nats::ConsumerLag>)>,
+            )> = {
                 let source = source.lock().await;
-                let subscriber = source.subscriber();
-                let cmd_stream = subscriber.stream_name().to_string();
-                let cmd_consumer = subscriber.consumer_name().to_string();
-                let cmd_result = subscriber.consumer_lag().await;
-                let cmd = (cmd_stream, cmd_consumer, cmd_result);
+                match source.nats_subscriber() {
+                    None => None,
+                    Some(subscriber) => {
+                        let cmd_stream = subscriber.stream_name().to_string();
+                        let cmd_consumer = subscriber.consumer_name().to_string();
+                        let cmd_result = subscriber.consumer_lag().await;
+                        let cmd = (cmd_stream, cmd_consumer, cmd_result);
 
-                let mat = if let Some((stream, consumer)) = materializer.as_ref() {
-                    let result = subscriber.consumer_lag_for(stream, consumer).await;
-                    Some((stream.clone(), consumer.clone(), result))
-                } else {
-                    None
-                };
-                // The state materializer (noetl/ai-meta#166 Phase 2) is its own
-                // durable consumer; its backlog is the writer-lag signal the RFC
-                // asks for — surfaced on the same gauge, distinct label set.
-                let state = if let Some((stream, consumer)) = state_materializer.as_ref() {
-                    let result = subscriber.consumer_lag_for(stream, consumer).await;
-                    Some((stream.clone(), consumer.clone(), result))
-                } else {
-                    None
-                };
-                (cmd, mat, state)
+                        let mat = if let Some((stream, consumer)) = materializer.as_ref() {
+                            let result = subscriber.consumer_lag_for(stream, consumer).await;
+                            Some((stream.clone(), consumer.clone(), result))
+                        } else {
+                            None
+                        };
+                        // The state materializer (noetl/ai-meta#166 Phase 2) is its
+                        // own durable consumer; its backlog is the writer-lag signal
+                        // the RFC asks for — same gauge, distinct label set.
+                        let state = if let Some((stream, consumer)) = state_materializer.as_ref() {
+                            let result = subscriber.consumer_lag_for(stream, consumer).await;
+                            Some((stream.clone(), consumer.clone(), result))
+                        } else {
+                            None
+                        };
+                        Some((cmd, mat, state))
+                    }
+                }
             };
 
-            record_pair(cmd.0, cmd.1, cmd.2);
-            if let Some((stream, consumer, result)) = mat {
-                record_pair(stream, consumer, result);
-            }
-            if let Some((stream, consumer, result)) = state {
-                record_pair(stream, consumer, result);
+            if let Some((cmd, mat, state)) = snapshot {
+                record_pair(cmd.0, cmd.1, cmd.2);
+                if let Some((stream, consumer, result)) = mat {
+                    record_pair(stream, consumer, result);
+                }
+                if let Some((stream, consumer, result)) = state {
+                    record_pair(stream, consumer, result);
+                }
             }
 
             ticker.tick().await;
@@ -122,11 +135,7 @@ pub fn spawn(
 /// Record one consumer's lag snapshot into the gauges, or WARN on
 /// fetch failure.  Shared by the command-consumer poll and the
 /// materializer-consumer poll so both land identical behaviour.
-fn record_pair(
-    stream: String,
-    consumer: String,
-    result: anyhow::Result<crate::nats::ConsumerLag>,
-) {
+fn record_pair(stream: String, consumer: String, result: anyhow::Result<crate::nats::ConsumerLag>) {
     match result {
         Ok(lag) => {
             // i64 cast: JetStream returns u64 for num_pending and
