@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.76.0](https://github.com/noetl/worker/compare/v5.75.0...v5.76.0) (2026-07-22)
+
+### Features
+
+* **command-bus:** pool-declaring EHDB claim + DNS claim addr (L1 T4 findings) ([#185](https://github.com/noetl/worker/issues/185)) ([7cde41e](https://github.com/noetl/worker/commit/7cde41ed67d05d859c1953ad4595676229a35295)), closes [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194) [#1](https://github.com/noetl/worker/issues/1) [#2](https://github.com/noetl/worker/issues/2) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194)
+
 ## [5.75.0](https://github.com/noetl/worker/compare/v5.74.1...v5.75.0) (2026-07-21)
 
 ### Features
