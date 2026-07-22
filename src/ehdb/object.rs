@@ -1122,7 +1122,8 @@ mod tests {
         assert_eq!(r.version, Some(1));
         assert!(r.parity.as_ref().unwrap().holds());
         // ServedPrimary is only reachable with PRIMARY_SERVE_ACTIVATED == true.
-        assert!(PRIMARY_SERVE_ACTIVATED);
+        // Compile-time invariant: ServedPrimary is only reachable with the flag on.
+        const _: () = assert!(PRIMARY_SERVE_ACTIVATED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

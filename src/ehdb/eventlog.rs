@@ -949,7 +949,8 @@ mod tests {
         assert_eq!(r.outcome, EventLogOutcome::ServedPrimary);
         assert_eq!(r.global_sequence, Some(1));
         assert!(r.parity.as_ref().unwrap().holds());
-        assert!(PRIMARY_SERVE_ACTIVATED);
+        // Compile-time invariant: ServedPrimary is only reachable with the flag on.
+        const _: () = assert!(PRIMARY_SERVE_ACTIVATED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
