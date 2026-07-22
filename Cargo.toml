@@ -287,14 +287,14 @@ arrow = "53"
 # two incompatible copies of ehdb-reference (its `ProjectionDriver` /
 # `ExecutionStateView` would be distinct types).  This rev is the merge SHA of
 # noetl/ehdb#272 on ehdb main (both pins move together on every ehdb bump).
-ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "8669232a846273941e1f423500e7d4bbe0711ee4" }
+ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "fa730e0b6b3a57e661518e8aa6e16b198121c576" }
 # ehdb-service: the Flight SQL projection-tier read surface the external
 # data-plane endpoint (src/ehdb/flight_sql_endpoint.rs) serves.  Inert at rest:
 # no listener binds unless NOETL_EHDB_FLIGHT_SQL is truthy AND the role is a
 # data-plane role.
-ehdb-service = { git = "https://github.com/noetl/ehdb", rev = "8669232a846273941e1f423500e7d4bbe0711ee4" }
-ehdb-feed = { git = "https://github.com/noetl/ehdb", rev = "8669232a846273941e1f423500e7d4bbe0711ee4" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", rev = "8669232a846273941e1f423500e7d4bbe0711ee4" }
+ehdb-service = { git = "https://github.com/noetl/ehdb", rev = "fa730e0b6b3a57e661518e8aa6e16b198121c576" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", rev = "fa730e0b6b3a57e661518e8aa6e16b198121c576" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", rev = "fa730e0b6b3a57e661518e8aa6e16b198121c576" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

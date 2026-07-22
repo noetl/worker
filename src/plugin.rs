@@ -1228,9 +1228,12 @@ mod tests {
     /// A recording capability ring — captures `(op, key, payload)` per call so a
     /// test can assert what a plug-in invoked. Backed by an `Arc<Mutex<…>>` the
     /// test keeps a handle to after the caps are moved into the store.
+    /// `(method, arg-string, payload-bytes)` recorded per host-capability call.
+    type RecordedCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>;
+
     #[derive(Clone, Default)]
     struct RecordingCapabilities {
-        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+        calls: RecordedCalls,
     }
     impl HostCapabilities for RecordingCapabilities {
         fn event_publish(&mut self, p: &[u8]) -> Result<(), String> {

@@ -1305,9 +1305,6 @@ mod tests {
                             None => Err(axum::http::StatusCode::NOT_FOUND),
                         }
                         .map(|json| (axum::http::StatusCode::OK, json))
-                        .or_else(|status| {
-                            Err::<(axum::http::StatusCode, Json<serde_json::Value>), _>(status)
-                        })
                         .map(|(_status, body)| {
                             // Echo the alias so the test can assert
                             // the URL was routed correctly.

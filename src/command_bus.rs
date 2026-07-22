@@ -80,7 +80,10 @@ pub struct CommandBusConfig {
     pub ingest_bind: Option<SocketAddr>,
     pub claim_bind: Option<SocketAddr>,
     pub metrics_bind: Option<SocketAddr>,
-    pub claim_addr: Option<SocketAddr>,
+    /// The claim coordinator's address as a `host:port` string — a DNS service
+    /// name (resolved at connect time) or `ip:port`. Not a parsed `SocketAddr`,
+    /// so a Kubernetes service name works directly (finding #2, noetl/ai-meta#194).
+    pub claim_addr: Option<String>,
     pub ack_wait: Duration,
 }
 
@@ -116,7 +119,10 @@ impl CommandBusConfig {
             ingest_bind: env_addr("NOETL_COMMAND_BUS_INGEST_BIND"),
             claim_bind: env_addr("NOETL_COMMAND_BUS_CLAIM_BIND"),
             metrics_bind: env_addr("NOETL_COMMAND_BUS_METRICS_BIND"),
-            claim_addr: env_addr("NOETL_COMMAND_BUS_CLAIM_ADDR"),
+            claim_addr: std::env::var("NOETL_COMMAND_BUS_CLAIM_ADDR")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|s| !s.is_empty()),
             ack_wait: Duration::from_secs(env_u32("NOETL_COMMAND_BUS_ACK_WAIT_SECS", 30) as u64),
         }
     }
@@ -149,6 +155,10 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
         config.shard,
         config.ack_wait,
         0,
+        // Route each command to its target pool by the `execution_pool` the
+        // server stamps on the notification — so a member claims only within
+        // its pool (system ⇄ shared isolation, noetl/ai-meta#194 finding #1).
+        ehdb_feed::d1_execution_pool_route(),
     ));
     if let Some(addr) = config.claim_bind {
         let listener = TcpListener::bind(addr).await?;
@@ -193,7 +203,11 @@ fn member_id(worker_id: &str) -> u32 {
 /// coordinator (competing with the pool's other replicas), then runs the shared
 /// claim → `ClaimOutcome` path. The ack handle carries the global sort key.
 pub struct EhdbCommandSource {
-    claim_addr: SocketAddr,
+    claim_addr: String,
+    /// This worker's pool segment (its `NATS_FILTER_SUBJECT` segment, default
+    /// `shared`). The coordinator only ever hands it a command whose
+    /// `execution_pool` matches — strict isolation (noetl/ai-meta#194 finding #1).
+    pool: String,
     member: u32,
     worker_id: String,
     client: ControlPlaneClient,
@@ -211,10 +225,16 @@ pub struct EhdbAckHandle {
 }
 
 impl EhdbCommandSource {
-    pub fn new(claim_addr: SocketAddr, worker_id: String, client: ControlPlaneClient) -> Self {
+    pub fn new(
+        claim_addr: String,
+        pool: String,
+        worker_id: String,
+        client: ControlPlaneClient,
+    ) -> Self {
         let member = member_id(&worker_id);
         Self {
             claim_addr,
+            pool,
             member,
             worker_id,
             client,
@@ -226,7 +246,8 @@ impl EhdbCommandSource {
     async fn ack_client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<ClaimClient>>> {
         let mut guard = self.ack_conn.lock().await;
         if guard.is_none() {
-            *guard = Some(ClaimClient::connect(self.claim_addr, self.member).await?);
+            *guard =
+                Some(ClaimClient::connect(&self.claim_addr, self.member, self.pool.clone()).await?);
         }
         Ok(guard)
     }
@@ -263,7 +284,7 @@ impl CommandSource for EhdbCommandSource {
     async fn next(&mut self) -> Result<Option<Pulled<Self::AckHandle>>> {
         loop {
             if self.pull.is_none() {
-                match ClaimClient::connect(self.claim_addr, self.member).await {
+                match ClaimClient::connect(&self.claim_addr, self.member, self.pool.clone()).await {
                     Ok(c) => self.pull = Some(c),
                     Err(e) => {
                         tracing::warn!(claim_addr = %self.claim_addr, error = %e, "EHDB claim connect failed; retrying");
