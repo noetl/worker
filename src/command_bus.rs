@@ -155,10 +155,11 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
         config.shard,
         config.ack_wait,
         0,
-        // Route each command to its target pool by the `execution_pool` the
-        // server stamps on the notification — so a member claims only within
-        // its pool (system ⇄ shared isolation, noetl/ai-meta#194 finding #1).
-        ehdb_feed::d1_execution_pool_route(),
+        // Derive each command's routing subject (`commands.<pool>.shard.<n>`)
+        // from the notification — so a member claims only within its subscribed
+        // subjects (pool + shard isolation, noetl/ai-meta#194 finding #1, the
+        // general NATS-subject mechanism).
+        ehdb_feed::d1_command_subject(config.shard_count),
     ));
     if let Some(addr) = config.claim_bind {
         let listener = TcpListener::bind(addr).await?;
@@ -204,10 +205,11 @@ fn member_id(worker_id: &str) -> u32 {
 /// claim → `ClaimOutcome` path. The ack handle carries the global sort key.
 pub struct EhdbCommandSource {
     claim_addr: String,
-    /// This worker's pool segment (its `NATS_FILTER_SUBJECT` segment, default
-    /// `shared`). The coordinator only ever hands it a command whose
-    /// `execution_pool` matches — strict isolation (noetl/ai-meta#194 finding #1).
-    pool: String,
+    /// This worker's subject subscription filter (e.g. `commands.shared.>` for
+    /// the shared pool on any shard), derived from its `NATS_FILTER_SUBJECT`
+    /// segment. The coordinator only ever hands it a command whose subject
+    /// matches — strict pool + shard isolation (noetl/ai-meta#194 finding #1).
+    filter: String,
     member: u32,
     worker_id: String,
     client: ControlPlaneClient,
@@ -227,14 +229,14 @@ pub struct EhdbAckHandle {
 impl EhdbCommandSource {
     pub fn new(
         claim_addr: String,
-        pool: String,
+        filter: String,
         worker_id: String,
         client: ControlPlaneClient,
     ) -> Self {
         let member = member_id(&worker_id);
         Self {
             claim_addr,
-            pool,
+            filter,
             member,
             worker_id,
             client,
@@ -246,8 +248,9 @@ impl EhdbCommandSource {
     async fn ack_client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<ClaimClient>>> {
         let mut guard = self.ack_conn.lock().await;
         if guard.is_none() {
-            *guard =
-                Some(ClaimClient::connect(&self.claim_addr, self.member, self.pool.clone()).await?);
+            *guard = Some(
+                ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await?,
+            );
         }
         Ok(guard)
     }
@@ -284,7 +287,8 @@ impl CommandSource for EhdbCommandSource {
     async fn next(&mut self) -> Result<Option<Pulled<Self::AckHandle>>> {
         loop {
             if self.pull.is_none() {
-                match ClaimClient::connect(&self.claim_addr, self.member, self.pool.clone()).await {
+                match ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await
+                {
                     Ok(c) => self.pull = Some(c),
                     Err(e) => {
                         tracing::warn!(claim_addr = %self.claim_addr, error = %e, "EHDB claim connect failed; retrying");
