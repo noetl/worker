@@ -75,17 +75,20 @@ impl Worker {
             let claim_addr = cmdbus.claim_addr.ok_or_else(|| {
                 anyhow::anyhow!("NOETL_COMMAND_BUS=ehdb requires NOETL_COMMAND_BUS_CLAIM_ADDR")
             })?;
-            // This worker's pool segment — the same `NATS_FILTER_SUBJECT`
-            // derivation the NATS path uses (default `shared`). The coordinator
-            // only ever hands it a command whose `execution_pool` matches, so a
-            // system command never reaches a shared worker (noetl/ai-meta#194 #1).
+            // This worker's subject subscription — its pool segment (the same
+            // `NATS_FILTER_SUBJECT` derivation the NATS path uses, default
+            // `shared`) over any shard the coordinator serves: `commands.<pool>.>`.
+            // The coordinator only ever hands it a matching command, so a system
+            // command never reaches a shared worker (noetl/ai-meta#194 #1) — the
+            // general subject mechanism, of which pool + shard are dimensions.
             let pool = crate::nats::segment_from_filter(&config.nats_filter_subject)
                 .unwrap_or_else(|| ehdb_feed::DEFAULT_POOL.to_string());
-            tracing::info!(%claim_addr, %pool, "worker consuming commands from the EHDB bus");
+            let filter = format!("commands.{pool}.>");
+            tracing::info!(%claim_addr, %filter, "worker consuming commands from the EHDB bus");
             crate::command_bus::WorkerCommandSource::Ehdb(Box::new(
                 crate::command_bus::EhdbCommandSource::new(
                     claim_addr,
-                    pool,
+                    filter,
                     config.worker_id.clone(),
                     client.clone(),
                 ),
