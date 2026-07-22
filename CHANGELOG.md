@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.77.0](https://github.com/noetl/worker/compare/v5.76.0...v5.77.0) (2026-07-22)
+
+### Features
+
+* **command-bus:** subject-filter subscription on the EHDB claim path (L1 T4) ([#186](https://github.com/noetl/worker/issues/186)) ([34a2f3b](https://github.com/noetl/worker/commit/34a2f3b6572dfb8a213ac524e6d3a636b431e310)), closes [#166](https://github.com/noetl/worker/issues/166) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194) [#1](https://github.com/noetl/worker/issues/1) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194)
+
 ## [5.76.0](https://github.com/noetl/worker/compare/v5.75.0...v5.76.0) (2026-07-22)
 
 ### Features
