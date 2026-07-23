@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.78.0](https://github.com/noetl/worker/compare/v5.77.0...v5.78.0) (2026-07-23)
+
+### Features
+
+* **state-builder:** sink-confirmation-gated cache eviction (default-off) ([#188](https://github.com/noetl/worker/issues/188)) ([30b1476](https://github.com/noetl/worker/commit/30b1476382f30fc4b6379e993c9586be1d4d43c9)), closes [#198](https://github.com/noetl/worker/issues/198) [#104](https://github.com/noetl/worker/issues/104) [#254](https://github.com/noetl/worker/issues/254) [noetl/ai-meta#198](https://github.com/noetl/ai-meta/issues/198) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194)
+
 ## [5.77.0](https://github.com/noetl/worker/compare/v5.76.0...v5.77.0) (2026-07-22)
 
 ### Features
