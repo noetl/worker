@@ -613,6 +613,85 @@ impl EvictionPolicy {
     }
 }
 
+/// Sink-confirmation-gated eviction (noetl/ai-meta#198, EHDB write-behind-cache
+/// boundary, RFC `docs/rfc/ehdb-layered-platform.md` §0).
+///
+/// The transient processing cache (this WAL index) MAY hold full business
+/// context — but only as a **write-behind cache**: it must be **sunk to the
+/// customer's system of record** and only then **evicted**. This gate enforces
+/// that invariant on the cache's eviction paths: an execution marked
+/// [`Self::mark`] (holds un-sunk business context) is **never evicted** until
+/// [`Self::confirm`] records that its context was sunk — at which point it
+/// becomes evictable (and [`WalEventIndex::confirm_sunk`] drops it, so cached
+/// context is never warehoused indefinitely).
+///
+/// **Off by default** (`NOETL_SINK_GATE_EVICTION` unset) — every gate op is a
+/// no-op and eviction behaves exactly as before, so a worker carrying this code
+/// is behavior-neutral until an operator opts in.
+///
+/// The **sink-confirmation signal wiring** — who calls [`WalEventIndex::mark_pending_sink`]
+/// when un-sunk business context enters the cache, and [`WalEventIndex::confirm_sunk`]
+/// when a playbook connector step (transfer / artifact / postgres / http) confirms
+/// the customer-store write — plus extending the gate to the Feather result-tier
+/// GC (#104) and the durable-segment GC (#254), is a tracked follow-up. This
+/// slice lands the **gating primitive** on the primary transient cache (the WAL
+/// index) + its proof. Enabling the flag before the confirm signal is wired would
+/// retain terminal context indefinitely, so it stays off until the wiring lands.
+#[derive(Debug, Clone, Default)]
+pub struct SinkGate {
+    enabled: bool,
+    /// Executions holding un-sunk business context — eviction-blocked until a
+    /// sink is confirmed for them.
+    pending: std::collections::HashSet<i64>,
+}
+
+impl SinkGate {
+    /// Resolve from env: `NOETL_SINK_GATE_EVICTION` truthy ⇒ enabled. Unset /
+    /// falsey ⇒ off (the default — every op a no-op, eviction unchanged).
+    pub fn from_env() -> Self {
+        let enabled = matches!(
+            std::env::var("NOETL_SINK_GATE_EVICTION")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        Self {
+            enabled,
+            pending: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Whether the gate actually blocks evictions (the flag is on).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// True when `eid` holds un-sunk business context and must be retained.
+    /// Always false when the gate is off, so callers stay behavior-neutral.
+    fn is_blocked(&self, eid: i64) -> bool {
+        self.enabled && self.pending.contains(&eid)
+    }
+
+    /// Mark `eid` as holding un-sunk business context — eviction-blocked until
+    /// [`Self::confirm`]. No-op when the gate is off. Returns true if newly marked.
+    fn mark(&mut self, eid: i64) -> bool {
+        self.enabled && self.pending.insert(eid)
+    }
+
+    /// Record that `eid`'s context was sunk to the customer store — it is no
+    /// longer eviction-blocked. Returns true if it was pending.
+    fn confirm(&mut self, eid: i64) -> bool {
+        self.pending.remove(&eid)
+    }
+
+    /// Number of executions currently retained pending a sink confirmation.
+    fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 /// One bounded-cache eviction sweep's accounting (noetl/ai-meta#166 §5.1) — how
 /// many chains left by each reason, so the drain can record the
 /// `state_builder_evictions_total{reason}` metric.
@@ -653,6 +732,9 @@ pub struct WalEventIndex {
     /// bounded-cache byte ledger.  Maintained incrementally on apply / evict so
     /// the byte ceiling never walks the whole index to size it.
     total_bytes: usize,
+    /// Sink-confirmation-gated eviction (noetl/ai-meta#198). Default off ⇒ every
+    /// eviction path behaves exactly as before.
+    sink_gate: SinkGate,
 }
 
 /// Event types that put an execution into a terminal state — the eviction signal
@@ -685,8 +767,53 @@ impl WalEventIndex {
         Self {
             order,
             policy,
+            // noetl/ai-meta#198: resolve the sink-eviction gate from env here (the
+            // worker's startup constructor) so it is wired on the real index; the
+            // test/default constructors leave it off.
+            sink_gate: SinkGate::from_env(),
             ..Default::default()
         }
+    }
+
+    /// Mark an execution as holding un-sunk business context — the WAL index will
+    /// not evict it (terminal, TTL, byte-ceiling, or max-executions) until its
+    /// sink is confirmed (noetl/ai-meta#198). No-op when the gate is off.
+    pub fn mark_pending_sink(&mut self, execution_id: i64) {
+        if self.sink_gate.mark(execution_id) {
+            crate::metrics::record_sink_gate_marked();
+        }
+    }
+
+    /// Record that an execution's cached business context was sunk to the
+    /// customer's system of record — it is no longer eviction-blocked, and its
+    /// now-sunk context is dropped from the cache immediately (write-behind cache:
+    /// never warehouse sunk context). No-op for an unknown/unmarked execution
+    /// beyond a normal evict. Returns true if it had been retained pending a sink.
+    pub fn confirm_sunk(&mut self, execution_id: i64) -> bool {
+        let was_pending = self.sink_gate.confirm(execution_id);
+        // Cleared from `pending` above, so `evict` no longer treats it as blocked.
+        self.evict(execution_id);
+        if was_pending {
+            crate::metrics::record_sink_gate_confirmed();
+        }
+        was_pending
+    }
+
+    /// True when `execution_id` is retained pending a sink confirmation.
+    pub fn sink_blocked(&self, execution_id: i64) -> bool {
+        self.sink_gate.is_blocked(execution_id)
+    }
+
+    /// Executions currently retained in the cache pending a sink confirmation.
+    pub fn sink_pending_count(&self) -> usize {
+        self.sink_gate.pending_count()
+    }
+
+    /// Enable the sink-eviction gate without the env var — test seam for the
+    /// gating invariants (noetl/ai-meta#198).
+    #[cfg(test)]
+    fn enable_sink_gate_for_test(&mut self) {
+        self.sink_gate.enabled = true;
     }
 
     /// The active eviction policy.
@@ -778,11 +905,19 @@ impl WalEventIndex {
     /// Drop a terminal execution's chain — frees memory. Mirrors the server's
     /// orch-cache + chain-head eviction on a terminal event.  Keeps the byte
     /// ledger + access map in step with the removed chain (noetl/ai-meta#166).
-    pub fn evict(&mut self, execution_id: i64) {
+    pub fn evict(&mut self, execution_id: i64) -> bool {
+        // noetl/ai-meta#198 write-behind-cache invariant: never evict an
+        // execution holding un-sunk business context. Off by default ⇒ never
+        // blocks. `confirm_sunk` clears the block before its own evict.
+        if self.sink_gate.is_blocked(execution_id) {
+            crate::metrics::record_sink_gate_retained();
+            return false;
+        }
         if let Some(chain) = self.chains.remove(&execution_id) {
             self.total_bytes = self.total_bytes.saturating_sub(chain.bytes());
         }
         self.access.remove(&execution_id);
+        true
     }
 
     /// Number of executions currently indexed.
@@ -832,52 +967,60 @@ impl WalEventIndex {
                 })
                 .collect();
             for eid in stale {
-                self.evict(eid);
-                stats.ttl += 1;
-            }
-        }
-
-        // 2) Max-executions — evict LRU until at or under the cap.
-        if let Some(max) = self.policy.max_executions {
-            while self.chains.len() > max {
-                match self.lru_execution() {
-                    Some(eid) => {
-                        self.evict(eid);
-                        stats.max_executions += 1;
-                    }
-                    None => break,
+                // noetl/ai-meta#198: a sink-blocked chain is retained (evict
+                // returns false) and not counted — never evict un-sunk context.
+                if self.evict(eid) {
+                    stats.ttl += 1;
                 }
             }
         }
 
-        // 3) Byte ceiling — the bounded-memory guarantee.  Evict LRU until the
-        //    resident set is at or under the ceiling.
+        // 2) Max-executions — evict LRU until at or under the cap.  Selects the
+        //    LRU *evictable* chain (skips sink-blocked ones) and stops when only
+        //    blocked chains remain, so the sweep never spins (noetl/ai-meta#198).
+        if let Some(max) = self.policy.max_executions {
+            while self.chains.len() > max {
+                match self.lru_evictable_execution() {
+                    Some(eid) if self.evict(eid) => {
+                        stats.max_executions += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // 3) Byte ceiling — the bounded-memory guarantee.  Evict the LRU
+        //    *evictable* chain until at or under the ceiling; stop when only
+        //    sink-blocked chains remain (the write-behind-cache invariant wins
+        //    over the ceiling — un-sunk context is never dropped).
         if let Some(max_bytes) = self.policy.max_bytes {
             while self.total_bytes > max_bytes && !self.chains.is_empty() {
-                match self.lru_execution() {
-                    Some(eid) => {
-                        self.evict(eid);
+                match self.lru_evictable_execution() {
+                    Some(eid) if self.evict(eid) => {
                         stats.byte_ceiling += 1;
                     }
-                    None => break,
+                    _ => break,
                 }
             }
         }
         stats
     }
 
-    /// [`Self::enforce_limits_at`] at the current instant — the drain-loop entry.
-    pub fn enforce_limits(&mut self) -> EvictionStats {
-        self.enforce_limits_at(Instant::now())
-    }
-
-    /// The least-recently-active resident execution (LRU eviction victim).  A
-    /// chain missing from `access` sorts oldest (evicted first).
-    fn lru_execution(&self) -> Option<i64> {
+    /// The least-recently-active **evictable** execution — the LRU key excluding
+    /// any chain the sink gate is blocking (noetl/ai-meta#198). `None` when every
+    /// resident chain is sink-blocked, which stops the byte/max sweeps rather than
+    /// spinning against un-evictable chains.
+    fn lru_evictable_execution(&self) -> Option<i64> {
         self.chains
             .keys()
             .copied()
+            .filter(|eid| !self.sink_gate.is_blocked(*eid))
             .min_by_key(|eid| self.access.get(eid).copied())
+    }
+
+    /// [`Self::enforce_limits_at`] at the current instant — the drain-loop entry.
+    pub fn enforce_limits(&mut self) -> EvictionStats {
+        self.enforce_limits_at(Instant::now())
     }
 
     /// Advance an execution's cached spine (exercising the cache: hit /
@@ -2805,6 +2948,106 @@ mod tests {
         idx.evict(77);
         assert_eq!(idx.total_bytes(), after_one, "evict must subtract the chain's bytes");
         assert_eq!(idx.execution_count(), 1);
+    }
+
+    // ---- noetl/ai-meta#198: sink-confirmation-gated eviction ----
+
+    fn started(event_id: i64, execution_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "event_id": event_id,
+            "execution_id": execution_id,
+            "event_type": "playbook_started",
+        })
+    }
+
+    #[test]
+    fn sink_gate_off_by_default_is_behavior_neutral() {
+        // Without the flag, mark is a no-op and eviction behaves exactly as today.
+        let mut idx = WalEventIndex::new();
+        idx.apply_at(&started(1, 100), Instant::now());
+        idx.mark_pending_sink(100);
+        assert_eq!(idx.sink_pending_count(), 0, "mark is a no-op when the gate is off");
+        assert!(!idx.sink_blocked(100));
+        assert!(idx.evict(100), "evict proceeds normally when the gate is off");
+        assert!(idx.chain(100).is_none());
+    }
+
+    #[test]
+    fn sink_gate_retains_unsunk_then_confirm_drops_it() {
+        // The write-behind-cache invariant: un-sunk business context is never
+        // evicted; once sunk-confirmed it is dropped.
+        let mut idx = WalEventIndex::new();
+        idx.enable_sink_gate_for_test();
+        idx.apply_at(&started(1, 100), Instant::now());
+        idx.mark_pending_sink(100);
+        assert!(idx.sink_blocked(100));
+        assert_eq!(idx.sink_pending_count(), 1);
+
+        // A direct evict (the terminal-eviction path) is refused — context retained.
+        assert!(!idx.evict(100), "un-sunk context is not evicted");
+        assert!(idx.chain(100).is_some(), "un-sunk context stays resident");
+
+        // Confirm the sink → the now-sunk context is dropped, and it reports it
+        // had been retained pending the sink.
+        assert!(idx.confirm_sunk(100), "confirm reports it was pending");
+        assert!(idx.chain(100).is_none(), "sunk-confirmed context is dropped");
+        assert_eq!(idx.sink_pending_count(), 0);
+    }
+
+    #[test]
+    fn sink_gate_blocks_sweep_but_evicts_unmarked() {
+        // A TTL sweep evicts an idle *unmarked* chain but retains an idle chain
+        // whose context is not yet sunk.
+        let ttl = Duration::from_secs(900);
+        let mut idx = WalEventIndex::with_order_policy(
+            SpineOrder::Causal,
+            EvictionPolicy {
+                ttl: Some(ttl),
+                ..Default::default()
+            },
+        );
+        idx.enable_sink_gate_for_test();
+        let t0 = Instant::now();
+        idx.apply_at(&started(1, 100), t0); // un-sunk business context
+        idx.apply_at(&started(2, 200), t0); // control-only, not marked
+        idx.mark_pending_sink(100);
+
+        // Both idle past the TTL; the sweep may only take the unmarked one.
+        let sweep = t0 + ttl + Duration::from_secs(1);
+        let stats = idx.enforce_limits_at(sweep);
+        assert_eq!(stats.ttl, 1, "only the unmarked idle chain is evicted");
+        assert!(idx.chain(200).is_none(), "unmarked idle chain evicted");
+        assert!(idx.chain(100).is_some(), "un-sunk context retained despite TTL");
+        assert_eq!(idx.sink_pending_count(), 1);
+    }
+
+    #[test]
+    fn sink_gate_byte_ceiling_skips_blocked_without_spinning() {
+        // Under a byte ceiling with every resident chain sink-blocked, the sweep
+        // must terminate (not spin) and evict nothing — the write-behind-cache
+        // invariant wins over the ceiling.
+        let mut idx = WalEventIndex::with_order_policy(
+            SpineOrder::Causal,
+            EvictionPolicy {
+                max_bytes: Some(1), // force the ceiling to want to evict
+                ..Default::default()
+            },
+        );
+        idx.enable_sink_gate_for_test();
+        let t0 = Instant::now();
+        idx.apply_at(&started(1, 100), t0);
+        idx.apply_at(&started(2, 200), t0);
+        idx.mark_pending_sink(100);
+        idx.mark_pending_sink(200);
+
+        let stats = idx.enforce_limits_at(t0);
+        assert_eq!(stats.total(), 0, "no blocked chain is evicted under the ceiling");
+        assert_eq!(idx.execution_count(), 2, "both retained; the sweep terminated");
+
+        // Confirming one frees it; the next sweep can reclaim only that one.
+        idx.confirm_sunk(100);
+        assert!(idx.chain(100).is_none(), "confirmed chain dropped");
+        assert!(idx.chain(200).is_some(), "still-un-sunk chain retained");
     }
 
     #[test]

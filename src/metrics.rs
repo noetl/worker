@@ -287,6 +287,11 @@ pub struct WorkerMetrics {
     /// `byte_ceiling` (LRU under the hard resident-byte ceiling).  A rising `ttl`
     /// rate is the cure for the OOM treadmill firing.
     pub state_builder_evictions_total: IntCounterVec,
+    /// Sink-confirmation-gated eviction outcomes (noetl/ai-meta#198): `marked`
+    /// (a chain flagged as holding un-sunk business context), `confirmed` (its
+    /// context was sunk to the customer store and the chain dropped), `retained`
+    /// (an eviction skipped because the chain's context is not yet sunk).
+    pub sink_gate_events_total: IntCounterVec,
     /// Cold-rebuild-on-miss outcomes (noetl/ai-meta#166 §5.2): `served` (re-read
     /// the missed execution from the retained WAL and the drive then built its
     /// state), `incomplete` (re-indexed events but the chain still couldn't reach
@@ -972,6 +977,18 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_evictions_total.clone()))
             .expect("register state_builder_evictions_total");
 
+        let sink_gate_events_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_sink_gate_events_total",
+                "Sink-confirmation-gated eviction outcomes — marked / confirmed / retained (noetl/ai-meta#198).",
+            ),
+            &["outcome"],
+        )
+        .expect("sink_gate_events_total metric");
+        registry
+            .register(Box::new(sink_gate_events_total.clone()))
+            .expect("register sink_gate_events_total");
+
         let state_builder_rehydrate_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_state_builder_rehydrate_total",
@@ -1299,6 +1316,7 @@ impl WorkerMetrics {
             state_builder_index_events,
             state_builder_index_bytes,
             state_builder_evictions_total,
+            sink_gate_events_total,
             state_builder_rehydrate_total,
             state_shard_reads_total,
             state_shard_read_duration_seconds,
@@ -1724,6 +1742,30 @@ pub fn record_state_builder_eviction(reason: &str, n: usize) {
             .with_label_values(&[reason])
             .inc_by(n as u64);
     }
+}
+
+/// A chain was flagged as holding un-sunk business context (noetl/ai-meta#198).
+pub fn record_sink_gate_marked() {
+    WorkerMetrics::global()
+        .sink_gate_events_total
+        .with_label_values(&["marked"])
+        .inc();
+}
+
+/// A chain's context was confirmed sunk to the customer store and dropped.
+pub fn record_sink_gate_confirmed() {
+    WorkerMetrics::global()
+        .sink_gate_events_total
+        .with_label_values(&["confirmed"])
+        .inc();
+}
+
+/// An eviction was skipped because the chain's business context is not yet sunk.
+pub fn record_sink_gate_retained() {
+    WorkerMetrics::global()
+        .sink_gate_events_total
+        .with_label_values(&["retained"])
+        .inc();
 }
 
 /// Record one cold-rebuild-on-miss outcome (`served` | `incomplete` | `empty` |
