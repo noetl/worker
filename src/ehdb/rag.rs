@@ -298,6 +298,18 @@ fn namespace_of(opts: &RagOptions) -> String {
 /// Ingest one document + its chunks into the derived retrieval fabric.  Disabled
 /// ⇒ `Disabled` no-op.  A bound violation (empty/oversized chunk, duplicate id)
 /// ⇒ `Rejected`; a bad identifier ⇒ `Invalid`.
+///
+/// ## Boundary (noetl/ai-meta#197, EHDB write-behind-cache §0.2 Slice C)
+///
+/// This ingest surface is **platform-only** — system docs / catalog embeddings.
+/// **Never wire a playbook / user-facing `tool:` to `rag::ingest`.** User-document
+/// RAG goes to the **user's own vector store via a connector**, never the platform
+/// vector/RAG tier (D6) — otherwise user business data lands in EHDB, crossing the
+/// boundary.  The surface is role-permissive by design (the platform selfcheck
+/// drives it), so the guard is a **discipline**, not a type: the only caller today
+/// is the diagnostic `ehdb-selfcheck` binary, and the
+/// `no_playbook_tool_path_reaches_rag_ingest` guard test in this module fails if a
+/// future change adds any other call site.
 pub fn ingest(
     env: &EnvMap,
     document: &RagDocument,
@@ -490,6 +502,91 @@ fn classify_ingest_error<E: std::fmt::Display>(err: &E) -> RagOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Boundary guard (noetl/ai-meta#197, EHDB write-behind-cache §0.2 Slice C).
+    ///
+    /// The platform vector/RAG tier (D6) must stay **platform-only** — system
+    /// docs / catalog embeddings.  No user-facing / playbook `tool:` path may
+    /// reach [`ingest`]: user-document RAG goes to the user's own vector store
+    /// via a connector, never EHDB.  The ingest surface is role-permissive by
+    /// design (the platform selfcheck drives it), so this is enforced as a
+    /// discipline, not a type — this test scans the whole worker source tree and
+    /// fails if `rag::ingest` is referenced anywhere but the diagnostic
+    /// `ehdb-selfcheck` binary (the sole sanctioned caller) and the module that
+    /// defines it. A future change that wires a user tool to the platform RAG
+    /// ingest surface trips this test.
+    #[test]
+    fn no_playbook_tool_path_reaches_rag_ingest() {
+        // Files allowed to reference `rag::ingest` — the diagnostic binary (the
+        // only sanctioned caller) and the defining module itself.
+        const ALLOWED_SUFFIXES: &[&str] = &["src/bin/ehdb-selfcheck.rs", "src/ehdb/rag.rs"];
+
+        fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "guard scan found no .rs files under {} — path resolution broke",
+            src_root.display()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut sanctioned_hits = 0usize;
+        for file in &files {
+            let rel = file
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let allowed = ALLOWED_SUFFIXES.iter().any(|s| rel.ends_with(s));
+            let contents = std::fs::read_to_string(file).unwrap_or_default();
+            for (i, line) in contents.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // Skip comment / doc lines — the boundary is about live call
+                // sites and `use` imports, not the prose that documents them.
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                if line.contains("rag::ingest") {
+                    if allowed {
+                        sanctioned_hits += 1;
+                    } else {
+                        offenders.push(format!("{}:{}: {}", rel, i + 1, trimmed));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "user-facing/playbook code path reaches the platform RAG ingest surface \
+             (noetl/ai-meta#197) — user-document RAG must go to the user's own vector \
+             store via a connector, never `rag::ingest`:\n  {}",
+            offenders.join("\n  ")
+        );
+        // Sanity: the scan actually resolved + matched the sanctioned caller, so
+        // a future rename that hides the surface can't make this a silent no-op.
+        assert!(
+            sanctioned_hits > 0,
+            "guard scan matched no `rag::ingest` reference even in the sanctioned \
+             files — the scan or the surface moved; re-point the guard"
+        );
+    }
 
     fn env(pairs: &[(&str, &str)]) -> EnvMap {
         pairs
