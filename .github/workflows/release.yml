@@ -51,19 +51,21 @@ jobs:
   publish-crate:
     runs-on: ubuntu-latest
     needs: verify-version
-    env:
-      CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Publish crate
-        if: ${{ env.CRATES_IO_TOKEN != '' }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
-        run: cargo publish
-      - name: Skip publish (no token)
-        if: ${{ env.CRATES_IO_TOKEN == '' }}
-        run: echo "CRATES_IO_TOKEN is not set; skipping crate publish."
+      # noetl-worker is a BINARY, not a library.  The release artifact is
+      # the multi-arch container image (ghcr.io/noetl/worker, built by
+      # publish-image / publish-manifest below); nothing on crates.io
+      # depends on noetl-worker (verified: 0 reverse dependencies).  The
+      # crate also carries git-only deps (ehdb-reference / ehdb-service /
+      # ehdb-feed / ehdb-l0), and `cargo publish` rejects a crate whose
+      # git deps carry no version ("all dependencies must have a version
+      # requirement specified when publishing") — so this step could not
+      # succeed once the EHDB integration landed.  This job publishes no
+      # library crate, so we intentionally do NOT publish anything to
+      # crates.io here; the container image is the deploy artifact.
+      # See https://github.com/noetl/ai-meta/issues/200.
+      - name: Crate publish intentionally skipped (binary, not a library)
+        run: echo "noetl-worker is a binary; the release artifact is ghcr.io/noetl/worker. Not publishing to crates.io (0 reverse deps; git-only ehdb deps forbid cargo publish)."
 
   # Split per-arch build matrix: each arch builds on its NATIVE
   # runner (ubuntu-latest = amd64; ubuntu-24.04-arm = arm64).  Per
