@@ -344,8 +344,17 @@ impl Worker {
         // spawned, so a default worker is byte-identical.  Reclaims each owned
         // shard's consumed sealed segments (local + shared) on a blocking thread,
         // serialized against appends per shard.
-        let eventlog_gc_handle = crate::ehdb::eventlog_gc::GcConfig::from_env()
-            .map(|cfg| crate::ehdb::eventlog_gc::spawn(cfg, self.config.worker_id.clone()));
+        let eventlog_gc_handle = crate::ehdb::eventlog_gc::GcConfig::from_env().map(|cfg| {
+            crate::ehdb::eventlog_gc::spawn(
+                cfg,
+                self.config.worker_id.clone(),
+                // noetl/ai-meta#199 Slice B — gate the reclaim on sink state so a
+                // pass never drops a segment referencing un-sunk business context.
+                // Same in-process index the drive/drain share; the gate is inert
+                // until an operator enables NOETL_SINK_GATE_EVICTION.
+                Some(self.state_builder_index.clone()),
+            )
+        });
 
         // Dedicated external Flight SQL data-plane endpoint (noetl/ai-meta#184).
         // Off unless NOETL_EHDB_FLIGHT_SQL is truthy AND a data-plane
