@@ -292,6 +292,13 @@ pub struct WorkerMetrics {
     /// context was sunk to the customer store and the chain dropped), `retained`
     /// (an eviction skipped because the chain's context is not yet sunk).
     pub sink_gate_events_total: IntCounterVec,
+    /// Sink-confirmation signals the connector-step wiring emits
+    /// (noetl/ai-meta#199 Slice A), labeled by `tool_kind` and `signal`
+    /// (`mark` when a declared sink step dispatches, `confirm` when it succeeds).
+    /// Distinct from `sink_gate_events_total`, which records what the gate *did*:
+    /// this counter records the wiring *firing* even when the gate is off, so the
+    /// signal path is observable before an operator opts into eviction.
+    pub sink_signal_total: IntCounterVec,
     /// Cold-rebuild-on-miss outcomes (noetl/ai-meta#166 §5.2): `served` (re-read
     /// the missed execution from the retained WAL and the drive then built its
     /// state), `incomplete` (re-indexed events but the chain still couldn't reach
@@ -989,6 +996,18 @@ impl WorkerMetrics {
             .register(Box::new(sink_gate_events_total.clone()))
             .expect("register sink_gate_events_total");
 
+        let sink_signal_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_sink_signal_total",
+                "Sink-confirmation signals the connector-step wiring emits — mark / confirm, by tool_kind (noetl/ai-meta#199).",
+            ),
+            &["tool_kind", "signal"],
+        )
+        .expect("sink_signal_total metric");
+        registry
+            .register(Box::new(sink_signal_total.clone()))
+            .expect("register sink_signal_total");
+
         let state_builder_rehydrate_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_state_builder_rehydrate_total",
@@ -1317,6 +1336,7 @@ impl WorkerMetrics {
             state_builder_index_bytes,
             state_builder_evictions_total,
             sink_gate_events_total,
+            sink_signal_total,
             state_builder_rehydrate_total,
             state_shard_reads_total,
             state_shard_read_duration_seconds,
@@ -1765,6 +1785,18 @@ pub fn record_sink_gate_retained() {
     WorkerMetrics::global()
         .sink_gate_events_total
         .with_label_values(&["retained"])
+        .inc();
+}
+
+/// The connector-step wiring emitted a sink signal (noetl/ai-meta#199 Slice A):
+/// `signal` is `mark` (a declared `sink: true` step dispatched) or `confirm`
+/// (that step succeeded, so its execution's business context is sunk to the
+/// customer store). Fires regardless of whether the eviction gate is enabled, so
+/// the wiring is observable before an operator opts in.
+pub fn record_sink_signal(tool_kind: &str, signal: &str) {
+    WorkerMetrics::global()
+        .sink_signal_total
+        .with_label_values(&[tool_kind, signal])
         .inc();
 }
 
