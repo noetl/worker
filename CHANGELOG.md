@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.79.0](https://github.com/noetl/worker/compare/v5.78.0...v5.79.0) (2026-07-25)
+
+### Features
+
+* **ehdb:** gate durable-segment GC on sink-confirmation state ([41957b4](https://github.com/noetl/worker/commit/41957b4c773062037c2d54999cc41428b37dd37a)), closes [worker#188](https://github.com/noetl/worker/issues/188) [ehdb#254](https://github.com/noetl/ehdb/issues/254)
+
 ## [5.78.0](https://github.com/noetl/worker/compare/v5.77.0...v5.78.0) (2026-07-23)
 
 ### Features
