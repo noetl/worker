@@ -1134,6 +1134,17 @@ impl SharedWalIndex {
     pub fn notify_appended(&self) {
         self.appended.notify_waiters();
     }
+
+    /// Whether any execution is currently retained pending a sink confirmation
+    /// (noetl/ai-meta#199 Slice B). True only when the sink gate is enabled AND at
+    /// least one execution has been marked (the mark is a no-op when the gate is
+    /// off, so a non-zero count already implies an opted-in operator) — so the
+    /// downstream GC gates that consult this stay byte-identical by default. Used
+    /// by the durable-segment GC to defer a reclaim pass while un-sunk business
+    /// context could still be referenced by the segments it would drop.
+    pub async fn any_sink_pending(&self) -> bool {
+        self.inner.lock().await.sink_pending_count() > 0
+    }
 }
 
 /// Where the worker's state builder operates — resolved from env at startup.
@@ -3048,6 +3059,32 @@ mod tests {
         idx.confirm_sunk(100);
         assert!(idx.chain(100).is_none(), "confirmed chain dropped");
         assert!(idx.chain(200).is_some(), "still-un-sunk chain retained");
+    }
+
+    #[tokio::test]
+    async fn any_sink_pending_tracks_the_gated_set() {
+        // The downstream GC gates (noetl/ai-meta#199 Slice B) consult this. It is
+        // false by default (gate off ⇒ mark is a no-op ⇒ pending stays empty),
+        // true only while a marked execution is un-sunk.
+        let shared = SharedWalIndex::new(WalEventIndex::new());
+        assert!(!shared.any_sink_pending().await, "empty index ⇒ nothing pending");
+
+        // Gate off: a mark is a no-op, so the GC gate never fires.
+        shared.lock().await.mark_pending_sink(100);
+        assert!(
+            !shared.any_sink_pending().await,
+            "gate off ⇒ mark is a no-op ⇒ GC gate byte-identical"
+        );
+
+        // Gate on: a marked execution is pending until confirmed.
+        {
+            let mut idx = shared.lock().await;
+            idx.enable_sink_gate_for_test();
+            idx.mark_pending_sink(100);
+        }
+        assert!(shared.any_sink_pending().await, "un-sunk execution ⇒ GC deferred");
+        shared.lock().await.confirm_sunk(100);
+        assert!(!shared.any_sink_pending().await, "sunk ⇒ GC may proceed");
     }
 
     #[test]

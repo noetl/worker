@@ -37,6 +37,7 @@ use tokio::task::JoinHandle;
 
 use super::contract::{contract_from_env, EhdbContract};
 use super::{eventlog_backend, metrics, process_env, EnvMap};
+use crate::state_builder::SharedWalIndex;
 
 /// The cadence env var: the periodic reclaim interval in whole seconds. `0` (or
 /// unset / unparsable) disables the periodic task — the fail-safe default.
@@ -116,7 +117,11 @@ impl GcConfig {
 /// to the EHDB metric family `noetl_ehdb_eventlog_gc_*`. Returns the join handle
 /// so the caller can `abort()` it on shutdown. The task is best-effort: a
 /// per-shard error is recorded + logged, never fatal.
-pub fn spawn(cfg: GcConfig, worker_id: String) -> JoinHandle<()> {
+pub fn spawn(
+    cfg: GcConfig,
+    worker_id: String,
+    sink_state: Option<SharedWalIndex>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!(
             worker_id,
@@ -131,7 +136,7 @@ pub fn spawn(cfg: GcConfig, worker_id: String) -> JoinHandle<()> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            run_once(&cfg, &worker_id).await;
+            run_once(&cfg, &worker_id, sink_state.as_ref()).await;
         }
     })
 }
@@ -139,7 +144,32 @@ pub fn spawn(cfg: GcConfig, worker_id: String) -> JoinHandle<()> {
 /// Run one reclaim pass across owned shards (a blocking op off the async
 /// runtime), classify + record the outcome. Public for the `ehdb-selfcheck` GC
 /// verb, which drives a single pass for kind validation.
-pub async fn run_once(cfg: &GcConfig, worker_id: &str) {
+///
+/// `sink_state` gates the pass on the write-behind-cache invariant
+/// (noetl/ai-meta#199 Slice B): when any execution is retained pending a sink
+/// confirmation, the segments this pass would reclaim may still reference un-sunk
+/// business context (under the slimmed log the durable segments carry the byte
+/// references), so the whole pass is **deferred** to the next tick rather than
+/// risk dropping a pointer to context that has not reached the customer's system
+/// of record. `None` (the `ehdb-selfcheck` single-pass driver) or an empty
+/// pending set ⇒ reclaim proceeds exactly as before — the default path is
+/// unchanged, since a non-empty pending set only exists once an operator enables
+/// `NOETL_SINK_GATE_EVICTION` and a sink step marks an execution.
+pub async fn run_once(cfg: &GcConfig, worker_id: &str, sink_state: Option<&SharedWalIndex>) {
+    if let Some(index) = sink_state {
+        if index.any_sink_pending().await {
+            // Conservative pass-level defer: retain every shard's segments while
+            // un-sunk context exists. A per-shard exclusion (skip only the shards
+            // owning pending-sink executions) is a follow-up refinement.
+            metrics::record_eventlog_gc("deferred_sink", true, false, 0.0);
+            tracing::debug!(
+                worker_id,
+                "EHDB segment-GC pass deferred: executions pending sink confirmation \
+                 (write-behind-cache invariant, noetl/ai-meta#199)"
+            );
+            return;
+        }
+    }
     let env = cfg.env.clone();
     let contract = cfg.contract.clone();
     let policy = cfg.policy;
