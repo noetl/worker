@@ -287,6 +287,12 @@ pub struct WorkerMetrics {
     /// `byte_ceiling` (LRU under the hard resident-byte ceiling).  A rising `ttl`
     /// rate is the cure for the OOM treadmill firing.
     pub state_builder_evictions_total: IntCounterVec,
+    /// Platform-automatic sink observations (noetl/ai-meta#199 Slice C), by
+    /// `outcome`: `candidate` (a resident execution past the byte threshold whose
+    /// context the write slice would auto-sink), `skipped_explicit` (an explicit
+    /// sink step already owns it — double-write avoidance), `observed_only` (one
+    /// completed observe pass — the first slice writes nothing).
+    pub autosink_total: IntCounterVec,
     /// Sink-confirmation-gated eviction outcomes (noetl/ai-meta#198): `marked`
     /// (a chain flagged as holding un-sunk business context), `confirmed` (its
     /// context was sunk to the customer store and the chain dropped), `retained`
@@ -977,6 +983,18 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_evictions_total.clone()))
             .expect("register state_builder_evictions_total");
 
+        let autosink_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_autosink_total",
+                "Platform-automatic sink observations — candidate / skipped_explicit / observed_only (noetl/ai-meta#199).",
+            ),
+            &["outcome"],
+        )
+        .expect("autosink_total metric");
+        registry
+            .register(Box::new(autosink_total.clone()))
+            .expect("register autosink_total");
+
         let sink_gate_events_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_sink_gate_events_total",
@@ -1316,6 +1334,7 @@ impl WorkerMetrics {
             state_builder_index_events,
             state_builder_index_bytes,
             state_builder_evictions_total,
+            autosink_total,
             sink_gate_events_total,
             state_builder_rehydrate_total,
             state_shard_reads_total,
@@ -1742,6 +1761,16 @@ pub fn record_state_builder_eviction(reason: &str, n: usize) {
             .with_label_values(&[reason])
             .inc_by(n as u64);
     }
+}
+
+/// One platform-automatic sink observation (noetl/ai-meta#199 Slice C). `outcome`
+/// is `candidate`, `skipped_explicit`, or `observed_only`. The first slice is
+/// observe-only — it never writes to any store.
+pub fn record_autosink(outcome: &str) {
+    WorkerMetrics::global()
+        .autosink_total
+        .with_label_values(&[outcome])
+        .inc();
 }
 
 /// A chain was flagged as holding un-sunk business context (noetl/ai-meta#198).

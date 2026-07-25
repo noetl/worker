@@ -356,6 +356,15 @@ impl Worker {
             )
         });
 
+        // Platform-automatic sink — observe-only first slice (noetl/ai-meta#199
+        // Slice C). Spawns ONLY when NOETL_AUTOSINK is truthy + a positive
+        // interval; otherwise from_env returns None and nothing spawns, so a
+        // default worker is byte-identical. This slice writes nothing to any
+        // store — it classifies the resident set and records candidate metrics.
+        let autosink_handle = crate::autosink::AutoSinkConfig::from_env().map(|cfg| {
+            crate::autosink::spawn(cfg, self.config.worker_id.clone(), self.state_builder_index.clone())
+        });
+
         // Dedicated external Flight SQL data-plane endpoint (noetl/ai-meta#184).
         // Off unless NOETL_EHDB_FLIGHT_SQL is truthy AND a data-plane
         // local-reference contract + an auth mode resolve; serves the
@@ -389,6 +398,9 @@ impl Worker {
             h.abort();
         }
         if let Some(h) = eventlog_gc_handle {
+            h.abort();
+        }
+        if let Some(h) = autosink_handle {
             h.abort();
         }
         if let Some(h) = flight_sql_handle {
