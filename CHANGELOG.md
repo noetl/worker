@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.81.0](https://github.com/noetl/worker/compare/v5.80.0...v5.81.0) (2026-07-26)
+
+### Features
+
+* **autosink:** platform-automatic sink — observe-only first slice ([9173638](https://github.com/noetl/worker/commit/9173638a9dc7c925ed40713c1a4dd508131e624b))
+
 ## [5.80.0](https://github.com/noetl/worker/compare/v5.79.0...v5.80.0) (2026-07-26)
 
 ### Features
