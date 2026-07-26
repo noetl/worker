@@ -676,6 +676,24 @@ impl CommandExecutor {
             "Executing tool"
         );
 
+        // noetl/ai-meta#199 Slice A — sink-confirmation signal (write-behind
+        // cache). An author-declared sink step (`sink: true`) writes this
+        // execution's business context to the customer's system of record. Mark
+        // the execution eviction-blocked for the duration of the sink so a
+        // concurrent bounded-cache sweep can't drop its un-sunk context mid-write;
+        // the matching `confirm_sunk` on success (below) clears the block. Both
+        // sides are no-ops on the WAL index when the gate is off
+        // (`NOETL_SINK_GATE_EVICTION` unset), so the default path is unchanged —
+        // only the signal metric fires, for observability of the wiring itself.
+        let is_sink_step = command_declares_sink(&tool_config);
+        if is_sink_step {
+            crate::metrics::record_sink_signal(&tool_config.kind, "mark");
+            self.state_builder_index
+                .lock()
+                .await
+                .mark_pending_sink(command.execution_id);
+        }
+
         // noetl/ai-meta#104 Phase E — side-effect durability barrier.
         //
         // Before (re-)dispatching a SIDE-EFFECTING tool, check whether this
@@ -887,6 +905,27 @@ impl CommandExecutor {
                         }),
                     )
                     .await?;
+                }
+
+                // noetl/ai-meta#199 Slice A — confirm the sink. The declared sink
+                // step completed successfully, so this execution's business
+                // context has landed in the customer's system of record: clear
+                // the eviction block so the normal terminal/TTL paths may reclaim
+                // its transient cache. Guarded on `is_success()` — a tool that
+                // returns a non-success `ToolResult` without erroring did NOT
+                // sink, and must not release un-sunk context. Skipped on the
+                // `pending_callback` path, where the terminal result (and thus the
+                // real sink completion) arrives later via the async callback, not
+                // here. No-op on the index when the gate is off.
+                if is_sink_step
+                    && result.is_success()
+                    && !matches!(result.pending_callback, Some(true))
+                {
+                    crate::metrics::record_sink_signal(&tool_config.kind, "confirm");
+                    self.state_builder_index
+                        .lock()
+                        .await
+                        .confirm_sunk(command.execution_id);
                 }
 
                 result
@@ -2292,6 +2331,46 @@ fn command_is_side_effecting(tool_config: &ToolConfig) -> bool {
     }
 }
 
+/// Whether this command is an **explicit sink to the customer's system of
+/// record** (noetl/ai-meta#199 Slice A) — a connector step the playbook author
+/// declared with `sink: true` because it writes the execution's business context
+/// to the authoritative customer store.
+///
+/// The signal is **author-declared, never inferred.** A `postgres` / `http` /
+/// `transfer` step can equally be a *read* (a `SELECT`, a `GET`, a fetch), so
+/// classifying by tool kind would confirm-sink on reads and wrongly release
+/// un-sunk context. Only an explicit `sink: true` on the step counts — so the
+/// wiring can never confirm a sink that did not happen (the write-behind-cache
+/// invariant's fail-safe direction: under-confirm, never over-confirm).
+///
+/// Looks **through** the `task_sequence` wrapper the orchestrator wraps a step's
+/// tool(s) in (mirroring [`command_is_side_effecting`]): a `task_sequence` is a
+/// sink iff **any** sub-task declares `sink: true`. Absent / non-boolean / false
+/// ⇒ not a sink (the default — no mark, no confirm, fully behavior-neutral).
+fn command_declares_sink(tool_config: &ToolConfig) -> bool {
+    fn flag_is_true(v: Option<&serde_json::Value>) -> bool {
+        v.and_then(|s| s.as_bool()).unwrap_or(false)
+    }
+    if tool_config.kind != "task_sequence" {
+        return flag_is_true(tool_config.config.get("sink"));
+    }
+    // `task_sequence` sub-tasks live under `config.tool_config` as an array of
+    // `{ <label>: { kind, sink?, ... } }` (the worker envelope shape).
+    match tool_config
+        .config
+        .get("tool_config")
+        .and_then(|v| v.as_array())
+    {
+        Some(subs) => subs.iter().any(|item| {
+            item.as_object()
+                .and_then(|o| o.values().next())
+                .map(|spec| flag_is_true(spec.get("sink")))
+                .unwrap_or(false)
+        }),
+        None => false,
+    }
+}
+
 /// Whether the Phase E side-effect barrier should consult the durable result
 /// tier before dispatching this cycle. It checks only when the barrier flag is
 /// on **and** the command is side-effecting (per [`command_is_side_effecting`],
@@ -3251,6 +3330,73 @@ mod tests {
         // A non-wrapped command is classified by its own kind.
         assert!(command_is_side_effecting(&tc("postgres", serde_json::json!({}))));
         assert!(!command_is_side_effecting(&tc("noop", serde_json::json!({}))));
+    }
+
+    /// A `task_sequence` wrapping one sub-task of `kind` carrying an explicit
+    /// `sink` flag (noetl/ai-meta#199).
+    fn task_seq_sink(kind: &str, sink: bool) -> ToolConfig {
+        tc(
+            "task_sequence",
+            serde_json::json!({
+                "tool_config": [ { "t0": { "kind": kind, "sink": sink } } ]
+            }),
+        )
+    }
+
+    #[test]
+    fn command_declares_sink_only_on_explicit_marker() {
+        // noetl/ai-meta#199 Slice A: the sink signal is author-declared, never
+        // inferred from tool kind — a connector kind alone is NOT a sink.
+        assert!(!command_declares_sink(&tc("postgres", serde_json::json!({}))));
+        assert!(!command_declares_sink(&tc("http", serde_json::json!({}))));
+        assert!(!command_declares_sink(&tc("transfer", serde_json::json!({}))));
+        // A read-shaped connector step with sink:false stays un-confirmed.
+        assert!(!command_declares_sink(&tc(
+            "postgres",
+            serde_json::json!({ "sink": false })
+        )));
+        // Only an explicit sink:true marks the step a sink.
+        assert!(command_declares_sink(&tc(
+            "postgres",
+            serde_json::json!({ "sink": true })
+        )));
+        assert!(command_declares_sink(&tc(
+            "transfer",
+            serde_json::json!({ "sink": true })
+        )));
+        // Non-boolean markers are ignored (fail-safe: under-confirm).
+        assert!(!command_declares_sink(&tc(
+            "http",
+            serde_json::json!({ "sink": "yes" })
+        )));
+    }
+
+    #[test]
+    fn command_declares_sink_looks_through_task_sequence() {
+        // The orchestrator wraps a step's tool(s) in a task_sequence, so the sink
+        // marker must be read from the INNER sub-task, not the wrapper.
+        assert!(command_declares_sink(&task_seq_sink("postgres", true)));
+        assert!(!command_declares_sink(&task_seq_sink("postgres", false)));
+        // A plain sub-task with no marker is not a sink.
+        assert!(!command_declares_sink(&task_seq(&["postgres"])));
+        assert!(!command_declares_sink(&task_seq(&["http", "rhai"])));
+        // Any sub-task declaring sink:true makes the whole step a sink.
+        let mixed = tc(
+            "task_sequence",
+            serde_json::json!({
+                "tool_config": [
+                    { "a": { "kind": "rhai" } },
+                    { "b": { "kind": "postgres", "sink": true } }
+                ]
+            }),
+        );
+        assert!(command_declares_sink(&mixed));
+        // An empty / uninspectable task_sequence is NOT a sink (fail-safe).
+        assert!(!command_declares_sink(&tc("task_sequence", serde_json::json!({}))));
+        assert!(!command_declares_sink(&tc(
+            "task_sequence",
+            serde_json::json!({ "tool_config": [] })
+        )));
     }
 
     // --- #105 routing: the wasm dispatch helpers ---

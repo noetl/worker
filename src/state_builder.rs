@@ -785,18 +785,39 @@ impl WalEventIndex {
     }
 
     /// Record that an execution's cached business context was sunk to the
-    /// customer's system of record — it is no longer eviction-blocked, and its
-    /// now-sunk context is dropped from the cache immediately (write-behind cache:
-    /// never warehouse sunk context). No-op for an unknown/unmarked execution
-    /// beyond a normal evict. Returns true if it had been retained pending a sink.
+    /// customer's system of record — it is no longer eviction-blocked, so the
+    /// existing eviction paths (terminal-on-`playbook_completed`, TTL, byte
+    /// ceiling) may now reclaim it. Returns true if it had been retained pending
+    /// a sink.
+    ///
+    /// **Unblock-only, not force-drop (noetl/ai-meta#199 Slice A).** #198's
+    /// primitive dropped the chain immediately on confirm. But the wiring
+    /// (noetl/ai-meta#199) fires this from a connector step's success — which,
+    /// unless that step is the execution's last, lands **mid-flow**, and under the
+    /// slimmed WAL model (noetl/ai-meta#195/#196) this index holds the drive's
+    /// **control-flow spine**, not business bytes. Force-dropping the chain there
+    /// would strand the off-server drive's subsequent hops (they'd cold-rebuild
+    /// from an empty index → `Incomplete` → fall back to server state, a stall
+    /// under `NOETL_STATE_BUILDER=offserver`). Clearing the block and letting the
+    /// already-gated terminal/TTL eviction reclaim the chain keeps the spine live
+    /// for the rest of the run and still honors "never warehouse sunk context
+    /// indefinitely" — a sink step is near-terminal, so `playbook_completed`
+    /// reclaims it shortly after. Business-context **bytes** (the tiers a sink
+    /// actually protects) are reclaimed by their own GC gates (Slice B).
     pub fn confirm_sunk(&mut self, execution_id: i64) -> bool {
         let was_pending = self.sink_gate.confirm(execution_id);
-        // Cleared from `pending` above, so `evict` no longer treats it as blocked.
-        self.evict(execution_id);
         if was_pending {
             crate::metrics::record_sink_gate_confirmed();
         }
         was_pending
+    }
+
+    /// Whether the sink-eviction gate is active on this index (the
+    /// `NOETL_SINK_GATE_EVICTION` flag). Lets the connector-step wiring and the
+    /// downstream GC gates (noetl/ai-meta#199 Slice B) cheaply skip their work
+    /// when the operator hasn't opted in — the default path stays byte-identical.
+    pub fn sink_gate_enabled(&self) -> bool {
+        self.sink_gate.is_enabled()
     }
 
     /// True when `execution_id` is retained pending a sink confirmation.
@@ -2984,9 +3005,12 @@ mod tests {
     }
 
     #[test]
-    fn sink_gate_retains_unsunk_then_confirm_drops_it() {
+    fn sink_gate_retains_unsunk_then_confirm_unblocks_it() {
         // The write-behind-cache invariant: un-sunk business context is never
-        // evicted; once sunk-confirmed it is dropped.
+        // evicted; once sunk-confirmed it is unblocked and the normal eviction
+        // paths may reclaim it (noetl/ai-meta#199 Slice A — confirm is unblock-
+        // only, not a mid-flow force-drop, so the drive's control-flow spine
+        // survives until the execution terminates).
         let mut idx = WalEventIndex::new();
         idx.enable_sink_gate_for_test();
         idx.apply_at(&started(1, 100), Instant::now());
@@ -2998,11 +3022,16 @@ mod tests {
         assert!(!idx.evict(100), "un-sunk context is not evicted");
         assert!(idx.chain(100).is_some(), "un-sunk context stays resident");
 
-        // Confirm the sink → the now-sunk context is dropped, and it reports it
-        // had been retained pending the sink.
+        // Confirm the sink → the block clears (it reports it had been pending),
+        // and the chain stays resident (spine still live) but is now evictable.
         assert!(idx.confirm_sunk(100), "confirm reports it was pending");
-        assert!(idx.chain(100).is_none(), "sunk-confirmed context is dropped");
+        assert!(!idx.sink_blocked(100), "confirmed context is no longer blocked");
         assert_eq!(idx.sink_pending_count(), 0);
+        assert!(idx.chain(100).is_some(), "chain retained until a normal eviction");
+
+        // The now-unblocked chain is reclaimable by the ordinary eviction path.
+        assert!(idx.evict(100), "confirmed context evicts normally");
+        assert!(idx.chain(100).is_none(), "reclaimed after confirmation");
     }
 
     #[test]
@@ -3055,9 +3084,13 @@ mod tests {
         assert_eq!(stats.total(), 0, "no blocked chain is evicted under the ceiling");
         assert_eq!(idx.execution_count(), 2, "both retained; the sweep terminated");
 
-        // Confirming one frees it; the next sweep can reclaim only that one.
+        // Confirming one unblocks it; the next sweep can reclaim only that one
+        // (the still-un-sunk chain stays retained under the ceiling).
         idx.confirm_sunk(100);
-        assert!(idx.chain(100).is_none(), "confirmed chain dropped");
+        assert!(!idx.sink_blocked(100), "confirmed chain unblocked");
+        let after = idx.enforce_limits_at(t0);
+        assert_eq!(after.total(), 1, "the sweep reclaims exactly the unblocked chain");
+        assert!(idx.chain(100).is_none(), "confirmed chain reclaimed by the sweep");
         assert!(idx.chain(200).is_some(), "still-un-sunk chain retained");
     }
 
