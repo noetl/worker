@@ -831,9 +831,11 @@ impl WalEventIndex {
     }
 
     /// Enable the sink-eviction gate without the env var — test seam for the
-    /// gating invariants (noetl/ai-meta#198).
+    /// gating invariants (noetl/ai-meta#198) and the auto-sink observe pass
+    /// (noetl/ai-meta#199 Slice C). `pub(crate)` so sibling modules' tests can
+    /// set up a sink-blocked chain.
     #[cfg(test)]
-    fn enable_sink_gate_for_test(&mut self) {
+    pub(crate) fn enable_sink_gate_for_test(&mut self) {
         self.sink_gate.enabled = true;
     }
 
@@ -956,6 +958,20 @@ impl WalEventIndex {
     /// (the `654 × 27` headline of the #166 problem statement).
     pub fn event_count(&self) -> usize {
         self.chains.values().map(|c| c.len()).sum()
+    }
+
+    /// A snapshot of the resident set for the platform-automatic sink loop
+    /// (noetl/ai-meta#199 Slice C): `(execution_id, cache_bytes, sink_blocked)` per
+    /// resident chain. `sink_blocked` is true when an explicit sink step is
+    /// already handling this execution (Slice A) — the auto-sink skips those to
+    /// avoid a double write. `cache_bytes` is the chain's cache footprint; the
+    /// actual business bytes an auto-sink would write live in the result tier, so
+    /// this is the selection proxy the observe-only first slice reports.
+    pub fn resident_snapshot(&self) -> Vec<(i64, usize, bool)> {
+        self.chains
+            .iter()
+            .map(|(eid, chain)| (*eid, chain.bytes(), self.sink_gate.is_blocked(*eid)))
+            .collect()
     }
 
     /// Enforce the bounded-cache policy (noetl/ai-meta#166 §5.1), evicting chains
@@ -1165,6 +1181,12 @@ impl SharedWalIndex {
     /// context could still be referenced by the segments it would drop.
     pub async fn any_sink_pending(&self) -> bool {
         self.inner.lock().await.sink_pending_count() > 0
+    }
+
+    /// Snapshot the resident set for the platform-automatic sink loop
+    /// (noetl/ai-meta#199 Slice C) — see [`WalEventIndex::resident_snapshot`].
+    pub async fn resident_snapshot(&self) -> Vec<(i64, usize, bool)> {
+        self.inner.lock().await.resident_snapshot()
     }
 }
 

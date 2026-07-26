@@ -8,6 +8,7 @@
 //! - Command executor with tool dispatch
 //! - Case/when/then evaluation
 
+pub mod autosink;
 pub mod client;
 pub mod command_bus;
 pub mod config;
