@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.80.0](https://github.com/noetl/worker/compare/v5.79.0...v5.80.0) (2026-07-26)
+
+### Features
+
+* **state-builder:** wire sink-confirmation signal from connector steps ([6a21d4c](https://github.com/noetl/worker/commit/6a21d4cd213675ede93da58700c3204d6c4a2c2e))
+
 ## [5.79.0](https://github.com/noetl/worker/compare/v5.78.0...v5.79.0) (2026-07-25)
 
 ### Features
