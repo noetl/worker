@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.81.1](https://github.com/noetl/worker/compare/v5.81.0...v5.81.1) (2026-07-28)
+
+### Bug Fixes
+
+* **ehdb:** bump ehdb pin to d4b6235 — command-bus delivery-loss fix ([#203](https://github.com/noetl/worker/issues/203)) ([#193](https://github.com/noetl/worker/issues/193)) ([0aa3b16](https://github.com/noetl/worker/commit/0aa3b16b7cd09e2a088a3f4fcddf0061d4474ed0)), closes [noetl/ehdb#300](https://github.com/noetl/ehdb/issues/300)
+
 ## [5.81.0](https://github.com/noetl/worker/compare/v5.80.0...v5.81.0) (2026-07-26)
 
 ### Features
