@@ -1,4 +1,8 @@
 target
+# Nested Cargo target dirs (e.g. plugins/reference-materializer/target) — the
+# top-level `target` glob only matches at the context root, so without this a
+# locally-built plug-in ships its whole target dir in the build context.
+**/target
 .git
 .github
 .DS_Store
