@@ -1261,7 +1261,7 @@ dependencies = [
 [[package]]
 name = "ehdb-catalog"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1271,7 +1271,7 @@ dependencies = [
 [[package]]
 name = "ehdb-core"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "arrow-schema",
  "serde",
@@ -1280,7 +1280,7 @@ dependencies = [
 [[package]]
 name = "ehdb-feed"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "ehdb-core",
  "ehdb-l0",
@@ -1292,7 +1292,7 @@ dependencies = [
 [[package]]
 name = "ehdb-l0"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1303,7 +1303,7 @@ dependencies = [
 [[package]]
 name = "ehdb-reference"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1323,7 +1323,7 @@ dependencies = [
 [[package]]
 name = "ehdb-retrieval"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1332,7 +1332,7 @@ dependencies = [
 [[package]]
 name = "ehdb-service"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "arrow-array",
  "arrow-flight",
@@ -1356,7 +1356,7 @@ dependencies = [
 [[package]]
 name = "ehdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1366,7 +1366,7 @@ dependencies = [
 [[package]]
 name = "ehdb-stream"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1376,7 +1376,7 @@ dependencies = [
 [[package]]
 name = "ehdb-system"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1387,7 +1387,7 @@ dependencies = [
 [[package]]
 name = "ehdb-transaction"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=f5dd76bd5046edfb2b0a7829cd18a7f52e311cde#f5dd76bd5046edfb2b0a7829cd18a7f52e311cde"
+source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1457,7 +1457,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2261,15 +2261,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2967,7 +2958,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3463,7 +3454,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3582,7 +3573,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3880,7 +3871,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4522,7 +4513,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5666,7 +5657,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
