@@ -1,0 +1,170 @@
+# Cloud Build: native amd64 image build -> Artifact Registry.
+#
+# WHY amd64-ONLY HERE (and not the --platform linux/amd64,linux/arm64
+# multi-arch build you might expect):
+#
+#   Cloud Build offers no arm64 machine type.  The full enum is
+#   e2-medium, e2-standard-2, e2-highcpu-8, e2-highcpu-32,
+#   n1-highcpu-8, n1-highcpu-32 -- every one of them x86_64.  An
+#   arm64 build here would therefore run under QEMU emulation, which
+#   for a Rust/cargo-chef build is 6-10x slower than native (this is
+#   exactly the regression noetl/ai-meta#44 fixed by moving GitHub
+#   Actions off QEMU and onto native ubuntu-24.04-arm runners).
+#
+#   So the split is:
+#     amd64 -> HERE (Cloud Build, native, 32 vCPU, pushes to AR)
+#     arm64 -> GitHub Actions ubuntu-24.04-arm (native, pushes to GHCR)
+#
+#   That is deliberate, not a gap.  GKE (shastaratech-noetl-prod,
+#   Autopilot) runs amd64, so the AR copy only ever needs amd64.
+#   Local kind on Apple Silicon needs arm64 and keeps getting it from
+#   GHCR.  The existing GHCR workflow is untouched -- this is an
+#   additive path.
+#
+# CACHING: Cloud Build VMs are ephemeral, so the Docker layer cache is
+# cold on every run and cargo-chef's `cook` layer -- the expensive one
+# -- would rebuild from scratch every time.  We fix that with a buildx
+# registry cache (`mode=max`, which exports *intermediate* stages, not
+# just the final image) stored alongside the image in AR under the
+# `:buildcache` tag.  Incremental builds reuse the cook layer.
+
+substitutions:
+  _AR_HOST: us-central1-docker.pkg.dev
+  _AR_PROJECT: shastaratech-noetl-prod
+  _AR_REPO: noetl
+  # Image name matches what the prod manifests already reference.
+  _IMAGE: noetl-worker-rust
+  # Release version WITHOUT the leading "v" (e.g. 5.79.0).  Leave empty
+  # to derive it from Cargo.toml.
+  _VERSION: ""
+  # Set to "false" to skip moving the :latest tag (useful for one-off
+  # or pre-release builds).
+  _PUSH_LATEST: "true"
+
+options:
+  # 8 vCPU.  cargo parallelizes well, so machine size is the single
+  # biggest lever on wall-clock for a cold cargo-chef cook and
+  # E2_HIGHCPU_32 would be the natural pick -- but this project has
+  # NO quota for the 32-vCPU type:
+  #
+  #   FAILED_PRECONDITION: due to quota restrictions, Cloud Build
+  #   cannot run builds of this machine type in this region
+  #
+  # That is the default posture for a new project, and lifting it
+  # needs a quota increase for "Cloud Build / CPUs" in us-central1
+  # (console: IAM & Admin > Quotas, filter cloudbuild.googleapis.com).
+  # E2_HIGHCPU_8 was verified available in us-central1 and is still
+  # 2x the 4-vCPU GitHub-hosted runner the GHCR job uses.
+  #
+  # Once the quota lands, bump this line to E2_HIGHCPU_32 -- nothing
+  # else in this file has to change.
+  machineType: E2_HIGHCPU_8
+  # Rust + cargo-chef needs headroom for the target dir.
+  diskSizeGb: 200
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 2400s
+
+steps:
+  # ---------------------------------------------------------------
+  # 1. Resolve the version once, share it with later steps via
+  #    /workspace (the only directory persisted across steps).
+  # ---------------------------------------------------------------
+  - id: resolve-version
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        VERSION="${_VERSION}"
+        if [[ -z "$$VERSION" ]]; then
+          # First `version = "..."` in Cargo.toml is the package version.
+          VERSION=$$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+        fi
+        # Defensive: a leading "v" here would produce ":vv5.79.0" downstream.
+        VERSION="$${VERSION#v}"
+        if [[ -z "$$VERSION" ]]; then
+          echo "FATAL: could not resolve a version" >&2
+          exit 1
+        fi
+        echo -n "$$VERSION" > /workspace/VERSION
+        echo "resolved version: $$VERSION"
+
+  # ---------------------------------------------------------------
+  # 2. Bootstrap buildx + authenticate to Artifact Registry.
+  #
+  #    buildx is fetched from the pinned docker/buildx-bin image rather
+  #    than relying on whatever the cloud-builders/docker base happens
+  #    to bundle -- that keeps the build reproducible.
+  #
+  #    The docker-container driver runs the build in its own container,
+  #    which does NOT inherit Cloud Build's ambient credential helper,
+  #    so we log in explicitly with the build SA's access token from the
+  #    metadata server.
+  # ---------------------------------------------------------------
+  - id: buildx-bootstrap
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # `docker/buildx-bin` carries no CMD/ENTRYPOINT, and `docker
+        # create` refuses an image with no command ("Error response
+        # from daemon: No command specified").  The container is only
+        # ever a file source for `docker cp` -- it is never started --
+        # so any placeholder command satisfies the daemon.
+        docker create --name bx docker/buildx-bin:0.19.3 noop
+        docker cp bx:/buildx /workspace/buildx
+        docker rm bx
+        chmod +x /workspace/buildx
+        /workspace/buildx version
+
+        TOKEN=$$(curl -sf -H 'Metadata-Flavor: Google' \
+          'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+          | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+        if [[ -z "$$TOKEN" ]]; then
+          echo "FATAL: could not obtain an access token from the metadata server" >&2
+          exit 1
+        fi
+        echo -n "$$TOKEN" | docker login -u oauth2accesstoken --password-stdin "https://${_AR_HOST}"
+
+  # ---------------------------------------------------------------
+  # 3. Build amd64 natively and push straight to AR.
+  #
+  #    --cache-from is best-effort: on the very first build the
+  #    :buildcache tag does not exist yet and buildx simply proceeds
+  #    with a cold cache.
+  # ---------------------------------------------------------------
+  - id: build-push
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        VERSION=$$(cat /workspace/VERSION)
+        REPO="${_AR_HOST}/${_AR_PROJECT}/${_AR_REPO}/${_IMAGE}"
+
+        /workspace/buildx create --name cb --driver docker-container --use
+        /workspace/buildx inspect --bootstrap
+
+        TAGS="--tag $${REPO}:v$${VERSION}"
+        if [[ "${_PUSH_LATEST}" == "true" ]]; then
+          TAGS="$${TAGS} --tag $${REPO}:latest"
+        fi
+
+        # shellcheck disable=SC2086
+        /workspace/buildx build \
+          --platform linux/amd64 \
+          --file ./Dockerfile \
+          $${TAGS} \
+          --cache-from "type=registry,ref=$${REPO}:buildcache" \
+          --cache-to   "type=registry,ref=$${REPO}:buildcache,mode=max" \
+          --provenance=false \
+          --push \
+          .
+
+        echo "=== pushed ==="
+        echo "$${REPO}:v$${VERSION}"

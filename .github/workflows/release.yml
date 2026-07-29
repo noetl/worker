@@ -141,6 +141,56 @@ jobs:
           echo "=== manifest list ==="
           docker buildx imagetools inspect ghcr.io/noetl/worker:${VERSION}
 
+  # Additive Artifact Registry path.  Builds the SAME release version
+  # on Cloud Build (native amd64, in us-central1 next to the GKE
+  # cluster) and pushes to
+  # us-central1-docker.pkg.dev/<project>/noetl/noetl-worker-rust.
+  #
+  # WHY THIS IS DECOUPLED: `needs` lists only ``verify-version`` -- not
+  # publish-image / publish-manifest.  The GHCR path is the release
+  # artifact of record and must not be able to fail because of an AR
+  # problem, and ``github-release`` gates on publish-manifest only, so
+  # nothing here can block a release.  This job is purely additive.
+  #
+  # WHY IT IS OFF BY DEFAULT: the `if` requires two repo *variables*
+  # (Settings > Secrets and variables > Actions > Variables).  Until
+  # they are set the job is skipped, so merging this file changes
+  # nothing about today's pipeline.
+  #
+  #   GCP_WIF_PROVIDER  projects/<NUM>/locations/global/workloadIdentityPools/github/providers/noetl
+  #   GCP_CLOUDBUILD_SA gh-actions-cloudbuild@<project>.iam.gserviceaccount.com
+  #   GCP_PROJECT_ID    shastaratech-noetl-prod   (optional; defaults below)
+  #
+  # Auth is Workload Identity Federation -- keyless, no long-lived JSON
+  # service-account key in GitHub secrets.
+  publish-ar:
+    runs-on: ubuntu-latest
+    needs: [verify-version]
+    if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_CLOUDBUILD_SA != '' }}
+    permissions:
+      contents: read
+      # Required for the OIDC token that WIF exchanges for GCP creds.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CLOUDBUILD_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Cloud Build -> Artifact Registry
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'shastaratech-noetl-prod' }}
+        run: |
+          set -euo pipefail
+          gcloud builds submit \
+            --project="${PROJECT_ID}" \
+            --region=us-central1 \
+            --config=cloudbuild.yaml \
+            --substitutions=_VERSION="${VERSION}" \
+            .
+
   github-release:
     runs-on: ubuntu-latest
     needs: [verify-version, publish-image, publish-manifest]
