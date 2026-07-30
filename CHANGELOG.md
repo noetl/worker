@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.81.3](https://github.com/noetl/worker/compare/v5.81.2...v5.81.3) (2026-07-30)
+
+### Bug Fixes
+
+* **command-bus:** survive a writer restart — resume from the committed cursor, seal on SIGTERM ([#208](https://github.com/noetl/worker/issues/208)) ([73d4ed0](https://github.com/noetl/worker/commit/73d4ed028c3bfc8bf09c1e529a8b90776fb530c7))
+
 ## [5.81.2](https://github.com/noetl/worker/compare/v5.81.1...v5.81.2) (2026-07-30)
 
 ### Performance Improvements
