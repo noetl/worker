@@ -18,6 +18,17 @@
 //! since ack is by global sort key against the shared coordinator and must not
 //! stall a blocked pull. Lazy-connected + drop-on-error redial, so a worker never
 //! hard-depends on the host being up at boot.
+//!
+//! **Surviving a writer restart (noetl/ai-meta#208).** Restarting only the writer
+//! pod used to stop dispatch outright. Two changes here close it:
+//!
+//! - The claim connection can now *notice*: `ehdb-feed` arms TCP keepalive and a
+//!   coordinator heartbeat, so a vanished writer surfaces as an `Err` and the redial
+//!   below actually runs. Previously the read parked forever on a half-open socket
+//!   and no error was ever logged.
+//! - The hosted coordinator **resumes from its committed cursor** (persisted on the
+//!   writer's volume) instead of replaying the shard from 0, and seals the log on
+//!   SIGTERM so the reopened engine recovers the tail.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -30,7 +41,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use ehdb_feed::scaler::ShardLag;
-use ehdb_feed::{ClaimClient, ClaimCoordinator, FeedWriter};
+use ehdb_feed::{ClaimClient, ClaimCoordinator, CursorFallback, CursorStore, FeedWriter};
 use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{D1EventLog, EventRecord, L0Config, L0Engine, LocalFsSubstrate};
 use noetl_executor::worker::source::{CommandSource, Pulled};
@@ -85,6 +96,13 @@ pub struct CommandBusConfig {
     /// so a Kubernetes service name works directly (finding #2, noetl/ai-meta#194).
     pub claim_addr: Option<String>,
     pub ack_wait: Duration,
+    /// How often the hosted coordinator persists its committed cursor to the
+    /// writer's volume (`NOETL_COMMAND_BUS_CURSOR_PERSIST_MS`, default 1000).
+    /// `0` disables the ticker; the shutdown persist still runs.
+    pub cursor_persist: Duration,
+    /// Where a restarted coordinator starts when nothing has been persisted yet
+    /// (`NOETL_COMMAND_BUS_CURSOR_FALLBACK`, default `tail`).
+    pub cursor_fallback: CursorFallback,
 }
 
 impl CommandBusConfig {
@@ -124,6 +142,13 @@ impl CommandBusConfig {
                 .map(|v| v.trim().to_string())
                 .filter(|s| !s.is_empty()),
             ack_wait: Duration::from_secs(env_u32("NOETL_COMMAND_BUS_ACK_WAIT_SECS", 30) as u64),
+            cursor_persist: Duration::from_millis(env_u32(
+                "NOETL_COMMAND_BUS_CURSOR_PERSIST_MS",
+                1_000,
+            ) as u64),
+            cursor_fallback: CursorFallback::from_env_value(
+                &std::env::var("NOETL_COMMAND_BUS_CURSOR_FALLBACK").unwrap_or_default(),
+            ),
         }
     }
 }
@@ -150,17 +175,38 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
         tracing::info!(%addr, shard = config.shard, "EHDB command-bus ingest listener up");
     }
 
-    let coordinator = Arc::new(ClaimCoordinator::new(
+    // **Resume, don't replay** (noetl/ai-meta#208 defect 2). This used to pass
+    // `from_cursor = 0`, so every restart re-served the shard's whole log —
+    // 2738 long-completed commands in kind, each costing a control-plane
+    // round-trip to learn it was already claimed, with fresh commands queued
+    // behind them. The committed cursor now lives on the writer's own volume
+    // beside the log and the coordinator picks up where the last one left off.
+    let coordinator = Arc::new(ClaimCoordinator::resume(
         writer.clone(),
         config.shard,
         config.ack_wait,
-        0,
         // Derive each command's routing subject (`commands.<pool>.shard.<n>`)
         // from the notification — so a member claims only within its subscribed
         // subjects (pool + shard isolation, noetl/ai-meta#194 finding #1, the
         // general NATS-subject mechanism).
         ehdb_feed::d1_command_subject(config.shard_count),
-    ));
+        CursorStore::open(&dir, config.shard)?,
+        config.cursor_fallback,
+    )?);
+    let (from_cursor, origin) = coordinator.started_from();
+    tracing::info!(
+        shard = config.shard,
+        from_cursor,
+        origin = origin.as_str(),
+        "EHDB command-bus claim coordinator resumed"
+    );
+    if config.cursor_persist > Duration::ZERO {
+        coordinator
+            .clone()
+            .spawn_cursor_persister(config.cursor_persist);
+    }
+    spawn_graceful_writer_shutdown(writer.clone(), coordinator.clone(), config.shard);
+
     if let Some(addr) = config.claim_bind {
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(ehdb_feed::serve_claims(listener, coordinator.clone()));
@@ -171,11 +217,17 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
         // The scaler provider is sync; publish the async lag into an atomic that a
         // background sampler refreshes.
         let gauge = Arc::new(AtomicU64::new(0));
+        // The committed cursor rides the same sampler: it is the value a restart
+        // resumes from, so an operator watching a restart can see it advance
+        // (noetl/ai-meta#208) instead of the hardcoded 0 reported before.
+        let committed = Arc::new(AtomicU64::new(0));
         let sampler = gauge.clone();
+        let committed_sampler = committed.clone();
         let coord = coordinator.clone();
         tokio::spawn(async move {
             loop {
                 sampler.store(coord.lag().await, Ordering::Relaxed);
+                committed_sampler.store(coord.committed_cursor().await, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
@@ -184,7 +236,7 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
         tokio::spawn(ehdb_feed::scaler::bind_and_serve(addr, move || {
             vec![ShardLag {
                 shard,
-                committed: 0,
+                committed: committed.load(Ordering::Relaxed),
                 lag: read.load(Ordering::Relaxed),
             }]
         }));
@@ -192,6 +244,76 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
     }
 
     Ok(writer)
+}
+
+/// **Seal the command log and persist the cursor on SIGTERM** — the other half of
+/// surviving a writer restart (noetl/ai-meta#208).
+///
+/// The L0 engine reopens from its **durable manifest**, so records still sitting in
+/// an unsealed active part are invisible to the restarted process even though every
+/// append `fsync`ed them. A rollout restart would therefore drop the tail of the
+/// command log (up to `seal_max_records`, 1024 by default) *and* leave the
+/// persisted cursor up to one persist-interval stale. Sealing + flushing uploads on
+/// the termination signal closes both: the reopened writer recovers everything, and
+/// the coordinator resumes from an exact cursor.
+///
+/// Best-effort by nature — this races the process exit, and a SIGKILL / OOM skips it
+/// entirely. That crash path is why the resume cursor is clamped to the reopened
+/// log's tip (`ClaimCoordinator::resume`): worst case the bus redelivers, it never
+/// goes dark. Commands genuinely lost with an unsealed part are re-issued by the
+/// control plane's orphaned-command guardrail (noetl/ai-meta#171).
+#[cfg(unix)]
+fn spawn_graceful_writer_shutdown(
+    writer: Arc<FeedWriter<D1EventLog>>,
+    coordinator: Arc<ClaimCoordinator<D1EventLog>>,
+    shard: u32,
+) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut sigterm), Ok(mut sigint)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            tracing::warn!("EHDB command-bus writer could not install its shutdown handler");
+            return;
+        };
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
+        }
+        // Cursor first: it is cheap, and a cursor that is behind the log is always
+        // safe while a log that is behind the cursor needs the clamp.
+        match coordinator.persist_cursor().await {
+            Ok(Some(cursor)) => {
+                tracing::info!(
+                    shard,
+                    cursor,
+                    "EHDB command-bus cursor persisted on shutdown"
+                )
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(shard, error = %e, "EHDB command-bus cursor persist failed"),
+        }
+        // `flush_and_wait_uploads` blocks on the uploader, so keep it off the async
+        // worker threads.
+        let sealed = tokio::task::spawn_blocking(move || {
+            writer.engine().lock().unwrap().flush_and_wait_uploads()
+        })
+        .await;
+        match sealed {
+            Ok(Ok(())) => tracing::info!(shard, "EHDB command-bus log sealed on shutdown"),
+            Ok(Err(e)) => tracing::warn!(shard, error = %e, "EHDB command-bus seal failed"),
+            Err(e) => tracing::warn!(shard, error = %e, "EHDB command-bus seal task failed"),
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_graceful_writer_shutdown(
+    _writer: Arc<FeedWriter<D1EventLog>>,
+    _coordinator: Arc<ClaimCoordinator<D1EventLog>>,
+    _shard: u32,
+) {
 }
 
 fn member_id(worker_id: &str) -> u32 {
@@ -306,7 +428,18 @@ impl CommandSource for EhdbCommandSource {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!(error = %e, "EHDB claim_next failed; reconnecting");
+                    // Reachable at all only because the claim connection can now
+                    // detect a dead coordinator (keepalive + heartbeat,
+                    // noetl/ai-meta#208 defect 1). Before that a restarted writer
+                    // left this read parked forever, so dispatch stopped with
+                    // nothing logged anywhere.
+                    tracing::warn!(
+                        claim_addr = %self.claim_addr,
+                        member = self.member,
+                        filter = %self.filter,
+                        error = %e,
+                        "EHDB claim_next failed; reconnecting to the claim coordinator"
+                    );
                     self.pull = None;
                     continue;
                 }
