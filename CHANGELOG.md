@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.81.2](https://github.com/noetl/worker/compare/v5.81.1...v5.81.2) (2026-07-30)
+
+### Performance Improvements
+
+* **command-bus:** adopt the ehdb writer's group commit (ehdb 03e94be) ([78a4898](https://github.com/noetl/worker/commit/78a4898aca614feaeffb0857e0772ce8fd8a4233)), closes [noetl/ai-meta#205](https://github.com/noetl/ai-meta/issues/205) [#203](https://github.com/noetl/worker/issues/203) [noetl/ai-meta#205](https://github.com/noetl/ai-meta/issues/205)
+
 ## [5.81.1](https://github.com/noetl/worker/compare/v5.81.0...v5.81.1) (2026-07-28)
 
 ### Bug Fixes
