@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.84.0](https://github.com/noetl/worker/compare/v5.83.0...v5.84.0) (2026-07-31)
+
+### Features
+
+* **event-bus:** host the EHDB events feed beside the command bus ([dcb3a5e](https://github.com/noetl/worker/commit/dcb3a5e6a1b801b49c2fefd928853a2e9d653186)), closes [noetl/ai-meta#205](https://github.com/noetl/ai-meta/issues/205) [#205](https://github.com/noetl/worker/issues/205)
+
 ## [5.83.0](https://github.com/noetl/worker/compare/v5.82.0...v5.83.0) (2026-07-31)
 
 ### Features
