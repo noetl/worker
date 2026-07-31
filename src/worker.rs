@@ -67,6 +67,17 @@ impl Worker {
             crate::command_bus::spawn_writer_host(&cmdbus).await?;
         }
 
+        // noetl/ai-meta#212 L1 T3 — the events feed, the `noetl.events.>`
+        // fan-out's EHDB home. Independent of the command bus in every way that
+        // matters: its own flag, its own L0 engine + directory, its own ports.
+        // Events run roughly an order of magnitude hotter than commands, so
+        // sharing the command bus's engine would put that volume in front of
+        // command dispatch latency and re-open noetl/ai-meta#205.
+        let eventbus = crate::event_bus::EventBusConfig::from_env();
+        if eventbus.host {
+            crate::event_bus::spawn_event_writer_host(&eventbus).await?;
+        }
+
         // Select the command source by mode.  `ehdb` claims over the network from
         // the shard coordinator (competing across replicas) and creates NO NATS
         // subscriber (supports the NATS-deleted end state); every other mode is
