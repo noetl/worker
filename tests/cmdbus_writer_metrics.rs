@@ -101,6 +101,14 @@ async fn the_writer_metrics_endpoint_serves_the_per_pool_trigger_and_the_resume_
         resp.contains("ehdb_feed_shard_resume_replay_records{shard=\"0\"}"),
         "resume facts missing from the deployed writer endpoint: {resp}"
     );
+    // The noetl/ai-meta#203 loss-class detector must be observable in prod, not
+    // just asserted in ehdb's tests — T5 removes the NATS fallback, so a soak has
+    // to be able to watch it (noetl/ai-meta#206).
+    assert!(
+        resp.contains("ehdb_l0_out_of_order_appends 0\n"),
+        "append-integrity counter missing or non-zero: {resp}"
+    );
+    assert!(resp.contains("ehdb_l0_appends "), "{resp}");
     // And the families the existing ScaledObject + runbooks already read.
     assert!(resp.contains("ehdb_feed_total_lag "), "{resp}");
     assert!(
