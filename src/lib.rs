@@ -13,6 +13,7 @@ pub mod client;
 pub mod command_bus;
 pub mod config;
 pub mod ehdb;
+pub mod event_bus;
 pub mod events;
 pub mod executor;
 pub mod materializer;
