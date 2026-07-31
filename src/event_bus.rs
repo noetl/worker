@@ -24,6 +24,7 @@
 //! |---|---|---|
 //! | ingest | `NOETL_EVENT_BUS_INGEST_BIND` (9103) | the server's event publish |
 //! | group claims | `NOETL_EVENT_BUS_CLAIM_BIND` (9104) | the three materializers |
+//! | SSE | `NOETL_EVENT_BUS_SSE_BIND` (9105) | the gateway's live SPA feed |
 //! | `/metrics` | `NOETL_EVENT_BUS_METRICS_BIND` (9106) | per-group lag + resume facts |
 //!
 //! The command bus's 9100/9101/9102 are untouched, as is every type it uses.
@@ -96,6 +97,12 @@ pub struct EventBusConfig {
     pub writer_dir: Option<PathBuf>,
     pub ingest_bind: Option<SocketAddr>,
     pub claim_bind: Option<SocketAddr>,
+    /// `NOETL_EVENT_BUS_SSE_BIND` — the broadcast face.  Separate from the group
+    /// claim face because the gateway is a fundamentally different consumer: it
+    /// wants every event with no ack and no competing peer, and `Last-Event-ID`
+    /// maps straight onto the feed cursor.  Serving it through a claim group
+    /// would make SPA clients compete for events, which is exactly wrong.
+    pub sse_bind: Option<SocketAddr>,
     pub metrics_bind: Option<SocketAddr>,
     pub ack_wait: Duration,
     pub cursor_persist: Duration,
@@ -130,6 +137,7 @@ impl EventBusConfig {
                 .map(PathBuf::from),
             ingest_bind: env_addr("NOETL_EVENT_BUS_INGEST_BIND"),
             claim_bind: env_addr("NOETL_EVENT_BUS_CLAIM_BIND"),
+            sse_bind: env_addr("NOETL_EVENT_BUS_SSE_BIND"),
             metrics_bind: env_addr("NOETL_EVENT_BUS_METRICS_BIND"),
             ack_wait: Duration::from_secs(env_u32("NOETL_EVENT_BUS_ACK_WAIT_SECS", 30) as u64),
             cursor_persist: Duration::from_secs(env_u32(
@@ -188,6 +196,12 @@ pub async fn spawn_event_writer_host(
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(ehdb_feed::serve_group_claims(listener, coordinator.clone()));
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed group coordinator up");
+    }
+
+    if let Some(addr) = config.sse_bind {
+        let listener = TcpListener::bind(addr).await?;
+        tokio::spawn(ehdb_feed::sse::serve_sse(listener, writer.clone()));
+        tracing::info!(%addr, shard = config.shard, "EHDB events-feed SSE face up");
     }
 
     if config.cursor_persist > Duration::ZERO {
@@ -323,6 +337,7 @@ mod tests {
             writer_dir: None,
             ingest_bind: None,
             claim_bind: None,
+            sse_bind: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::from_secs(DEFAULT_CURSOR_PERSIST_SECS),
@@ -344,6 +359,7 @@ mod tests {
             writer_dir: None,
             ingest_bind: None,
             claim_bind: None,
+            sse_bind: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::ZERO,
@@ -369,6 +385,7 @@ mod tests {
             writer_dir: Some(dir.clone()),
             ingest_bind: None,
             claim_bind: None,
+            sse_bind: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::ZERO,
