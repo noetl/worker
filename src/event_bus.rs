@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ehdb_feed::{CursorFallback, FeedWriter, GroupCoordinator};
 use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{D1EventLog, L0Config, L0Engine, LocalFsSubstrate};
@@ -57,6 +57,32 @@ pub const ALL_EVENTS_FILTER: &str = "events.>";
 /// How often the host persists each group's committed cursor, on top of the
 /// per-ack persist. Bounds the replay window if the pod dies between acks.
 const DEFAULT_CURSOR_PERSIST_SECS: u64 = 5;
+
+/// Which transport a materializer drains (`NOETL_*_SOURCE`).
+///
+/// Deliberately separate from the server's publish-side `NOETL_EVENT_BUS`: the
+/// cutover is per-consumer, so a materializer moves to the EHDB feed while
+/// publish stays in `shadow` and NATS remains authoritative for everything else.
+/// Anything unrecognised is `nats`, so a typo can never quietly move the sole
+/// writer of the durable event log onto an unproven transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventSourceMode {
+    #[default]
+    Nats,
+    Ehdb,
+}
+
+impl EventSourceMode {
+    pub fn from_env_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ehdb" => Self::Ehdb,
+            _ => Self::Nats,
+        }
+    }
+    pub fn is_ehdb(self) -> bool {
+        matches!(self, Self::Ehdb)
+    }
+}
 
 /// Resolved events-feed host configuration.
 #[derive(Debug, Clone)]
@@ -362,5 +388,205 @@ mod tests {
         }
         assert!(body.contains("ehdb_events_cursor_errors 0"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Consumer side — draining a named group off the events feed.
+// ---------------------------------------------------------------------------
+
+/// One record drained from the events feed.
+#[derive(Debug, Clone)]
+pub struct DrainedEvent {
+    /// The feed's writer-assigned sort key — the ack token.
+    pub sort_key: u64,
+    /// The event payload (the server published `to_stream_json()` bytes).
+    pub payload: serde_json::Value,
+}
+
+/// A consumer's connection to one named group on the events feed.
+///
+/// **Why a background claim task rather than calling `claim_next` inline.**
+/// `claim_next` *blocks* until a record is available, and the claim protocol is
+/// strict request/response on one socket. A caller that wants "up to N records,
+/// or whatever arrives in T milliseconds" therefore cannot simply time out the
+/// call: abandoning an in-flight claim leaves the coordinator about to write a
+/// response nobody will read, and the next read on that socket returns the stale
+/// record — silently mis-associating an ack.
+///
+/// So one task owns the pull socket and never abandons a request; it pushes
+/// claimed records into a bounded channel. [`poll`](Self::poll) drains that
+/// channel with a deadline, which is a pure local operation. Acks go over a
+/// second connection, so an ack never waits behind a blocked claim.
+///
+/// The bounded channel is the backpressure seam: when the consumer is slower
+/// than the feed, the claim task parks on a full channel rather than claiming
+/// records it cannot ack, which keeps the group's in-flight set small and its
+/// `ack_wait` redeliveries rare.
+pub struct EhdbGroupSource {
+    group: String,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<DrainedEvent>>,
+    ack: tokio::sync::Mutex<Option<ehdb_feed::GroupClaimClient>>,
+    claim_addr: String,
+    member: u32,
+    /// Set when the claim task dies so `poll` can report it rather than looking
+    /// like a permanently idle feed.
+    claim_task: tokio::task::JoinHandle<()>,
+}
+
+impl EhdbGroupSource {
+    /// Connect a drain for `group` at `claim_addr`, subscribing with `filter`
+    /// (`events.>` for every type). `capacity` bounds the in-flight prefetch.
+    pub async fn connect(
+        claim_addr: String,
+        group: String,
+        filter: String,
+        member: u32,
+        capacity: usize,
+    ) -> Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
+        let addr = claim_addr.clone();
+        let g = group.clone();
+        let f = filter.clone();
+        let claim_task = tokio::spawn(async move {
+            claim_loop(addr, g, f, member, tx).await;
+        });
+        Ok(Self {
+            group,
+            rx: tokio::sync::Mutex::new(rx),
+            ack: tokio::sync::Mutex::new(None),
+            claim_addr,
+            member,
+            claim_task,
+        })
+    }
+
+    /// The group this source drains.
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+
+    /// Drain up to `max` records, waiting at most `timeout` for the first one.
+    /// Returns an empty vec when the feed is idle — the caller then sleeps.
+    pub async fn poll(&self, max: usize, timeout: Duration) -> Vec<DrainedEvent> {
+        let mut rx = self.rx.lock().await;
+        let mut out = Vec::new();
+        // Wait for the first record; after that take only what is already
+        // buffered, so a partially-full batch is not held for the full timeout.
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(first)) => out.push(first),
+            Ok(None) => return out, // channel closed — claim task gone
+            Err(_) => return out,   // idle
+        }
+        while out.len() < max {
+            match rx.try_recv() {
+                Ok(ev) => out.push(ev),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Ack a drained batch by sort key. Errors are returned so the caller can
+    /// decide; an unacked record simply redelivers after `ack_wait`.
+    pub async fn ack(&self, sort_keys: &[u64]) -> Result<usize> {
+        if sort_keys.is_empty() {
+            return Ok(0);
+        }
+        let mut guard = self.ack.lock().await;
+        if guard.is_none() {
+            *guard = Some(
+                ehdb_feed::GroupClaimClient::connect(
+                    self.claim_addr.as_str(),
+                    self.group.clone(),
+                    self.member,
+                    ALL_EVENTS_FILTER,
+                )
+                .await
+                .with_context(|| format!("events-feed ack connect ({})", self.claim_addr))?,
+            );
+        }
+        let client = guard.as_mut().expect("just connected");
+        let mut acked = 0usize;
+        for key in sort_keys {
+            if let Err(e) = client.ack(*key).await {
+                // Drop the connection so the next call redials; the unacked
+                // remainder redelivers, which is the at-least-once contract.
+                *guard = None;
+                return Err(anyhow!("events-feed ack failed after {acked}: {e}"));
+            }
+            acked += 1;
+        }
+        Ok(acked)
+    }
+
+    /// True when the background claim task has exited — a source in this state
+    /// will never yield another record.
+    pub fn is_finished(&self) -> bool {
+        self.claim_task.is_finished()
+    }
+}
+
+impl Drop for EhdbGroupSource {
+    fn drop(&mut self) {
+        self.claim_task.abort();
+    }
+}
+
+/// Own the pull socket and claim forever, redialing on error. Never abandons an
+/// in-flight claim (see [`EhdbGroupSource`] for why that matters).
+async fn claim_loop(
+    claim_addr: String,
+    group: String,
+    filter: String,
+    member: u32,
+    tx: tokio::sync::mpsc::Sender<DrainedEvent>,
+) {
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        let client = match ehdb_feed::GroupClaimClient::connect(
+            claim_addr.as_str(),
+            group.clone(),
+            member,
+            filter.clone(),
+        )
+        .await
+        {
+            Ok(c) => {
+                backoff = Duration::from_millis(200);
+                c
+            }
+            Err(error) => {
+                tracing::warn!(%claim_addr, group, %error, "events-feed claim connect failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                continue;
+            }
+        };
+        let mut client = client;
+        loop {
+            match client.claim_next::<ehdb_l0::EventRecord>().await {
+                Ok(claimed) => {
+                    let payload =
+                        serde_json::from_str::<serde_json::Value>(&claimed.record.payload)
+                            .unwrap_or(serde_json::Value::Null);
+                    if tx
+                        .send(DrainedEvent {
+                            sort_key: claimed.sort_key,
+                            payload,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return; // receiver dropped — the source is gone
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(group, %error, "events-feed claim failed; redialing");
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(backoff).await;
     }
 }
