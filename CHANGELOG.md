@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.85.0](https://github.com/noetl/worker/compare/v5.84.0...v5.85.0) (2026-07-31)
+
+### Features
+
+* **materializer:** drain the durable event log off the EHDB events feed ([77c8cdd](https://github.com/noetl/worker/commit/77c8cdd908ea23dcd350db8b4bc83e47e8159ecd))
+
 ## [5.84.0](https://github.com/noetl/worker/compare/v5.83.0...v5.84.0) (2026-07-31)
 
 ### Features
