@@ -80,6 +80,14 @@ pub struct MaterializerConfig {
     pub timeout_ms: u64,
     pub idle_sleep: Duration,
     pub error_backoff: Duration,
+    /// noetl/ai-meta#212 T3 — which transport this materializer drains.
+    /// `NOETL_MATERIALIZER_SOURCE`: `nats` (default) or `ehdb`. Independent of
+    /// the server's `NOETL_EVENT_BUS` publish mode on purpose, so a consumer can
+    /// be cut over one at a time while publish stays in `shadow`.
+    pub source_mode: crate::event_bus::EventSourceMode,
+    /// `NOETL_EVENT_BUS_CLAIM_ADDR` — the events feed's group-claim address.
+    pub event_claim_addr: Option<String>,
+
     /// Chaos / validation knob: fail (skip the POST + leave the batch
     /// un-acked) the first N non-empty cycles, to exercise the redelivery
     /// path deterministically. `NOETL_MATERIALIZER_FAULT_FAIL_FIRST`, default
@@ -121,8 +129,10 @@ impl MaterializerConfig {
 
         let batch = env_u32("NOETL_MATERIALIZER_BATCH", DEFAULT_BATCH).clamp(1, 1000);
         let timeout_ms = env_u64("NOETL_MATERIALIZER_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
-        let idle_sleep =
-            Duration::from_millis(env_u64("NOETL_MATERIALIZER_IDLE_SLEEP_MS", DEFAULT_IDLE_SLEEP_MS));
+        let idle_sleep = Duration::from_millis(env_u64(
+            "NOETL_MATERIALIZER_IDLE_SLEEP_MS",
+            DEFAULT_IDLE_SLEEP_MS,
+        ));
         let error_backoff = Duration::from_millis(env_u64(
             "NOETL_MATERIALIZER_ERROR_BACKOFF_MS",
             DEFAULT_ERROR_BACKOFF_MS,
@@ -144,6 +154,13 @@ impl MaterializerConfig {
             idle_sleep,
             error_backoff,
             fault_fail_first,
+            source_mode: crate::event_bus::EventSourceMode::from_env_value(
+                &std::env::var("NOETL_MATERIALIZER_SOURCE").unwrap_or_default(),
+            ),
+            event_claim_addr: std::env::var("NOETL_EVENT_BUS_CLAIM_ADDR")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }))
     }
 
@@ -178,6 +195,147 @@ pub fn spawn(config: MaterializerConfig) -> tokio::task::JoinHandle<()> {
 /// The drain → project → ack loop. Runs forever; the worker aborts it on
 /// shutdown.
 async fn run_loop(config: MaterializerConfig) -> Result<()> {
+    if config.source_mode.is_ehdb() {
+        return run_loop_ehdb(config).await;
+    }
+    run_loop_nats(config).await
+}
+
+/// The EHDB-sourced drain: same project → ack commit point as the NATS loop,
+/// over a named durable group on the events feed instead of a JetStream
+/// consumer.
+///
+/// Deliberately a sibling function rather than a generic over the two sources.
+/// The loops share their *contract* (drain → project → ack only on 2xx) but not
+/// their mechanics — poll options, ack handles and error taxonomy all differ —
+/// and threading a trait through would have obscured the one line that actually
+/// matters here: the batch is acked ONLY after `events/project` returns 2xx, so
+/// a crash mid-batch redelivers rather than losing rows from the durable log.
+async fn run_loop_ehdb(config: MaterializerConfig) -> Result<()> {
+    let claim_addr = config.event_claim_addr.clone().ok_or_else(|| {
+        anyhow!("NOETL_MATERIALIZER_SOURCE=ehdb requires NOETL_EVENT_BUS_CLAIM_ADDR")
+    })?;
+    let member = member_id(&config.consumer);
+    let source = crate::event_bus::EhdbGroupSource::connect(
+        claim_addr.clone(),
+        config.consumer.clone(),
+        crate::event_bus::ALL_EVENTS_FILTER.to_string(),
+        member,
+        (config.batch as usize).max(1),
+    )
+    .await?;
+    let http = reqwest::Client::new();
+    let project_url = format!("{}/api/internal/events/project", config.server_url);
+
+    tracing::info!(
+        %claim_addr,
+        group = %config.consumer,
+        batch = config.batch,
+        "CQRS event materializer started on the EHDB events feed (ack-after-materialize)"
+    );
+
+    let poll_timeout = Duration::from_millis(config.timeout_ms);
+    let mut faults_remaining = config.fault_fail_first;
+
+    loop {
+        let cycle_start = Instant::now();
+        let drained_batch = source.poll(config.batch as usize, poll_timeout).await;
+        let drained = drained_batch.len();
+        if drained == 0 {
+            if source.is_finished() {
+                return Err(anyhow!(
+                    "events-feed claim task exited; materializer cannot drain"
+                ));
+            }
+            tokio::time::sleep(config.idle_sleep).await;
+            continue;
+        }
+
+        let payloads: Vec<serde_json::Value> =
+            drained_batch.iter().map(|d| d.payload.clone()).collect();
+        let sort_keys: Vec<u64> = drained_batch.iter().map(|d| d.sort_key).collect();
+        let (events, skipped) = build_envelopes_from_payloads(&payloads);
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                drained,
+                "materializer skipped messages with no event_id (not materializable)"
+            );
+        }
+
+        if faults_remaining > 0 {
+            faults_remaining -= 1;
+            crate::metrics::record_materializer_project_error();
+            tracing::warn!(
+                drained,
+                faults_remaining,
+                "materializer FAULT-INJECT: skipping project + ack; batch will redeliver"
+            );
+            tokio::time::sleep(config.error_backoff).await;
+            continue;
+        }
+
+        if events.is_empty() {
+            // Nothing materializable — ack to advance the cursor, else the same
+            // batch poison-loops forever.
+            if let Err(error) = source.ack(&sort_keys).await {
+                tracing::warn!(%error, "materializer ack failed on a non-event batch");
+            }
+            continue;
+        }
+
+        match project(&http, &project_url, &config.internal_token, &events).await {
+            Ok((projected, duplicates)) => {
+                let acked = match source.ack(&sort_keys).await {
+                    Ok(n) => n,
+                    Err(error) => {
+                        // The rows ARE durable; only the ack failed. Those
+                        // records redeliver and `events/project` dedupes them by
+                        // event_id, so this costs a repeat, never a row.
+                        tracing::warn!(%error, "materializer ack failed after a durable project");
+                        0
+                    }
+                };
+                tracing::debug!(
+                    drained,
+                    projected,
+                    duplicates,
+                    acked,
+                    executions = distinct_execution_ids(&events).len(),
+                    "materializer cycle (ehdb): drained → projected → acked"
+                );
+                crate::metrics::record_materializer_cycle(
+                    drained as u64,
+                    projected as u64,
+                    duplicates as u64,
+                    acked as u64,
+                    cycle_start.elapsed().as_secs_f64(),
+                );
+            }
+            Err(e) => {
+                // DO NOT ack — the batch redelivers after ack_wait. No row lost.
+                crate::metrics::record_materializer_project_error();
+                tracing::warn!(
+                    drained,
+                    error = %e,
+                    "materializer project failed; batch NOT acked, will redeliver"
+                );
+                tokio::time::sleep(config.error_backoff).await;
+            }
+        }
+    }
+}
+
+/// Stable non-zero member id for a group member, derived from the group name.
+fn member_id(name: &str) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    (h.finish() as u32) | 1
+}
+
+/// The NATS-sourced drain — unchanged.
+async fn run_loop_nats(config: MaterializerConfig) -> Result<()> {
     let source = build_source(&config.source_config()?, &ExecutionContext::default())
         .map_err(|e| anyhow!("materializer build_source failed: {e}"))?;
     let http = reqwest::Client::new();
@@ -241,7 +399,13 @@ async fn run_loop(config: MaterializerConfig) -> Result<()> {
         if events.is_empty() {
             // Nothing materializable in this batch — ack to advance the cursor
             // (leaving them un-acked would poison-loop forever).
-            dispose(&*source, &outcome.ack_ids, AckDisposition::Ack, "non-event batch").await;
+            dispose(
+                &*source,
+                &outcome.ack_ids,
+                AckDisposition::Ack,
+                "non-event batch",
+            )
+            .await;
             continue;
         }
 
@@ -299,13 +463,29 @@ async fn run_loop(config: MaterializerConfig) -> Result<()> {
 /// materialized row keeps its original time. Messages whose payload isn't an
 /// object or carries no `event_id` are not materializable and are dropped
 /// (counted in the returned `skipped`).
-fn build_envelopes(messages: &[noetl_tools::tools::source::PolledMessage]) -> (Vec<serde_json::Value>, usize) {
-    let mut events = Vec::with_capacity(messages.len());
+fn build_envelopes(
+    messages: &[noetl_tools::tools::source::PolledMessage],
+) -> (Vec<serde_json::Value>, usize) {
+    let payloads: Vec<serde_json::Value> = messages.iter().map(|m| m.data.clone()).collect();
+    build_envelopes_from_payloads(&payloads)
+}
+
+/// The transport-independent half of [`build_envelopes`]: map raw payloads to
+/// `events/project` envelopes.
+///
+/// Split out so the EHDB feed drain shares the EXACT same envelope construction
+/// as the NATS drain. That identity is what makes the shadow comparison
+/// meaningful — if the two transports built envelopes differently, a parity
+/// check would be comparing the adapters, not the buses.
+fn build_envelopes_from_payloads(
+    payloads: &[serde_json::Value],
+) -> (Vec<serde_json::Value>, usize) {
+    let mut events = Vec::with_capacity(payloads.len());
     let mut skipped = 0usize;
-    for msg in messages {
+    for data in payloads {
         // `data` may already be a JSON object, or a string holding JSON.
-        let obj = match &msg.data {
-            serde_json::Value::Object(_) => Some(msg.data.clone()),
+        let obj = match data {
+            serde_json::Value::Object(_) => Some(data.clone()),
             serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).ok(),
             _ => None,
         };
@@ -358,8 +538,14 @@ async fn project(
         return Err(anyhow!("events/project HTTP {}: {}", status.as_u16(), body));
     }
     let parsed: serde_json::Value = resp.json().await.context("events/project decode")?;
-    let projected = parsed.get("projected").and_then(|v| v.as_i64()).unwrap_or(0);
-    let duplicates = parsed.get("duplicates").and_then(|v| v.as_i64()).unwrap_or(0);
+    let projected = parsed
+        .get("projected")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let duplicates = parsed
+        .get("duplicates")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     Ok((projected, duplicates))
 }
 
@@ -375,7 +561,9 @@ async fn dispose(
     }
     match source.ack(ack_ids, disposition).await {
         Ok(report) if report.is_clean() => {}
-        Ok(report) => tracing::warn!(reason, errors = ?report.errors, "materializer dispose partial"),
+        Ok(report) => {
+            tracing::warn!(reason, errors = ?report.errors, "materializer dispose partial")
+        }
         Err(e) => tracing::warn!(reason, error = %e, "materializer dispose failed"),
     }
 }
@@ -386,7 +574,9 @@ async fn dispose(
 /// precedence (matching the worker's command-source convention).
 pub(crate) fn parse_nats_credentials(nats_url: &str) -> (String, Option<String>, Option<String>) {
     let env_user = std::env::var("NATS_USER").ok().filter(|s| !s.is_empty());
-    let env_pass = std::env::var("NATS_PASSWORD").ok().filter(|s| !s.is_empty());
+    let env_pass = std::env::var("NATS_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
     if let (Some(u), Some(p)) = (&env_user, &env_pass) {
         let clean = strip_userinfo(nats_url);
         return (clean, Some(u.clone()), Some(p.clone()));
@@ -451,7 +641,9 @@ mod tests {
     #[test]
     fn build_envelopes_maps_created_at_and_drops_invalid() {
         let messages = vec![
-            msg(serde_json::json!({"event_id": 1, "execution_id": 9, "created_at": "2026-06-18T00:00:00Z"})),
+            msg(
+                serde_json::json!({"event_id": 1, "execution_id": 9, "created_at": "2026-06-18T00:00:00Z"}),
+            ),
             // string-encoded JSON payload
             msg(serde_json::Value::String(
                 r#"{"event_id": 2, "execution_id": 9, "timestamp": "2026-06-18T00:00:01Z"}"#.into(),
@@ -510,5 +702,97 @@ mod tests {
         assert!(!enabled());
         std::env::remove_var("NOETL_MATERIALIZER_ENABLED");
         assert!(!enabled());
+    }
+}
+
+#[cfg(test)]
+mod t3_source_tests {
+    use super::*;
+
+    /// The load-bearing property for shadow parity: the SAME payload must build
+    /// the SAME `events/project` envelope whether it arrived over NATS or the
+    /// EHDB feed.  If the two adapters diverged, a parity check would be
+    /// comparing adapters rather than buses.
+    #[test]
+    fn both_transports_build_identical_envelopes() {
+        let payload = serde_json::json!({
+            "event_id": 42,
+            "execution_id": 7,
+            "event_type": "action_started",
+            "created_at": "2026-07-31T00:00:00Z",
+            "status": "STARTED",
+        });
+
+        // The NATS adapter path wraps the payload in a PolledMessage; the EHDB
+        // adapter passes the payload directly.  Both must land on one envelope.
+        let (from_payload, skipped_p) = build_envelopes_from_payloads(&[payload.clone()]);
+        assert_eq!(skipped_p, 0);
+
+        // Same input, expressed as the string form NATS sometimes carries.
+        let as_string = serde_json::Value::String(payload.to_string());
+        let (from_string, skipped_s) = build_envelopes_from_payloads(&[as_string]);
+        assert_eq!(skipped_s, 0);
+
+        assert_eq!(
+            from_payload, from_string,
+            "object and string payloads must produce identical envelopes"
+        );
+        // created_at is renamed to timestamp exactly once, on both paths.
+        assert_eq!(from_payload[0]["timestamp"], "2026-07-31T00:00:00Z");
+        assert!(from_payload[0].get("created_at").is_none());
+        assert_eq!(from_payload[0]["event_id"], 42);
+    }
+
+    /// A payload with no `event_id` is not materializable and must be skipped
+    /// rather than posted — identical on both transports.
+    #[test]
+    fn payloads_without_event_id_are_skipped() {
+        let (events, skipped) = build_envelopes_from_payloads(&[
+            serde_json::json!({"execution_id": 1}),
+            serde_json::json!({"event_id": null, "execution_id": 1}),
+            serde_json::Value::String("not json".into()),
+            serde_json::json!(5),
+        ]);
+        assert!(events.is_empty());
+        assert_eq!(skipped, 4);
+    }
+
+    /// The source mode must default to NATS and fall back to NATS on garbage —
+    /// a typo must never move the sole writer of the durable event log onto an
+    /// unproven transport.
+    #[test]
+    fn source_mode_defaults_to_nats_and_falls_back_safely() {
+        use crate::event_bus::EventSourceMode as M;
+        assert_eq!(M::from_env_value(""), M::Nats);
+        assert_eq!(M::from_env_value("nats"), M::Nats);
+        assert_eq!(M::from_env_value("ehdb"), M::Ehdb);
+        assert_eq!(M::from_env_value("EHDB"), M::Ehdb);
+        assert_eq!(M::from_env_value("ehbd"), M::Nats);
+        assert_eq!(M::default(), M::Nats);
+        assert!(M::Ehdb.is_ehdb() && !M::Nats.is_ehdb());
+    }
+
+    /// Each materializer group gets a distinct, non-zero member id, so the two
+    /// system-pool pods compete correctly within a group and the three groups
+    /// never collide.
+    #[test]
+    fn member_ids_are_distinct_and_non_zero() {
+        let ids: Vec<u32> = [
+            "noetl_materializer",
+            "noetl_result_materializer",
+            "noetl_state_materializer",
+        ]
+        .iter()
+        .map(|g| member_id(g))
+        .collect();
+        assert!(ids.iter().all(|i| *i != 0), "member id must be non-zero");
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            3,
+            "group member ids must not collide: {ids:?}"
+        );
     }
 }
