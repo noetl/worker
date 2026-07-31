@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.82.0](https://github.com/noetl/worker/compare/v5.81.3...v5.82.0) (2026-07-31)
+
+### Features
+
+* **command-bus:** serve the per-pool lag + resume facts from the writer /metrics ([#194](https://github.com/noetl/worker/issues/194)) ([ea8b74e](https://github.com/noetl/worker/commit/ea8b74e3df190b14d3e3cece7c3a797f42a998b9)), closes [noetl/ehdb#303](https://github.com/noetl/ehdb/issues/303) [#304](https://github.com/noetl/worker/issues/304) [noetl/ai-meta#210](https://github.com/noetl/ai-meta/issues/210) [noetl/ai-meta#210](https://github.com/noetl/ai-meta/issues/210) [noetl/ai-meta#208](https://github.com/noetl/ai-meta/issues/208)
+
 ## [5.81.3](https://github.com/noetl/worker/compare/v5.81.2...v5.81.3) (2026-07-30)
 
 ### Bug Fixes
