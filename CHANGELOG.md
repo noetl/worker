@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.86.0](https://github.com/noetl/worker/compare/v5.85.0...v5.86.0) (2026-07-31)
+
+### Features
+
+* **event-bus:** bind the events feed's SSE broadcast face ([ab1b261](https://github.com/noetl/worker/commit/ab1b261487d3927513ad0141c3c9b919608ec20c))
+
 ## [5.85.0](https://github.com/noetl/worker/compare/v5.84.0...v5.85.0) (2026-07-31)
 
 ### Features
