@@ -214,6 +214,14 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
     }
 
     if let Some(addr) = config.metrics_bind {
+        // Seed the reported subject label set from the existing log **before** the
+        // endpoint is up, so the very first scrape after a restart already carries
+        // a line for every pool this shard has ever routed to. Without it a
+        // freshly-restarted writer reports an empty subject set until each pool's
+        // next command arrives — and to KEDA a `valueLocation` that matches no
+        // line is a *scaler error*, not a backlog of 0 (noetl/ai-meta#194).
+        coordinator.seed_subjects().await;
+
         // The scaler provider is sync; publish the async lag into an atomic that a
         // background sampler refreshes.
         let gauge = Arc::new(AtomicU64::new(0));
@@ -221,26 +229,46 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
         // resumes from, so an operator watching a restart can see it advance
         // (noetl/ai-meta#208) instead of the hardcoded 0 reported before.
         let committed = Arc::new(AtomicU64::new(0));
+        // The per-pool split — the value the user pool's ScaledObject actually
+        // triggers on. Whole-shard lag mixes the pools that share this shard, so a
+        // stuck system-pool command would pin it high and hold the user pool at
+        // maxReplicaCount forever (noetl/ai-meta#194, noetl/ai-meta#210).
+        let subjects = Arc::new(std::sync::Mutex::new(Vec::<ehdb_feed::SubjectLag>::new()));
         let sampler = gauge.clone();
         let committed_sampler = committed.clone();
+        let subject_sampler = subjects.clone();
         let coord = coordinator.clone();
         tokio::spawn(async move {
             loop {
                 sampler.store(coord.lag().await, Ordering::Relaxed);
                 committed_sampler.store(coord.committed_cursor().await, Ordering::Relaxed);
+                let split = coord.subject_lags().await;
+                if let Ok(mut guard) = subject_sampler.lock() {
+                    *guard = split;
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
         let shard = config.shard;
         let read = gauge.clone();
-        tokio::spawn(ehdb_feed::scaler::bind_and_serve(addr, move || {
-            vec![ShardLag {
-                shard,
-                committed: committed.load(Ordering::Relaxed),
-                lag: read.load(Ordering::Relaxed),
-            }]
-        }));
-        tracing::info!(%addr, "EHDB command-bus /metrics lag endpoint up");
+        // Serve the lag snapshot **and** the resume facts from one endpoint: the
+        // autoscaler reads `ehdb_feed_subject_lag`, a restart runbook reads
+        // `ehdb_feed_shard_resume_replay_records`, and a writer that binds only one
+        // of the two drops the other silently (noetl/ai-meta#208 follow-up).
+        let resume_reports = coordinator.resume_report().into_iter().collect::<Vec<_>>();
+        tokio::spawn(ehdb_feed::bind_and_serve_snapshot_with_resume(
+            addr,
+            resume_reports,
+            move || ehdb_feed::LagSnapshot {
+                shards: vec![ShardLag {
+                    shard,
+                    committed: committed.load(Ordering::Relaxed),
+                    lag: read.load(Ordering::Relaxed),
+                }],
+                subjects: subjects.lock().map(|g| g.clone()).unwrap_or_default(),
+            },
+        ));
+        tracing::info!(%addr, "EHDB command-bus /metrics lag + resume endpoint up");
     }
 
     Ok(writer)
