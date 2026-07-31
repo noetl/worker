@@ -251,12 +251,13 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
         });
         let shard = config.shard;
         let read = gauge.clone();
-        // Serve the lag snapshot **and** the resume facts from one endpoint: the
-        // autoscaler reads `ehdb_feed_subject_lag`, a restart runbook reads
-        // `ehdb_feed_shard_resume_replay_records`, and a writer that binds only one
-        // of the two drops the other silently (noetl/ai-meta#208 follow-up).
+        // Serve the lag snapshot, the resume facts, **and** the append-integrity
+        // counters from one endpoint. Each answers a different question an
+        // operator asks about this bus, and a writer that binds only one of them
+        // drops the others silently (noetl/ai-meta#208 follow-up).
         let resume_reports = coordinator.resume_report().into_iter().collect::<Vec<_>>();
-        tokio::spawn(ehdb_feed::bind_and_serve_snapshot_with_resume(
+        let integrity_engine = writer.clone();
+        tokio::spawn(serve_writer_metrics(
             addr,
             resume_reports,
             move || ehdb_feed::LagSnapshot {
@@ -267,11 +268,101 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
                 }],
                 subjects: subjects.lock().map(|g| g.clone()).unwrap_or_default(),
             },
+            move || {
+                integrity_engine
+                    .engine()
+                    .lock()
+                    .ok()
+                    .map(|e| e.metrics().snapshot())
+            },
         ));
-        tracing::info!(%addr, "EHDB command-bus /metrics lag + resume endpoint up");
+        tracing::info!(%addr, "EHDB command-bus /metrics lag + resume + integrity endpoint up");
     }
 
     Ok(writer)
+}
+
+/// Render the writer's **append-integrity** counters (noetl/ai-meta#206).
+///
+/// `out_of_order_appends` is the detector for the noetl/ai-meta#203 loss class:
+/// the writer assigns each command's feed ordering key from its own
+/// `global_sequence`, and `L0Engine` counts any append whose key fails to advance
+/// past the previous one. A non-zero value means a command could be dropped from
+/// a subscriber's view — the exact failure that stalled 23 of 40 commands before
+/// #203 was fixed.
+///
+/// It was asserted in ehdb's tests from the start but never exposed on the
+/// writer, so **in production the invariant was unobservable** — you could only
+/// infer it after the fact from delivery accounting in `noetl.event`. That is not
+/// good enough for a bus with no NATS behind it: T5 removes the fallback, so this
+/// has to be a gauge a soak can watch, not a postmortem query.
+///
+/// `appends` rides along as the denominator — a rate of zero out-of-order appends
+/// is only meaningful next to how many appends actually happened.
+fn render_integrity(m: &ehdb_l0::metrics::L0MetricsSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP ehdb_l0_out_of_order_appends Appends whose assigned sort key did not advance — the noetl/ai-meta#203 delivery-loss detector. Must stay 0.\n",
+    );
+    out.push_str("# TYPE ehdb_l0_out_of_order_appends counter\n");
+    out.push_str(&format!(
+        "ehdb_l0_out_of_order_appends {}\n",
+        m.out_of_order_appends
+    ));
+    out.push_str("# HELP ehdb_l0_appends Total appends to this writer's log — the denominator for the counter above.\n");
+    out.push_str("# TYPE ehdb_l0_appends counter\n");
+    out.push_str(&format!("ehdb_l0_appends {}\n", m.appends));
+    out
+}
+
+/// The writer's `/metrics`: lag snapshot + resume facts + append integrity.
+///
+/// Composed here rather than in `ehdb-feed` because the integrity counters come
+/// off the **L0 engine**, not the feed's scaler surface, and because keeping the
+/// composition worker-side means adding a series does not require an ehdb
+/// revision bump (which would invalidate the image's dependency layer).
+///
+/// The lag + resume halves are rendered by ehdb's own public renderers, so their
+/// byte shape — which KEDA prefix-matches — stays owned by the crate that tests
+/// it.
+async fn serve_writer_metrics<L, I>(
+    addr: SocketAddr,
+    reports: Vec<ehdb_feed::ResumeReport>,
+    lag: L,
+    integrity: I,
+) -> std::io::Result<()>
+where
+    L: Fn() -> ehdb_feed::LagSnapshot + Send + Sync + 'static,
+    I: Fn() -> Option<ehdb_l0::metrics::L0MetricsSnapshot> + Send + Sync + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind(addr).await?;
+    let resume = Arc::new(ehdb_feed::render_resume(&reports));
+    let lag = Arc::new(lag);
+    let integrity = Arc::new(integrity);
+    loop {
+        let (mut sock, _peer) = listener.accept().await?;
+        let (lag, resume, integrity) = (lag.clone(), resume.clone(), integrity.clone());
+        tokio::spawn(async move {
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let mut body = ehdb_feed::render_snapshot(&lag());
+            body.push_str(&resume);
+            // Best-effort: a contended engine lock must not fail the scrape, or
+            // the autoscaler's lag series would vanish with it.
+            if let Some(m) = integrity() {
+                body.push_str(&render_integrity(&m));
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+    }
 }
 
 /// **Seal the command log and persist the cursor on SIGTERM** — the other half of
