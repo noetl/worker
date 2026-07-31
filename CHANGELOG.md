@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.83.0](https://github.com/noetl/worker/compare/v5.82.0...v5.83.0) (2026-07-31)
+
+### Features
+
+* **command-bus:** expose the append-integrity counters on the writer /metrics ([#206](https://github.com/noetl/worker/issues/206)) ([71c0bef](https://github.com/noetl/worker/commit/71c0bef886908395e747c652a76f8949b5ff1f2d)), closes [noetl/ai-meta#203](https://github.com/noetl/ai-meta/issues/203) [#203](https://github.com/noetl/worker/issues/203) [#203](https://github.com/noetl/worker/issues/203)
+
 ## [5.82.0](https://github.com/noetl/worker/compare/v5.81.3...v5.82.0) (2026-07-31)
 
 ### Features
