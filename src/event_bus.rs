@@ -658,3 +658,123 @@ async fn claim_loop(
         tokio::time::sleep(backoff).await;
     }
 }
+
+/// A uniform drain over either transport, so a materializer's loop does not
+/// care which bus it is on.
+///
+/// The three materializers had one NATS drain each; adding an EHDB path to all
+/// of them by copy-paste would have produced three near-identical loops that
+/// drift. This carries the difference — poll shape, ack token type — in one
+/// place, and each loop keeps its own *policy* (what it does with a batch,
+/// when it acks), which is what actually differs between them.
+#[allow(clippy::large_enum_variant)] // EhdbGroupSource is the common case and
+                                     // is constructed once per materializer; boxing it would add an indirection on
+                                     // every poll to save a few words on a long-lived value.
+pub enum MaterializerFeed {
+    Nats(Box<dyn noetl_tools::tools::source::SourceClient>),
+    Ehdb(EhdbGroupSource),
+}
+
+/// One drained batch: the payloads plus whatever this transport acks with.
+pub struct DrainedBatch {
+    pub payloads: Vec<serde_json::Value>,
+    nats_acks: Vec<String>,
+    ehdb_acks: Vec<u64>,
+}
+
+impl DrainedBatch {
+    pub fn len(&self) -> usize {
+        self.payloads.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.payloads.is_empty()
+    }
+}
+
+impl MaterializerFeed {
+    /// Open the feed selected by `mode`. `group` names both the JetStream
+    /// durable consumer and the EHDB named group — they are deliberately the
+    /// same string, so an operator reads one name in both worlds.
+    pub async fn open(
+        mode: EventSourceMode,
+        group: &str,
+        claim_addr: Option<&str>,
+        nats_source: impl FnOnce() -> Result<Box<dyn noetl_tools::tools::source::SourceClient>>,
+        batch: u32,
+    ) -> Result<Self> {
+        if mode.is_ehdb() {
+            let addr = claim_addr.ok_or_else(|| {
+                anyhow!("EHDB materializer source requires NOETL_EVENT_BUS_CLAIM_ADDR")
+            })?;
+            let member = group_member_id(group);
+            return Ok(Self::Ehdb(
+                EhdbGroupSource::connect(
+                    addr.to_string(),
+                    group.to_string(),
+                    ALL_EVENTS_FILTER.to_string(),
+                    member,
+                    (batch as usize).max(1),
+                )
+                .await?,
+            ));
+        }
+        Ok(Self::Nats(nats_source()?))
+    }
+
+    /// Drain up to `batch`, waiting at most `timeout` for the first record.
+    pub async fn poll(&self, batch: u32, timeout: Duration) -> Result<DrainedBatch> {
+        match self {
+            Self::Nats(source) => {
+                use noetl_tools::tools::source::{AckMode, PollOptions};
+                let opts = PollOptions::new(
+                    Some(batch),
+                    Some(timeout.as_millis() as u64),
+                    AckMode::Defer,
+                );
+                let outcome = source
+                    .poll(&opts)
+                    .await
+                    .map_err(|e| anyhow!("nats drain failed: {e}"))?;
+                Ok(DrainedBatch {
+                    payloads: outcome.messages.iter().map(|m| m.data.clone()).collect(),
+                    nats_acks: outcome.ack_ids,
+                    ehdb_acks: Vec::new(),
+                })
+            }
+            Self::Ehdb(source) => {
+                if source.is_finished() {
+                    return Err(anyhow!("events-feed claim task exited"));
+                }
+                let drained = source.poll(batch as usize, timeout).await;
+                Ok(DrainedBatch {
+                    payloads: drained.iter().map(|d| d.payload.clone()).collect(),
+                    nats_acks: Vec::new(),
+                    ehdb_acks: drained.iter().map(|d| d.sort_key).collect(),
+                })
+            }
+        }
+    }
+
+    /// Ack a drained batch. Returns how many were acked.
+    pub async fn ack(&self, batch: &DrainedBatch) -> usize {
+        match self {
+            Self::Nats(source) => {
+                use noetl_tools::tools::source::AckDisposition;
+                source
+                    .ack(&batch.nats_acks, AckDisposition::Ack)
+                    .await
+                    .map(|r| r.disposed)
+                    .unwrap_or(0)
+            }
+            Self::Ehdb(source) => source.ack(&batch.ehdb_acks).await.unwrap_or(0),
+        }
+    }
+}
+
+/// Stable non-zero member id for a group member.
+pub fn group_member_id(name: &str) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    (h.finish() as u32) | 1
+}

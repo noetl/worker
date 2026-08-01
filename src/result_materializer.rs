@@ -47,9 +47,8 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use noetl_tools::tools::source::{AckDisposition, AckMode, PollOptions};
-use noetl_tools::tools::{build_source, SubscriptionConfig};
 use noetl_tools::locator::{CellPlacement, ResultCoordinates, DEFAULT_SHARD_COUNT};
+use noetl_tools::tools::{build_source, SubscriptionConfig};
 use noetl_tools::ExecutionContext;
 
 use crate::client::ControlPlaneClient;
@@ -102,7 +101,8 @@ impl CellSeed {
     fn from_env() -> Self {
         Self {
             env: std::env::var("NOETL_RESULT_CELL_ENV").unwrap_or_else(|_| "dev".to_string()),
-            region: std::env::var("NOETL_RESULT_CELL_REGION").unwrap_or_else(|_| "local".to_string()),
+            region: std::env::var("NOETL_RESULT_CELL_REGION")
+                .unwrap_or_else(|_| "local".to_string()),
             cell: std::env::var("NOETL_RESULT_CELL").unwrap_or_else(|_| "local-0".to_string()),
             shard_count: env_u32("NOETL_RESULT_SHARD_COUNT", DEFAULT_SHARD_COUNT).max(1),
         }
@@ -203,7 +203,10 @@ impl ResultMaterializerConfig {
 }
 
 /// Spawn the result-materializer loop, returning its join handle.
-pub fn spawn(config: ResultMaterializerConfig, client: ControlPlaneClient) -> tokio::task::JoinHandle<()> {
+pub fn spawn(
+    config: ResultMaterializerConfig,
+    client: ControlPlaneClient,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run_loop(config, client).await {
             tracing::error!(error = %e, "result materializer loop exited with error");
@@ -213,8 +216,28 @@ pub fn spawn(config: ResultMaterializerConfig, client: ControlPlaneClient) -> to
 
 /// One drain → classify → (fetch → encode → object_put) → ack cycle, forever.
 async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) -> Result<()> {
-    let source = build_source(&config.source_config()?, &ExecutionContext::default())
-        .map_err(|e| anyhow!("result materializer build_source failed: {e}"))?;
+    // noetl/ai-meta#212 — drain whichever bus is selected. Same group name in
+    // both worlds, so an operator reads one name whether it is a JetStream
+    // durable consumer or an EHDB named group.
+    let source_mode = crate::event_bus::EventSourceMode::from_env_value(
+        &std::env::var("NOETL_RESULT_MATERIALIZER_SOURCE").unwrap_or_default(),
+    );
+    let claim_addr = std::env::var("NOETL_EVENT_BUS_CLAIM_ADDR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let cfg_for_source = config.source_config()?;
+    let source = crate::event_bus::MaterializerFeed::open(
+        source_mode,
+        &config.consumer,
+        claim_addr.as_deref(),
+        || {
+            build_source(&cfg_for_source, &ExecutionContext::default())
+                .map_err(|e| anyhow!("result materializer build_source failed: {e}"))
+        },
+        config.batch,
+    )
+    .await?;
 
     // Phase D (#104): when the tier is authoritative the materializer is the
     // authoritative writer; otherwise it is the Phase B shadow copy. The write
@@ -242,11 +265,16 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
     let producer_stage = crate::result_producer_stage::enabled();
 
     // Deferred ack: we ack the batch ourselves after best-effort shadow writes.
-    let opts = PollOptions::new(Some(config.batch), Some(config.timeout_ms), AckMode::Defer);
 
     loop {
         let cycle_start = Instant::now();
-        let outcome = match source.poll(&opts).await {
+        let outcome = match source
+            .poll(
+                config.batch,
+                std::time::Duration::from_millis(config.timeout_ms),
+            )
+            .await
+        {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(error = %e, "result materializer drain failed; backing off");
@@ -255,15 +283,15 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
             }
         };
 
-        let drained = outcome.messages.len();
+        let drained = outcome.len();
         if drained == 0 {
             tokio::time::sleep(config.idle_sleep).await;
             continue;
         }
 
         let mut tally = CycleTally::default();
-        for msg in &outcome.messages {
-            let row = match parse_row(&msg.data) {
+        for payload in &outcome.payloads {
+            let row = match parse_row(payload) {
                 Some(r) => r,
                 None => {
                     tally.skipped += 1;
@@ -278,10 +306,17 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
                     if config.dr_repair {
                         // Phase F: verify-and-repair instead of an unconditional
                         // write — rebuild only a missing/corrupt tier object.
-                        rederive_one(&client, &config.cell, &legacy_ref, &coords, &mut tally)
-                            .await;
+                        rederive_one(&client, &config.cell, &legacy_ref, &coords, &mut tally).await;
                     } else {
-                        write_shadow(&client, &config.cell, producer_stage, &legacy_ref, &coords, &mut tally).await;
+                        write_shadow(
+                            &client,
+                            &config.cell,
+                            producer_stage,
+                            &legacy_ref,
+                            &coords,
+                            &mut tally,
+                        )
+                        .await;
                     }
                 }
             }
@@ -290,10 +325,7 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
         // SHADOW: always ack — the result tier must never wedge its own consumer
         // nor (it being a separate consumer) the event-materialize path. Failed
         // writes are counted; idempotent object keys make any future re-run safe.
-        let report = source
-            .ack(&outcome.ack_ids, AckDisposition::Ack)
-            .await
-            .unwrap_or_default();
+        let acked = source.ack(&outcome).await;
 
         tracing::debug!(
             drained,
@@ -302,7 +334,7 @@ async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) 
             json = tally.json,
             skipped = tally.skipped,
             errors = tally.errors,
-            acked = report.disposed,
+            acked,
             "result materializer cycle"
         );
         crate::metrics::record_result_materializer_cycle(
@@ -353,10 +385,14 @@ async fn write_shadow(
         let date = crate::snowflake::date_partition(coords.execution_id);
         let placement = cell.placement_for(coords);
         let staged = matches!(
-            client.object_get(&coords.physical_key(&placement, &date, "feather")).await,
+            client
+                .object_get(&coords.physical_key(&placement, &date, "feather"))
+                .await,
             Ok(Some(_))
         ) || matches!(
-            client.object_get(&coords.physical_key(&placement, &date, "json")).await,
+            client
+                .object_get(&coords.physical_key(&placement, &date, "json"))
+                .await,
             Ok(Some(_))
         );
         if staged {
@@ -376,7 +412,11 @@ async fn write_shadow(
         Ok(Some(p)) => p,
         Ok(None) => {
             // GC'd / not yet durable — a benign skip for shadow, not an error.
-            tracing::debug!(execution_id = eid, result_ref = legacy_ref, "result payload not found; shadow skip");
+            tracing::debug!(
+                execution_id = eid,
+                result_ref = legacy_ref,
+                "result payload not found; shadow skip"
+            );
             tally.skipped += 1;
             tally.eligible -= 1;
             return;
@@ -474,7 +514,11 @@ async fn rederive_one(
         Ok(None) => {
             // No source → cannot re-derive. Distinct from a benign shadow skip:
             // under DR this means the object is unrecoverable from its source.
-            tracing::debug!(execution_id = eid, result_ref = legacy_ref, "DR: result source not found; cannot re-derive");
+            tracing::debug!(
+                execution_id = eid,
+                result_ref = legacy_ref,
+                "DR: result source not found; cannot re-derive"
+            );
             tally.eligible -= 1;
             crate::metrics::record_result_tier_dr(DrOutcome::SourceGone.label());
             return;
@@ -663,7 +707,12 @@ mod tests {
         // Keep-every (OQ1): attempt is in the URN, so two attempts of the same
         // (eid, step, frame, row) derive DISTINCT physical keys — never an
         // overwrite of a prior attempt.
-        let cell = CellSeed { env: "dev".into(), region: "local".into(), cell: "local-0".into(), shard_count: 256 };
+        let cell = CellSeed {
+            env: "dev".into(),
+            region: "local".into(),
+            cell: "local-0".into(),
+            shard_count: 256,
+        };
         let a1 = coords_from_uri("noetl://t/p/results/1/s/0/0/1").unwrap();
         let a2 = coords_from_uri("noetl://t/p/results/1/s/0/0/2").unwrap();
         let k1 = a1.physical_key(&cell.placement_for(&a1), "2026-06-22", "feather");
@@ -675,10 +724,17 @@ mod tests {
 
     #[test]
     fn physical_key_tier_extension_matches() {
-        let cell = CellSeed { env: "dev".into(), region: "local".into(), cell: "local-0".into(), shard_count: 256 };
+        let cell = CellSeed {
+            env: "dev".into(),
+            region: "local".into(),
+            cell: "local-0".into(),
+            shard_count: 256,
+        };
         let c = coords_from_uri("noetl://default/default/results/9/s/0/0/1").unwrap();
         let pl = cell.placement_for(&c);
-        assert!(c.physical_key(&pl, "2026-06-22", "feather").ends_with(".feather"));
+        assert!(c
+            .physical_key(&pl, "2026-06-22", "feather")
+            .ends_with(".feather"));
         assert!(c.physical_key(&pl, "2026-06-22", "json").ends_with(".json"));
         // Single-cell seed: env/region/cell come straight from config.
         let k = c.physical_key(&pl, "2026-06-22", "json");
@@ -795,7 +851,12 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn test_cell() -> CellSeed {
-        CellSeed { env: "dev".into(), region: "local".into(), cell: "local-0".into(), shard_count: 256 }
+        CellSeed {
+            env: "dev".into(),
+            region: "local".into(),
+            cell: "local-0".into(),
+            shard_count: 256,
+        }
     }
 
     /// When producer-staging is on and the tier object already exists (the
@@ -813,7 +874,10 @@ mod tests {
                 get(|| async {
                     (
                         axum::http::StatusCode::OK,
-                        [(axum::http::header::CONTENT_TYPE, crate::result_locator::FEATHER_MEDIA)],
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            crate::result_locator::FEATHER_MEDIA,
+                        )],
                         vec![1u8, 2, 3],
                     )
                 }),
@@ -835,13 +899,24 @@ mod tests {
         let client = ControlPlaneClient::new(&base);
         let coords = coords_from_uri("noetl://t/p/results/325/load/2/4/1").unwrap();
         let mut tally = CycleTally::default();
-        write_shadow(&client, &test_cell(), true, "noetl://execution/325/result/s/9001", &coords, &mut tally).await;
+        write_shadow(
+            &client,
+            &test_cell(),
+            true,
+            "noetl://execution/325/result/s/9001",
+            &coords,
+            &mut tally,
+        )
+        .await;
 
         assert_eq!(tally.skipped, 1, "already-staged object → skipped");
         assert_eq!(tally.eligible, 0, "skip decrements the eligible count");
         assert_eq!(tally.feather, 0, "no rewrite");
         assert_eq!(tally.json, 0);
-        assert!(!resolve_hit.load(Ordering::SeqCst), "must NOT read result_store for a producer-staged object");
+        assert!(
+            !resolve_hit.load(Ordering::SeqCst),
+            "must NOT read result_store for a producer-staged object"
+        );
     }
 
     /// Producer-staging on but the object is ABSENT (producer didn't stage, or it
@@ -856,11 +931,16 @@ mod tests {
 
         let app = Router::new()
             // object_get → 404 (NOT staged) for both feather + json probes.
-            .route("/api/internal/objects/{*key}", get(|| async { axum::http::StatusCode::NOT_FOUND })
-                .put(move |_: Bytes| {
+            .route(
+                "/api/internal/objects/{*key}",
+                get(|| async { axum::http::StatusCode::NOT_FOUND }).put(move |_: Bytes| {
                     let ph = Arc::clone(&ph);
-                    async move { ph.store(true, Ordering::SeqCst); axum::http::StatusCode::OK }
-                }))
+                    async move {
+                        ph.store(true, Ordering::SeqCst);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            )
             // resolve → the authoritative payload (tabular → Feather).
             .route(
                 "/api/result/resolve",
@@ -879,10 +959,24 @@ mod tests {
         let client = ControlPlaneClient::new(&base);
         let coords = coords_from_uri("noetl://t/p/results/325/load/2/4/1").unwrap();
         let mut tally = CycleTally::default();
-        write_shadow(&client, &test_cell(), true, "noetl://execution/325/result/s/9001", &coords, &mut tally).await;
+        write_shadow(
+            &client,
+            &test_cell(),
+            true,
+            "noetl://execution/325/result/s/9001",
+            &coords,
+            &mut tally,
+        )
+        .await;
 
-        assert!(resolve_hit.load(Ordering::SeqCst), "absent object → materializer fetches result_store (safety net)");
-        assert!(put_hit.load(Ordering::SeqCst), "absent object → materializer writes the tier");
+        assert!(
+            resolve_hit.load(Ordering::SeqCst),
+            "absent object → materializer fetches result_store (safety net)"
+        );
+        assert!(
+            put_hit.load(Ordering::SeqCst),
+            "absent object → materializer writes the tier"
+        );
         assert_eq!(tally.feather, 1, "wrote the Feather tier");
     }
 }
