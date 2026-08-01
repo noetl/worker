@@ -19,7 +19,7 @@ pub mod executor;
 pub mod materializer;
 pub mod metrics;
 pub mod metrics_server;
-pub mod nats;
+pub mod dispatch;
 /// WASM plug-in host for the system worker pool (noetl/ai-meta#105). Gated
 /// behind the `wasm-plugin` feature while it is an unwired skeleton.
 #[cfg(feature = "wasm-plugin")]

@@ -49,7 +49,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::client::ControlPlaneClient;
-use crate::nats::{claim_outcome, CommandNotification, NatsAckHandle, NatsCommandSource};
+use crate::dispatch::{claim_outcome, CommandNotification};
 
 /// Which transport carries commands (`NOETL_COMMAND_BUS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -586,20 +586,17 @@ impl CommandSource for EhdbCommandSource {
     }
 }
 
-/// The worker's active command source — NATS (default) or the EHDB bus. Keeps
-/// `Worker` non-generic while dispatching the trait + the NATS-only reconnect.
+/// The worker's command source. Only the EHDB bus remains (noetl/ai-meta#212);
+/// the enum is kept so `Worker` stays non-generic and a second transport can be
+/// added back without threading a type parameter through the pull loop.
 pub enum WorkerCommandSource {
-    // Both boxed so neither large source inflates the enum (large_enum_variant).
-    Nats(Box<NatsCommandSource>),
+    // Boxed so the source does not inflate the enum (large_enum_variant).
     Ehdb(Box<EhdbCommandSource>),
 }
 
 /// The ack mechanism for a claimed command (kept separate from the notification
 /// metadata so `Worker::process_commands` reads `handle.notification` uniformly).
 enum WorkerAckInner {
-    /// The NATS message handle (its `ack`/`nack` go through JetStream). Boxed:
-    /// the message dwarfs the EHDB sort key.
-    Nats(Box<NatsAckHandle>),
     /// The EHDB claim's global sort key (ack/nack go through the coordinator).
     Ehdb(u64),
 }
@@ -611,38 +608,12 @@ pub struct WorkerAckHandle {
     inner: WorkerAckInner,
 }
 
-impl WorkerCommandSource {
-    /// Reconnect the NATS subscriber in-process (noetl/ai-meta#163 self-heal).
-    /// A no-op for the EHDB source (its claim client redials on error).
-    pub fn replace_subscriber(&mut self, subscriber: crate::nats::NatsSubscriber) {
-        if let Self::Nats(s) = self {
-            s.replace_subscriber(subscriber);
-        }
-    }
-
-    /// The NATS subscriber, when this is the NATS source — `None` on the EHDB
-    /// bus (whose lag is exported by the writer `/metrics`, not a NATS consumer).
-    pub fn nats_subscriber(&self) -> Option<&crate::nats::NatsSubscriber> {
-        match self {
-            Self::Nats(s) => Some(s.subscriber()),
-            Self::Ehdb(_) => None,
-        }
-    }
-}
-
 #[async_trait]
 impl CommandSource for WorkerCommandSource {
     type AckHandle = WorkerAckHandle;
 
     async fn next(&mut self) -> Result<Option<Pulled<Self::AckHandle>>> {
         match self {
-            Self::Nats(s) => Ok(s.next().await?.map(|p| Pulled {
-                outcome: p.outcome,
-                ack: WorkerAckHandle {
-                    notification: p.ack.notification.clone(),
-                    inner: WorkerAckInner::Nats(Box::new(p.ack)),
-                },
-            })),
             Self::Ehdb(s) => Ok(s.next().await?.map(|p| Pulled {
                 outcome: p.outcome,
                 ack: WorkerAckHandle {
@@ -654,19 +625,15 @@ impl CommandSource for WorkerCommandSource {
     }
 
     async fn ack(&self, handle: Self::AckHandle) -> Result<()> {
-        match (self, handle.inner) {
-            (Self::Nats(s), WorkerAckInner::Nats(h)) => s.ack(*h).await,
-            (Self::Ehdb(s), WorkerAckInner::Ehdb(sort_key)) => s.ack_sort_key(sort_key).await,
-            _ => Err(anyhow!("command-source / ack-handle mismatch")),
-        }
+        let Self::Ehdb(s) = self;
+        let WorkerAckInner::Ehdb(sort_key) = handle.inner;
+        s.ack_sort_key(sort_key).await
     }
 
     async fn nack(&self, handle: Self::AckHandle) -> Result<()> {
-        match (self, handle.inner) {
-            (Self::Nats(s), WorkerAckInner::Nats(h)) => s.nack(*h).await,
-            (Self::Ehdb(s), WorkerAckInner::Ehdb(sort_key)) => s.nack_sort_key(sort_key).await,
-            _ => Err(anyhow!("command-source / ack-handle mismatch")),
-        }
+        let Self::Ehdb(s) = self;
+        let WorkerAckInner::Ehdb(sort_key) = handle.inner;
+        s.nack_sort_key(sort_key).await
     }
 }
 

@@ -86,25 +86,18 @@ impl WorkerConfig {
         let nats_subject =
             std::env::var("NATS_SUBJECT").unwrap_or_else(|_| "noetl.commands".to_string());
 
-        // noetl/ai-meta#218 — this value drives **EHDB** pool routing, not just
-        // the (now retired) NATS consumer filter.  `NOETL_FEED_FILTER_SUBJECT` is
-        // the EHDB-native name; `NATS_FILTER_SUBJECT` is read as a fallback for
-        // one release so a mid-roll cluster keeps working.
+        // The routing filter subject — the input EHDB pool routing is derived
+        // from (noetl/ai-meta#218). The legacy `NATS_FILTER_SUBJECT` fallback is
+        // gone now that every manifest carries the EHDB-native name.
         //
-        // Getting this wrong is not a config nit: with neither set, the pool
-        // segment falls back to `shared`, so a **system-pool** worker silently
-        // subscribes to `commands.shared.>`, never claims an orchestrate command,
-        // and every execution stalls at RUNNING with nothing in the logs. That is
-        // exactly what unsetting `NATS_FILTER_SUBJECT` did during the NATS
-        // teardown.
+        // With neither this nor `NATS_SUBJECT` set the value degrades to the
+        // bare subject, from which `segment_from_filter` yields `None` — and the
+        // worker then refuses to start rather than silently joining `shared`,
+        // which is what made unsetting the old name stall every execution with
+        // nothing in the logs.
         let nats_filter_subject = std::env::var("NOETL_FEED_FILTER_SUBJECT")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                std::env::var("NATS_FILTER_SUBJECT")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            })
             .unwrap_or_else(|| nats_subject.clone());
 
         let heartbeat_secs: u64 = std::env::var("WORKER_HEARTBEAT_INTERVAL")
@@ -195,9 +188,8 @@ mod t218_filter_rename_tests {
     /// The precedence and the failure mode are the whole point of this rename, so
     /// pin them with a pure function rather than mutating process env (other
     /// tests run in parallel in the same process).
-    fn resolve(new: Option<&str>, legacy: Option<&str>, subject: &str) -> String {
+    fn resolve(new: Option<&str>, _legacy: Option<&str>, subject: &str) -> String {
         new.filter(|s| !s.trim().is_empty())
-            .or(legacy.filter(|s| !s.trim().is_empty()))
             .map(str::to_string)
             .unwrap_or_else(|| subject.to_string())
     }
@@ -214,27 +206,27 @@ mod t218_filter_rename_tests {
         );
     }
 
+    /// The legacy name is NO LONGER honoured — every manifest carries the
+    /// EHDB-native one, and keeping a second spelling alive is how the
+    /// misnaming persisted in the first place.
     #[test]
-    fn legacy_name_still_works_for_one_release() {
-        assert_eq!(
-            resolve(None, Some("noetl.commands.system.>"), "noetl.commands"),
-            "noetl.commands.system.>"
-        );
+    fn the_legacy_name_is_no_longer_honoured() {
+        assert_eq!(resolve(None, None, "noetl.commands"), "noetl.commands");
     }
 
     #[test]
     fn blank_values_do_not_shadow_the_fallback() {
-        // An empty env var must not win — that is how a mid-roll manifest with
-        // the key present but unset would have collapsed the pool.
-        assert_eq!(
-            resolve(
-                Some("  "),
-                Some("noetl.commands.system.>"),
-                "noetl.commands"
-            ),
-            "noetl.commands.system.>"
-        );
+        // A blank value must not count as "set". It degrades to the bare
+        // subject, from which no pool resolves — so the worker refuses to start
+        // rather than silently joining `shared`. A manifest with the key present
+        // but empty is exactly how this would otherwise recur.
+        assert_eq!(resolve(Some("  "), None, "noetl.commands"), "noetl.commands");
         assert_eq!(resolve(Some(""), None, "noetl.commands"), "noetl.commands");
+        assert_eq!(
+            crate::dispatch::segment_from_filter("noetl.commands"),
+            None,
+            "the degraded value must not resolve a pool"
+        );
     }
 
     /// With neither set the value degrades to the bare subject, from which
@@ -244,7 +236,7 @@ mod t218_filter_rename_tests {
     fn neither_set_yields_an_unresolvable_pool() {
         let v = resolve(None, None, "noetl.commands");
         assert_eq!(v, "noetl.commands");
-        assert_eq!(crate::nats::segment_from_filter(&v), None);
+        assert_eq!(crate::dispatch::segment_from_filter(&v), None);
     }
 
     #[test]
@@ -255,12 +247,15 @@ mod t218_filter_rename_tests {
             ("noetl.commands.cmdbus.>", "cmdbus"),
         ] {
             assert_eq!(
-                crate::nats::segment_from_filter(filter).as_deref(),
+                crate::dispatch::segment_from_filter(filter).as_deref(),
                 Some(pool),
                 "{filter} must resolve to {pool}"
             );
         }
         // A wildcard segment is NOT a pool.
-        assert_eq!(crate::nats::segment_from_filter("noetl.commands.>"), None);
+        assert_eq!(
+            crate::dispatch::segment_from_filter("noetl.commands.>"),
+            None
+        );
     }
 }
