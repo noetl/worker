@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.89.0](https://github.com/noetl/worker/compare/v5.88.0...v5.89.0) (2026-08-01)
+
+### Features
+
+* **state-builder:** drain the off-server WAL off the EHDB events feed ([9e77bbd](https://github.com/noetl/worker/commit/9e77bbd98cbf154e6ef88d5300d06907da079646)), closes [#119](https://github.com/noetl/worker/issues/119) [noetl/ai-meta#166](https://github.com/noetl/ai-meta/issues/166)
+
 ## [5.88.0](https://github.com/noetl/worker/compare/v5.87.0...v5.88.0) (2026-08-01)
 
 ### Features
