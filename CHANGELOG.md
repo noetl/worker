@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.91.2](https://github.com/noetl/worker/compare/v5.91.1...v5.91.2) (2026-08-01)
+
+### Bug Fixes
+
+* **config:** require NOETL_FEED_FILTER_SUBJECT instead of defaulting to shared ([61ba7de](https://github.com/noetl/worker/commit/61ba7de5145b4e15e1b5a9e7a317fc28e5a7a053)), closes [noetl/ai-meta#218](https://github.com/noetl/ai-meta/issues/218)
+
 ## [5.91.1](https://github.com/noetl/worker/compare/v5.91.0...v5.91.1) (2026-08-01)
 
 ### Bug Fixes
