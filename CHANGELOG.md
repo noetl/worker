@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.90.0](https://github.com/noetl/worker/compare/v5.89.0...v5.90.0) (2026-08-01)
+
+### Features
+
+* **config:** NOETL_FEED_FILTER_SUBJECT — the EHDB-native pool-routing name ([c363c3e](https://github.com/noetl/worker/commit/c363c3e801ca4b3f754261d3413eace7194b9f11))
+
 ## [5.89.0](https://github.com/noetl/worker/compare/v5.88.0...v5.89.0) (2026-08-01)
 
 ### Features
