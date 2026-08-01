@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.88.0](https://github.com/noetl/worker/compare/v5.87.0...v5.88.0) (2026-08-01)
+
+### Features
+
+* **materializer:** drain the result + state materializers off EHDB too ([2469b91](https://github.com/noetl/worker/commit/2469b91104f0109f17e2b2d44f9aba7b08bbec69))
+
 ## [5.87.0](https://github.com/noetl/worker/compare/v5.86.0...v5.87.0) (2026-08-01)
 
 ### Features
