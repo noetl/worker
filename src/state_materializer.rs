@@ -360,15 +360,22 @@ struct CycleTally {
 
 /// The drain → project → (encode → object_put) → ack cycle, forever.
 async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -> Result<()> {
-    // Self-ensure the durable consumer before the source's `get_consumer` runs.
-    ensure_consumer(&config).await?;
-
     // noetl/ai-meta#212 — drain whichever bus is selected. Same group name in
     // both worlds, so an operator reads one name whether it is a JetStream
     // durable consumer or an EHDB named group.
     let source_mode = crate::event_bus::EventSourceMode::from_env_value(
         &std::env::var("NOETL_STATE_MATERIALIZER_SOURCE").unwrap_or_default(),
     );
+
+    // Self-ensure the durable consumer — a JetStream-only concern.  On EHDB the
+    // named group is created lazily by the coordinator on first claim, and there
+    // is no NATS to connect to at all: calling this in EHDB mode made the whole
+    // loop exit with "state materializer NATS connect" and the materializer
+    // never started, silently, while its feed group sat at a flat cursor
+    // (noetl/ai-meta#217).
+    if !source_mode.is_ehdb() {
+        ensure_consumer(&config).await?;
+    }
     let claim_addr = std::env::var("NOETL_EVENT_BUS_CLAIM_ADDR")
         .ok()
         .map(|v| v.trim().to_string())
@@ -1038,5 +1045,31 @@ mod tests {
         let built = StateMaterializerConfig::from_env(&cfg).expect("enabled → built");
         assert_eq!(built.consumer, STATE_MATERIALIZER_CONSUMER);
         std::env::remove_var("NOETL_STATE_SHARD_WRITE");
+    }
+}
+
+#[cfg(test)]
+mod t217_ehdb_ensure_tests {
+    /// `ensure_consumer` is a JetStream-only step.  Running it under the EHDB
+    /// source made the whole loop exit with "state materializer NATS connect"
+    /// and the materializer never started — silently, while its feed group sat
+    /// at a flat cursor.  Pin the gate so the skip cannot regress.
+    #[test]
+    fn ensure_consumer_is_skipped_only_for_ehdb() {
+        use crate::event_bus::EventSourceMode as M;
+        assert!(
+            M::from_env_value("ehdb").is_ehdb(),
+            "ehdb must skip ensure_consumer"
+        );
+        assert!(
+            !M::from_env_value("nats").is_ehdb(),
+            "nats must still ensure it"
+        );
+        assert!(
+            !M::from_env_value("").is_ehdb(),
+            "the default must still ensure it"
+        );
+        // A typo must not accidentally skip the JetStream setup either.
+        assert!(!M::from_env_value("ehbd").is_ehdb());
     }
 }
