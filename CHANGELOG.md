@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.91.1](https://github.com/noetl/worker/compare/v5.91.0...v5.91.1) (2026-08-01)
+
+### Bug Fixes
+
+* **state-materializer:** do not ensure a JetStream consumer on the EHDB source ([cc8e7e7](https://github.com/noetl/worker/commit/cc8e7e72bdc817b1983a86a4b6192ea822144904))
+
 ## [5.91.0](https://github.com/noetl/worker/compare/v5.90.0...v5.91.0) (2026-08-01)
 
 ### Features
