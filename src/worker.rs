@@ -17,7 +17,6 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::client::ControlPlaneClient;
 use crate::config::WorkerConfig;
 use crate::executor::CommandExecutor;
-use crate::nats::{NatsCommandSource, NatsSubscriber};
 use crate::snowflake::SnowflakeGen;
 
 /// Worker pool that processes commands.
@@ -82,66 +81,50 @@ impl Worker {
         // the shard coordinator (competing across replicas) and creates NO NATS
         // subscriber (supports the NATS-deleted end state); every other mode is
         // the unchanged NATS durable pull consumer.
-        let source = if cmdbus.mode.consumes_ehdb() {
-            let claim_addr = cmdbus.claim_addr.ok_or_else(|| {
-                anyhow::anyhow!("NOETL_COMMAND_BUS=ehdb requires NOETL_COMMAND_BUS_CLAIM_ADDR")
+        // The EHDB bus is the only command transport (noetl/ai-meta#212). A
+        // mode that selects anything else is a hard error rather than a silent
+        // fall-through, because a worker that starts without a command source
+        // looks healthy and claims nothing.
+        if !cmdbus.mode.consumes_ehdb() {
+            anyhow::bail!(
+                "NOETL_COMMAND_BUS={:?} selects a transport that no longer exists — set \
+                 NOETL_COMMAND_BUS=ehdb",
+                cmdbus.mode
+            );
+        }
+        let claim_addr = cmdbus.claim_addr.ok_or_else(|| {
+            anyhow::anyhow!("NOETL_COMMAND_BUS=ehdb requires NOETL_COMMAND_BUS_CLAIM_ADDR")
+        })?;
+        // This worker's subject subscription — its pool segment over any shard
+        // the coordinator serves: `commands.<pool>.>`. The coordinator only ever
+        // hands it a matching command, so a system command never reaches a
+        // shared worker (noetl/ai-meta#194).
+        //
+        // noetl/ai-meta#218 — a worker that cannot resolve its pool must NOT
+        // quietly default to `shared`. Doing so put system-pool workers on
+        // `commands.shared.>`, where they never claim an orchestrate command and
+        // every execution stalls with nothing in the logs.
+        let pool =
+            crate::dispatch::segment_from_filter(&config.nats_filter_subject).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot resolve the command pool from filter subject {:?} — set \
+                     NOETL_FEED_FILTER_SUBJECT (e.g. `noetl.commands.system.>` or \
+                     `noetl.commands.shared.>`). Refusing to default to `{}`, because a \
+                     worker on the wrong pool stalls executions silently (noetl/ai-meta#218)",
+                    config.nats_filter_subject,
+                    ehdb_feed::DEFAULT_POOL,
+                )
             })?;
-            // This worker's subject subscription — its pool segment (the same
-            // `NATS_FILTER_SUBJECT` derivation the NATS path uses, default
-            // `shared`) over any shard the coordinator serves: `commands.<pool>.>`.
-            // The coordinator only ever hands it a matching command, so a system
-            // command never reaches a shared worker (noetl/ai-meta#194 #1) — the
-            // general subject mechanism, of which pool + shard are dimensions.
-            // noetl/ai-meta#218 — a worker that cannot resolve its pool must NOT
-            // quietly default to `shared`.  Doing so put system-pool workers on
-            // `commands.shared.>`, where they never claim an orchestrate command
-            // and every execution stalls with nothing in the logs.  A worker that
-            // refuses to start is strictly better than one that silently joins
-            // the wrong pool, so an unresolvable filter is a hard error unless the
-            // operator names the default explicitly.
-            let pool =
-                crate::nats::segment_from_filter(&config.nats_filter_subject).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "cannot resolve the command pool from filter subject {:?} — set \
-                         NOETL_FEED_FILTER_SUBJECT (e.g. `noetl.commands.system.>` or \
-                         `noetl.commands.shared.>`). Refusing to default to `{}`, because a \
-                         worker on the wrong pool stalls executions silently (noetl/ai-meta#218)",
-                        config.nats_filter_subject,
-                        ehdb_feed::DEFAULT_POOL,
-                    )
-                })?;
-            let filter = format!("commands.{pool}.>");
-            tracing::info!(%claim_addr, %filter, pool = %pool, "worker consuming commands from the EHDB bus");
-            crate::command_bus::WorkerCommandSource::Ehdb(Box::new(
-                crate::command_bus::EhdbCommandSource::new(
-                    claim_addr,
-                    filter,
-                    config.worker_id.clone(),
-                    client.clone(),
-                ),
-            ))
-        } else {
-            // Default NATS path.  `nats_subject` is the base for the stream
-            // config; `nats_filter_subject` is the consumer-side filter.
-            let subscriber = NatsSubscriber::connect(
-                &config.nats_url,
-                &config.nats_stream,
-                &config.nats_consumer,
-                &config.nats_subject,
-                &config.nats_filter_subject,
-            )
-            .await?;
-            // noetl/ai-meta#166 Phase 4: execution-affinity routing policy (env).
-            // Behaviour-neutral by default (single-shard, flag off).
-            let affinity = crate::sharding::AffinityConfig::from_env();
-            crate::command_bus::WorkerCommandSource::Nats(Box::new(NatsCommandSource::new(
-                subscriber,
-                client.clone(),
+        let filter = format!("commands.{pool}.>");
+        tracing::info!(%claim_addr, %filter, pool = %pool, "worker consuming commands from the EHDB bus");
+        let source = crate::command_bus::WorkerCommandSource::Ehdb(Box::new(
+            crate::command_bus::EhdbCommandSource::new(
+                claim_addr,
+                filter,
                 config.worker_id.clone(),
-                crate::nats::segment_from_filter(&config.nats_filter_subject),
-                affinity,
-            )))
-        };
+                client.clone(),
+            ),
+        ));
         let source = Arc::new(Mutex::new(source));
 
         // One snowflake generator per worker process — populates the
@@ -233,55 +216,11 @@ impl Worker {
         // `agents/rules/observability.md` Principle 2.
         let metrics_handle = crate::metrics_server::spawn(&self.config.metrics_bind).await?;
 
-        // Start NATS consumer-lag poller.  Periodically queries
-        // JetStream consumer info and updates the
-        // `noetl_worker_nats_consumer_pending` +
-        // `noetl_worker_nats_consumer_ack_pending` gauges so KEDA
-        // and the dashboard can read queue depth without scraping
-        // logs.  Cadence is `WORKER_NATS_LAG_POLL_INTERVAL` env (s),
-        // default 5s.  Per `observability.md` Principle 2.
-        let lag_poll_interval = crate::nats::lag_poller::poll_interval_from_env();
-        // When this worker runs the materializer (system pool, under
-        // NOETL_MATERIALIZER_ENABLED), the lag poller also tracks the
-        // noetl_events/noetl_materializer consumer backlog — the
-        // earliest signal that events are piling up un-materialized
-        // under the PUBLISH_ONLY gate (noetl/ai-meta#103 flip
-        // guardrail).  An independent task is what catches a stalled
-        // or dead materializer loop, which can't report its own lag.
-        let materializer_lag_target = if crate::materializer::enabled() {
-            let stream = std::env::var("NOETL_MATERIALIZER_STREAM")
-                .unwrap_or_else(|_| crate::materializer::EVENT_STREAM.to_string());
-            let consumer = std::env::var("NOETL_MATERIALIZER_CONSUMER")
-                .unwrap_or_else(|_| crate::materializer::MATERIALIZER_CONSUMER.to_string());
-            Some((stream, consumer))
-        } else {
-            None
-        };
-        // When this worker runs the state materializer (system pool, under
-        // NOETL_STATE_SHARD_WRITE), the lag poller also tracks the
-        // noetl_state_materializer consumer backlog — the writer-lag health
-        // signal (noetl/ai-meta#166 Phase 2 §9 writer-lag risk).
-        let state_materializer_lag_target = if crate::state_materializer::enabled() {
-            let stream = std::env::var("NOETL_STATE_SHARD_STREAM")
-                .unwrap_or_else(|_| crate::materializer::EVENT_STREAM.to_string());
-            let consumer = std::env::var("NOETL_STATE_SHARD_CONSUMER").unwrap_or_else(|_| {
-                crate::state_materializer::STATE_MATERIALIZER_CONSUMER.to_string()
-            });
-            Some((stream, consumer))
-        } else {
-            None
-        };
-        let lag_handle = crate::nats::lag_poller::spawn(
-            self.source.clone(),
-            lag_poll_interval,
-            materializer_lag_target.clone(),
-            state_materializer_lag_target.clone(),
-        );
-        tracing::info!(
-            interval_secs = lag_poll_interval.as_secs(),
-            materializer_lag = ?materializer_lag_target,
-            "NATS consumer-lag poller started"
-        );
+        // The NATS consumer-lag poller is gone with NATS (noetl/ai-meta#212).
+        // It had already become a no-op on the EHDB bus — `nats_subscriber()`
+        // returned `None`, so it woke every 5s to do nothing. Lag now comes from
+        // the writer's own `/metrics` (`ehdb_feed_shard_lag`,
+        // `ehdb_events_group_lag`), which is where KEDA reads it.
 
         // Start the CQRS event materializer (noetl/ai-meta#103) when enabled
         // (system worker pool only).  It drains noetl_events with deferred ack
@@ -412,10 +351,9 @@ impl Worker {
         // Process commands
         let result = self.process_commands().await;
 
-        // Stop heartbeat + metrics server + lag poller + materializer
+        // Stop heartbeat + metrics server + materializer
         heartbeat_handle.abort();
         metrics_handle.abort();
-        lag_handle.abort();
         if let Some(h) = materializer_handle {
             h.abort();
         }
@@ -753,12 +691,16 @@ impl Worker {
     ) {
         match classify_loop_error(err) {
             LoopAction::Reconnect => {
+                // The EHDB claim client redials itself on error, so there is no
+                // subscriber to rebuild here — back off and let it reconnect.
+                crate::metrics::record_command_loop_reconnect(op);
                 tracing::warn!(
                     op,
                     error = %err,
-                    "command-loop NATS disconnect; rebuilding subscriber in-process (noetl/ai-meta#163)"
+                    "command-loop disconnect; the EHDB claim client will redial"
                 );
-                self.reconnect_command_source(op, backoff).await;
+                tokio::time::sleep(*backoff).await;
+                *backoff = (*backoff * 2).min(crate::state_builder::REBUILD_BACKOFF_MAX);
             }
             LoopAction::Backoff => {
                 // Not a disconnect (e.g. a transient control-plane claim blip).
@@ -769,50 +711,6 @@ impl Worker {
                     "command-loop transient error (non-disconnect); backing off then retrying"
                 );
                 tokio::time::sleep(crate::state_builder::REBUILD_BACKOFF_MIN).await;
-            }
-        }
-    }
-
-    /// Rebuild the NATS command subscriber in-process with bounded exponential
-    /// backoff and swap it into the source (noetl/ai-meta#163).  Loops until a
-    /// fresh connect + durable-consumer bind succeeds — a permanently-down NATS
-    /// keeps the loop retrying (as the pre-#163 `exit(1)` + crash-restart also
-    /// couldn't make progress against a down NATS, but without the full-WAL-replay
-    /// outage on every attempt).  The rebuilt subscriber re-binds the SAME durable
-    /// consumer by name, so its server-side cursor is unchanged — no command is
-    /// replayed or skipped across the reconnect.
-    async fn reconnect_command_source(&self, reason: &str, backoff: &mut std::time::Duration) {
-        crate::metrics::record_command_loop_reconnect(reason);
-        loop {
-            match NatsSubscriber::connect(
-                &self.config.nats_url,
-                &self.config.nats_stream,
-                &self.config.nats_consumer,
-                &self.config.nats_subject,
-                &self.config.nats_filter_subject,
-            )
-            .await
-            {
-                Ok(subscriber) => {
-                    self.source.lock().await.replace_subscriber(subscriber);
-                    tracing::info!(
-                        reason,
-                        "command-loop NATS reconnected in-process; resuming consume (noetl/ai-meta#163)"
-                    );
-                    *backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
-                    return;
-                }
-                Err(e) => {
-                    crate::metrics::record_command_loop_reconnect("connect_error");
-                    tracing::warn!(
-                        error = %e,
-                        backoff_ms = backoff.as_millis() as u64,
-                        reason,
-                        "command-loop NATS reconnect failed; backing off then retrying (noetl/ai-meta#163)"
-                    );
-                    tokio::time::sleep(*backoff).await;
-                    *backoff = (*backoff * 2).min(crate::state_builder::REBUILD_BACKOFF_MAX);
-                }
             }
         }
     }
