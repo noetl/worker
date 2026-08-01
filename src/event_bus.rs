@@ -26,6 +26,7 @@
 //! | group claims | `NOETL_EVENT_BUS_CLAIM_BIND` (9104) | the three materializers |
 //! | SSE | `NOETL_EVENT_BUS_SSE_BIND` (9105) | the gateway's live SPA feed |
 //! | `/metrics` | `NOETL_EVENT_BUS_METRICS_BIND` (9106) | per-group lag + resume facts |
+//! | KV | `NOETL_EVENT_BUS_KV_BIND` (9107) | the gateway's session + request stores |
 //!
 //! The command bus's 9100/9101/9102 are untouched, as is every type it uses.
 
@@ -58,6 +59,14 @@ pub const ALL_EVENTS_FILTER: &str = "events.>";
 /// How often the host persists each group's committed cursor, on top of the
 /// per-ack persist. Bounds the replay window if the pod dies between acks.
 const DEFAULT_CURSOR_PERSIST_SECS: u64 = 5;
+
+/// The logical KV buckets the gateway uses — the two NATS KV buckets this face
+/// replaces. Named so the sweeper knows what to reclaim.
+pub const KV_BUCKETS: [&str; 2] = ["sessions", "requests"];
+
+/// How often lapsed KV entries are reclaimed. Generous, because it is a space
+/// concern only: an expired key is already invisible to readers.
+const KV_SWEEP: Duration = Duration::from_secs(60);
 
 /// Which transport a materializer drains (`NOETL_*_SOURCE`).
 ///
@@ -103,6 +112,14 @@ pub struct EventBusConfig {
     /// maps straight onto the feed cursor.  Serving it through a claim group
     /// would make SPA clients compete for events, which is exactly wrong.
     pub sse_bind: Option<SocketAddr>,
+    /// `NOETL_EVENT_BUS_KV_BIND` — the networked KV face that replaces the two
+    /// NATS KV buckets (`sessions`, `requests`).  Its own D4 engine in its own
+    /// directory: KV is a random-access fold, the events log is an append-only
+    /// stream, and putting session churn in front of the event log's fsync would
+    /// repeat the coupling the separate events engine exists to avoid.
+    pub kv_bind: Option<SocketAddr>,
+    /// `NOETL_EVENT_BUS_KV_DIR` — the KV store's directory.
+    pub kv_dir: Option<PathBuf>,
     pub metrics_bind: Option<SocketAddr>,
     pub ack_wait: Duration,
     pub cursor_persist: Duration,
@@ -138,6 +155,10 @@ impl EventBusConfig {
             ingest_bind: env_addr("NOETL_EVENT_BUS_INGEST_BIND"),
             claim_bind: env_addr("NOETL_EVENT_BUS_CLAIM_BIND"),
             sse_bind: env_addr("NOETL_EVENT_BUS_SSE_BIND"),
+            kv_bind: env_addr("NOETL_EVENT_BUS_KV_BIND"),
+            kv_dir: std::env::var("NOETL_EVENT_BUS_KV_DIR")
+                .ok()
+                .map(PathBuf::from),
             metrics_bind: env_addr("NOETL_EVENT_BUS_METRICS_BIND"),
             ack_wait: Duration::from_secs(env_u32("NOETL_EVENT_BUS_ACK_WAIT_SECS", 30) as u64),
             cursor_persist: Duration::from_secs(env_u32(
@@ -218,6 +239,30 @@ pub async fn spawn_event_writer_host(
     }
 
     spawn_graceful_event_shutdown(coordinator.clone(), config.shard);
+
+    // The networked KV face — the NATS-KV replacement for the gateway's
+    // `sessions` + `requests` buckets (noetl/ai-meta#214, #215).  Its own D4
+    // engine in its own directory: KV is a random-access fold while the events
+    // log is an append-only stream, and putting session churn in front of the
+    // events log's fsync would repeat exactly the coupling the separate events
+    // engine exists to avoid.
+    if let Some(addr) = config.kv_bind {
+        let kv_dir = config
+            .kv_dir
+            .clone()
+            .ok_or_else(|| anyhow!("NOETL_EVENT_BUS_KV_BIND requires NOETL_EVENT_BUS_KV_DIR"))?;
+        std::fs::create_dir_all(&kv_dir)?;
+        let kv_substrate: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&kv_dir)?);
+        let store = ehdb_l0::KvStore::open(ehdb_l0::KvStore::config(&kv_dir), kv_substrate)?;
+        let kv = Arc::new(ehdb_feed::KvCoordinator::new(store));
+        // Reclaim lapsed entries; correctness already comes from the read-side
+        // TTL filter, so this only bounds the log's growth.
+        kv.clone()
+            .spawn_sweeper(KV_BUCKETS.iter().map(|s| s.to_string()).collect(), KV_SWEEP);
+        let listener = TcpListener::bind(addr).await?;
+        tokio::spawn(ehdb_feed::serve_kv(listener, kv));
+        tracing::info!(%addr, dir = %kv_dir.display(), "EHDB KV face up");
+    }
 
     if let Some(addr) = config.metrics_bind {
         tokio::spawn(serve_event_metrics(addr, coordinator.clone()));
@@ -338,6 +383,8 @@ mod tests {
             ingest_bind: None,
             claim_bind: None,
             sse_bind: None,
+            kv_bind: None,
+            kv_dir: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::from_secs(DEFAULT_CURSOR_PERSIST_SECS),
@@ -360,6 +407,8 @@ mod tests {
             ingest_bind: None,
             claim_bind: None,
             sse_bind: None,
+            kv_bind: None,
+            kv_dir: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::ZERO,
@@ -386,6 +435,8 @@ mod tests {
             ingest_bind: None,
             claim_bind: None,
             sse_bind: None,
+            kv_bind: None,
+            kv_dir: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::ZERO,
