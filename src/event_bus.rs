@@ -247,6 +247,7 @@ pub async fn spawn_event_writer_host(
     }
 
     spawn_graceful_event_shutdown(coordinator.clone(), config.shard);
+    tokio::spawn(watch_cursor_errors(coordinator.clone()));
 
     // The networked KV face — the NATS-KV replacement for the gateway's
     // `sessions` + `requests` buckets (noetl/ai-meta#214, #215).  Its own D4
@@ -318,6 +319,39 @@ async fn render_event_metrics(coordinator: &GroupCoordinator<D1EventLog>) -> Str
         coordinator.cursor_errors()
     ));
     out
+}
+
+/// Log any new cursor-persist failure the coordinator has recorded.
+///
+/// `ehdb-feed` carries no logging dependency, so it keeps the last failure and
+/// the host emits it. Without this the counter was a number with no way to learn
+/// why (noetl/ai-meta#216). Logged only when the count moves, so a persistent
+/// fault does not spam — the counter carries the rate, the log carries the
+/// reason.
+async fn watch_cursor_errors(coordinator: Arc<GroupCoordinator<D1EventLog>>) {
+    let mut seen = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let now = coordinator.cursor_errors();
+        if now > seen {
+            match coordinator.last_cursor_error() {
+                Some((group, error)) => tracing::warn!(
+                    group,
+                    %error,
+                    failures = now,
+                    new = now - seen,
+                    "EHDB events-feed cursor persist failed — group progress is not \
+                     durable, so a writer restart will replay from an older cursor \
+                     (records are re-delivered, never lost)"
+                ),
+                None => tracing::warn!(
+                    failures = now,
+                    "EHDB events-feed cursor persist failed (no detail recorded)"
+                ),
+            }
+            seen = now;
+        }
+    }
 }
 
 async fn serve_event_metrics(
