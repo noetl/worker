@@ -52,7 +52,6 @@ use anyhow::{anyhow, Context, Result};
 use async_nats::jetstream::{self, consumer::pull::Config as PullConfig, consumer::AckPolicy};
 use async_nats::ConnectOptions;
 use noetl_tools::locator::CellPlacement;
-use noetl_tools::tools::source::{AckDisposition, AckMode, PollOptions};
 use noetl_tools::tools::{build_source, SubscriptionConfig};
 use noetl_tools::ExecutionContext;
 
@@ -141,7 +140,8 @@ impl CellSeed {
     pub fn from_env() -> Self {
         Self {
             env: std::env::var("NOETL_RESULT_CELL_ENV").unwrap_or_else(|_| "dev".to_string()),
-            region: std::env::var("NOETL_RESULT_CELL_REGION").unwrap_or_else(|_| "local".to_string()),
+            region: std::env::var("NOETL_RESULT_CELL_REGION")
+                .unwrap_or_else(|_| "local".to_string()),
             cell: std::env::var("NOETL_RESULT_CELL").unwrap_or_else(|_| "local-0".to_string()),
             shard_count: env_u32("NOETL_RESULT_SHARD_COUNT", 256).max(1),
         }
@@ -151,7 +151,12 @@ impl CellSeed {
     /// stable shard hash (== the execution's result-byte folder), home it on the
     /// one configured cell.
     pub fn placement_for(&self, coords: &StateCoordinates) -> CellPlacement {
-        CellPlacement::new(&self.env, &self.region, &self.cell, coords.shard_key(self.shard_count))
+        CellPlacement::new(
+            &self.env,
+            &self.region,
+            &self.cell,
+            coords.shard_key(self.shard_count),
+        )
     }
 }
 
@@ -186,16 +191,29 @@ impl StateMaterializerConfig {
             nats_url,
             nats_user,
             nats_password,
-            stream: std::env::var("NOETL_STATE_SHARD_STREAM").unwrap_or_else(|_| EVENT_STREAM.to_string()),
+            stream: std::env::var("NOETL_STATE_SHARD_STREAM")
+                .unwrap_or_else(|_| EVENT_STREAM.to_string()),
             consumer: std::env::var("NOETL_STATE_SHARD_CONSUMER")
                 .unwrap_or_else(|_| STATE_MATERIALIZER_CONSUMER.to_string()),
             batch: env_u32("NOETL_STATE_SHARD_BATCH", DEFAULT_BATCH).clamp(1, 1000),
             timeout_ms: env_u64("NOETL_STATE_SHARD_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
-            idle_sleep: Duration::from_millis(env_u64("NOETL_STATE_SHARD_IDLE_SLEEP_MS", DEFAULT_IDLE_SLEEP_MS)),
-            error_backoff: Duration::from_millis(env_u64("NOETL_STATE_SHARD_ERROR_BACKOFF_MS", DEFAULT_ERROR_BACKOFF_MS)),
-            extracted_budget: env_u64("NOETL_STATE_SHARD_EXTRACTED_BUDGET", DEFAULT_EXTRACTED_BUDGET as u64) as usize,
+            idle_sleep: Duration::from_millis(env_u64(
+                "NOETL_STATE_SHARD_IDLE_SLEEP_MS",
+                DEFAULT_IDLE_SLEEP_MS,
+            )),
+            error_backoff: Duration::from_millis(env_u64(
+                "NOETL_STATE_SHARD_ERROR_BACKOFF_MS",
+                DEFAULT_ERROR_BACKOFF_MS,
+            )),
+            extracted_budget: env_u64(
+                "NOETL_STATE_SHARD_EXTRACTED_BUDGET",
+                DEFAULT_EXTRACTED_BUDGET as u64,
+            ) as usize,
             max_open: env_u64("NOETL_STATE_SHARD_MAX_OPEN", DEFAULT_MAX_OPEN as u64) as usize,
-            open_ttl: Duration::from_secs(env_u64("NOETL_STATE_SHARD_OPEN_TTL_SECS", DEFAULT_OPEN_TTL_SECS)),
+            open_ttl: Duration::from_secs(env_u64(
+                "NOETL_STATE_SHARD_OPEN_TTL_SECS",
+                DEFAULT_OPEN_TTL_SECS,
+            )),
             open_min_interval: Duration::from_secs(env_u64(
                 "NOETL_STATE_SHARD_OPEN_MIN_INTERVAL_SECS",
                 DEFAULT_OPEN_MIN_INTERVAL_SECS,
@@ -257,7 +275,10 @@ async fn ensure_consumer(config: &StateMaterializerConfig) -> Result<()> {
 }
 
 /// Spawn the state-materializer loop, returning its join handle.
-pub fn spawn(config: StateMaterializerConfig, client: ControlPlaneClient) -> tokio::task::JoinHandle<()> {
+pub fn spawn(
+    config: StateMaterializerConfig,
+    client: ControlPlaneClient,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run_loop(config, client).await {
             tracing::error!(error = %e, "state materializer loop exited with error");
@@ -317,7 +338,11 @@ struct OpenShard {
 
 impl OpenShard {
     fn coords(&self, execution_id: i64) -> StateCoordinates {
-        StateCoordinates::new(self.tenant.as_deref(), self.project.as_deref(), execution_id)
+        StateCoordinates::new(
+            self.tenant.as_deref(),
+            self.project.as_deref(),
+            execution_id,
+        )
     }
 }
 
@@ -338,8 +363,28 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
     // Self-ensure the durable consumer before the source's `get_consumer` runs.
     ensure_consumer(&config).await?;
 
-    let source = build_source(&config.source_config()?, &ExecutionContext::default())
-        .map_err(|e| anyhow!("state materializer build_source failed: {e}"))?;
+    // noetl/ai-meta#212 — drain whichever bus is selected. Same group name in
+    // both worlds, so an operator reads one name whether it is a JetStream
+    // durable consumer or an EHDB named group.
+    let source_mode = crate::event_bus::EventSourceMode::from_env_value(
+        &std::env::var("NOETL_STATE_MATERIALIZER_SOURCE").unwrap_or_default(),
+    );
+    let claim_addr = std::env::var("NOETL_EVENT_BUS_CLAIM_ADDR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let cfg_for_source = config.source_config()?;
+    let source = crate::event_bus::MaterializerFeed::open(
+        source_mode,
+        &config.consumer,
+        claim_addr.as_deref(),
+        || {
+            build_source(&cfg_for_source, &ExecutionContext::default())
+                .map_err(|e| anyhow!("state materializer build_source failed: {e}"))
+        },
+        config.batch,
+    )
+    .await?;
 
     tracing::info!(
         stream = %config.stream,
@@ -351,7 +396,6 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
     );
 
     // Deferred ack: we ack the batch ourselves after best-effort shadow writes.
-    let opts = PollOptions::new(Some(config.batch), Some(config.timeout_ms), AckMode::Defer);
 
     // Per-execution open shards, accumulated across cycles. Bounded by terminal
     // eviction + idle sweep + the max-open cap.
@@ -359,7 +403,13 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
 
     loop {
         let cycle_start = Instant::now();
-        let outcome = match source.poll(&opts).await {
+        let outcome = match source
+            .poll(
+                config.batch,
+                std::time::Duration::from_millis(config.timeout_ms),
+            )
+            .await
+        {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(error = %e, "state materializer drain failed; backing off");
@@ -368,7 +418,7 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
             }
         };
 
-        let drained = outcome.messages.len();
+        let drained = outcome.len();
         if drained == 0 {
             // Idle: sweep abandoned open shards so a wedged execution can't pin a
             // shard forever, then sleep.
@@ -377,15 +427,18 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
             continue;
         }
 
-        let mut tally = CycleTally { drained: drained as u64, ..Default::default() };
+        let mut tally = CycleTally {
+            drained: drained as u64,
+            ..Default::default()
+        };
         // Executions that received new events this cycle (write their shards once
         // at cycle end) and those that sealed (write sealed, then evict).
         let mut touched: Vec<i64> = Vec::new();
         let mut sealed: Vec<i64> = Vec::new();
         let now = Instant::now();
 
-        for msg in &outcome.messages {
-            let Some(row) = parse_row(&msg.data) else {
+        for payload in &outcome.payloads {
+            let Some(row) = parse_row(payload) else {
                 tally.skipped += 1;
                 continue;
             };
@@ -393,7 +446,13 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
                 tally.skipped += 1;
                 continue;
             };
-            let Projected { execution_id, row: slim, tenant, project, is_terminal } = p;
+            let Projected {
+                execution_id,
+                row: slim,
+                tenant,
+                project,
+                is_terminal,
+            } = p;
             tally.rows += 1;
             let shard = open.entry(execution_id).or_insert_with(|| OpenShard {
                 tenant: None,
@@ -433,13 +492,24 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
             }
             let due = open
                 .get(eid)
-                .map(|s| s.last_open_write.is_none_or(|t| now.duration_since(t) >= config.open_min_interval))
+                .map(|s| {
+                    s.last_open_write
+                        .is_none_or(|t| now.duration_since(t) >= config.open_min_interval)
+                })
                 .unwrap_or(false);
             if !due {
                 continue;
             }
             if let Some(shard) = open.get(eid) {
-                write_shard(&client, &config.cell, *eid, shard, ShardSeal::Open, &mut tally).await;
+                write_shard(
+                    &client,
+                    &config.cell,
+                    *eid,
+                    shard,
+                    ShardSeal::Open,
+                    &mut tally,
+                )
+                .await;
                 if let Some(s) = open.get_mut(eid) {
                     s.last_open_write = Some(now);
                 }
@@ -448,7 +518,15 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
         // Seal + evict terminal executions.
         for eid in &sealed {
             if let Some(shard) = open.get(eid) {
-                write_shard(&client, &config.cell, *eid, shard, ShardSeal::Sealed, &mut tally).await;
+                write_shard(
+                    &client,
+                    &config.cell,
+                    *eid,
+                    shard,
+                    ShardSeal::Sealed,
+                    &mut tally,
+                )
+                .await;
                 tally.sealed += 1;
             }
             open.remove(eid);
@@ -461,10 +539,7 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
         // SHADOW: always ack — the state tier must never wedge its own consumer
         // nor perturb the event-materialize path. Failed writes are counted;
         // deterministic keys make any redelivery a safe overwrite.
-        let report = source
-            .ack(&outcome.ack_ids, AckDisposition::Ack)
-            .await
-            .unwrap_or_default();
+        let acked = source.ack(&outcome).await;
 
         crate::metrics::set_state_materializer_open_shards(open.len() as i64);
         crate::metrics::record_state_materializer_cycle(
@@ -486,7 +561,7 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
             skipped = tally.skipped,
             errors = tally.errors,
             open = open.len(),
-            acked = report.disposed,
+            acked,
             "state materializer cycle"
         );
     }
@@ -505,7 +580,9 @@ async fn write_shard(
 ) {
     let coords = shard.coords(execution_id);
     let tabular = encode_slim_chain(shard.rows.values());
-    let Some(bytes) = noetl_tools::arrow_codec::try_encode_tabular_json(&tabular).map(|enc| enc.bytes) else {
+    let Some(bytes) =
+        noetl_tools::arrow_codec::try_encode_tabular_json(&tabular).map(|enc| enc.bytes)
+    else {
         // Empty / unencodable (never expected — a shard always has ≥1 row).
         tally.skipped += 1;
         return;
@@ -613,9 +690,19 @@ fn project_event(row: &serde_json::Value, extracted_budget: usize) -> Option<Pro
     let event_id = obj.get("event_id").and_then(|v| v.as_i64())?;
     let execution_id = obj.get("execution_id").and_then(|v| v.as_i64())?;
     let prev_event_id = obj.get("prev_event_id").and_then(|v| v.as_i64());
-    let event_type = obj.get("event_type").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let node_name = obj.get("node_name").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let status = obj.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let event_type = obj
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let node_name = obj
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let status = obj
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let is_terminal = TERMINAL_EVENT_TYPES.contains(&event_type.as_str());
 
     // The #104 result reference (`kind: "result_ref"`) carries the canonical URN
@@ -641,8 +728,8 @@ fn project_event(row: &serde_json::Value, extracted_budget: usize) -> Option<Pro
     // is the slim projection PLUS `prev_event_id` (the chain link the reader needs
     // in-band; the index strips it back out on apply).  Compact JSON (no
     // whitespace) so the stored bytes are stable across writer runs.
-    let payload = serde_json::to_string(&crate::state_builder::shard_chain_payload(row))
-        .unwrap_or_default();
+    let payload =
+        serde_json::to_string(&crate::state_builder::shard_chain_payload(row)).unwrap_or_default();
 
     Some(Projected {
         execution_id,
@@ -700,7 +787,12 @@ mod tests {
     use super::*;
 
     /// A worker `command.completed` event carrying an over-budget result ref.
-    fn event_with_ref(event_id: i64, prev: Option<i64>, etype: &str, uri: &str) -> serde_json::Value {
+    fn event_with_ref(
+        event_id: i64,
+        prev: Option<i64>,
+        etype: &str,
+        uri: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "event_id": event_id,
             "execution_id": 325,
@@ -717,16 +809,29 @@ mod tests {
 
     #[test]
     fn project_extracts_slim_row_and_tenant_from_uri() {
-        let ev = event_with_ref(2, Some(1), "command.completed", "noetl://muno/travel/results/325/load/0/0/1");
-        let Projected { execution_id: eid, row, tenant, project, is_terminal: terminal } =
-            project_event(&ev, 4096).unwrap();
+        let ev = event_with_ref(
+            2,
+            Some(1),
+            "command.completed",
+            "noetl://muno/travel/results/325/load/0/0/1",
+        );
+        let Projected {
+            execution_id: eid,
+            row,
+            tenant,
+            project,
+            is_terminal: terminal,
+        } = project_event(&ev, 4096).unwrap();
         assert_eq!(eid, 325);
         assert_eq!(row.event_id, 2);
         assert_eq!(row.prev_event_id, Some(1));
         assert_eq!(row.event_type, "command.completed");
         assert_eq!(row.node_name.as_deref(), Some("load_offers"));
         assert_eq!(row.status.as_deref(), Some("completed"));
-        assert_eq!(row.result_ref.as_deref(), Some("noetl://muno/travel/results/325/load/0/0/1"));
+        assert_eq!(
+            row.result_ref.as_deref(),
+            Some("noetl://muno/travel/results/325/load/0/0/1")
+        );
         assert_eq!(row.extracted.as_deref(), Some("{\"rows\":4}"));
         // tenant/project recovered from the URN → co-locates with result bytes.
         assert_eq!(tenant.as_deref(), Some("muno"));
@@ -740,8 +845,13 @@ mod tests {
             "event_id": 1, "execution_id": 325, "prev_event_id": null,
             "event_type": "playbook_started", "node_name": "start", "status": "running"
         });
-        let Projected { execution_id: eid, row, tenant, project, is_terminal: terminal } =
-            project_event(&ev, 4096).unwrap();
+        let Projected {
+            execution_id: eid,
+            row,
+            tenant,
+            project,
+            is_terminal: terminal,
+        } = project_event(&ev, 4096).unwrap();
         assert_eq!(eid, 325);
         assert_eq!(row.prev_event_id, None);
         assert_eq!(row.result_ref, None);
@@ -785,11 +895,30 @@ mod tests {
         // The slim chain encodes to a non-empty Feather batch whose rows carry the
         // result_ref URN — the shadow-shard correctness proof.
         let rows = [
-            SlimRow { event_id: 1, prev_event_id: None, event_type: "playbook_started".into(), node_name: Some("start".into()), status: Some("running".into()), result_ref: None, extracted: None, payload: "{\"event_id\":1,\"event_type\":\"playbook_started\"}".into() },
-            SlimRow { event_id: 2, prev_event_id: Some(1), event_type: "command.completed".into(), node_name: Some("load".into()), status: Some("completed".into()), result_ref: Some("noetl://muno/travel/results/325/load/0/0/1".into()), extracted: Some("{\"rows\":4}".into()), payload: "{\"event_id\":2,\"event_type\":\"command.completed\"}".into() },
+            SlimRow {
+                event_id: 1,
+                prev_event_id: None,
+                event_type: "playbook_started".into(),
+                node_name: Some("start".into()),
+                status: Some("running".into()),
+                result_ref: None,
+                extracted: None,
+                payload: "{\"event_id\":1,\"event_type\":\"playbook_started\"}".into(),
+            },
+            SlimRow {
+                event_id: 2,
+                prev_event_id: Some(1),
+                event_type: "command.completed".into(),
+                node_name: Some("load".into()),
+                status: Some("completed".into()),
+                result_ref: Some("noetl://muno/travel/results/325/load/0/0/1".into()),
+                extracted: Some("{\"rows\":4}".into()),
+                payload: "{\"event_id\":2,\"event_type\":\"command.completed\"}".into(),
+            },
         ];
         let tabular = encode_slim_chain(rows.iter());
-        let enc = noetl_tools::arrow_codec::try_encode_tabular_json(&tabular).expect("slim chain → Feather");
+        let enc = noetl_tools::arrow_codec::try_encode_tabular_json(&tabular)
+            .expect("slim chain → Feather");
         assert!(!enc.bytes.is_empty());
         assert_eq!(enc.row_count, 2);
         // Round-trips back through the decoder with the result_ref + payload columns.
@@ -815,11 +944,16 @@ mod tests {
         let mut open: HashMap<i64, OpenShard> = HashMap::new();
         let base = Instant::now();
         for i in 0..10i64 {
-            open.insert(i, OpenShard {
-                tenant: None, project: None, rows: BTreeMap::new(),
-                last_activity: base + Duration::from_millis(i as u64),
-                last_open_write: None,
-            });
+            open.insert(
+                i,
+                OpenShard {
+                    tenant: None,
+                    project: None,
+                    rows: BTreeMap::new(),
+                    last_activity: base + Duration::from_millis(i as u64),
+                    last_open_write: None,
+                },
+            );
         }
         enforce_max_open(&mut open, 4);
         assert_eq!(open.len(), 4);
@@ -834,9 +968,27 @@ mod tests {
         let mut open: HashMap<i64, OpenShard> = HashMap::new();
         let now = Instant::now();
         // Stale: last activity 2h ago.
-        open.insert(1, OpenShard { tenant: None, project: None, rows: BTreeMap::new(), last_activity: now - Duration::from_secs(7200), last_open_write: None });
+        open.insert(
+            1,
+            OpenShard {
+                tenant: None,
+                project: None,
+                rows: BTreeMap::new(),
+                last_activity: now - Duration::from_secs(7200),
+                last_open_write: None,
+            },
+        );
         // Fresh: just now.
-        open.insert(2, OpenShard { tenant: None, project: None, rows: BTreeMap::new(), last_activity: now, last_open_write: None });
+        open.insert(
+            2,
+            OpenShard {
+                tenant: None,
+                project: None,
+                rows: BTreeMap::new(),
+                last_activity: now,
+                last_open_write: None,
+            },
+        );
         let swept = sweep_idle(&mut open, Duration::from_secs(3600), now);
         assert_eq!(swept, 1);
         assert!(!open.contains_key(&1));
@@ -852,8 +1004,14 @@ mod tests {
         let interval = Duration::from_secs(30);
         let due = |last: Option<Instant>| last.is_none_or(|t| now.duration_since(t) >= interval);
         assert!(due(None), "first open write is always due");
-        assert!(!due(Some(now - Duration::from_secs(5))), "5s after a write → throttled");
-        assert!(due(Some(now - Duration::from_secs(31))), "31s after a write → due again");
+        assert!(
+            !due(Some(now - Duration::from_secs(5))),
+            "5s after a write → throttled"
+        );
+        assert!(
+            due(Some(now - Duration::from_secs(31))),
+            "31s after a write → due again"
+        );
     }
 
     #[test]
