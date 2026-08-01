@@ -92,10 +92,26 @@ impl Worker {
             // The coordinator only ever hands it a matching command, so a system
             // command never reaches a shared worker (noetl/ai-meta#194 #1) — the
             // general subject mechanism, of which pool + shard are dimensions.
-            let pool = crate::nats::segment_from_filter(&config.nats_filter_subject)
-                .unwrap_or_else(|| ehdb_feed::DEFAULT_POOL.to_string());
+            // noetl/ai-meta#218 — a worker that cannot resolve its pool must NOT
+            // quietly default to `shared`.  Doing so put system-pool workers on
+            // `commands.shared.>`, where they never claim an orchestrate command
+            // and every execution stalls with nothing in the logs.  A worker that
+            // refuses to start is strictly better than one that silently joins
+            // the wrong pool, so an unresolvable filter is a hard error unless the
+            // operator names the default explicitly.
+            let pool =
+                crate::nats::segment_from_filter(&config.nats_filter_subject).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot resolve the command pool from filter subject {:?} — set \
+                         NOETL_FEED_FILTER_SUBJECT (e.g. `noetl.commands.system.>` or \
+                         `noetl.commands.shared.>`). Refusing to default to `{}`, because a \
+                         worker on the wrong pool stalls executions silently (noetl/ai-meta#218)",
+                        config.nats_filter_subject,
+                        ehdb_feed::DEFAULT_POOL,
+                    )
+                })?;
             let filter = format!("commands.{pool}.>");
-            tracing::info!(%claim_addr, %filter, "worker consuming commands from the EHDB bus");
+            tracing::info!(%claim_addr, %filter, pool = %pool, "worker consuming commands from the EHDB bus");
             crate::command_bus::WorkerCommandSource::Ehdb(Box::new(
                 crate::command_bus::EhdbCommandSource::new(
                     claim_addr,
@@ -373,7 +389,11 @@ impl Worker {
         // default worker is byte-identical. This slice writes nothing to any
         // store — it classifies the resident set and records candidate metrics.
         let autosink_handle = crate::autosink::AutoSinkConfig::from_env().map(|cfg| {
-            crate::autosink::spawn(cfg, self.config.worker_id.clone(), self.state_builder_index.clone())
+            crate::autosink::spawn(
+                cfg,
+                self.config.worker_id.clone(),
+                self.state_builder_index.clone(),
+            )
         });
 
         // Dedicated external Flight SQL data-plane endpoint (noetl/ai-meta#184).
