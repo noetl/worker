@@ -39,6 +39,10 @@ pub struct WorkerConfig {
     /// behaviour, no change).  PR-4 sets this to
     /// `noetl.commands.shared.>` via the Rust worker's deployment
     /// env so the Rust pool only sees shared-segment commands.
+    /// The routing filter subject.  Sourced from `NOETL_FEED_FILTER_SUBJECT`
+    /// (falling back to the legacy `NATS_FILTER_SUBJECT` for one release).
+    /// Despite the field name it is the **EHDB** pool-routing input — see
+    /// [`WorkerConfig::from_env`] and noetl/ai-meta#218.
     pub nats_filter_subject: String,
 
     /// Heartbeat interval.
@@ -82,9 +86,25 @@ impl WorkerConfig {
         let nats_subject =
             std::env::var("NATS_SUBJECT").unwrap_or_else(|_| "noetl.commands".to_string());
 
-        let nats_filter_subject = std::env::var("NATS_FILTER_SUBJECT")
+        // noetl/ai-meta#218 — this value drives **EHDB** pool routing, not just
+        // the (now retired) NATS consumer filter.  `NOETL_FEED_FILTER_SUBJECT` is
+        // the EHDB-native name; `NATS_FILTER_SUBJECT` is read as a fallback for
+        // one release so a mid-roll cluster keeps working.
+        //
+        // Getting this wrong is not a config nit: with neither set, the pool
+        // segment falls back to `shared`, so a **system-pool** worker silently
+        // subscribes to `commands.shared.>`, never claims an orchestrate command,
+        // and every execution stalls at RUNNING with nothing in the logs. That is
+        // exactly what unsetting `NATS_FILTER_SUBJECT` did during the NATS
+        // teardown.
+        let nats_filter_subject = std::env::var("NOETL_FEED_FILTER_SUBJECT")
             .ok()
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("NATS_FILTER_SUBJECT")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or_else(|| nats_subject.clone());
 
         let heartbeat_secs: u64 = std::env::var("WORKER_HEARTBEAT_INTERVAL")
@@ -167,5 +187,80 @@ mod tests {
         let config = WorkerConfig::default();
         assert_eq!(config.nats_subject, "noetl.commands");
         assert_eq!(config.nats_filter_subject, config.nats_subject);
+    }
+}
+
+#[cfg(test)]
+mod t218_filter_rename_tests {
+    /// The precedence and the failure mode are the whole point of this rename, so
+    /// pin them with a pure function rather than mutating process env (other
+    /// tests run in parallel in the same process).
+    fn resolve(new: Option<&str>, legacy: Option<&str>, subject: &str) -> String {
+        new.filter(|s| !s.trim().is_empty())
+            .or(legacy.filter(|s| !s.trim().is_empty()))
+            .map(str::to_string)
+            .unwrap_or_else(|| subject.to_string())
+    }
+
+    #[test]
+    fn new_name_wins_over_the_legacy_one() {
+        assert_eq!(
+            resolve(
+                Some("noetl.commands.system.>"),
+                Some("noetl.commands.shared.>"),
+                "noetl.commands"
+            ),
+            "noetl.commands.system.>"
+        );
+    }
+
+    #[test]
+    fn legacy_name_still_works_for_one_release() {
+        assert_eq!(
+            resolve(None, Some("noetl.commands.system.>"), "noetl.commands"),
+            "noetl.commands.system.>"
+        );
+    }
+
+    #[test]
+    fn blank_values_do_not_shadow_the_fallback() {
+        // An empty env var must not win — that is how a mid-roll manifest with
+        // the key present but unset would have collapsed the pool.
+        assert_eq!(
+            resolve(
+                Some("  "),
+                Some("noetl.commands.system.>"),
+                "noetl.commands"
+            ),
+            "noetl.commands.system.>"
+        );
+        assert_eq!(resolve(Some(""), None, "noetl.commands"), "noetl.commands");
+    }
+
+    /// With neither set the value degrades to the bare subject, from which
+    /// `segment_from_filter` yields None — which the worker now treats as a hard
+    /// error instead of silently joining `shared` (noetl/ai-meta#218).
+    #[test]
+    fn neither_set_yields_an_unresolvable_pool() {
+        let v = resolve(None, None, "noetl.commands");
+        assert_eq!(v, "noetl.commands");
+        assert_eq!(crate::nats::segment_from_filter(&v), None);
+    }
+
+    #[test]
+    fn real_pool_filters_resolve_to_their_segment() {
+        for (filter, pool) in [
+            ("noetl.commands.system.>", "system"),
+            ("noetl.commands.shared.>", "shared"),
+            ("noetl.commands.cmdbus.>", "cmdbus"),
+        ] {
+            assert_eq!(
+                crate::nats::segment_from_filter(filter).as_deref(),
+                Some(pool),
+                "{filter} must resolve to {pool}"
+            );
+        }
+        // A wildcard segment is NOT a pool.
+        assert_eq!(crate::nats::segment_from_filter("noetl.commands.>"), None);
     }
 }
