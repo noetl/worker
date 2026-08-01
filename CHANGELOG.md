@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.91.0](https://github.com/noetl/worker/compare/v5.90.0...v5.91.0) (2026-08-01)
+
+### Features
+
+* **event-bus:** log the cursor-persist failures the feed records ([8419d0f](https://github.com/noetl/worker/commit/8419d0f7549a34632fe15c54f0205ae54f2a6d0b)), closes [noetl/ai-meta#216](https://github.com/noetl/ai-meta/issues/216)
+
 ## [5.90.0](https://github.com/noetl/worker/compare/v5.89.0...v5.90.0) (2026-08-01)
 
 ### Features
