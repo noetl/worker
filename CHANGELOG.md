@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.87.0](https://github.com/noetl/worker/compare/v5.86.0...v5.87.0) (2026-08-01)
+
+### Features
+
+* **event-bus:** host the networked KV face for the gateway's stores ([d6021bd](https://github.com/noetl/worker/commit/d6021bd7c2e68026f5362cc2adb3f1127aabe748))
+
 ## [5.86.0](https://github.com/noetl/worker/compare/v5.85.0...v5.86.0) (2026-07-31)
 
 ### Features
