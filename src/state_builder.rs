@@ -48,7 +48,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_nats::jetstream::{
     self,
     consumer::{pull::Config as PullConfig, AckPolicy, DeliverPolicy},
@@ -105,9 +105,7 @@ fn approx_json_bytes(v: &serde_json::Value) -> usize {
         serde_json::Value::Bool(_) => 5,
         serde_json::Value::Number(_) => 8,
         serde_json::Value::String(s) => s.len() + 2,
-        serde_json::Value::Array(a) => {
-            2 + a.len() + a.iter().map(approx_json_bytes).sum::<usize>()
-        }
+        serde_json::Value::Array(a) => 2 + a.len() + a.iter().map(approx_json_bytes).sum::<usize>(),
         serde_json::Value::Object(m) => {
             2 + m
                 .iter()
@@ -289,7 +287,13 @@ impl ExecutionChain {
     /// Index one WAL event. Idempotent: re-applying the same `event_id` (a
     /// JetStream redelivery) overwrites with identical data and never double-counts
     /// the head. Returns `true` if this event was new to the index.
-    pub fn apply(&mut self, event_id: i64, prev_event_id: Option<i64>, event_type: String, raw: serde_json::Value) -> bool {
+    pub fn apply(
+        &mut self,
+        event_id: i64,
+        prev_event_id: Option<i64>,
+        event_type: String,
+        raw: serde_json::Value,
+    ) -> bool {
         let bytes = approx_json_bytes(&raw) + INDEXED_EVENT_OVERHEAD;
         // Adjust the byte ledger by the delta: a redelivery overwrite replaces an
         // existing entry's cost, a new event adds its cost.
@@ -303,7 +307,12 @@ impl ExecutionChain {
         self.bytes += bytes;
         self.events.insert(
             event_id,
-            IndexedEvent { prev_event_id, event_type, raw, bytes },
+            IndexedEvent {
+                prev_event_id,
+                event_type,
+                raw,
+                bytes,
+            },
         );
         // Advance the head monotonically — the chain tip is the max id seen.
         if self.head.is_none_or(|h| event_id > h) {
@@ -423,7 +432,12 @@ impl ExecutionChain {
     /// (rooted at `expected_head` under #117), not a fresh max-id walk.
     fn cached_spine_events(&self) -> Option<Vec<serde_json::Value>> {
         let c = self.cache.as_ref()?;
-        Some(c.ordered_ids.iter().map(|id| self.events[id].raw.clone()).collect())
+        Some(
+            c.ordered_ids
+                .iter()
+                .map(|id| self.events[id].raw.clone())
+                .collect(),
+        )
     }
 
     /// Advance the cached spine to the **max-id head** — the shadow/observation
@@ -740,10 +754,24 @@ pub struct WalEventIndex {
 /// Event types that put an execution into a terminal state — the eviction signal
 /// (mirror of the server's terminal-eviction set). Underscore forms are the
 /// emitted shapes (`playbook_completed`, not `playbook.completed`).
+/// Terminal execution events, in **both** spellings.
+///
+/// The dotted forms were missing, and prod emits exactly those: the orchestrator
+/// publishes `playbook.completed` while the cancel/finalize chokepoint publishes
+/// `playbook_completed`. With only the underscore spellings listed, a normally
+/// completing execution was never flagged terminal, so the drain's per-batch
+/// `idx.evict` fast path never fired for it and its chain sat resident until the
+/// TTL/byte sweep reclaimed it (noetl/ai-meta#166). Not a correctness bug — the
+/// bounded cache still reclaimed eventually — but it silently disabled the cheap
+/// path on the common case. The server's own `is_terminal_event_type` has
+/// matched both spellings all along; this brings the index in line.
 const TERMINAL_EVENT_TYPES: &[&str] = &[
     "playbook_completed",
     "playbook_failed",
     "playbook_cancelled",
+    "playbook.completed",
+    "playbook.failed",
+    "playbook.cancelled",
 ];
 
 impl WalEventIndex {
@@ -1069,7 +1097,10 @@ impl WalEventIndex {
     /// the off-server drive then falls back to the server-built state.  Returns
     /// the [`AdvanceOutcome`] alongside so the caller can record the cache metric
     /// even on an incomplete read.
-    pub fn build_spine(&mut self, execution_id: i64) -> (AdvanceOutcome, Option<Vec<serde_json::Value>>) {
+    pub fn build_spine(
+        &mut self,
+        execution_id: i64,
+    ) -> (AdvanceOutcome, Option<Vec<serde_json::Value>>) {
         match self.chains.get_mut(&execution_id) {
             Some(chain) => {
                 let outcome = chain.advance();
@@ -1270,8 +1301,11 @@ pub async fn build_offserver_input(
         // from the server-supplied `trigger_event_id`.  Falls back to
         // `command.completed` (the only triggering type) if the id isn't indexed.
         let resolved_trigger_type = trigger_event_type.map(|s| s.to_string()).or_else(|| {
-            trigger_event_id
-                .and_then(|tid| chain.and_then(|c| c.event_type_of(tid)).map(|s| s.to_string()))
+            trigger_event_id.and_then(|tid| {
+                chain
+                    .and_then(|c| c.event_type_of(tid))
+                    .map(|s| s.to_string())
+            })
         });
         (outcome, spine, resolved_trigger_type)
     };
@@ -1381,6 +1415,12 @@ pub struct DrainConfig {
     pub batch: u32,
     pub timeout_ms: u64,
     pub idle_sleep: Duration,
+    /// noetl/ai-meta#217 — which transport the WAL drain reads.  `Ehdb` replays
+    /// the retained EHDB events log from cursor 0 over the writer's raw fan-out
+    /// face; `Nats` is the legacy JetStream path.
+    pub source: crate::event_bus::EventSourceMode,
+    /// `NOETL_EVENT_BUS_WAL_ADDR` — the writer's WAL fan-out face.
+    pub wal_addr: Option<String>,
 }
 
 /// The durable consumer name the authoritative state-builder uses on the
@@ -1424,6 +1464,16 @@ impl DrainConfig {
             durable,
             batch: env_u32("NOETL_STATE_BUILDER_BATCH", 200).clamp(1, 1000),
             timeout_ms: env_u64("NOETL_STATE_BUILDER_TIMEOUT_MS", 2_000),
+            // noetl/ai-meta#217 — read the WAL off EHDB when asked.  Defaults to
+            // nats so an unset value can never silently change where the drive's
+            // state comes from.
+            source: crate::event_bus::EventSourceMode::from_env_value(
+                &std::env::var("NOETL_STATE_BUILDER_SOURCE").unwrap_or_default(),
+            ),
+            wal_addr: std::env::var("NOETL_EVENT_BUS_WAL_ADDR")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|s| !s.is_empty()),
             // noetl/ai-meta#130: the post-empty backoff was 500ms — on an idle
             // cluster a freshly-published event could sit up to that long between
             // an empty long-poll returning and the next `batch()` starting, which
@@ -1618,6 +1668,234 @@ async fn connect_with_backoff(
 /// pre-#119 shape, an instant revert).  Either way the index is the same — the
 /// chain walk + cache produce identical state.
 async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()> {
+    if config.source.is_ehdb() {
+        return run_drain_loop_ehdb(config, index).await;
+    }
+    run_drain_loop_nats(config, index).await
+}
+
+/// The EHDB WAL drain — replays the retained events log from cursor 0 and
+/// indexes every record, exactly like the ephemeral `DeliverAll` JetStream
+/// consumer it replaces (noetl/ai-meta#119, #217).
+///
+/// **A subscription, not a consumer group, and that is the load-bearing
+/// choice.** A group would persist a cursor, and a persisted cursor that
+/// outruns a freshly-restarted worker's empty in-memory index is exactly the
+/// #119 stall: the drive asks for a chain the index never rebuilt, every
+/// orchestrate returns `WAL chain incomplete`, and executions wedge with no
+/// error anywhere. Replaying from 0 on every boot makes the index
+/// self-rehydrating by construction.
+///
+/// There is no ack and no dead-consumer machinery here: `FeedSubscription` is a
+/// plain socket, so a writer restart surfaces as a read error and the reconnect
+/// below re-subscribes from 0. The NATS loop's #161/#163 rebuild logic has no
+/// EHDB counterpart because there is no server-side consumer to orphan.
+async fn run_drain_loop_ehdb(config: DrainConfig, index: SharedWalIndex) -> Result<()> {
+    let addr = config.wal_addr.clone().ok_or_else(|| {
+        anyhow!("NOETL_STATE_BUILDER source=ehdb requires NOETL_EVENT_BUS_WAL_ADDR")
+    })?;
+    let authoritative = config.mode == BuilderMode::Authoritative;
+    let projection_hook = crate::ehdb::projection::runtime_hook_env(&crate::ehdb::process_env());
+    let mut rehydrated = false;
+    let mut last_sweep = Instant::now();
+    let sweep_interval = Duration::from_secs(env_u64("NOETL_STATE_INDEX_SWEEP_SECS", 15));
+    let mut backoff = REBUILD_BACKOFF_MIN;
+    let shard: u32 = std::env::var("NOETL_EVENT_BUS_SHARD")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+
+    tracing::info!(
+        %addr,
+        shard,
+        mode = ?config.mode,
+        "off-server state-builder WAL drain started on the EHDB events feed \
+         (replay-from-0 per boot, no acks — the #119 self-rehydrating shape)"
+    );
+
+    loop {
+        // Always resume from 0: the in-memory index is rebuilt on every
+        // (re)connect, so the retained log is the only source of truth for it.
+        let mut sub = match ehdb_feed::FeedSubscription::connect(addr.as_str(), shard, 0).await {
+            Ok(s) => {
+                backoff = REBUILD_BACKOFF_MIN;
+                crate::metrics::set_state_builder_healthy(true);
+                s
+            }
+            Err(error) => {
+                crate::metrics::set_state_builder_healthy(false);
+                tracing::warn!(%addr, %error, "state-builder WAL subscribe failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(REBUILD_BACKOFF_MAX);
+                continue;
+            }
+        };
+
+        loop {
+            let records: Vec<ehdb_l0::EventRecord> = match sub.recv_batch().await {
+                Ok(r) => r,
+                Err(error) => {
+                    crate::metrics::set_state_builder_healthy(false);
+                    tracing::warn!(%addr, %error, "state-builder WAL feed dropped; resubscribing from 0");
+                    break;
+                }
+            };
+            let payloads: Vec<serde_json::Value> = records
+                .iter()
+                .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.payload).ok())
+                .collect();
+
+            let mut batch = DrainBatch::default();
+            for payload in &payloads {
+                apply_indexed(&index, payload, &mut batch, projection_hook.is_some()).await;
+            }
+            let consumed = payloads.len() as u64;
+
+            maybe_sweep(&index, &mut last_sweep, sweep_interval).await;
+            if consumed == 0 {
+                tokio::time::sleep(config.idle_sleep).await;
+                continue;
+            }
+            crate::metrics::record_state_builder_wal_events(consumed);
+            finish_batch(
+                &index,
+                batch,
+                authoritative,
+                &projection_hook,
+                consumed,
+                true,
+                &mut rehydrated,
+            )
+            .await;
+        }
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// What one drained batch accumulated.
+#[derive(Default)]
+struct DrainBatch {
+    touched: Vec<i64>,
+    terminals: Vec<i64>,
+    projection_window: Vec<serde_json::Value>,
+}
+
+/// Index one event payload, recording what it touched.  Shared by both drains so
+/// the two transports cannot drift in what they index.
+async fn apply_indexed(
+    index: &SharedWalIndex,
+    payload: &serde_json::Value,
+    batch: &mut DrainBatch,
+    projection_armed: bool,
+) {
+    let applied = {
+        let mut idx = index.lock().await;
+        idx.apply(payload)
+    };
+    if let Some((execution_id, _is_new, is_terminal)) = applied {
+        if !batch.touched.contains(&execution_id) {
+            batch.touched.push(execution_id);
+        }
+        if is_terminal {
+            batch.terminals.push(execution_id);
+        }
+        if projection_armed {
+            batch.projection_window.push(payload.clone());
+        }
+        // Wake any drive build-retry loop waiting on this execution the instant
+        // the event is indexed — not after the whole batch drains.
+        index.notify_appended();
+    }
+}
+
+/// The throttled bounded-cache sweep.  Runs on idle AND busy iterations so
+/// abandoned chains are reclaimed on a quiet feed (noetl/ai-meta#166).
+async fn maybe_sweep(index: &SharedWalIndex, last_sweep: &mut Instant, interval: Duration) {
+    if last_sweep.elapsed() < interval {
+        return;
+    }
+    *last_sweep = Instant::now();
+    let (indexed, events, bytes) = {
+        let mut idx = index.lock().await;
+        let evicted = idx.enforce_limits();
+        if evicted.total() > 0 {
+            crate::metrics::record_state_builder_eviction("ttl", evicted.ttl);
+            crate::metrics::record_state_builder_eviction("max_executions", evicted.max_executions);
+            crate::metrics::record_state_builder_eviction("byte_ceiling", evicted.byte_ceiling);
+        }
+        (idx.execution_count(), idx.event_count(), idx.total_bytes())
+    };
+    crate::metrics::set_state_builder_indexed_executions(indexed as i64);
+    crate::metrics::set_state_builder_index_events(events as i64);
+    crate::metrics::set_state_builder_index_bytes(bytes as i64);
+}
+
+/// Post-batch work shared by both drains: the shadow advance, terminal
+/// eviction, gauges and the one-shot rehydration breadcrumb.
+async fn finish_batch(
+    index: &SharedWalIndex,
+    mut batch: DrainBatch,
+    authoritative: bool,
+    projection_hook: &Option<crate::ehdb::EnvMap>,
+    consumed: u64,
+    durable: bool,
+    rehydrated: &mut bool,
+) {
+    if let Some(hook_env) = projection_hook {
+        if !batch.projection_window.is_empty() {
+            let hook_env = hook_env.clone();
+            let window = std::mem::take(&mut batch.projection_window);
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::ehdb::projection::mirror_live_window(&hook_env, &window)
+            })
+            .await;
+        }
+    }
+    if !authoritative {
+        let mut idx = index.lock().await;
+        for eid in &batch.touched {
+            if let Some(chain) = idx.chain_mut(*eid) {
+                let outcome = chain.advance();
+                match outcome {
+                    AdvanceOutcome::CacheHit => {
+                        crate::metrics::record_state_builder_build("cache_hit")
+                    }
+                    AdvanceOutcome::Incremental(_) => {
+                        crate::metrics::record_state_builder_build("incremental")
+                    }
+                    AdvanceOutcome::ColdRebuild(hops) => {
+                        crate::metrics::record_state_builder_build("cold_rebuild");
+                        crate::metrics::record_state_builder_chain_hops(hops);
+                    }
+                    AdvanceOutcome::Incomplete => {
+                        crate::metrics::record_state_builder_build("incomplete")
+                    }
+                }
+            }
+        }
+    }
+    let (indexed, bytes) = {
+        let mut idx = index.lock().await;
+        for eid in batch.terminals {
+            idx.evict(eid);
+        }
+        (idx.execution_count(), idx.total_bytes())
+    };
+    crate::metrics::set_state_builder_indexed_executions(indexed as i64);
+    crate::metrics::set_state_builder_index_bytes(bytes as i64);
+    if !*rehydrated && indexed > 0 {
+        *rehydrated = true;
+        tracing::info!(
+            indexed_executions = indexed,
+            wal_events = consumed,
+            durable,
+            "off-server state-builder index rehydrated from the retained WAL (noetl/ai-meta#119)"
+        );
+    }
+}
+
+/// The legacy NATS JetStream WAL drain.
+async fn run_drain_loop_nats(config: DrainConfig, index: SharedWalIndex) -> Result<()> {
     // `authoritative` (mode) governs the *advance timing* (advance-on-demand in
     // the command dispatch vs. advance-in-loop for shadow) + terminal eviction.
     // `durable` (a consumer name is configured) governs the *ack policy*: only a
@@ -1738,13 +2016,8 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
             }
         };
 
-        let mut touched: Vec<i64> = Vec::new();
+        let mut nats_batch = DrainBatch::default();
         let mut consumed = 0u64;
-        let mut terminals: Vec<i64> = Vec::new();
-        // noetl/ehdb#234: when the projection shadow hook is armed, collect the
-        // batch's raw event payloads for the post-batch windowed shadow-project.
-        // Empty (and never allocated) when the hook is inactive.
-        let mut projection_window: Vec<serde_json::Value> = Vec::new();
         // Set when a dead-consumer signal surfaces mid-drain (noetl/ai-meta#161)
         // so the post-batch handler can decide rebuild-vs-retry once the batch
         // stops; the events consumed before it are already indexed.
@@ -1798,28 +2071,9 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
             // Short critical section: just the apply, then drop the lock so the
             // off-server build path can read the index while we await the next
             // message.
-            let applied = {
-                let mut idx = index.lock().await;
-                idx.apply(&payload)
-            };
-            if let Some((execution_id, _is_new, is_terminal)) = applied {
-                if !touched.contains(&execution_id) {
-                    touched.push(execution_id);
-                }
-                if is_terminal {
-                    terminals.push(execution_id);
-                }
-                // noetl/ehdb#234: buffer the just-indexed event for the post-batch
-                // projection shadow window.  Only when the hook is armed (prod
-                // default off ⇒ this branch never runs); bounded by the pull's
-                // `max_messages` batch size.
-                if projection_hook.is_some() {
-                    projection_window.push(payload.clone());
-                }
-                // Wake any drive build-retry loop waiting on this execution the
-                // instant the event is indexed — not after the whole batch drains.
-                index.notify_appended();
-            }
+            // Shared with the EHDB drain so the two transports cannot drift in
+            // what they index (noetl/ai-meta#217).
+            apply_indexed(&index, &payload, &mut nats_batch, projection_hook.is_some()).await;
             // Durable consumer: ack after the event is indexed (at-least-once;
             // re-apply on redelivery is idempotent — same event_id overwrites
             // identical data).  The ephemeral DeliverAll consumer (the #119
@@ -1834,9 +2088,12 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         // otherwise fall through and retry — the events consumed so far this
         // cycle are already indexed.
         if let Some(err) = dead_msg.take() {
-            if let DeadAction::Rebuild =
-                on_dead_signal(&mut dead_since, &last_healthy, rebuild_after, unhealthy_after)
-            {
+            if let DeadAction::Rebuild = on_dead_signal(
+                &mut dead_since,
+                &last_healthy,
+                rebuild_after,
+                unhealthy_after,
+            ) {
                 crate::metrics::record_state_builder_consumer_recreate("drain_dead");
                 crate::metrics::set_state_builder_healthy(false);
                 tracing::warn!(
@@ -1868,41 +2125,9 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         last_healthy = Instant::now();
         crate::metrics::set_state_builder_healthy(true);
 
-        // noetl/ai-meta#166: throttled bounded-cache sweep — runs on idle AND
-        // busy iterations so idle/abandoned chains are reclaimed even when no new
-        // events are arriving (the system-pool-at-idle case).  A no-op when the
-        // policy is unbounded.  Also refreshes the resident-set gauges so the
-        // OOM-trail observability stays live on a quiet stream.
-        if last_sweep.elapsed() >= sweep_interval {
-            last_sweep = Instant::now();
-            let (indexed, events, bytes) = {
-                let mut idx = index.lock().await;
-                let evicted = idx.enforce_limits();
-                if evicted.total() > 0 {
-                    crate::metrics::record_state_builder_eviction("ttl", evicted.ttl);
-                    crate::metrics::record_state_builder_eviction(
-                        "max_executions",
-                        evicted.max_executions,
-                    );
-                    crate::metrics::record_state_builder_eviction(
-                        "byte_ceiling",
-                        evicted.byte_ceiling,
-                    );
-                    tracing::debug!(
-                        ttl = evicted.ttl,
-                        max_executions = evicted.max_executions,
-                        byte_ceiling = evicted.byte_ceiling,
-                        resident = idx.execution_count(),
-                        bytes = idx.total_bytes(),
-                        "state-builder bounded-cache eviction sweep (noetl/ai-meta#166)"
-                    );
-                }
-                (idx.execution_count(), idx.event_count(), idx.total_bytes())
-            };
-            crate::metrics::set_state_builder_indexed_executions(indexed as i64);
-            crate::metrics::set_state_builder_index_events(events as i64);
-            crate::metrics::set_state_builder_index_bytes(bytes as i64);
-        }
+        // Throttled bounded-cache sweep, shared with the EHDB drain
+        // (noetl/ai-meta#166).
+        maybe_sweep(&index, &mut last_sweep, sweep_interval).await;
 
         if consumed == 0 {
             tokio::time::sleep(config.idle_sleep).await;
@@ -1910,88 +2135,18 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
         }
         crate::metrics::record_state_builder_wal_events(consumed);
 
-        // noetl/ehdb#234 projection tier — post-batch cadence checkpoint.  A
-        // drained batch is a natural projection window: windowed-materialize the
-        // batch's real events into a fresh throwaway EHDB projection store and
-        // parity-check against the worker's own fold (advances
-        // `noetl_ehdb_projection_*`).  Best-effort + isolated: run it on a blocking
-        // thread so the sync engine I/O never stalls the drain reactor, and never
-        // let a shadow error touch the authoritative index.  No-op unless the hook
-        // is armed (prod default).
-        if let Some(hook_env) = &projection_hook {
-            if !projection_window.is_empty() {
-                let hook_env = hook_env.clone();
-                let window = std::mem::take(&mut projection_window);
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::ehdb::projection::mirror_live_window(&hook_env, &window)
-                })
-                .await;
-            }
-        }
-
-        // Shadow: advance each touched execution's cached spine here — the cache
-        // mechanics under observation.  Authoritative: the command-dispatch
-        // off-server-build path ([`build_offserver_input`]) advances on demand
-        // when a drive command arrives, so the drain only INDEXES here (and
-        // evicts terminals) to keep the on-demand advance a cheap incremental.
-        if !authoritative {
-            let mut idx = index.lock().await;
-            for eid in &touched {
-                if let Some(chain) = idx.chain_mut(*eid) {
-                    let outcome = chain.advance();
-                    match outcome {
-                        AdvanceOutcome::CacheHit => {
-                            crate::metrics::record_state_builder_build("cache_hit")
-                        }
-                        AdvanceOutcome::Incremental(_) => {
-                            crate::metrics::record_state_builder_build("incremental")
-                        }
-                        AdvanceOutcome::ColdRebuild(hops) => {
-                            crate::metrics::record_state_builder_build("cold_rebuild");
-                            crate::metrics::record_state_builder_chain_hops(hops);
-                        }
-                        AdvanceOutcome::Incomplete => {
-                            crate::metrics::record_state_builder_build("incomplete")
-                        }
-                    }
-                    tracing::debug!(
-                        execution_id = *eid,
-                        indexed = chain.len(),
-                        spine = ?chain.cached_len(),
-                        head = ?chain.head(),
-                        outcome = ?outcome,
-                        "state-builder shadow advanced execution (WAL chain walk, no noetl.event scan)"
-                    );
-                }
-            }
-        }
-        let (indexed, bytes) = {
-            let mut idx = index.lock().await;
-            // Terminal eviction stays per-batch — the cheap O(terminals) fast
-            // path that frees a chain the instant it completes.  The TTL/byte
-            // bounded-cache sweep is the throttled periodic pass above.
-            for eid in terminals {
-                idx.evict(eid);
-            }
-            (idx.execution_count(), idx.total_bytes())
-        };
-        // noetl/ai-meta#119 rehydration proof: surface the indexed-execution count
-        // (the bug was this stuck at 0 after a restart — the durable cursor outran
-        // the empty index).  A non-zero count after boot means the index rebuilt
-        // from the retained WAL.  Log the first non-empty rebuild once per process.
-        // O(1) gauges refreshed every busy batch; the O(n) event_count gauge is
-        // refreshed by the throttled sweep above (noetl/ai-meta#166).
-        crate::metrics::set_state_builder_indexed_executions(indexed as i64);
-        crate::metrics::set_state_builder_index_bytes(bytes as i64);
-        if !rehydrated && indexed > 0 {
-            rehydrated = true;
-            tracing::info!(
-                indexed_executions = indexed,
-                wal_events = consumed,
-                durable,
-                "off-server state-builder index rehydrated from retained noetl_events WAL (noetl/ai-meta#119)"
-            );
-        }
+        // Shared post-batch work — the shadow advance, terminal eviction,
+        // gauges and the rehydration breadcrumb (noetl/ai-meta#217).
+        finish_batch(
+            &index,
+            nats_batch,
+            authoritative,
+            &projection_hook,
+            consumed,
+            durable,
+            &mut rehydrated,
+        )
+        .await;
     }
 }
 
@@ -2001,7 +2156,9 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
 /// local so the shadow stays self-contained.
 fn parse_nats_credentials(nats_url: &str) -> (String, Option<String>, Option<String>) {
     let env_user = std::env::var("NATS_USER").ok().filter(|s| !s.is_empty());
-    let env_pass = std::env::var("NATS_PASSWORD").ok().filter(|s| !s.is_empty());
+    let env_pass = std::env::var("NATS_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
     if let (Some(u), Some(p)) = (&env_user, &env_pass) {
         return (strip_userinfo(nats_url), Some(u.clone()), Some(p.clone()));
     }
@@ -2103,7 +2260,8 @@ impl RehydrateConfig {
                 .unwrap_or_else(|_| EVENT_STREAM.to_string()),
             batch: env_u32("NOETL_STATE_INDEX_REHYDRATE_BATCH", 500).clamp(1, 2000),
             poll_ms: env_u64("NOETL_STATE_INDEX_REHYDRATE_POLL_MS", 300).clamp(50, 5_000),
-            deadline_ms: env_u64("NOETL_STATE_INDEX_REHYDRATE_DEADLINE_MS", 3_000).clamp(100, 30_000),
+            deadline_ms: env_u64("NOETL_STATE_INDEX_REHYDRATE_DEADLINE_MS", 3_000)
+                .clamp(100, 30_000),
             max_messages: env_u64("NOETL_STATE_INDEX_REHYDRATE_MAX_MESSAGES", 100_000),
         }
     }
@@ -2241,7 +2399,12 @@ mod tests {
 
         // First observation arms the timer and asks to retry, not rebuild.
         assert!(matches!(
-            on_dead_signal(&mut dead_since, &last_healthy, rebuild_after, unhealthy_after),
+            on_dead_signal(
+                &mut dead_since,
+                &last_healthy,
+                rebuild_after,
+                unhealthy_after
+            ),
             DeadAction::Retry
         ));
         assert!(dead_since.is_some());
@@ -2249,7 +2412,12 @@ mod tests {
         // After the dead signal has persisted past `rebuild_after`, it rebuilds.
         std::thread::sleep(Duration::from_millis(60));
         assert!(matches!(
-            on_dead_signal(&mut dead_since, &last_healthy, rebuild_after, unhealthy_after),
+            on_dead_signal(
+                &mut dead_since,
+                &last_healthy,
+                rebuild_after,
+                unhealthy_after
+            ),
             DeadAction::Rebuild
         ));
     }
@@ -2259,15 +2427,20 @@ mod tests {
         // last_healthy already past the unhealthy window → the retry path flips
         // the health gauge to false so /livez fails (backstop restart).
         let rebuild_after = Duration::from_secs(60); // never rebuild in this test
-        // Zero window → already past it on the first observation (avoids
-        // `Instant - Duration` underflow on freshly-booted hosts).
+                                                     // Zero window → already past it on the first observation (avoids
+                                                     // `Instant - Duration` underflow on freshly-booted hosts).
         let unhealthy_after = Duration::ZERO;
         let last_healthy = Instant::now();
         let mut dead_since: Option<Instant> = None;
 
         crate::metrics::set_state_builder_healthy(true);
         assert!(matches!(
-            on_dead_signal(&mut dead_since, &last_healthy, rebuild_after, unhealthy_after),
+            on_dead_signal(
+                &mut dead_since,
+                &last_healthy,
+                rebuild_after,
+                unhealthy_after
+            ),
             DeadAction::Retry
         ));
         assert!(!crate::metrics::state_builder_healthy());
@@ -2299,7 +2472,11 @@ mod tests {
     fn linear_spine(n: i64) -> Vec<serde_json::Value> {
         let mut out = vec![ev(1, None, "playbook_started")];
         for i in 2..=n {
-            let ty = if i % 2 == 0 { "command.issued" } else { "command.completed" };
+            let ty = if i % 2 == 0 {
+                "command.issued"
+            } else {
+                "command.completed"
+            };
             out.push(ev(i, Some(i - 1), ty));
         }
         out
@@ -2319,10 +2496,16 @@ mod tests {
         let chain = chain_from(&reversed);
         let walk = chain.chain_walk().expect("complete chain");
         let scan: Vec<i64> = (1..=6).collect();
-        assert_eq!(walk, scan, "chain-walk order must equal event-scan event_id ASC");
+        assert_eq!(
+            walk, scan,
+            "chain-walk order must equal event-scan event_id ASC"
+        );
         // And the raw ordered events come back in the same order.
         let ordered = chain.ordered_events().expect("ordered events");
-        let ids: Vec<i64> = ordered.iter().map(|e| e["event_id"].as_i64().unwrap()).collect();
+        let ids: Vec<i64> = ordered
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
         assert_eq!(ids, scan);
     }
 
@@ -2336,7 +2519,10 @@ mod tests {
             ev(6, Some(5), "command.issued"),
         ];
         let chain = chain_from(&tail);
-        assert!(chain.chain_walk().is_none(), "non-genesis tail must be incomplete");
+        assert!(
+            chain.chain_walk().is_none(),
+            "non-genesis tail must be incomplete"
+        );
     }
 
     #[test]
@@ -2345,12 +2531,35 @@ mod tests {
         // from the WAL yet (materializer/stream ordering). The walk hits a missing
         // hop and reports incomplete → caller falls back, retries next event.
         let mut chain = ExecutionChain::default();
-        chain.apply(1, None, "playbook_started".into(), ev(1, None, "playbook_started"));
-        chain.apply(3, Some(2), "command.completed".into(), ev(3, Some(2), "command.completed"));
-        chain.apply(4, Some(3), "command.issued".into(), ev(4, Some(3), "command.issued"));
-        assert!(chain.chain_walk().is_none(), "missing hop 2 must be incomplete");
+        chain.apply(
+            1,
+            None,
+            "playbook_started".into(),
+            ev(1, None, "playbook_started"),
+        );
+        chain.apply(
+            3,
+            Some(2),
+            "command.completed".into(),
+            ev(3, Some(2), "command.completed"),
+        );
+        chain.apply(
+            4,
+            Some(3),
+            "command.issued".into(),
+            ev(4, Some(3), "command.issued"),
+        );
+        assert!(
+            chain.chain_walk().is_none(),
+            "missing hop 2 must be incomplete"
+        );
         // Once 2 arrives, the chain is whole.
-        chain.apply(2, Some(1), "command.issued".into(), ev(2, Some(1), "command.issued"));
+        chain.apply(
+            2,
+            Some(1),
+            "command.issued".into(),
+            ev(2, Some(1), "command.issued"),
+        );
         assert_eq!(chain.chain_walk().unwrap(), vec![1, 2, 3, 4]);
     }
 
@@ -2368,8 +2577,18 @@ mod tests {
         assert_eq!(chain.advance(), AdvanceOutcome::CacheHit);
 
         // Append two new tail events, advance → incremental (only the tail walked).
-        chain.apply(5, Some(4), "command.completed".into(), ev(5, Some(4), "command.completed"));
-        chain.apply(6, Some(5), "command.issued".into(), ev(6, Some(5), "command.issued"));
+        chain.apply(
+            5,
+            Some(4),
+            "command.completed".into(),
+            ev(5, Some(4), "command.completed"),
+        );
+        chain.apply(
+            6,
+            Some(5),
+            "command.issued".into(),
+            ev(6, Some(5), "command.issued"),
+        );
         assert_eq!(chain.advance(), AdvanceOutcome::Incremental(2));
         let incremental_spine = chain.cached_len();
 
@@ -2409,7 +2628,12 @@ mod tests {
         assert_eq!(chain.advance(), AdvanceOutcome::ColdRebuild(3));
         // Inject a higher-id event whose prev points at a NOT-yet-present id 9,
         // so the tail walk from the new head can't reach the cached head 3.
-        chain.apply(10, Some(9), "command.issued".into(), ev(10, Some(9), "command.issued"));
+        chain.apply(
+            10,
+            Some(9),
+            "command.issued".into(),
+            ev(10, Some(9), "command.issued"),
+        );
         // Tail walk 10→9(missing) fails to reach cached head 3 → not incremental.
         // The full walk from head 10 also hits the missing hop → Incomplete.
         assert_eq!(chain.advance(), AdvanceOutcome::Incomplete);
@@ -2445,7 +2669,10 @@ mod tests {
         let mut after = WalEventIndex::new();
         let (o_empty, s_empty) = after.build_spine_to(42, tip);
         assert!(matches!(o_empty, AdvanceOutcome::Incomplete));
-        assert!(s_empty.is_none(), "empty post-restart index stalls (the bug)");
+        assert!(
+            s_empty.is_none(),
+            "empty post-restart index stalls (the bug)"
+        );
 
         // Rehydrate: replay the same retained WAL into the fresh index → it serves
         // the identical complete spine again (the fix — full DeliverAll replay).
@@ -2496,7 +2723,10 @@ mod tests {
         let (outcome, spine) = idx.build_spine(42);
         assert!(matches!(outcome, AdvanceOutcome::ColdRebuild(4)));
         let spine = spine.expect("complete chain yields a spine");
-        let ids: Vec<i64> = spine.iter().map(|e| e["event_id"].as_i64().unwrap()).collect();
+        let ids: Vec<i64> = spine
+            .iter()
+            .map(|e| e["event_id"].as_i64().unwrap())
+            .collect();
         assert_eq!(ids, vec![1, 2, 3, 4], "spine in event_id order");
         // Each payload is the raw WAL event (carries created_at + status), so it
         // deserializes into the orchestrate-core Event the plug-in expects.
@@ -2513,7 +2743,10 @@ mod tests {
         idx2.apply(&ev(5, None, "command.completed"));
         idx2.apply(&ev(6, Some(5), "command.issued"));
         let (o3, s3) = idx2.build_spine(42);
-        assert!(matches!(o3, AdvanceOutcome::ColdRebuild(_) | AdvanceOutcome::Incomplete));
+        assert!(matches!(
+            o3,
+            AdvanceOutcome::ColdRebuild(_) | AdvanceOutcome::Incomplete
+        ));
         assert!(s3.is_none(), "non-genesis tail must not yield a spine");
     }
 
@@ -2528,8 +2761,8 @@ mod tests {
     fn inverted_fanout_spine() -> Vec<serde_json::Value> {
         vec![
             ev(1, None, "playbook_started"),
-            ev(2, Some(1), "command.issued"),   // normalize dispatch
-            ev(3, Some(2), "command.issued"),   // enrich dispatch
+            ev(2, Some(1), "command.issued"), // normalize dispatch
+            ev(3, Some(2), "command.issued"), // enrich dispatch
             ev(100, Some(3), "command.completed"), // normalize.completed (1st, high id)
             ev(50, Some(100), "command.completed"), // enrich.completed (2nd, LOW id) — inversion
         ]
@@ -2656,7 +2889,11 @@ mod tests {
             .iter()
             .map(|e| e["event_id"].as_i64().unwrap())
             .collect();
-        assert_eq!(ids2, vec![1, 2, 3, 100, 50], "causal order preserves the chain");
+        assert_eq!(
+            ids2,
+            vec![1, 2, 3, 100, 50],
+            "causal order preserves the chain"
+        );
     }
 
     #[test]
@@ -2692,7 +2929,10 @@ mod tests {
             .iter()
             .map(|e| e["event_id"].as_i64().unwrap())
             .collect();
-        assert_eq!(ids_incr, ids_cold, "incremental == cold rebuild through inversion");
+        assert_eq!(
+            ids_incr, ids_cold,
+            "incremental == cold rebuild through inversion"
+        );
         assert_eq!(ids_incr, vec![1, 2, 3, 100, 50]);
     }
 
@@ -2751,12 +2991,18 @@ mod tests {
         // Staleness guard: an expected_head ahead of the index head → None (the
         // drain hasn't caught up to the server's dispatch watermark yet).
         assert!(
-            build_offserver_input(&index, 42, &playbook, None, None, Some(99), false).await.is_none(),
+            build_offserver_input(&index, 42, &playbook, None, None, Some(99), false)
+                .await
+                .is_none(),
             "stale index (head < expected_head) must not serve"
         );
 
         // An unknown execution → None (the caller falls back to run_state).
-        assert!(build_offserver_input(&index, 7, &playbook, None, None, None, false).await.is_none());
+        assert!(
+            build_offserver_input(&index, 7, &playbook, None, None, None, false)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2871,7 +3117,11 @@ mod tests {
             .expect("waiter resolves before the timeout")
             .expect("waiter task did not panic");
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["events"].as_array().unwrap().len(), 3, "served the full spine");
+        assert_eq!(
+            v["events"].as_array().unwrap().len(),
+            3,
+            "served the full spine"
+        );
         assert_eq!(v["trigger_event_type"], "command.completed");
     }
 
@@ -2901,7 +3151,12 @@ mod tests {
     /// A fat envelope: the Event-relevant fields PLUS the non-Event fields a real
     /// `noetl_events` envelope carries (`node_id`, `node_type`, `duration`,
     /// `stack_trace`, `trace_component`, `parent_event_id`, an `extra` blob).
-    fn fat_event(event_id: i64, prev: Option<i64>, event_type: &str, bulk: usize) -> serde_json::Value {
+    fn fat_event(
+        event_id: i64,
+        prev: Option<i64>,
+        event_type: &str,
+        bulk: usize,
+    ) -> serde_json::Value {
         serde_json::json!({
             "event_id": event_id,
             "execution_id": 42,
@@ -2929,11 +3184,29 @@ mod tests {
         let slim = slim_event_payload(&full);
         let obj = slim.as_object().unwrap();
         // Every Event-deserialized field survives…
-        for k in ["event_id", "execution_id", "event_type", "node_name", "status", "result", "context", "created_at"] {
+        for k in [
+            "event_id",
+            "execution_id",
+            "event_type",
+            "node_name",
+            "status",
+            "result",
+            "context",
+            "created_at",
+        ] {
             assert!(obj.contains_key(k), "slim must keep Event field {k}");
         }
         // …and the non-Event envelope fields are gone.
-        for k in ["node_id", "node_type", "duration", "stack_trace", "trace_component", "parent_event_id", "some_extra_blob", "prev_event_id"] {
+        for k in [
+            "node_id",
+            "node_type",
+            "duration",
+            "stack_trace",
+            "trace_component",
+            "parent_event_id",
+            "some_extra_blob",
+            "prev_event_id",
+        ] {
             assert!(!obj.contains_key(k), "slim must drop non-Event field {k}");
         }
         // Output-equivalence by construction: the kept body fields are byte-identical.
@@ -2962,7 +3235,10 @@ mod tests {
 
         let mut slim = WalEventIndex::with_order_policy(
             SpineOrder::Causal,
-            EvictionPolicy { slim: true, ..Default::default() },
+            EvictionPolicy {
+                slim: true,
+                ..Default::default()
+            },
         );
         for e in &events {
             slim.apply(e);
@@ -2983,7 +3259,10 @@ mod tests {
             assert_eq!(f["context"], s["context"]);
             assert_eq!(f["event_type"], s["event_type"]);
         }
-        assert!(slim.total_bytes() < full.total_bytes(), "slim index is smaller");
+        assert!(
+            slim.total_bytes() < full.total_bytes(),
+            "slim index is smaller"
+        );
     }
 
     #[test]
@@ -2995,12 +3274,20 @@ mod tests {
         assert!(after_one > 0);
         // Redelivery (same event_id) is an overwrite, not a double-count.
         idx.apply(&fat_event(1, None, "playbook_started", 100));
-        assert_eq!(idx.total_bytes(), after_one, "redelivery must not double-count bytes");
+        assert_eq!(
+            idx.total_bytes(),
+            after_one,
+            "redelivery must not double-count bytes"
+        );
         // A second execution adds bytes; evicting it returns to the prior total.
         idx.apply(&serde_json::json!({"event_id": 9, "execution_id": 77, "event_type": "playbook_started"}));
         assert!(idx.total_bytes() > after_one);
         idx.evict(77);
-        assert_eq!(idx.total_bytes(), after_one, "evict must subtract the chain's bytes");
+        assert_eq!(
+            idx.total_bytes(),
+            after_one,
+            "evict must subtract the chain's bytes"
+        );
         assert_eq!(idx.execution_count(), 1);
     }
 
@@ -3020,9 +3307,16 @@ mod tests {
         let mut idx = WalEventIndex::new();
         idx.apply_at(&started(1, 100), Instant::now());
         idx.mark_pending_sink(100);
-        assert_eq!(idx.sink_pending_count(), 0, "mark is a no-op when the gate is off");
+        assert_eq!(
+            idx.sink_pending_count(),
+            0,
+            "mark is a no-op when the gate is off"
+        );
         assert!(!idx.sink_blocked(100));
-        assert!(idx.evict(100), "evict proceeds normally when the gate is off");
+        assert!(
+            idx.evict(100),
+            "evict proceeds normally when the gate is off"
+        );
         assert!(idx.chain(100).is_none());
     }
 
@@ -3047,9 +3341,15 @@ mod tests {
         // Confirm the sink → the block clears (it reports it had been pending),
         // and the chain stays resident (spine still live) but is now evictable.
         assert!(idx.confirm_sunk(100), "confirm reports it was pending");
-        assert!(!idx.sink_blocked(100), "confirmed context is no longer blocked");
+        assert!(
+            !idx.sink_blocked(100),
+            "confirmed context is no longer blocked"
+        );
         assert_eq!(idx.sink_pending_count(), 0);
-        assert!(idx.chain(100).is_some(), "chain retained until a normal eviction");
+        assert!(
+            idx.chain(100).is_some(),
+            "chain retained until a normal eviction"
+        );
 
         // The now-unblocked chain is reclaimable by the ordinary eviction path.
         assert!(idx.evict(100), "confirmed context evicts normally");
@@ -3079,7 +3379,10 @@ mod tests {
         let stats = idx.enforce_limits_at(sweep);
         assert_eq!(stats.ttl, 1, "only the unmarked idle chain is evicted");
         assert!(idx.chain(200).is_none(), "unmarked idle chain evicted");
-        assert!(idx.chain(100).is_some(), "un-sunk context retained despite TTL");
+        assert!(
+            idx.chain(100).is_some(),
+            "un-sunk context retained despite TTL"
+        );
         assert_eq!(idx.sink_pending_count(), 1);
     }
 
@@ -3103,16 +3406,31 @@ mod tests {
         idx.mark_pending_sink(200);
 
         let stats = idx.enforce_limits_at(t0);
-        assert_eq!(stats.total(), 0, "no blocked chain is evicted under the ceiling");
-        assert_eq!(idx.execution_count(), 2, "both retained; the sweep terminated");
+        assert_eq!(
+            stats.total(),
+            0,
+            "no blocked chain is evicted under the ceiling"
+        );
+        assert_eq!(
+            idx.execution_count(),
+            2,
+            "both retained; the sweep terminated"
+        );
 
         // Confirming one unblocks it; the next sweep can reclaim only that one
         // (the still-un-sunk chain stays retained under the ceiling).
         idx.confirm_sunk(100);
         assert!(!idx.sink_blocked(100), "confirmed chain unblocked");
         let after = idx.enforce_limits_at(t0);
-        assert_eq!(after.total(), 1, "the sweep reclaims exactly the unblocked chain");
-        assert!(idx.chain(100).is_none(), "confirmed chain reclaimed by the sweep");
+        assert_eq!(
+            after.total(),
+            1,
+            "the sweep reclaims exactly the unblocked chain"
+        );
+        assert!(
+            idx.chain(100).is_none(),
+            "confirmed chain reclaimed by the sweep"
+        );
         assert!(idx.chain(200).is_some(), "still-un-sunk chain retained");
     }
 
@@ -3122,7 +3440,10 @@ mod tests {
         // false by default (gate off ⇒ mark is a no-op ⇒ pending stays empty),
         // true only while a marked execution is un-sunk.
         let shared = SharedWalIndex::new(WalEventIndex::new());
-        assert!(!shared.any_sink_pending().await, "empty index ⇒ nothing pending");
+        assert!(
+            !shared.any_sink_pending().await,
+            "empty index ⇒ nothing pending"
+        );
 
         // Gate off: a mark is a no-op, so the GC gate never fires.
         shared.lock().await.mark_pending_sink(100);
@@ -3137,7 +3458,10 @@ mod tests {
             idx.enable_sink_gate_for_test();
             idx.mark_pending_sink(100);
         }
-        assert!(shared.any_sink_pending().await, "un-sunk execution ⇒ GC deferred");
+        assert!(
+            shared.any_sink_pending().await,
+            "un-sunk execution ⇒ GC deferred"
+        );
         shared.lock().await.confirm_sunk(100);
         assert!(!shared.any_sink_pending().await, "sunk ⇒ GC may proceed");
     }
@@ -3149,7 +3473,10 @@ mod tests {
         let ttl = Duration::from_secs(900);
         let mut idx = WalEventIndex::with_order_policy(
             SpineOrder::Causal,
-            EvictionPolicy { ttl: Some(ttl), ..Default::default() },
+            EvictionPolicy {
+                ttl: Some(ttl),
+                ..Default::default()
+            },
         );
         let t0 = Instant::now();
         // Two executions applied at t0.
@@ -3170,7 +3497,8 @@ mod tests {
     fn byte_ceiling_evicts_lru_until_under() {
         // The hard bounded-memory guarantee: evict least-recently-active chains
         // until resident bytes are under the ceiling.
-        let mut idx = WalEventIndex::with_order_policy(SpineOrder::Causal, EvictionPolicy::default());
+        let mut idx =
+            WalEventIndex::with_order_policy(SpineOrder::Causal, EvictionPolicy::default());
         let t0 = Instant::now();
         // Three executions, applied oldest→newest, each ~same size.
         for (i, eid) in [100, 200, 300].into_iter().enumerate() {
@@ -3181,10 +3509,16 @@ mod tests {
         }
         let one = idx.total_bytes() / 3;
         // Set a ceiling that fits ~2 of the 3 chains.
-        idx.set_policy_for_test(EvictionPolicy { max_bytes: Some(one * 2 + one / 2), ..Default::default() });
+        idx.set_policy_for_test(EvictionPolicy {
+            max_bytes: Some(one * 2 + one / 2),
+            ..Default::default()
+        });
         let stats = idx.enforce_limits_at(t0 + Duration::from_secs(10));
         assert!(stats.byte_ceiling >= 1);
-        assert!(idx.total_bytes() <= one * 2 + one / 2, "resident set held under the ceiling");
+        assert!(
+            idx.total_bytes() <= one * 2 + one / 2,
+            "resident set held under the ceiling"
+        );
         // The LRU (oldest, execution 100) was the first evicted.
         assert!(idx.chain(100).is_none(), "LRU victim evicted first");
         assert!(idx.chain(300).is_some(), "most-recently-active survives");
@@ -3194,7 +3528,10 @@ mod tests {
     fn max_executions_evicts_lru() {
         let mut idx = WalEventIndex::with_order_policy(
             SpineOrder::Causal,
-            EvictionPolicy { max_executions: Some(2), ..Default::default() },
+            EvictionPolicy {
+                max_executions: Some(2),
+                ..Default::default()
+            },
         );
         let t0 = Instant::now();
         for (i, eid) in [100, 200, 300].into_iter().enumerate() {
@@ -3248,7 +3585,11 @@ mod tests {
         let ids = |s: &[serde_json::Value]| -> Vec<i64> {
             s.iter().map(|e| e["event_id"].as_i64().unwrap()).collect()
         };
-        assert_eq!(ids(&before), ids(&after), "cold-rebuild reproduces the same spine");
+        assert_eq!(
+            ids(&before),
+            ids(&after),
+            "cold-rebuild reproduces the same spine"
+        );
     }
 
     #[test]
@@ -3257,5 +3598,129 @@ mod tests {
         let p = EvictionPolicy::default();
         assert!(!p.bounds_memory());
         assert!(p.max_bytes.is_none() && p.ttl.is_none() && p.max_executions.is_none() && !p.slim);
+    }
+}
+
+#[cfg(test)]
+mod t217_ehdb_drain_tests {
+    use super::*;
+
+    /// The WAL drain must default to NATS: an unset value silently moving the
+    /// drive's state source would be the #217 stall all over again.
+    #[test]
+    fn wal_source_defaults_to_nats_and_falls_back_safely() {
+        use crate::event_bus::EventSourceMode as M;
+        assert_eq!(M::from_env_value(""), M::Nats);
+        assert_eq!(M::from_env_value("ehdb"), M::Ehdb);
+        assert_eq!(M::from_env_value("EHDB"), M::Ehdb);
+        assert_eq!(M::from_env_value("ehbd"), M::Nats);
+    }
+
+    /// Both drains index through `apply_indexed`, so the same payload must
+    /// produce the same index effect regardless of transport.  This is what
+    /// makes the EHDB drain a drop-in for the JetStream one.
+    #[tokio::test]
+    async fn apply_indexed_records_touched_and_terminal() {
+        let index = SharedWalIndex::new(WalEventIndex::new());
+        let mut batch = DrainBatch::default();
+
+        let started = serde_json::json!({
+            "event_id": 1, "execution_id": 7, "event_type": "playbook_started",
+            "status": "STARTED", "prev_event_id": null,
+        });
+        apply_indexed(&index, &started, &mut batch, false).await;
+        assert_eq!(
+            batch.touched,
+            vec![7],
+            "a started event must touch its execution"
+        );
+        assert!(batch.terminals.is_empty());
+
+        let done = serde_json::json!({
+            "event_id": 2, "execution_id": 7, "event_type": "playbook.completed",
+            "status": "COMPLETED", "prev_event_id": 1,
+        });
+        apply_indexed(&index, &done, &mut batch, false).await;
+        assert_eq!(
+            batch.touched,
+            vec![7],
+            "the same execution must not be double-counted"
+        );
+        assert_eq!(
+            batch.terminals,
+            vec![7],
+            "a terminal event must be flagged for eviction"
+        );
+    }
+
+    /// Both terminal spellings must flag eviction. The dotted form is what the
+    /// orchestrator actually emits in prod, and it was missing from the index's
+    /// terminal list — so the cheap per-batch evict never fired on the common
+    /// path.
+    #[tokio::test]
+    async fn both_terminal_spellings_are_recognised() {
+        for (i, ty) in [
+            "playbook.completed",
+            "playbook_completed",
+            "playbook.failed",
+            "playbook_failed",
+            "playbook.cancelled",
+            "playbook_cancelled",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let index = SharedWalIndex::new(WalEventIndex::new());
+            let mut batch = DrainBatch::default();
+            let eid = 100 + i as i64;
+            apply_indexed(
+                &index,
+                &serde_json::json!({
+                    "event_id": 1, "execution_id": eid, "event_type": ty,
+                    "status": "COMPLETED", "prev_event_id": null,
+                }),
+                &mut batch,
+                false,
+            )
+            .await;
+            assert_eq!(batch.terminals, vec![eid], "{ty} must be terminal");
+        }
+    }
+
+    /// The projection window is only populated when the hook is armed — the prod
+    /// default must allocate nothing.
+    #[tokio::test]
+    async fn projection_window_is_empty_unless_armed() {
+        let index = SharedWalIndex::new(WalEventIndex::new());
+        let ev = serde_json::json!({
+            "event_id": 1, "execution_id": 3, "event_type": "playbook_started",
+            "status": "STARTED", "prev_event_id": null,
+        });
+
+        let mut off = DrainBatch::default();
+        apply_indexed(&index, &ev, &mut off, false).await;
+        assert!(off.projection_window.is_empty());
+
+        let index2 = SharedWalIndex::new(WalEventIndex::new());
+        let mut on = DrainBatch::default();
+        apply_indexed(&index2, &ev, &mut on, true).await;
+        assert_eq!(on.projection_window.len(), 1);
+    }
+
+    /// A payload the index cannot apply must not be recorded as touched — the
+    /// drain would otherwise advance chains that were never indexed.
+    #[tokio::test]
+    async fn unapplicable_payloads_touch_nothing() {
+        let index = SharedWalIndex::new(WalEventIndex::new());
+        let mut batch = DrainBatch::default();
+        for junk in [
+            serde_json::json!({}),
+            serde_json::json!({"event_id": 1}),
+            serde_json::json!(5),
+        ] {
+            apply_indexed(&index, &junk, &mut batch, false).await;
+        }
+        assert!(batch.touched.is_empty(), "junk must not touch an execution");
+        assert!(batch.terminals.is_empty());
     }
 }

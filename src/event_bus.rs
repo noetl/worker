@@ -27,6 +27,7 @@
 //! | SSE | `NOETL_EVENT_BUS_SSE_BIND` (9105) | the gateway's live SPA feed |
 //! | `/metrics` | `NOETL_EVENT_BUS_METRICS_BIND` (9106) | per-group lag + resume facts |
 //! | KV | `NOETL_EVENT_BUS_KV_BIND` (9107) | the gateway's session + request stores |
+//! | WAL fan-out | `NOETL_EVENT_BUS_WAL_BIND` (9108) | the off-server state builder's WAL replay |
 //!
 //! The command bus's 9100/9101/9102 are untouched, as is every type it uses.
 
@@ -120,6 +121,12 @@ pub struct EventBusConfig {
     pub kv_bind: Option<SocketAddr>,
     /// `NOETL_EVENT_BUS_KV_DIR` — the KV store's directory.
     pub kv_dir: Option<PathBuf>,
+    /// `NOETL_EVENT_BUS_WAL_BIND` — the raw fan-out face.  The off-server state
+    /// builder replays the retained WAL from cursor 0 on every boot and never
+    /// acks, which is a *subscription*, not a consumer group: giving it a group
+    /// would persist a cursor that could outrun a freshly-restarted worker's
+    /// empty index — precisely the noetl/ai-meta#119 stall.
+    pub wal_bind: Option<SocketAddr>,
     pub metrics_bind: Option<SocketAddr>,
     pub ack_wait: Duration,
     pub cursor_persist: Duration,
@@ -156,6 +163,7 @@ impl EventBusConfig {
             claim_bind: env_addr("NOETL_EVENT_BUS_CLAIM_BIND"),
             sse_bind: env_addr("NOETL_EVENT_BUS_SSE_BIND"),
             kv_bind: env_addr("NOETL_EVENT_BUS_KV_BIND"),
+            wal_bind: env_addr("NOETL_EVENT_BUS_WAL_BIND"),
             kv_dir: std::env::var("NOETL_EVENT_BUS_KV_DIR")
                 .ok()
                 .map(PathBuf::from),
@@ -246,6 +254,12 @@ pub async fn spawn_event_writer_host(
     // log is an append-only stream, and putting session churn in front of the
     // events log's fsync would repeat exactly the coupling the separate events
     // engine exists to avoid.
+    if let Some(addr) = config.wal_bind {
+        let listener = TcpListener::bind(addr).await?;
+        tokio::spawn(ehdb_feed::serve(writer.clone(), listener));
+        tracing::info!(%addr, shard = config.shard, "EHDB events-feed WAL fan-out face up");
+    }
+
     if let Some(addr) = config.kv_bind {
         let kv_dir = config
             .kv_dir
@@ -385,6 +399,7 @@ mod tests {
             sse_bind: None,
             kv_bind: None,
             kv_dir: None,
+            wal_bind: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::from_secs(DEFAULT_CURSOR_PERSIST_SECS),
@@ -409,6 +424,7 @@ mod tests {
             sse_bind: None,
             kv_bind: None,
             kv_dir: None,
+            wal_bind: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::ZERO,
@@ -437,6 +453,7 @@ mod tests {
             sse_bind: None,
             kv_bind: None,
             kv_dir: None,
+            wal_bind: None,
             metrics_bind: None,
             ack_wait: Duration::from_secs(30),
             cursor_persist: Duration::ZERO,
