@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.91.3](https://github.com/noetl/worker/compare/v5.91.2...v5.91.3) (2026-08-03)
+
+### Bug Fixes
+
+* **ehdb:** a face that dies must say so — it currently dies silently ([b171212](https://github.com/noetl/worker/commit/b1712120bf1e8f2b4b4b876a52f3e674dd56dc67)), closes [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209)
+* **ehdb:** sequence and await the writer seal on SIGTERM ([baa7cea](https://github.com/noetl/worker/commit/baa7ceaf7b4c7cc287e397f7c83a5bf486c2c06f)), closes [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209) [noetl/server#290](https://github.com/noetl/server/issues/290) [#209](https://github.com/noetl/worker/issues/209) [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209)
+* **ehdb:** the stop-ingest signal was losable — make it a watch, and await it ([c44ebf2](https://github.com/noetl/worker/commit/c44ebf25632fbdb512ddbe37ae6796a2b02a6dc1)), closes [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209) [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209) [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209)
+* **event-bus:** an unset or typo'd internal source is a hard error ([5a1ecb0](https://github.com/noetl/worker/commit/5a1ecb0ae7c47d06e137beb04891ba47a402f8ba)), closes [noetl/ai-meta#212](https://github.com/noetl/ai-meta/issues/212) [noetl/ai-meta#212](https://github.com/noetl/ai-meta/issues/212) [noetl/ai-meta#218](https://github.com/noetl/ai-meta/issues/218)
+
 ## [5.91.2](https://github.com/noetl/worker/compare/v5.91.1...v5.91.2) (2026-08-01)
 
 ### Bug Fixes
