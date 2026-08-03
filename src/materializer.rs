@@ -154,9 +154,9 @@ impl MaterializerConfig {
             idle_sleep,
             error_backoff,
             fault_fail_first,
-            source_mode: crate::event_bus::EventSourceMode::from_env_value(
-                &std::env::var("NOETL_MATERIALIZER_SOURCE").unwrap_or_default(),
-            ),
+            source_mode: crate::event_bus::EventSourceMode::from_env_strict(
+                "NOETL_MATERIALIZER_SOURCE",
+            )?,
             event_claim_addr: std::env::var("NOETL_EVENT_BUS_CLAIM_ADDR")
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -757,19 +757,64 @@ mod t3_source_tests {
         assert_eq!(skipped, 4);
     }
 
-    /// The source mode must default to NATS and fall back to NATS on garbage —
-    /// a typo must never move the sole writer of the durable event log onto an
-    /// unproven transport.
+    /// H5 — the inversion of the old rule.
+    ///
+    /// While NATS existed, falling back to `nats` on an unset or garbage value
+    /// was the safe direction: a typo could not move the sole writer of the
+    /// durable event log onto an unproven transport.  Since the internal NATS
+    /// bus was deleted (noetl/ai-meta#212) that fall-through points a
+    /// materializer at a transport that is not there, and the failure is
+    /// **silent** — the worker registers, heartbeats, reports ready, and its
+    /// group cursor never moves while executions keep completing.
+    ///
+    /// So unset and unrecognised are now hard errors.  Explicit `nats` still
+    /// parses: written out in a manifest it is an auditable operator choice,
+    /// not a default nobody chose.
     #[test]
-    fn source_mode_defaults_to_nats_and_falls_back_safely() {
+    fn an_unset_or_typod_source_is_a_hard_error() {
         use crate::event_bus::EventSourceMode as M;
-        assert_eq!(M::from_env_value(""), M::Nats);
-        assert_eq!(M::from_env_value("nats"), M::Nats);
-        assert_eq!(M::from_env_value("ehdb"), M::Ehdb);
-        assert_eq!(M::from_env_value("EHDB"), M::Ehdb);
-        assert_eq!(M::from_env_value("ehbd"), M::Nats);
-        assert_eq!(M::default(), M::Nats);
+        const V: &str = "NOETL_MATERIALIZER_SOURCE";
+
+        // The whole point: unset no longer silently means NATS.
+        let unset = M::parse_strict(V, "").unwrap_err().to_string();
+        assert!(unset.contains(V), "the error must name the var: {unset}");
+        assert!(
+            unset.contains("unset"),
+            "the error must say what is wrong: {unset}"
+        );
+
+        // A one-character typo must not resolve to anything at all.
+        let typo = M::parse_strict(V, "ehbd").unwrap_err().to_string();
+        assert!(
+            typo.contains("ehbd"),
+            "the error must echo the offending value: {typo}"
+        );
+        // Whitespace-only is the same as unset, not a valid value.
+        assert!(M::parse_strict(V, "   ").is_err());
+
+        // Valid values still resolve, case- and whitespace-insensitively.
+        assert_eq!(M::parse_strict(V, "ehdb").unwrap(), M::Ehdb);
+        assert_eq!(M::parse_strict(V, " EHDB ").unwrap(), M::Ehdb);
+        assert_eq!(M::parse_strict(V, "nats").unwrap(), M::Nats);
         assert!(M::Ehdb.is_ehdb() && !M::Nats.is_ehdb());
+    }
+
+    /// The strict resolver must reach the config builder, so a misconfigured
+    /// materializer fails on the startup path rather than inside its spawned
+    /// task.  Uses the real env var, hence `serial` semantics via a unique
+    /// value set and cleared within the test.
+    #[test]
+    fn from_env_strict_reads_the_real_var() {
+        use crate::event_bus::EventSourceMode as M;
+        // A var name nothing else in the test binary touches.
+        const V: &str = "NOETL_TEST_H5_SOURCE_PROBE";
+        assert!(
+            M::from_env_strict(V).is_err(),
+            "an unset var must be an error, not a default"
+        );
+        std::env::set_var(V, "ehdb");
+        assert_eq!(M::from_env_strict(V).unwrap(), M::Ehdb);
+        std::env::remove_var(V);
     }
 
     /// Each materializer group gets a distinct, non-zero member id, so the two

@@ -162,6 +162,9 @@ impl CellSeed {
 
 /// Resolved state-materializer configuration.
 pub struct StateMaterializerConfig {
+    /// Which internal bus this group drains (`NOETL_STATE_MATERIALIZER_SOURCE`).
+    /// Resolved strictly at startup — see [`crate::event_bus::EventSourceMode`].
+    pub source_mode: crate::event_bus::EventSourceMode,
     pub nats_url: String,
     pub nats_user: Option<String>,
     pub nats_password: Option<String>,
@@ -181,13 +184,20 @@ pub struct StateMaterializerConfig {
 }
 
 impl StateMaterializerConfig {
-    /// Build from worker config + env. `None` when disabled (default → no-op).
-    pub fn from_env(worker: &WorkerConfig) -> Option<Self> {
+    /// Build from worker config + env. `Ok(None)` when disabled (default → no-op).
+    ///
+    /// `Err` when enabled but `NOETL_STATE_MATERIALIZER_SOURCE` is unset or
+    /// unrecognised (H5) — resolved here on the startup path so a bad value
+    /// crashloops rather than killing the spawned loop silently.
+    pub fn from_env(worker: &WorkerConfig) -> Result<Option<Self>> {
         if !enabled() {
-            return None;
+            return Ok(None);
         }
         let (nats_url, nats_user, nats_password) = parse_nats_credentials(&worker.nats_url);
-        Some(Self {
+        Ok(Some(Self {
+            source_mode: crate::event_bus::EventSourceMode::from_env_strict(
+                "NOETL_STATE_MATERIALIZER_SOURCE",
+            )?,
             nats_url,
             nats_user,
             nats_password,
@@ -219,7 +229,7 @@ impl StateMaterializerConfig {
                 DEFAULT_OPEN_MIN_INTERVAL_SECS,
             )),
             cell: CellSeed::from_env(),
-        })
+        }))
     }
 
     fn source_config(&self) -> Result<SubscriptionConfig> {
@@ -363,9 +373,8 @@ async fn run_loop(config: StateMaterializerConfig, client: ControlPlaneClient) -
     // noetl/ai-meta#212 — drain whichever bus is selected. Same group name in
     // both worlds, so an operator reads one name whether it is a JetStream
     // durable consumer or an EHDB named group.
-    let source_mode = crate::event_bus::EventSourceMode::from_env_value(
-        &std::env::var("NOETL_STATE_MATERIALIZER_SOURCE").unwrap_or_default(),
-    );
+    // H5: resolved at config time on the startup path (see `from_env`).
+    let source_mode = config.source_mode;
 
     // Self-ensure the durable consumer — a JetStream-only concern.  On EHDB the
     // named group is created lazily by the coordinator on first claim, and there
@@ -1038,13 +1047,26 @@ mod tests {
             max_concurrent_tasks: 1,
             metrics_bind: "0.0.0.0:9090".into(),
         };
-        // Disabled → no config built (true no-op: nothing spawned).
-        assert!(StateMaterializerConfig::from_env(&cfg).is_none());
+        // Disabled → no config built (true no-op: nothing spawned).  Holds with
+        // the H5 source var unset: an off materializer needs no transport.
+        std::env::remove_var("NOETL_STATE_MATERIALIZER_SOURCE");
+        assert!(StateMaterializerConfig::from_env(&cfg).unwrap().is_none());
+
+        // H5: enabled without a source is a hard error, not a NATS default.
         std::env::set_var("NOETL_STATE_SHARD_WRITE", "true");
         assert!(enabled());
-        let built = StateMaterializerConfig::from_env(&cfg).expect("enabled → built");
+        assert!(
+            StateMaterializerConfig::from_env(&cfg).is_err(),
+            "enabled + unset source must refuse to build"
+        );
+
+        std::env::set_var("NOETL_STATE_MATERIALIZER_SOURCE", "ehdb");
+        let built = StateMaterializerConfig::from_env(&cfg)
+            .expect("enabled → built")
+            .expect("enabled → Some");
         assert_eq!(built.consumer, STATE_MATERIALIZER_CONSUMER);
         std::env::remove_var("NOETL_STATE_SHARD_WRITE");
+        std::env::remove_var("NOETL_STATE_MATERIALIZER_SOURCE");
     }
 }
 
@@ -1065,11 +1087,11 @@ mod t217_ehdb_ensure_tests {
             !M::from_env_value("nats").is_ehdb(),
             "nats must still ensure it"
         );
-        assert!(
-            !M::from_env_value("").is_ehdb(),
-            "the default must still ensure it"
-        );
-        // A typo must not accidentally skip the JetStream setup either.
-        assert!(!M::from_env_value("ehbd").is_ehdb());
+        // H5: there is no longer an unset case to reason about here — an unset
+        // or typo'd source never reaches `run_loop` at all, because
+        // `StateMaterializerConfig::from_env` refuses to build.
+        const V: &str = "NOETL_STATE_MATERIALIZER_SOURCE";
+        assert!(M::parse_strict(V, "").is_err());
+        assert!(M::parse_strict(V, "ehbd").is_err());
     }
 }

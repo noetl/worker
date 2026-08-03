@@ -1429,13 +1429,17 @@ pub struct DrainConfig {
 pub const STATE_BUILDER_CONSUMER: &str = "noetl_state_builder";
 
 impl DrainConfig {
-    /// Build from the worker config + env, or `None` when the builder is off
-    /// (mode `Off`).  Authoritative (`NOETL_STATE_BUILDER=offserver`) takes
+    /// Build from the worker config + env, or `Ok(None)` when the builder is
+    /// off (mode `Off`).  Authoritative (`NOETL_STATE_BUILDER=offserver`) takes
     /// precedence over shadow.
-    pub fn from_env(nats_url: &str) -> Option<Self> {
+    ///
+    /// `Err` when the builder is enabled but `NOETL_STATE_BUILDER_SOURCE` is
+    /// unset or unrecognised (H5) — an enabled drive with no resolvable WAL
+    /// source must not start.
+    pub fn from_env(nats_url: &str) -> Result<Option<Self>> {
         let mode = builder_mode();
         if mode == BuilderMode::Off {
-            return None;
+            return Ok(None);
         }
         let (nats_url, nats_user, nats_password) = parse_nats_credentials(nats_url);
         // noetl/ai-meta#119: the authoritative drain defaults to an **ephemeral**
@@ -1454,7 +1458,7 @@ impl DrainConfig {
         } else {
             None
         };
-        Some(Self {
+        Ok(Some(Self {
             mode,
             nats_url,
             nats_user,
@@ -1464,12 +1468,16 @@ impl DrainConfig {
             durable,
             batch: env_u32("NOETL_STATE_BUILDER_BATCH", 200).clamp(1, 1000),
             timeout_ms: env_u64("NOETL_STATE_BUILDER_TIMEOUT_MS", 2_000),
-            // noetl/ai-meta#217 — read the WAL off EHDB when asked.  Defaults to
-            // nats so an unset value can never silently change where the drive's
-            // state comes from.
-            source: crate::event_bus::EventSourceMode::from_env_value(
-                &std::env::var("NOETL_STATE_BUILDER_SOURCE").unwrap_or_default(),
-            ),
+            // noetl/ai-meta#217 — read the WAL off EHDB when asked.  H5: no
+            // default any more.  An unset value used to mean `nats`, which since
+            // the internal bus was deleted points the drive's state source at a
+            // transport that is not there — and the drive stalling on an empty
+            // index is exactly the silent failure this whole surface keeps
+            // producing.  Resolved here (config time, on the startup path) so it
+            // is a crashloop, not a `tracing::error!` inside a dead task.
+            source: crate::event_bus::EventSourceMode::from_env_strict(
+                "NOETL_STATE_BUILDER_SOURCE",
+            )?,
             wal_addr: std::env::var("NOETL_EVENT_BUS_WAL_ADDR")
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -1484,7 +1492,7 @@ impl DrainConfig {
             // re-arms its long-poll near-immediately and the append signal fires
             // within milliseconds of an event landing.  Still env-overridable.
             idle_sleep: Duration::from_millis(env_u64("NOETL_STATE_BUILDER_IDLE_SLEEP_MS", 25)),
-        })
+        }))
     }
 }
 
@@ -3608,12 +3616,17 @@ mod t217_ehdb_drain_tests {
     /// The WAL drain must default to NATS: an unset value silently moving the
     /// drive's state source would be the #217 stall all over again.
     #[test]
-    fn wal_source_defaults_to_nats_and_falls_back_safely() {
+    fn wal_source_has_no_default_and_rejects_typos() {
         use crate::event_bus::EventSourceMode as M;
-        assert_eq!(M::from_env_value(""), M::Nats);
-        assert_eq!(M::from_env_value("ehdb"), M::Ehdb);
-        assert_eq!(M::from_env_value("EHDB"), M::Ehdb);
-        assert_eq!(M::from_env_value("ehbd"), M::Nats);
+        const V: &str = "NOETL_STATE_BUILDER_SOURCE";
+        // H5: an enabled drive whose WAL source is unset must not start — a
+        // drive stalled on an empty index is the silent failure this surface
+        // keeps producing (noetl/ai-meta#119, #217).
+        assert!(M::parse_strict(V, "").is_err());
+        assert!(M::parse_strict(V, "ehbd").is_err());
+        assert_eq!(M::parse_strict(V, "ehdb").unwrap(), M::Ehdb);
+        assert_eq!(M::parse_strict(V, "EHDB").unwrap(), M::Ehdb);
+        assert_eq!(M::parse_strict(V, "nats").unwrap(), M::Nats);
     }
 
     /// Both drains index through `apply_indexed`, so the same payload must

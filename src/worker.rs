@@ -247,8 +247,10 @@ impl Worker {
         // copy; under NOETL_RESULT_MINT_AUTHORITATIVE (Phase D) it is the
         // authoritative tier writer (the consume path resolves from it, with the
         // dual-written result_store as the reversible fallback).  Default off.
+        // H5: `?` — an enabled materializer with an unresolvable source is a
+        // startup failure, not a `tracing::error!` in a task nobody reads.
         let result_materializer_handle =
-            crate::result_materializer::ResultMaterializerConfig::from_env(&self.config)
+            crate::result_materializer::ResultMaterializerConfig::from_env(&self.config)?
                 .map(|cfg| crate::result_materializer::spawn(cfg, self.client.clone()));
 
         // Start the state materializer (noetl/ai-meta#166 Phase 2) when enabled
@@ -259,7 +261,7 @@ impl Worker {
         // READ-ONLY w.r.t. noetl.* (object PUT only), so it can neither perturb
         // the drive nor the #103 sole-writer.  Default off (NOETL_STATE_SHARD_WRITE).
         let state_materializer_handle =
-            crate::state_materializer::StateMaterializerConfig::from_env(&self.config)
+            crate::state_materializer::StateMaterializerConfig::from_env(&self.config)?
                 .map(|cfg| crate::state_materializer::spawn(cfg, self.client.clone()));
 
         // Off-server state-builder drain (noetl/ai-meta#115 Phase 4): drain the
@@ -270,7 +272,7 @@ impl Worker {
         // command dispatch reads to build drive state off the WAL spine. Zero
         // noetl.event scans either way. Default off.
         let state_builder_handle =
-            crate::state_builder::DrainConfig::from_env(&self.config.nats_url).map(|cfg| {
+            crate::state_builder::DrainConfig::from_env(&self.config.nats_url)?.map(|cfg| {
                 crate::state_builder::spawn_drain(cfg, self.state_builder_index.clone())
             });
 

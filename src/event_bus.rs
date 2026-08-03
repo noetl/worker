@@ -72,24 +72,75 @@ const KV_SWEEP: Duration = Duration::from_secs(60);
 /// Which transport a materializer drains (`NOETL_*_SOURCE`).
 ///
 /// Deliberately separate from the server's publish-side `NOETL_EVENT_BUS`: the
-/// cutover is per-consumer, so a materializer moves to the EHDB feed while
-/// publish stays in `shadow` and NATS remains authoritative for everything else.
-/// Anything unrecognised is `nats`, so a typo can never quietly move the sole
-/// writer of the durable event log onto an unproven transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// cutover was per-consumer, so a materializer could move to the EHDB feed
+/// while publish stayed in `shadow`.
+///
+/// **There is no default any more (H5).**  While NATS existed, falling back to
+/// `nats` on an unrecognised value was the safe direction — a typo could not
+/// quietly move the sole writer of the durable event log onto an unproven
+/// transport.  Since the internal NATS bus was deleted (noetl/ai-meta#212, prod
+/// 2026-08-01) that same fall-through inverted into the dangerous direction: it
+/// points a materializer at a transport that is not there.  The failure is
+/// silent — the group's cursor simply never advances while executions keep
+/// completing — so the mode is now resolved with [`Self::from_env_strict`] at
+/// worker startup and an unset or unrecognised value is a hard error.
+///
+/// The `Default` impl is gone on purpose: `EventSourceMode::default()` was a
+/// third silent path to `Nats`, and there is no longer a defensible default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSourceMode {
-    #[default]
     Nats,
     Ehdb,
 }
 
 impl EventSourceMode {
+    /// Permissive parse, kept for callers that already hold a value and want
+    /// the historical fall-through.  Prefer [`Self::from_env_strict`] for
+    /// anything that decides which transport a consumer actually drains.
     pub fn from_env_value(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "ehdb" => Self::Ehdb,
             _ => Self::Nats,
         }
     }
+
+    /// Resolve the internal event-bus source for `var`, failing loud.
+    ///
+    /// Unset, empty, or unrecognised is an error rather than a fall-through.
+    /// This matches the command bus (`src/worker.rs`, noetl/ai-meta#212) and
+    /// pool routing (noetl/ai-meta#218): a worker that starts pointed at a
+    /// transport that no longer exists looks perfectly healthy — it registers,
+    /// heartbeats, and reports ready — while its group cursor sits flat. A
+    /// crashloop an operator sees in seconds beats a stall nobody sees at all.
+    ///
+    /// `nats` is still accepted when written explicitly: that is an auditable
+    /// choice in a manifest, not a silent default, and the NATS drain code is
+    /// still present for the user-facing carve-outs.
+    pub fn from_env_strict(var: &str) -> Result<Self> {
+        Self::parse_strict(var, &std::env::var(var).unwrap_or_default())
+    }
+
+    /// The pure half of [`Self::from_env_strict`], split out so the behaviour is
+    /// testable without mutating process-global env from parallel tests.
+    pub fn parse_strict(var: &str, value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ehdb" => Ok(Self::Ehdb),
+            "nats" => Ok(Self::Nats),
+            "" => anyhow::bail!(
+                "{var} is unset — refusing to guess the internal event-bus source. \
+                 The internal NATS bus was removed (noetl/ai-meta#212); set {var}=ehdb. \
+                 Defaulting here would start a materializer against a dead transport, \
+                 which fails silently (flat group cursor, executions still complete)."
+            ),
+            other => anyhow::bail!(
+                "{var}={other:?} is not a recognised internal event-bus source — \
+                 valid values are `ehdb` (and `nats`, which no longer exists internally). \
+                 Refusing to fall back, because a typo would silently point this \
+                 materializer at a dead transport (noetl/ai-meta#212)."
+            ),
+        }
+    }
+
     pub fn is_ehdb(self) -> bool {
         matches!(self, Self::Ehdb)
     }
