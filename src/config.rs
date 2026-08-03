@@ -69,8 +69,15 @@ impl WorkerConfig {
         let server_url = std::env::var("NOETL_SERVER_URL")
             .unwrap_or_else(|_| "http://localhost:8082".to_string());
 
-        let nats_url =
-            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        // H5: no `nats://localhost:4222` default any more.  The internal NATS
+        // bus was deleted (noetl/ai-meta#212, prod 2026-08-01), so that default
+        // named a broker that is not there and cannot be there — every consumer
+        // that took it got a connect failure at best, and at worst sat retrying
+        // against localhost while looking healthy.  Unset now means unset: the
+        // remaining readers are opt-in (the subscription spool's `nats_object`
+        // backend and the state-builder rehydrate path), and they fail visibly
+        // on an empty URL instead of silently on a phantom one.
+        let nats_url = std::env::var("NATS_URL").unwrap_or_default();
 
         let nats_stream =
             std::env::var("NATS_STREAM").unwrap_or_else(|_| "noetl_commands".to_string());

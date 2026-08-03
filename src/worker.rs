@@ -24,6 +24,13 @@ pub struct Worker {
     /// Worker configuration.
     config: WorkerConfig,
 
+    /// Shutdown handles for the EHDB writer hosts this process owns, in the
+    /// order they must be sealed (noetl/ai-meta#209).  Empty on a pod that
+    /// hosts neither writer.  `main` awaits [`Worker::shutdown`] on SIGTERM —
+    /// these used to be detached signal handlers that raced process exit, so
+    /// the seal usually lost.
+    writer_shutdowns: Vec<crate::graceful::WriterShutdown>,
+
     /// Pull-model command source — NATS JetStream (default) or the EHDB command
     /// bus (`NOETL_COMMAND_BUS=ehdb`, noetl/ai-meta#194 L1 T4).  Behind a `Mutex`
     /// so `process_commands` (which takes `&self`) can call `next()` (which takes
@@ -62,8 +69,10 @@ impl Worker {
         // spawn its ingest (server publishes) + claim (replicas compete) +
         // `/metrics` (lag) faces.
         let cmdbus = crate::command_bus::CommandBusConfig::from_env();
+        let mut writer_shutdowns = Vec::new();
         if cmdbus.host && cmdbus.mode.hosts_relevant() {
-            crate::command_bus::spawn_writer_host(&cmdbus).await?;
+            let (_writer, shutdown) = crate::command_bus::spawn_writer_host(&cmdbus).await?;
+            writer_shutdowns.push(shutdown);
         }
 
         // noetl/ai-meta#212 L1 T3 — the events feed, the `noetl.events.>`
@@ -74,7 +83,9 @@ impl Worker {
         // command dispatch latency and re-open noetl/ai-meta#205.
         let eventbus = crate::event_bus::EventBusConfig::from_env();
         if eventbus.host {
-            crate::event_bus::spawn_event_writer_host(&eventbus).await?;
+            let (_coordinator, shutdown) =
+                crate::event_bus::spawn_event_writer_host(&eventbus).await?;
+            writer_shutdowns.push(shutdown);
         }
 
         // Select the command source by mode.  `ehdb` claims over the network from
@@ -194,12 +205,33 @@ impl Worker {
 
         Ok(Self {
             config,
+            writer_shutdowns,
             source,
             client,
             executor,
             semaphore,
             state_builder_index,
         })
+    }
+
+    /// Seal every EHDB writer this process hosts, in order, before exit
+    /// (noetl/ai-meta#209).
+    ///
+    /// `main` awaits this on SIGTERM. It must be the last thing the process
+    /// does: the seal deliberately holds each engine's lock through exit so no
+    /// append can be acked after its log was sealed, which means the writer is
+    /// unusable afterwards by design. See [`crate::graceful`].
+    pub async fn shutdown(&self) {
+        if self.writer_shutdowns.is_empty() {
+            return;
+        }
+        tracing::info!(
+            hosts = self.writer_shutdowns.len(),
+            "sealing EHDB writer hosts before exit"
+        );
+        for shutdown in &self.writer_shutdowns {
+            shutdown.run().await;
+        }
     }
 
     /// Run the worker.
@@ -247,8 +279,10 @@ impl Worker {
         // copy; under NOETL_RESULT_MINT_AUTHORITATIVE (Phase D) it is the
         // authoritative tier writer (the consume path resolves from it, with the
         // dual-written result_store as the reversible fallback).  Default off.
+        // H5: `?` — an enabled materializer with an unresolvable source is a
+        // startup failure, not a `tracing::error!` in a task nobody reads.
         let result_materializer_handle =
-            crate::result_materializer::ResultMaterializerConfig::from_env(&self.config)
+            crate::result_materializer::ResultMaterializerConfig::from_env(&self.config)?
                 .map(|cfg| crate::result_materializer::spawn(cfg, self.client.clone()));
 
         // Start the state materializer (noetl/ai-meta#166 Phase 2) when enabled
@@ -259,7 +293,7 @@ impl Worker {
         // READ-ONLY w.r.t. noetl.* (object PUT only), so it can neither perturb
         // the drive nor the #103 sole-writer.  Default off (NOETL_STATE_SHARD_WRITE).
         let state_materializer_handle =
-            crate::state_materializer::StateMaterializerConfig::from_env(&self.config)
+            crate::state_materializer::StateMaterializerConfig::from_env(&self.config)?
                 .map(|cfg| crate::state_materializer::spawn(cfg, self.client.clone()));
 
         // Off-server state-builder drain (noetl/ai-meta#115 Phase 4): drain the
@@ -270,7 +304,7 @@ impl Worker {
         // command dispatch reads to build drive state off the WAL spine. Zero
         // noetl.event scans either way. Default off.
         let state_builder_handle =
-            crate::state_builder::DrainConfig::from_env(&self.config.nats_url).map(|cfg| {
+            crate::state_builder::DrainConfig::from_env(&self.config.nats_url)?.map(|cfg| {
                 crate::state_builder::spawn_drain(cfg, self.state_builder_index.clone())
             });
 

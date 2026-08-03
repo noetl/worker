@@ -118,6 +118,9 @@ impl CellSeed {
 
 /// Resolved result-materializer configuration.
 pub struct ResultMaterializerConfig {
+    /// Which internal bus this group drains (`NOETL_RESULT_MATERIALIZER_SOURCE`).
+    /// Resolved strictly at startup — see [`crate::event_bus::EventSourceMode`].
+    pub source_mode: crate::event_bus::EventSourceMode,
     pub nats_url: String,
     pub nats_user: Option<String>,
     pub nats_password: Option<String>,
@@ -144,23 +147,32 @@ pub struct ResultMaterializerConfig {
 }
 
 impl ResultMaterializerConfig {
-    /// Build from worker config + env. `None` when disabled.
+    /// Build from worker config + env. `Ok(None)` when disabled.
     ///
     /// Spawns when **either** `NOETL_RESULT_MATERIALIZER_ENABLED` (Phase B
     /// shadow) **or** `NOETL_RESULT_MINT_AUTHORITATIVE` (Phase D: the tier is the
     /// authoritative store, so the materializer is the authoritative writer) is
     /// set. Default off → not spawned (true no-op).
-    pub fn from_env(worker: &WorkerConfig) -> Option<Self> {
+    ///
+    /// `Err` when it is enabled but `NOETL_RESULT_MATERIALIZER_SOURCE` is unset
+    /// or unrecognised (H5).  The mode is resolved *here*, on the startup path,
+    /// rather than inside `run_loop` on the spawned task: an error raised in the
+    /// task only produced a `tracing::error!` and a dead materializer, which is
+    /// the silent shape this fix exists to remove.
+    pub fn from_env(worker: &WorkerConfig) -> Result<Option<Self>> {
         let authoritative = crate::result_resolver::mint_authoritative();
         let dr_repair = crate::result_resolver::result_tier_dr();
         // Phase F: the DR re-derive runs on the same consume-loop, so the
         // materializer must spawn when DR is requested even if the Phase B/D
         // write flags are off (DR-only mode: verify-and-repair the existing tier).
         if !enabled() && !authoritative && !dr_repair {
-            return None;
+            return Ok(None);
         }
         let (nats_url, nats_user, nats_password) = parse_nats_credentials(&worker.nats_url);
-        Some(Self {
+        Ok(Some(Self {
+            source_mode: crate::event_bus::EventSourceMode::from_env_strict(
+                "NOETL_RESULT_MATERIALIZER_SOURCE",
+            )?,
             nats_url,
             nats_user,
             nats_password,
@@ -182,7 +194,7 @@ impl ResultMaterializerConfig {
             cell: CellSeed::from_env(),
             authoritative,
             dr_repair,
-        })
+        }))
     }
 
     fn source_config(&self) -> Result<SubscriptionConfig> {
@@ -218,10 +230,10 @@ pub fn spawn(
 async fn run_loop(config: ResultMaterializerConfig, client: ControlPlaneClient) -> Result<()> {
     // noetl/ai-meta#212 — drain whichever bus is selected. Same group name in
     // both worlds, so an operator reads one name whether it is a JetStream
-    // durable consumer or an EHDB named group.
-    let source_mode = crate::event_bus::EventSourceMode::from_env_value(
-        &std::env::var("NOETL_RESULT_MATERIALIZER_SOURCE").unwrap_or_default(),
-    );
+    // durable consumer or an EHDB named group.  H5: resolved at config time on
+    // the startup path, so a bad value crashloops the worker instead of dying
+    // quietly in here.
+    let source_mode = config.source_mode;
     let claim_addr = std::env::var("NOETL_EVENT_BUS_CLAIM_ADDR")
         .ok()
         .map(|v| v.trim().to_string())
@@ -779,13 +791,26 @@ mod tests {
             max_concurrent_tasks: 1,
             metrics_bind: "0.0.0.0:9090".into(),
         };
-        // Disabled → no config built (true no-op: nothing spawned).
+        // Disabled → no config built (true no-op: nothing spawned).  Note this
+        // holds even with the H5 source var unset: a materializer that is off
+        // needs no transport, so `from_env` must not demand one.
         std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
         std::env::remove_var("NOETL_RESULT_TIER_DR");
-        assert!(ResultMaterializerConfig::from_env(&cfg).is_none());
+        std::env::remove_var("NOETL_RESULT_MATERIALIZER_SOURCE");
+        assert!(ResultMaterializerConfig::from_env(&cfg).unwrap().is_none());
+
+        // H5: enabled without a source is now a hard error, not a NATS default.
         std::env::set_var("NOETL_RESULT_MATERIALIZER_ENABLED", "true");
         assert!(enabled());
-        let built = ResultMaterializerConfig::from_env(&cfg).expect("enabled → built");
+        assert!(
+            ResultMaterializerConfig::from_env(&cfg).is_err(),
+            "enabled + unset source must refuse to build"
+        );
+
+        std::env::set_var("NOETL_RESULT_MATERIALIZER_SOURCE", "ehdb");
+        let built = ResultMaterializerConfig::from_env(&cfg)
+            .expect("enabled → built")
+            .expect("enabled → Some");
         // Phase B shadow: enabled but not authoritative, not DR.
         assert!(!built.authoritative);
         assert!(!built.dr_repair);
@@ -794,12 +819,15 @@ mod tests {
         // Phase F: NOETL_RESULT_TIER_DR alone (no write flags) spawns the
         // materializer in verify-and-repair mode.
         std::env::set_var("NOETL_RESULT_TIER_DR", "true");
-        let dr = ResultMaterializerConfig::from_env(&cfg).expect("DR → materializer built");
+        let dr = ResultMaterializerConfig::from_env(&cfg)
+            .expect("DR → materializer built")
+            .expect("DR → Some");
         assert!(dr.dr_repair, "DR flag must set verify-and-repair mode");
         assert!(!dr.authoritative);
         std::env::remove_var("NOETL_RESULT_TIER_DR");
+        std::env::remove_var("NOETL_RESULT_MATERIALIZER_SOURCE");
         // All flags off again → not spawned (true no-op).
-        assert!(ResultMaterializerConfig::from_env(&cfg).is_none());
+        assert!(ResultMaterializerConfig::from_env(&cfg).unwrap().is_none());
     }
 
     // --- Phase F: DR re-derive ------------------------------------------------
@@ -837,10 +865,13 @@ mod tests {
             max_concurrent_tasks: 1,
             metrics_bind: "0.0.0.0:9090".into(),
         };
+        std::env::set_var("NOETL_RESULT_MATERIALIZER_SOURCE", "ehdb");
         let built = ResultMaterializerConfig::from_env(&cfg)
-            .expect("mint-authoritative → materializer built");
+            .expect("mint-authoritative → materializer built")
+            .expect("mint-authoritative → Some");
         assert!(built.authoritative, "Phase D writer must be authoritative");
         std::env::remove_var("NOETL_RESULT_MINT_AUTHORITATIVE");
+        std::env::remove_var("NOETL_RESULT_MATERIALIZER_SOURCE");
     }
 
     // --- #104 OQ5 Option A: materializer skip-on-exists -----------------------

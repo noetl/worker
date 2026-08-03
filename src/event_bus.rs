@@ -42,6 +42,8 @@ use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{D1EventLog, L0Config, L0Engine, LocalFsSubstrate};
 use tokio::net::TcpListener;
 
+use crate::graceful::WriterShutdown;
+
 /// The named durable groups this feed serves — the EHDB twins of the three
 /// JetStream durable consumers on `noetl_events`. Named here (rather than
 /// discovered from client traffic) so the host can open them at startup and log
@@ -72,24 +74,75 @@ const KV_SWEEP: Duration = Duration::from_secs(60);
 /// Which transport a materializer drains (`NOETL_*_SOURCE`).
 ///
 /// Deliberately separate from the server's publish-side `NOETL_EVENT_BUS`: the
-/// cutover is per-consumer, so a materializer moves to the EHDB feed while
-/// publish stays in `shadow` and NATS remains authoritative for everything else.
-/// Anything unrecognised is `nats`, so a typo can never quietly move the sole
-/// writer of the durable event log onto an unproven transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// cutover was per-consumer, so a materializer could move to the EHDB feed
+/// while publish stayed in `shadow`.
+///
+/// **There is no default any more (H5).**  While NATS existed, falling back to
+/// `nats` on an unrecognised value was the safe direction — a typo could not
+/// quietly move the sole writer of the durable event log onto an unproven
+/// transport.  Since the internal NATS bus was deleted (noetl/ai-meta#212, prod
+/// 2026-08-01) that same fall-through inverted into the dangerous direction: it
+/// points a materializer at a transport that is not there.  The failure is
+/// silent — the group's cursor simply never advances while executions keep
+/// completing — so the mode is now resolved with [`Self::from_env_strict`] at
+/// worker startup and an unset or unrecognised value is a hard error.
+///
+/// The `Default` impl is gone on purpose: `EventSourceMode::default()` was a
+/// third silent path to `Nats`, and there is no longer a defensible default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSourceMode {
-    #[default]
     Nats,
     Ehdb,
 }
 
 impl EventSourceMode {
+    /// Permissive parse, kept for callers that already hold a value and want
+    /// the historical fall-through.  Prefer [`Self::from_env_strict`] for
+    /// anything that decides which transport a consumer actually drains.
     pub fn from_env_value(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "ehdb" => Self::Ehdb,
             _ => Self::Nats,
         }
     }
+
+    /// Resolve the internal event-bus source for `var`, failing loud.
+    ///
+    /// Unset, empty, or unrecognised is an error rather than a fall-through.
+    /// This matches the command bus (`src/worker.rs`, noetl/ai-meta#212) and
+    /// pool routing (noetl/ai-meta#218): a worker that starts pointed at a
+    /// transport that no longer exists looks perfectly healthy — it registers,
+    /// heartbeats, and reports ready — while its group cursor sits flat. A
+    /// crashloop an operator sees in seconds beats a stall nobody sees at all.
+    ///
+    /// `nats` is still accepted when written explicitly: that is an auditable
+    /// choice in a manifest, not a silent default, and the NATS drain code is
+    /// still present for the user-facing carve-outs.
+    pub fn from_env_strict(var: &str) -> Result<Self> {
+        Self::parse_strict(var, &std::env::var(var).unwrap_or_default())
+    }
+
+    /// The pure half of [`Self::from_env_strict`], split out so the behaviour is
+    /// testable without mutating process-global env from parallel tests.
+    pub fn parse_strict(var: &str, value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ehdb" => Ok(Self::Ehdb),
+            "nats" => Ok(Self::Nats),
+            "" => anyhow::bail!(
+                "{var} is unset — refusing to guess the internal event-bus source. \
+                 The internal NATS bus was removed (noetl/ai-meta#212); set {var}=ehdb. \
+                 Defaulting here would start a materializer against a dead transport, \
+                 which fails silently (flat group cursor, executions still complete)."
+            ),
+            other => anyhow::bail!(
+                "{var}={other:?} is not a recognised internal event-bus source — \
+                 valid values are `ehdb` (and `nats`, which no longer exists internally). \
+                 Refusing to fall back, because a typo would silently point this \
+                 materializer at a dead transport (noetl/ai-meta#212)."
+            ),
+        }
+    }
+
     pub fn is_ehdb(self) -> bool {
         matches!(self, Self::Ehdb)
     }
@@ -181,10 +234,19 @@ impl EventBusConfig {
 }
 
 /// Host the events feed: open its own durable log and spawn the ingest, named-
-/// group claim, and `/metrics` faces. Returns the writer handle.
+/// group claim, SSE, WAL fan-out, KV and `/metrics` faces.
+///
+/// Returns the group coordinator **and** the [`WriterShutdown`] the caller must
+/// hold and await on SIGTERM (noetl/ai-meta#209).
+///
+/// Note this host previously **never sealed its log**: its shutdown handler
+/// only checkpointed group cursors, so every restart dropped the unsealed tail
+/// (up to `seal_max_records`, 1024) of the sole writer of the durable
+/// `noetl.event` log. The seal is now part of the same sequenced shutdown the
+/// command bus uses.
 pub async fn spawn_event_writer_host(
     config: &EventBusConfig,
-) -> Result<Arc<GroupCoordinator<D1EventLog>>> {
+) -> Result<(Arc<GroupCoordinator<D1EventLog>>, WriterShutdown)> {
     let dir = config
         .writer_dir
         .clone()
@@ -197,9 +259,24 @@ pub async fn spawn_event_writer_host(
     )?;
     let writer = Arc::new(FeedWriter::new(engine));
 
+    // noetl/ai-meta#209: the host owns the ingest face's lifetime, so shutdown
+    // can close the listener before it seals rather than sealing underneath a
+    // still-accepting publisher.
+    // One signal, shared: this host runs several faces (ingest, group-claim,
+    // SSE, KV, WAL). Only ingest appends to — and therefore acks into — the log
+    // this shutdown seals, so only ingest is registered here. The signal is a
+    // `watch`, which broadcasts, so registering the others later needs no change
+    // to the mechanism; a permit-storing `notify_one` would have woken exactly
+    // one of them. See `graceful`'s module docs.
+    let stop_ingest = crate::graceful::StopSignal::new();
+    let mut ingest_stop_handle = None;
     if let Some(addr) = config.ingest_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve_ingest(listener, writer.clone()));
+        tokio::spawn(crate::graceful::until_stopped(
+            stop_ingest.register("events ingest"),
+            ehdb_feed::serve_ingest(listener, writer.clone()),
+        ));
+        ingest_stop_handle = Some(stop_ingest.clone());
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed ingest listener up");
     }
 
@@ -223,13 +300,19 @@ pub async fn spawn_event_writer_host(
 
     if let Some(addr) = config.claim_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve_group_claims(listener, coordinator.clone()));
+        tokio::spawn(crate::graceful::supervised(
+            "events group-claim",
+            ehdb_feed::serve_group_claims(listener, coordinator.clone()),
+        ));
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed group coordinator up");
     }
 
     if let Some(addr) = config.sse_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::sse::serve_sse(listener, writer.clone()));
+        tokio::spawn(crate::graceful::supervised(
+            "events SSE",
+            ehdb_feed::sse::serve_sse(listener, writer.clone()),
+        ));
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed SSE face up");
     }
 
@@ -246,7 +329,25 @@ pub async fn spawn_event_writer_host(
         });
     }
 
-    spawn_graceful_event_shutdown(coordinator.clone(), config.shard);
+    // noetl/ai-meta#209: built here, run by `Worker::shutdown` from `main`'s
+    // signal branch. Replaces the detached SIGTERM handler that raced `main`'s
+    // own — and that only checkpointed cursors, never sealing the log.
+    let shutdown = {
+        let coordinator = coordinator.clone();
+        WriterShutdown::new(
+            "events-feed",
+            config.shard,
+            ingest_stop_handle,
+            Box::new(move || {
+                let coordinator = coordinator.clone();
+                Box::pin(async move {
+                    coordinator.checkpoint().await?;
+                    Ok(())
+                })
+            }),
+            vec![Arc::new(crate::graceful::EngineSeal::new(writer.engine()))],
+        )
+    };
     tokio::spawn(watch_cursor_errors(coordinator.clone()));
 
     // The networked KV face — the NATS-KV replacement for the gateway's
@@ -257,7 +358,13 @@ pub async fn spawn_event_writer_host(
     // engine exists to avoid.
     if let Some(addr) = config.wal_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve(writer.clone(), listener));
+        // The most fragile face of the lot: `ehdb_feed::serve` handshakes inside
+        // its accept loop, so ONE malformed connection kills it permanently.
+        // See `graceful::supervised`.
+        tokio::spawn(crate::graceful::supervised(
+            "events WAL fan-out",
+            ehdb_feed::serve(writer.clone(), listener),
+        ));
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed WAL fan-out face up");
     }
 
@@ -275,7 +382,10 @@ pub async fn spawn_event_writer_host(
         kv.clone()
             .spawn_sweeper(KV_BUCKETS.iter().map(|s| s.to_string()).collect(), KV_SWEEP);
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve_kv(listener, kv));
+        tokio::spawn(crate::graceful::supervised(
+            "events KV",
+            ehdb_feed::serve_kv(listener, kv),
+        ));
         tracing::info!(%addr, dir = %kv_dir.display(), "EHDB KV face up");
     }
 
@@ -284,7 +394,7 @@ pub async fn spawn_event_writer_host(
         tracing::info!(%addr, "EHDB events-feed /metrics endpoint up");
     }
 
-    Ok(coordinator)
+    Ok((coordinator, shutdown))
 }
 
 /// Render the events feed's Prometheus exposition: per-group committed cursor
@@ -382,36 +492,6 @@ async fn serve_event_metrics(
     }
 }
 
-#[cfg(unix)]
-fn spawn_graceful_event_shutdown(coordinator: Arc<GroupCoordinator<D1EventLog>>, shard: u32) {
-    tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut sigterm), Ok(mut sigint)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) else {
-            tracing::warn!("EHDB events-feed writer could not install its shutdown handler");
-            return;
-        };
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
-        }
-        // Persist every group's cursor before the process goes. A cursor behind
-        // the log is always safe (records redeliver); a cursor ahead of it needs
-        // the clamp, which is why this only ever writes committed positions.
-        match coordinator.checkpoint().await {
-            Ok(()) => tracing::info!(shard, "EHDB events-feed cursors persisted on shutdown"),
-            Err(error) => {
-                tracing::warn!(shard, %error, "EHDB events-feed cursor persist failed")
-            }
-        }
-    });
-}
-
-#[cfg(not(unix))]
-fn spawn_graceful_event_shutdown(_coordinator: Arc<GroupCoordinator<D1EventLog>>, _shard: u32) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,7 +573,7 @@ mod tests {
             cursor_persist: Duration::ZERO,
             cursor_fallback: CursorFallback::Tail,
         };
-        let coordinator = spawn_event_writer_host(&config).await.unwrap();
+        let (coordinator, _shutdown) = spawn_event_writer_host(&config).await.unwrap();
         let body = render_event_metrics(&coordinator).await;
         for group in EVENT_GROUPS {
             assert!(
