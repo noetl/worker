@@ -41,6 +41,9 @@ use ehdb_feed::{CursorFallback, FeedWriter, GroupCoordinator};
 use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{D1EventLog, L0Config, L0Engine, LocalFsSubstrate};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
+
+use crate::graceful::WriterShutdown;
 
 /// The named durable groups this feed serves — the EHDB twins of the three
 /// JetStream durable consumers on `noetl_events`. Named here (rather than
@@ -232,10 +235,19 @@ impl EventBusConfig {
 }
 
 /// Host the events feed: open its own durable log and spawn the ingest, named-
-/// group claim, and `/metrics` faces. Returns the writer handle.
+/// group claim, SSE, WAL fan-out, KV and `/metrics` faces.
+///
+/// Returns the group coordinator **and** the [`WriterShutdown`] the caller must
+/// hold and await on SIGTERM (noetl/ai-meta#209).
+///
+/// Note this host previously **never sealed its log**: its shutdown handler
+/// only checkpointed group cursors, so every restart dropped the unsealed tail
+/// (up to `seal_max_records`, 1024) of the sole writer of the durable
+/// `noetl.event` log. The seal is now part of the same sequenced shutdown the
+/// command bus uses.
 pub async fn spawn_event_writer_host(
     config: &EventBusConfig,
-) -> Result<Arc<GroupCoordinator<D1EventLog>>> {
+) -> Result<(Arc<GroupCoordinator<D1EventLog>>, WriterShutdown)> {
     let dir = config
         .writer_dir
         .clone()
@@ -248,9 +260,18 @@ pub async fn spawn_event_writer_host(
     )?;
     let writer = Arc::new(FeedWriter::new(engine));
 
+    // noetl/ai-meta#209: the host owns the ingest face's lifetime, so shutdown
+    // can close the listener before it seals rather than sealing underneath a
+    // still-accepting publisher.
+    let stop_ingest = Arc::new(Notify::new());
+    let mut ingest_stop_handle = None;
     if let Some(addr) = config.ingest_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve_ingest(listener, writer.clone()));
+        tokio::spawn(crate::graceful::until_stopped(
+            stop_ingest.clone(),
+            ehdb_feed::serve_ingest(listener, writer.clone()),
+        ));
+        ingest_stop_handle = Some(stop_ingest.clone());
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed ingest listener up");
     }
 
@@ -297,7 +318,25 @@ pub async fn spawn_event_writer_host(
         });
     }
 
-    spawn_graceful_event_shutdown(coordinator.clone(), config.shard);
+    // noetl/ai-meta#209: built here, run by `Worker::shutdown` from `main`'s
+    // signal branch. Replaces the detached SIGTERM handler that raced `main`'s
+    // own — and that only checkpointed cursors, never sealing the log.
+    let shutdown = {
+        let coordinator = coordinator.clone();
+        WriterShutdown::new(
+            "events-feed",
+            config.shard,
+            ingest_stop_handle,
+            Box::new(move || {
+                let coordinator = coordinator.clone();
+                Box::pin(async move {
+                    coordinator.checkpoint().await?;
+                    Ok(())
+                })
+            }),
+            vec![Arc::new(crate::graceful::EngineSeal::new(writer.engine()))],
+        )
+    };
     tokio::spawn(watch_cursor_errors(coordinator.clone()));
 
     // The networked KV face — the NATS-KV replacement for the gateway's
@@ -335,7 +374,7 @@ pub async fn spawn_event_writer_host(
         tracing::info!(%addr, "EHDB events-feed /metrics endpoint up");
     }
 
-    Ok(coordinator)
+    Ok((coordinator, shutdown))
 }
 
 /// Render the events feed's Prometheus exposition: per-group committed cursor
@@ -433,36 +472,6 @@ async fn serve_event_metrics(
     }
 }
 
-#[cfg(unix)]
-fn spawn_graceful_event_shutdown(coordinator: Arc<GroupCoordinator<D1EventLog>>, shard: u32) {
-    tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut sigterm), Ok(mut sigint)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) else {
-            tracing::warn!("EHDB events-feed writer could not install its shutdown handler");
-            return;
-        };
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
-        }
-        // Persist every group's cursor before the process goes. A cursor behind
-        // the log is always safe (records redeliver); a cursor ahead of it needs
-        // the clamp, which is why this only ever writes committed positions.
-        match coordinator.checkpoint().await {
-            Ok(()) => tracing::info!(shard, "EHDB events-feed cursors persisted on shutdown"),
-            Err(error) => {
-                tracing::warn!(shard, %error, "EHDB events-feed cursor persist failed")
-            }
-        }
-    });
-}
-
-#[cfg(not(unix))]
-fn spawn_graceful_event_shutdown(_coordinator: Arc<GroupCoordinator<D1EventLog>>, _shard: u32) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,7 +553,7 @@ mod tests {
             cursor_persist: Duration::ZERO,
             cursor_fallback: CursorFallback::Tail,
         };
-        let coordinator = spawn_event_writer_host(&config).await.unwrap();
+        let (coordinator, _shutdown) = spawn_event_writer_host(&config).await.unwrap();
         let body = render_event_metrics(&coordinator).await;
         for group in EVENT_GROUPS {
             assert!(

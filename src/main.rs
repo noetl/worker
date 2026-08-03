@@ -92,6 +92,28 @@ async fn main() -> Result<()> {
         }
         _ = shutdown => {
             tracing::info!("Shutting down worker");
+            // noetl/ai-meta#209: the seal has to happen HERE, awaited, before
+            // `main` returns.  This branch used to log and fall straight through
+            // — dropping the runtime while the writer hosts' own detached
+            // SIGTERM handlers were still sealing, so the seal usually lost the
+            // race and the unsealed tail (up to `seal_max_records`) was invisible
+            // to the next incarnation despite having been fsynced and acked.
+            //
+            // Bounded so a wedged uploader cannot hold the pod past Kubernetes'
+            // termination grace period and turn a graceful stop into a SIGKILL —
+            // which is the very case that loses data.
+            let budget = std::env::var("NOETL_EHDB_SHUTDOWN_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(std::time::Duration::from_millis)
+                .unwrap_or_else(|| std::time::Duration::from_secs(15));
+            if tokio::time::timeout(budget, worker.shutdown()).await.is_err() {
+                tracing::error!(
+                    timeout_ms = budget.as_millis() as u64,
+                    "EHDB writer seal did not finish within the shutdown budget — \
+                     the unsealed tail may be lost on restart"
+                );
+            }
         }
     }
 

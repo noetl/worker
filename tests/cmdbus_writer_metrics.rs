@@ -85,7 +85,7 @@ fn config_at(dir: &std::path::Path, metrics: SocketAddr) -> CommandBusConfig {
 async fn the_writer_metrics_endpoint_serves_the_per_pool_trigger_and_the_resume_facts() {
     let dir = unique_dir("families");
     let addr = free_addr().await;
-    let _writer = spawn_writer_host(&config_at(&dir, addr)).await.unwrap();
+    let (_writer, _shutdown) = spawn_writer_host(&config_at(&dir, addr)).await.unwrap();
 
     let resp = scrape(addr).await;
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
@@ -131,7 +131,7 @@ async fn a_restarted_writer_reports_a_drained_pool_as_zero_rather_than_omitting_
     // First incarnation: route one command to each pool, then let it go away.
     {
         let addr = free_addr().await;
-        let writer = spawn_writer_host(&config_at(&dir, addr)).await.unwrap();
+        let (writer, shutdown) = spawn_writer_host(&config_at(&dir, addr)).await.unwrap();
         for (seq, pool) in [(1u64, "shared"), (2, "system")] {
             writer
                 .append(ehdb_l0::EventRecord::new(
@@ -142,19 +142,18 @@ async fn a_restarted_writer_reports_a_drained_pool_as_zero_rather_than_omitting_
                 ))
                 .unwrap();
         }
-        // Seal, so the second incarnation's engine recovers the records from its
-        // durable manifest — the same thing the SIGTERM path does in the pod.
-        writer
-            .engine()
-            .lock()
-            .unwrap()
-            .flush_and_wait_uploads()
-            .unwrap();
+        // noetl/ai-meta#209: drive the REAL shutdown path rather than reaching
+        // into the engine to fake a seal.  This used to call
+        // `flush_and_wait_uploads` by hand with a comment saying it was "the
+        // same thing the SIGTERM path does in the pod" — which was the problem:
+        // the pod's SIGTERM path raced process exit and frequently did not run
+        // at all, and the test could never have noticed.
+        shutdown.run().await;
     }
 
     // Second incarnation: same directory, fresh process-equivalent wiring.
     let addr = free_addr().await;
-    let _writer = spawn_writer_host(&config_at(&dir, addr)).await.unwrap();
+    let (_writer, _shutdown) = spawn_writer_host(&config_at(&dir, addr)).await.unwrap();
     let resp = scrape(addr).await;
 
     assert!(

@@ -46,10 +46,11 @@ use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{D1EventLog, EventRecord, L0Config, L0Engine, LocalFsSubstrate};
 use noetl_executor::worker::source::{CommandSource, Pulled};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::client::ControlPlaneClient;
 use crate::dispatch::{claim_outcome, CommandNotification};
+use crate::graceful::WriterShutdown;
 
 /// Which transport carries commands (`NOETL_COMMAND_BUS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -154,9 +155,17 @@ impl CommandBusConfig {
 }
 
 /// Host the shard's writer: open the durable command-log engine and spawn its
-/// ingest (publish-in), claim (compete-out), and `/metrics` (lag) faces. Returns
-/// the writer handle. Idempotent per process; call once when `config.host`.
-pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWriter<D1EventLog>>> {
+/// ingest (publish-in), claim (compete-out), and `/metrics` (lag) faces.
+///
+/// Returns the writer handle **and** the [`WriterShutdown`] the caller must
+/// hold and await on SIGTERM (noetl/ai-meta#209). Dropping the shutdown handle
+/// is what the old code effectively did, and it is what let the seal race both
+/// in-flight ingest and process exit.
+///
+/// Idempotent per process; call once when `config.host`.
+pub async fn spawn_writer_host(
+    config: &CommandBusConfig,
+) -> Result<(Arc<FeedWriter<D1EventLog>>, WriterShutdown)> {
     let dir = config
         .writer_dir
         .clone()
@@ -169,9 +178,19 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
     )?;
     let writer = Arc::new(FeedWriter::new(engine));
 
+    // noetl/ai-meta#209: the host owns the ingest face's lifetime now. The
+    // acceptor runs under a `select!` against `stop_ingest`, so shutdown can
+    // close the listener *before* it seals instead of sealing underneath a
+    // still-accepting publisher.
+    let stop_ingest = Arc::new(Notify::new());
+    let mut ingest_stop_handle = None;
     if let Some(addr) = config.ingest_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve_ingest(listener, writer.clone()));
+        tokio::spawn(crate::graceful::until_stopped(
+            stop_ingest.clone(),
+            ehdb_feed::serve_ingest(listener, writer.clone()),
+        ));
+        ingest_stop_handle = Some(stop_ingest.clone());
         tracing::info!(%addr, shard = config.shard, "EHDB command-bus ingest listener up");
     }
 
@@ -205,7 +224,25 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
             .clone()
             .spawn_cursor_persister(config.cursor_persist);
     }
-    spawn_graceful_writer_shutdown(writer.clone(), coordinator.clone(), config.shard);
+    // noetl/ai-meta#209: built here, run by `Worker::shutdown` from `main`'s
+    // signal branch. The old detached SIGTERM handler is gone — a second,
+    // independent handler racing `main`'s was the reason the seal usually lost.
+    let shutdown = {
+        let coordinator = coordinator.clone();
+        WriterShutdown::new(
+            "command-bus",
+            config.shard,
+            ingest_stop_handle,
+            Box::new(move || {
+                let coordinator = coordinator.clone();
+                Box::pin(async move {
+                    coordinator.persist_cursor().await?;
+                    Ok(())
+                })
+            }),
+            vec![Arc::new(crate::graceful::EngineSeal::new(writer.engine()))],
+        )
+    };
 
     if let Some(addr) = config.claim_bind {
         let listener = TcpListener::bind(addr).await?;
@@ -279,7 +316,7 @@ pub async fn spawn_writer_host(config: &CommandBusConfig) -> Result<Arc<FeedWrit
         tracing::info!(%addr, "EHDB command-bus /metrics lag + resume + integrity endpoint up");
     }
 
-    Ok(writer)
+    Ok((writer, shutdown))
 }
 
 /// Render the writer's **append-integrity** counters (noetl/ai-meta#206).
@@ -363,76 +400,6 @@ where
             let _ = sock.flush().await;
         });
     }
-}
-
-/// **Seal the command log and persist the cursor on SIGTERM** — the other half of
-/// surviving a writer restart (noetl/ai-meta#208).
-///
-/// The L0 engine reopens from its **durable manifest**, so records still sitting in
-/// an unsealed active part are invisible to the restarted process even though every
-/// append `fsync`ed them. A rollout restart would therefore drop the tail of the
-/// command log (up to `seal_max_records`, 1024 by default) *and* leave the
-/// persisted cursor up to one persist-interval stale. Sealing + flushing uploads on
-/// the termination signal closes both: the reopened writer recovers everything, and
-/// the coordinator resumes from an exact cursor.
-///
-/// Best-effort by nature — this races the process exit, and a SIGKILL / OOM skips it
-/// entirely. That crash path is why the resume cursor is clamped to the reopened
-/// log's tip (`ClaimCoordinator::resume`): worst case the bus redelivers, it never
-/// goes dark. Commands genuinely lost with an unsealed part are re-issued by the
-/// control plane's orphaned-command guardrail (noetl/ai-meta#171).
-#[cfg(unix)]
-fn spawn_graceful_writer_shutdown(
-    writer: Arc<FeedWriter<D1EventLog>>,
-    coordinator: Arc<ClaimCoordinator<D1EventLog>>,
-    shard: u32,
-) {
-    tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut sigterm), Ok(mut sigint)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) else {
-            tracing::warn!("EHDB command-bus writer could not install its shutdown handler");
-            return;
-        };
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
-        }
-        // Cursor first: it is cheap, and a cursor that is behind the log is always
-        // safe while a log that is behind the cursor needs the clamp.
-        match coordinator.persist_cursor().await {
-            Ok(Some(cursor)) => {
-                tracing::info!(
-                    shard,
-                    cursor,
-                    "EHDB command-bus cursor persisted on shutdown"
-                )
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(shard, error = %e, "EHDB command-bus cursor persist failed"),
-        }
-        // `flush_and_wait_uploads` blocks on the uploader, so keep it off the async
-        // worker threads.
-        let sealed = tokio::task::spawn_blocking(move || {
-            writer.engine().lock().unwrap().flush_and_wait_uploads()
-        })
-        .await;
-        match sealed {
-            Ok(Ok(())) => tracing::info!(shard, "EHDB command-bus log sealed on shutdown"),
-            Ok(Err(e)) => tracing::warn!(shard, error = %e, "EHDB command-bus seal failed"),
-            Err(e) => tracing::warn!(shard, error = %e, "EHDB command-bus seal task failed"),
-        }
-    });
-}
-
-#[cfg(not(unix))]
-fn spawn_graceful_writer_shutdown(
-    _writer: Arc<FeedWriter<D1EventLog>>,
-    _coordinator: Arc<ClaimCoordinator<D1EventLog>>,
-    _shard: u32,
-) {
 }
 
 fn member_id(worker_id: &str) -> u32 {
