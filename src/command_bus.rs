@@ -46,7 +46,7 @@ use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{D1EventLog, EventRecord, L0Config, L0Engine, LocalFsSubstrate};
 use noetl_executor::worker::source::{CommandSource, Pulled};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 use crate::client::ControlPlaneClient;
 use crate::dispatch::{claim_outcome, CommandNotification};
@@ -182,13 +182,14 @@ pub async fn spawn_writer_host(
     // acceptor runs under a `select!` against `stop_ingest`, so shutdown can
     // close the listener *before* it seals instead of sealing underneath a
     // still-accepting publisher.
-    let stop_ingest = Arc::new(Notify::new());
+    let stop_ingest = crate::graceful::StopSignal::new();
     let mut ingest_stop_handle = None;
     if let Some(addr) = config.ingest_bind {
         let listener = TcpListener::bind(addr).await?;
+        // Register before spawning, so the shutdown barrier counts this face
+        // whether or not its task has been polled yet.
         tokio::spawn(crate::graceful::until_stopped(
-            stop_ingest.clone(),
-            "command-bus ingest",
+            stop_ingest.register("command-bus ingest"),
             ehdb_feed::serve_ingest(listener, writer.clone()),
         ));
         ingest_stop_handle = Some(stop_ingest.clone());

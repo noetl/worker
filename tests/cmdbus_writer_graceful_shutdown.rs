@@ -20,8 +20,21 @@
 //!    appending during the seal, so a command published in that instant was
 //!    acked and then landed in a fresh active part opened *after* the seal.
 //!
+//! Defect 2 took two attempts. The first sequenced the steps but signalled the
+//! acceptor with `Notify::notify_waiters()`, which wakes only waiters already
+//! registered — and the acceptor registers on its first poll, so shutdown firing
+//! before that poll lost the signal outright and `serve_ingest` accepted
+//! straight through the seal. `graceful::StopSignal` replaced it with a `watch`
+//! value plus a stop acknowledgement; see that module's docs.
+//!
 //! These tests drive the real `spawn_writer_host` wiring, so they fail if either
-//! the sequencing or the seal regresses.
+//! the sequencing or the seal regresses. Note which test covers which: the two
+//! `..._the_active_part_...` tests below drive `FeedWriter::append` in-process
+//! and never touch the ingest face, which is exactly why they stayed green
+//! 300/300 while defect 2 was live. The stop-ingest ordering is covered by
+//! `shutdown_that_fires_before_the_acceptor_is_polled_still_closes_the_listener`
+//! (with its yield-first control) and by the `..._over_the_wire_...` test, which
+//! publishes through the acceptor with the real `PublishClient`.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -50,6 +63,26 @@ async fn free_addr() -> SocketAddr {
     let a = l.local_addr().unwrap();
     drop(l);
     a
+}
+
+/// Can we take `addr` back? This is the only probe that answers "did **this**
+/// writer drop its listener", and it is why the assertions below re-bind rather
+/// than probe with a connect: a connect only reports that *someone* is
+/// listening, and `free_addr` hands out ports from the same ephemeral range the
+/// rest of the suite binds from in concurrently-run test binaries.
+///
+/// A short bounded retry, not a long one: after the fix `shutdown.run()` does
+/// not return until the acceptor future has been dropped, so the first attempt
+/// is expected to succeed. The retry only absorbs kernel-side close scheduling —
+/// it cannot rescue a *lost* stop signal, which never closes the listener at all.
+async fn rebindable(addr: SocketAddr) -> bool {
+    for _ in 0..10 {
+        if tokio::net::TcpListener::bind(addr).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
 }
 
 fn config_at(dir: &std::path::Path, ingest: Option<SocketAddr>) -> CommandBusConfig {
@@ -162,6 +195,153 @@ async fn without_the_seal_the_unsealed_tail_is_lost_the_hard_kill_exposure() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The invariant defect 2 is about, stated end to end over the real publish
+/// protocol: **everything the writer acked is visible to the next incarnation,
+/// and nothing can be acked once shutdown has returned.**
+///
+/// The earlier tests here drive `FeedWriter::append` in-process, which never
+/// touches the ingest face at all — that is exactly why they passed 300/300
+/// while the stop-ingest step was broken. This one publishes over the wire with
+/// `PublishClient`, the same client noetl-server uses, so the acceptor is in the
+/// path.
+///
+/// The post-shutdown probe accepts either outcome that means "not acked": a
+/// refused connect (the expected one), or a connect that never yields a sort
+/// key. It cannot simply require a refusal — `free_addr` hands out an ephemeral
+/// port that a concurrently-running test binary may take the moment the writer
+/// releases it, and a stranger answering the connect says nothing about this
+/// writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_the_writer_acked_over_the_wire_is_lost_and_nothing_is_acked_after_shutdown() {
+    let dir = unique_dir("wire");
+    let addr = free_addr().await;
+    const RECORDS: u64 = 200;
+    const _: () = assert!(RECORDS < 1024); // below seal_max_records: nothing auto-sealed
+
+    let (_writer, shutdown) = spawn_writer_host(&config_at(&dir, Some(addr)))
+        .await
+        .unwrap();
+
+    let mut publisher = ehdb_feed::PublishClient::connect(addr)
+        .await
+        .expect("the ingest face accepts publishers while the writer serves");
+    let mut acked = 0u64;
+    for seq in 1..=RECORDS {
+        publisher
+            .publish(&ehdb_l0::EventRecord::new(
+                seq,
+                format!("exec-{seq}"),
+                "command.issued",
+                format!("{{\"seq\":{seq}}}"),
+            ))
+            .await
+            .expect("durable ack");
+        acked += 1;
+    }
+    drop(publisher);
+
+    shutdown.run().await;
+
+    // Nothing new can earn an ack now: the listener is closed, and anything that
+    // slipped past it blocks forever on the held engine lock rather than landing
+    // in a post-seal part.
+    let late = tokio::time::timeout(Duration::from_millis(500), async {
+        let mut client = ehdb_feed::PublishClient::connect(addr).await.ok()?;
+        client
+            .publish(&ehdb_l0::EventRecord::new(
+                RECORDS + 1,
+                "exec-late".to_string(),
+                "command.issued",
+                "{\"late\":true}".to_string(),
+            ))
+            .await
+            .ok()
+    })
+    .await;
+    assert!(
+        !matches!(late, Ok(Some(_))),
+        "a publisher was acked after shutdown returned — that record lands in a \
+         part the next incarnation cannot see (noetl/ai-meta#209 defect 2)"
+    );
+
+    let visible = records_visible_after_reopen(&dir).await;
+    assert_eq!(
+        visible, acked,
+        "the reopened engine saw {visible} of {acked} records acked over the \
+         wire — an acked record was lost across the graceful restart"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The deterministic form of the lost-wakeup defect, with the ordering the
+/// scheduler only sometimes produces **forced**.
+///
+/// `#[tokio::test]` without a flavor is a *current-thread* runtime, and
+/// `tokio::spawn` on it never polls the new task inline — it queues it until the
+/// spawning task yields. `spawn_writer_host` performs no `await` between
+/// spawning the ingest acceptor and returning (with `ingest_bind` set and
+/// nothing else bound), so at the point `shutdown.run()` is called below the
+/// acceptor task is **guaranteed** never to have been polled.
+///
+/// That is exactly the ordering that loses a `Notify::notify_waiters()` signal:
+/// it wakes only waiters already registered and stores no permit, while the
+/// acceptor registers its waiter on its first poll. This test therefore fails
+/// 100% of the time against a registration-order-dependent signal, and is the
+/// deterministic anchor for the fix — no load, no contention, no retries.
+///
+/// See `graceful::StopSignal` for the mechanism that makes it pass.
+#[tokio::test]
+async fn shutdown_that_fires_before_the_acceptor_is_polled_still_closes_the_listener() {
+    let dir = unique_dir("forced");
+    let addr = free_addr().await;
+    let (_writer, shutdown) = spawn_writer_host(&config_at(&dir, Some(addr)))
+        .await
+        .unwrap();
+
+    // NO yield here. Anything that awaits — a sleep, a `yield_now`, a connect —
+    // hands the runtime to the acceptor and destroys the forced ordering. The
+    // control test below is the same body *with* that yield.
+    shutdown.run().await;
+
+    assert!(
+        rebindable(addr).await,
+        "the ingest listener was still holding {addr} after shutdown fired \
+         before the acceptor's first poll — the stop signal was lost, so \
+         `serve_ingest` accepts straight through the seal (noetl/ai-meta#209 \
+         defect 2)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The control for the test above: identical, except the acceptor is polled
+/// first. This passes both before and after the fix — which is what makes the
+/// forced-ordering case above *evidence* rather than noise.
+#[tokio::test]
+async fn shutdown_closes_the_listener_when_the_acceptor_registered_first_control() {
+    let dir = unique_dir("control");
+    let addr = free_addr().await;
+    let (_writer, shutdown) = spawn_writer_host(&config_at(&dir, Some(addr)))
+        .await
+        .unwrap();
+
+    // The only difference from the forced case: let the acceptor task run, so a
+    // registration-order-dependent signal has a waiter to wake.
+    tokio::task::yield_now().await;
+
+    shutdown.run().await;
+
+    assert!(
+        rebindable(addr).await,
+        "the ingest listener was still holding {addr} after shutdown, even with \
+         the acceptor polled first — this is not the lost-wakeup ordering, so \
+         something else on the shutdown path is failing to close the listener"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Shutdown must close the ingest listener, so a publisher cannot connect and
 /// get an ack for a record that would land after the seal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -180,49 +360,23 @@ async fn shutdown_closes_the_ingest_listener_before_sealing() {
     shutdown.run().await;
 
     // ...and the port is ours again afterwards, so nothing new can be acked
-    // post-seal.
+    // post-seal. See `rebindable` for why the probe re-binds instead of
+    // expecting a refused connect.
     //
-    // The check is "we can re-bind it", NOT "a connect is refused", because a
-    // connect probe cannot tell WHOSE listener answered. `free_addr` hands out
-    // a kernel-assigned ephemeral port and the rest of the suite binds from the
-    // same range (`tests/cmdbus_writer_metrics.rs` does it too, in a separate
-    // binary `cargo test` runs concurrently), so a sibling can take the port
-    // the writer released and make a connect probe succeed for reasons that
-    // have nothing to do with this writer.
+    // This assertion used to fail under load — 24 of 30 full-suite runs under
+    // contention, 0 of 15 idle — and the failure was real, not harness noise:
+    // `lsof` at the moment of failure showed the port still held in LISTEN by
+    // this very test process, with the writer host's own acceptor on it, after
+    // `shutdown.run()` had returned. The cause was a lost wakeup in
+    // `WriterShutdown::run`, now fixed; the deterministic form of that ordering
+    // is pinned above in
+    // `shutdown_that_fires_before_the_acceptor_is_polled_still_closes_the_listener`.
     //
-    // Re-binding cannot be satisfied by a stranger: it succeeds only if the
-    // writer really did drop its listener. Reaching the `connect` above already
-    // proves the writer owned this port, because `spawn_writer_host` binds it
-    // and would have failed if anything else held it.
-    //
-    // ⚠ As of this commit this assertion FAILS under load, and the failure is
-    // real, not flaky-test noise: `lsof` at the moment of failure shows the
-    // port still held in LISTEN **by this very test process**, with the writer
-    // host's own acceptor on it, after `shutdown.run()` has returned. The cause
-    // is a lost wakeup — `WriterShutdown::run` signals with
-    // `Notify::notify_waiters()`, which wakes only already-registered waiters
-    // and stores no permit, while the face runs under
-    // `tokio::spawn(until_stopped(..))` and registers on its FIRST POLL. If the
-    // spawned task has not been polled before shutdown fires, the signal is
-    // lost forever and `serve_ingest` keeps accepting. The connect on the line
-    // above does not disprove it: the socket is bound and listening before the
-    // spawn, so the kernel completes handshakes into the backlog whether or not
-    // the task ever runs. See noetl/ai-meta#209.
-    //
-    // Retry: closing the listener is asynchronous (the acceptor future is
-    // dropped), so the first attempt may still race that drop.
-    let mut reclaimed = None;
-    for _ in 0..50 {
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => {
-                reclaimed = Some(listener);
-                break;
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-        }
-    }
+    // Note the `connect` above never disproved it: the socket is bound and
+    // listening before the acceptor task is spawned, so the kernel completes
+    // handshakes into the backlog whether or not that task is ever polled.
     assert!(
-        reclaimed.is_some(),
+        rebindable(addr).await,
         "the ingest listener was still holding {addr} after shutdown — a \
          publisher could be acked for a record landing in a part opened after \
          the seal, which is precisely the acked-and-lost window of \

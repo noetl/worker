@@ -41,7 +41,6 @@ use ehdb_feed::{CursorFallback, FeedWriter, GroupCoordinator};
 use ehdb_l0::substrate::DurableSubstrate;
 use ehdb_l0::{D1EventLog, L0Config, L0Engine, LocalFsSubstrate};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
 
 use crate::graceful::WriterShutdown;
 
@@ -263,13 +262,18 @@ pub async fn spawn_event_writer_host(
     // noetl/ai-meta#209: the host owns the ingest face's lifetime, so shutdown
     // can close the listener before it seals rather than sealing underneath a
     // still-accepting publisher.
-    let stop_ingest = Arc::new(Notify::new());
+    // One signal, shared: this host runs several faces (ingest, group-claim,
+    // SSE, KV, WAL). Only ingest appends to — and therefore acks into — the log
+    // this shutdown seals, so only ingest is registered here. The signal is a
+    // `watch`, which broadcasts, so registering the others later needs no change
+    // to the mechanism; a permit-storing `notify_one` would have woken exactly
+    // one of them. See `graceful`'s module docs.
+    let stop_ingest = crate::graceful::StopSignal::new();
     let mut ingest_stop_handle = None;
     if let Some(addr) = config.ingest_bind {
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(crate::graceful::until_stopped(
-            stop_ingest.clone(),
-            "events ingest",
+            stop_ingest.register("events ingest"),
             ehdb_feed::serve_ingest(listener, writer.clone()),
         ));
         ingest_stop_handle = Some(stop_ingest.clone());
