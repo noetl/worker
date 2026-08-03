@@ -37,6 +37,14 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
     ))
 }
 
+/// A kernel-assigned ephemeral port, released so the writer can bind it.
+///
+/// Inherently a race: the port is free between the `drop` and the writer's
+/// bind, and free again after the writer releases it. Nothing here can close
+/// that — `CommandBusConfig::ingest_bind` is a `SocketAddr`, so the writer must
+/// do its own binding. Assertions built on this address must therefore never
+/// treat "something is listening on that port" as "the writer is listening on
+/// that port". See `shutdown_closes_the_ingest_listener_before_sealing`.
 async fn free_addr() -> SocketAddr {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
@@ -171,22 +179,54 @@ async fn shutdown_closes_the_ingest_listener_before_sealing() {
 
     shutdown.run().await;
 
-    // ...and is refused afterwards, so nothing new can be acked post-seal.
-    // Retry briefly: closing the listener is asynchronous (the acceptor future
-    // is dropped), so a connect racing that drop may still succeed once.
-    let mut refused = false;
+    // ...and the port is ours again afterwards, so nothing new can be acked
+    // post-seal.
+    //
+    // The check is "we can re-bind it", NOT "a connect is refused", because a
+    // connect probe cannot tell WHOSE listener answered. `free_addr` hands out
+    // a kernel-assigned ephemeral port and the rest of the suite binds from the
+    // same range (`tests/cmdbus_writer_metrics.rs` does it too, in a separate
+    // binary `cargo test` runs concurrently), so a sibling can take the port
+    // the writer released and make a connect probe succeed for reasons that
+    // have nothing to do with this writer.
+    //
+    // Re-binding cannot be satisfied by a stranger: it succeeds only if the
+    // writer really did drop its listener. Reaching the `connect` above already
+    // proves the writer owned this port, because `spawn_writer_host` binds it
+    // and would have failed if anything else held it.
+    //
+    // ⚠ As of this commit this assertion FAILS under load, and the failure is
+    // real, not flaky-test noise: `lsof` at the moment of failure shows the
+    // port still held in LISTEN **by this very test process**, with the writer
+    // host's own acceptor on it, after `shutdown.run()` has returned. The cause
+    // is a lost wakeup — `WriterShutdown::run` signals with
+    // `Notify::notify_waiters()`, which wakes only already-registered waiters
+    // and stores no permit, while the face runs under
+    // `tokio::spawn(until_stopped(..))` and registers on its FIRST POLL. If the
+    // spawned task has not been polled before shutdown fires, the signal is
+    // lost forever and `serve_ingest` keeps accepting. The connect on the line
+    // above does not disprove it: the socket is bound and listening before the
+    // spawn, so the kernel completes handshakes into the backlog whether or not
+    // the task ever runs. See noetl/ai-meta#209.
+    //
+    // Retry: closing the listener is asynchronous (the acceptor future is
+    // dropped), so the first attempt may still race that drop.
+    let mut reclaimed = None;
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect(addr).await.is_err() {
-            refused = true;
-            break;
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                reclaimed = Some(listener);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        refused,
-        "the ingest listener was still accepting after shutdown — a publisher \
-         could be acked for a record landing in a part opened after the seal, \
-         which is precisely the acked-and-lost window of noetl/ai-meta#209"
+        reclaimed.is_some(),
+        "the ingest listener was still holding {addr} after shutdown — a \
+         publisher could be acked for a record landing in a part opened after \
+         the seal, which is precisely the acked-and-lost window of \
+         noetl/ai-meta#209"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
