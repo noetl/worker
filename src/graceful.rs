@@ -211,19 +211,61 @@ impl WriterShutdown {
 ///
 /// Dropping the future is what closes the listener; the already-accepted
 /// connections are owned by tasks inside `ehdb-feed` and outlive this.
-pub async fn until_stopped<F>(stop: Arc<Notify>, serve: F)
+pub async fn until_stopped<F>(stop: Arc<Notify>, face: &'static str, serve: F)
 where
     F: Future<Output = std::io::Result<()>> + Send + 'static,
 {
     let stopped = stop.notified();
     tokio::pin!(stopped);
     tokio::select! {
-        result = serve => {
-            if let Err(error) = result {
-                tracing::warn!(%error, "EHDB face exited");
-            }
-        }
+        result = serve => report_face_exit(face, result),
         _ = &mut stopped => {}
+    }
+}
+
+/// Supervise a face that has no shutdown hook, purely so its exit is *visible*.
+///
+/// Every face used to be spawned as a bare `tokio::spawn(serve_x(..))`, which
+/// discards the returned `io::Result`. A face that dies therefore takes its
+/// listener down with it and says nothing: the startup line still claims the
+/// face is "up", `/metrics` carries no signal for it, and the only symptom is
+/// consumers logging `Connection refused` somewhere else entirely.
+///
+/// That is not hypothetical. `ehdb_feed::serve` — the WAL fan-out face — runs
+/// its subscribe handshake *inside* the accept loop, so `read_frame(..)?` and
+/// `serde_json::from_slice(..)?` propagate out of the whole function. **One**
+/// connection that closes early or sends a non-`SubscribeReq` frame (a port
+/// scan, a stray `curl`, an HTTP health probe pointed at the wrong port)
+/// permanently kills the face for the rest of the process's life. Reproduced
+/// deterministically in kind: listener present, one malformed frame, listener
+/// gone, no log line anywhere.
+///
+/// This does not fix that — the fix belongs in `ehdb-feed`, moving the
+/// handshake into the per-connection task and not letting a per-connection
+/// error escape the accept loop. It makes it *loud*, which is the part the
+/// worker owns.
+pub async fn supervised<F>(face: &'static str, serve: F)
+where
+    F: Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    report_face_exit(face, serve.await);
+}
+
+fn report_face_exit(face: &'static str, result: std::io::Result<()>) {
+    match result {
+        // A face returning at all means its listener is gone and the face is
+        // dead until the pod restarts. Never silent, error either way.
+        Ok(()) => tracing::error!(
+            face,
+            "EHDB {face} face accept loop ended — the listener is closed and this \
+             face is dead for the life of the process"
+        ),
+        Err(error) => tracing::error!(
+            face,
+            %error,
+            "EHDB {face} face accept loop failed — the listener is closed and this \
+             face is dead for the life of the process"
+        ),
     }
 }
 

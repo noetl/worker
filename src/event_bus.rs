@@ -269,6 +269,7 @@ pub async fn spawn_event_writer_host(
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(crate::graceful::until_stopped(
             stop_ingest.clone(),
+            "events ingest",
             ehdb_feed::serve_ingest(listener, writer.clone()),
         ));
         ingest_stop_handle = Some(stop_ingest.clone());
@@ -295,13 +296,19 @@ pub async fn spawn_event_writer_host(
 
     if let Some(addr) = config.claim_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve_group_claims(listener, coordinator.clone()));
+        tokio::spawn(crate::graceful::supervised(
+            "events group-claim",
+            ehdb_feed::serve_group_claims(listener, coordinator.clone()),
+        ));
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed group coordinator up");
     }
 
     if let Some(addr) = config.sse_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::sse::serve_sse(listener, writer.clone()));
+        tokio::spawn(crate::graceful::supervised(
+            "events SSE",
+            ehdb_feed::sse::serve_sse(listener, writer.clone()),
+        ));
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed SSE face up");
     }
 
@@ -347,7 +354,13 @@ pub async fn spawn_event_writer_host(
     // engine exists to avoid.
     if let Some(addr) = config.wal_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve(writer.clone(), listener));
+        // The most fragile face of the lot: `ehdb_feed::serve` handshakes inside
+        // its accept loop, so ONE malformed connection kills it permanently.
+        // See `graceful::supervised`.
+        tokio::spawn(crate::graceful::supervised(
+            "events WAL fan-out",
+            ehdb_feed::serve(writer.clone(), listener),
+        ));
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed WAL fan-out face up");
     }
 
@@ -365,7 +378,10 @@ pub async fn spawn_event_writer_host(
         kv.clone()
             .spawn_sweeper(KV_BUCKETS.iter().map(|s| s.to_string()).collect(), KV_SWEEP);
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve_kv(listener, kv));
+        tokio::spawn(crate::graceful::supervised(
+            "events KV",
+            ehdb_feed::serve_kv(listener, kv),
+        ));
         tracing::info!(%addr, dir = %kv_dir.display(), "EHDB KV face up");
     }
 

@@ -188,6 +188,7 @@ pub async fn spawn_writer_host(
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(crate::graceful::until_stopped(
             stop_ingest.clone(),
+            "command-bus ingest",
             ehdb_feed::serve_ingest(listener, writer.clone()),
         ));
         ingest_stop_handle = Some(stop_ingest.clone());
@@ -246,7 +247,10 @@ pub async fn spawn_writer_host(
 
     if let Some(addr) = config.claim_bind {
         let listener = TcpListener::bind(addr).await?;
-        tokio::spawn(ehdb_feed::serve_claims(listener, coordinator.clone()));
+        tokio::spawn(crate::graceful::supervised(
+            "command-bus claim",
+            ehdb_feed::serve_claims(listener, coordinator.clone()),
+        ));
         tracing::info!(%addr, shard = config.shard, "EHDB command-bus claim coordinator up");
     }
 
