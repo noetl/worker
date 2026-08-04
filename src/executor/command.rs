@@ -692,6 +692,15 @@ impl CommandExecutor {
                 .lock()
                 .await
                 .mark_pending_sink(command.execution_id);
+            // noetl/ai-meta#199 Slice A — the in-process index above gates the
+            // WORKER's durable-segment GC; the SERVER's Feather result-tier GC
+            // (noetl/server#286) reads its own `noetl.sink_pending` feed and had
+            // no producer at all. Both must be written, or the two GCs disagree
+            // about which executions hold un-sunk context — one retaining while
+            // the other reclaims is worse than neither gate existing.
+            dispatch_client
+                .post_sink_state(crate::client::SinkStateAction::Mark, command.execution_id)
+                .await;
         }
 
         // noetl/ai-meta#104 Phase E — side-effect durability barrier.
@@ -926,6 +935,17 @@ impl CommandExecutor {
                         .lock()
                         .await
                         .confirm_sunk(command.execution_id);
+                    // noetl/ai-meta#199 Slice A — release on the server's feed
+                    // too. Ordering matters the safe way round: the local index
+                    // is cleared first, so if the post fails the server keeps
+                    // RETAINING (conservative) rather than reclaiming context a
+                    // step has not confirmed.
+                    dispatch_client
+                        .post_sink_state(
+                            crate::client::SinkStateAction::Confirm,
+                            command.execution_id,
+                        )
+                        .await;
                 }
 
                 result

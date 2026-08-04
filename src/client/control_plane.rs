@@ -199,6 +199,29 @@ impl Command {
 }
 
 /// HTTP client for control plane API.
+/// Which half of the sink-state contract a post carries
+/// (noetl/ai-meta#199 Slice A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkStateAction {
+    /// Un-sunk business context entered the transient cache for this execution —
+    /// the server GC must retain its objects.
+    Mark,
+    /// A connector step confirmed the write to the customer's system of record —
+    /// the server GC may reclaim.
+    Confirm,
+}
+
+impl SinkStateAction {
+    /// The URL segment and the metric label, kept as one function so they can
+    /// never drift apart.
+    pub fn path_segment(self) -> &'static str {
+        match self {
+            Self::Mark => "mark",
+            Self::Confirm => "confirm",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ControlPlaneClient {
     client: reqwest::Client,
@@ -348,11 +371,10 @@ impl ControlPlaneClient {
         }
         let envelope: crate::client::SealedEnvelope = response.json().await?;
         let mut plaintext = crate::client::sealed_open(&self.sealing_sk, &envelope)?;
-        let credential: Credential =
-            serde_json::from_slice(&plaintext).map_err(|e| {
-                plaintext.zeroize();
-                anyhow::anyhow!("get_sealed_credential('{alias}'): decode plaintext: {e}")
-            })?;
+        let credential: Credential = serde_json::from_slice(&plaintext).map_err(|e| {
+            plaintext.zeroize();
+            anyhow::anyhow!("get_sealed_credential('{alias}'): decode plaintext: {e}")
+        })?;
         // Plaintext bytes wiped — the value is now in `credential.data`,
         // which the caller is responsible for clearing after the tool
         // dispatch consumes it.
@@ -456,6 +478,60 @@ impl ControlPlaneClient {
         }
 
         Ok(())
+    }
+
+    /// Tell the **server** that an execution holds un-sunk business context, or
+    /// that it no longer does (noetl/ai-meta#199 Slice A).
+    ///
+    /// The worker already records both signals in its in-process
+    /// [`SharedWalIndex`](crate::state_builder::SharedWalIndex) sink gate, which
+    /// is what gates the worker's own durable-segment GC. But the **server's**
+    /// Feather result-tier GC (noetl/server#286, Slice B) reads a different
+    /// store — the server-owned `noetl.sink_pending` feed — and nothing was
+    /// writing to it. Slice B therefore shipped a real, correctly-plumbed gate
+    /// over a table that could never be non-empty: the inertness moved from a
+    /// hardcoded empty set to an empty table.
+    ///
+    /// This is the producer. Both stores must be written or the two GCs disagree
+    /// about which executions hold un-sunk context, which is worse than neither
+    /// gate existing — one would retain and the other reclaim.
+    ///
+    /// **Never fails the caller.** A sink-state post is bookkeeping for a GC
+    /// gate that is itself default-off; a control-plane hiccup must not fail a
+    /// customer's connector step that has already written to their store. The
+    /// outcome is logged and counted, and the worst case of a lost `mark` is that
+    /// the server GC reclaims an object early — the same behaviour as today,
+    /// before this existed.
+    pub async fn post_sink_state(&self, action: SinkStateAction, execution_id: i64) {
+        let url = format!(
+            "{}/api/internal/sink-state/{}",
+            self.server_url,
+            action.path_segment()
+        );
+        let body = serde_json::json!({ "execution_id": execution_id });
+        match self.client.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                crate::metrics::record_sink_state_post(action.path_segment(), "ok");
+            }
+            Ok(resp) => {
+                crate::metrics::record_sink_state_post(action.path_segment(), "http_error");
+                tracing::warn!(
+                    execution_id,
+                    action = action.path_segment(),
+                    status = %resp.status(),
+                    "sink-state post rejected; the server GC gate will not see this execution"
+                );
+            }
+            Err(e) => {
+                crate::metrics::record_sink_state_post(action.path_segment(), "error");
+                tracing::warn!(
+                    execution_id,
+                    action = action.path_segment(),
+                    error = %e,
+                    "sink-state post failed; the server GC gate will not see this execution"
+                );
+            }
+        }
     }
 
     /// Emit an event with retry.
@@ -581,7 +657,11 @@ impl ControlPlaneClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("cell_registry fetch failed: HTTP {} {}", status.as_u16(), body);
+            anyhow::bail!(
+                "cell_registry fetch failed: HTTP {} {}",
+                status.as_u16(),
+                body
+            );
         }
         Ok(response.json().await?)
     }
@@ -918,8 +998,14 @@ impl ControlPlaneClient {
         parent_execution_id: Option<i64>,
         dedup: Option<&serde_json::Value>,
     ) -> Result<i64> {
-        let item =
-            DispatchItem::new(path, payload, execution_pool, trace, parent_execution_id, dedup);
+        let item = DispatchItem::new(
+            path,
+            payload,
+            execution_pool,
+            trace,
+            parent_execution_id,
+            dedup,
+        );
         let body = item.to_request_body();
         let response = self
             .client
@@ -935,7 +1021,11 @@ impl ControlPlaneClient {
         let v: serde_json::Value = response.json().await?;
         let eid = v
             .get("execution_id")
-            .and_then(|e| e.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| e.as_i64()))
+            .and_then(|e| {
+                e.as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| e.as_i64())
+            })
             .ok_or_else(|| anyhow::anyhow!("execute response missing execution_id: {v}"))?;
         Ok(eid)
     }
@@ -962,7 +1052,10 @@ impl ControlPlaneClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("execute batch ({} items) failed ({status}): {text}", items.len());
+            anyhow::bail!(
+                "execute batch ({} items) failed ({status}): {text}",
+                items.len()
+            );
         }
         let resp: BatchExecuteResponse = response.json().await?;
         Ok(resp.results)
@@ -1134,6 +1227,41 @@ pub struct SubscriptionStatus {
     pub state: String,
     #[serde(default)]
     pub last_event_type: String,
+}
+
+#[cfg(test)]
+mod tests_sink_state {
+    use super::SinkStateAction;
+
+    /// noetl/ai-meta#199 Slice A — the URL segment and the metric label come
+    /// from one function so they can never drift. A `mark` counted as a
+    /// `confirm` would read as the gate releasing context it is actually
+    /// retaining.
+    #[test]
+    fn sink_state_action_segments_are_distinct_and_stable() {
+        assert_eq!(SinkStateAction::Mark.path_segment(), "mark");
+        assert_eq!(SinkStateAction::Confirm.path_segment(), "confirm");
+        assert_ne!(
+            SinkStateAction::Mark.path_segment(),
+            SinkStateAction::Confirm.path_segment()
+        );
+    }
+
+    /// The segments are what build `/api/internal/sink-state/{segment}` on the
+    /// server (noetl/server#286). Pinning them here means renaming one side
+    /// breaks a test rather than silently starving the GC gate.
+    #[test]
+    fn sink_state_segments_match_the_server_routes() {
+        for (action, want) in [
+            (SinkStateAction::Mark, "/api/internal/sink-state/mark"),
+            (SinkStateAction::Confirm, "/api/internal/sink-state/confirm"),
+        ] {
+            assert_eq!(
+                format!("/api/internal/sink-state/{}", action.path_segment()),
+                want
+            );
+        }
+    }
 }
 
 #[cfg(test)]

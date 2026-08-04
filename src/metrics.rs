@@ -326,6 +326,16 @@ pub struct WorkerMetrics {
     /// this counter records the wiring *firing* even when the gate is off, so the
     /// signal path is observable before an operator opts into eviction.
     pub sink_signal_total: IntCounterVec,
+    /// Outcomes of posting a sink-state signal to the SERVER's feed
+    /// (noetl/ai-meta#199 Slice A): `action` is `mark` / `confirm`, `outcome` is
+    /// `ok` / `http_error` / `error`.
+    ///
+    /// Separate from `sink_signal_total` on purpose. That one counts the signal
+    /// being *produced*; this counts it *reaching the server*. They diverge
+    /// exactly when the server GC gate is being starved of input, which is the
+    /// failure this wiring exists to prevent and which is otherwise invisible —
+    /// a lost post degrades silently to the pre-Slice-A behaviour.
+    pub sink_state_post_total: IntCounterVec,
     /// Cold-rebuild-on-miss outcomes (noetl/ai-meta#166 §5.2): `served` (re-read
     /// the missed execution from the retained WAL and the drive then built its
     /// state), `incomplete` (re-indexed events but the chain still couldn't reach
@@ -1078,6 +1088,18 @@ impl WorkerMetrics {
             .register(Box::new(sink_signal_total.clone()))
             .expect("register sink_signal_total");
 
+        let sink_state_post_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_sink_state_post_total",
+                "Sink-state signals posted to the server's noetl.sink_pending feed, by action and outcome (noetl/ai-meta#199 Slice A). Divergence from sink_signal_total means the server GC gate is being starved.",
+            ),
+            &["action", "outcome"],
+        )
+        .expect("sink_state_post_total metric");
+        registry
+            .register(Box::new(sink_state_post_total.clone()))
+            .expect("register sink_state_post_total");
+
         let state_builder_rehydrate_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_state_builder_rehydrate_total",
@@ -1411,6 +1433,7 @@ impl WorkerMetrics {
             autosink_total,
             sink_gate_events_total,
             sink_signal_total,
+            sink_state_post_total,
             state_builder_rehydrate_total,
             state_shard_reads_total,
             state_shard_read_duration_seconds,
@@ -1898,6 +1921,14 @@ pub fn record_sink_gate_retained() {
 /// (that step succeeded, so its execution's business context is sunk to the
 /// customer store). Fires regardless of whether the eviction gate is enabled, so
 /// the wiring is observable before an operator opts in.
+pub fn record_sink_state_post(action: &str, outcome: &str) {
+    WorkerMetrics::global()
+        .sink_state_post_total
+        .with_label_values(&[action, outcome])
+        .inc();
+}
+
+/// The connector-step wiring emitted a sink signal — see the counter docs.
 pub fn record_sink_signal(tool_kind: &str, signal: &str) {
     WorkerMetrics::global()
         .sink_signal_total
@@ -1934,7 +1965,9 @@ pub fn observe_state_shard_read_duration(secs: f64) {
 /// Record one shard-vs-WAL spine divergence (the `NOETL_STATE_SHARD_READ_VERIFY`
 /// dual-build tripwire) — noetl/ai-meta#166 Phase 3.  MUST stay 0.
 pub fn record_state_equivalence_mismatch() {
-    WorkerMetrics::global().state_equivalence_mismatch_total.inc();
+    WorkerMetrics::global()
+        .state_equivalence_mismatch_total
+        .inc();
 }
 
 /// Record one off-server state build outcome (`cache_hit` | `incremental` |
@@ -2109,7 +2142,9 @@ pub fn record_state_materializer_cycle(
 
 /// Set the resident-open-shards gauge (noetl/ai-meta#166 Phase 2).
 pub fn set_state_materializer_open_shards(n: i64) {
-    WorkerMetrics::global().state_materializer_open_shards.set(n);
+    WorkerMetrics::global()
+        .state_materializer_open_shards
+        .set(n);
 }
 
 /// Record open state shards evicted before sealing (noetl/ai-meta#166 Phase 2).
