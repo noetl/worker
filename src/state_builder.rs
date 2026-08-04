@@ -1743,6 +1743,13 @@ async fn run_drain_loop_ehdb(config: DrainConfig, index: SharedWalIndex) -> Resu
             let records: Vec<ehdb_l0::EventRecord> = match sub.recv_batch().await {
                 Ok(r) => r,
                 Err(error) => {
+                    // noetl/ai-meta#225: the WAL fan-out had TCP keepalive but no
+                    // application-level heartbeat, so it could not tell "writer
+                    // alive but stuck" from "feed idle" and this arm went
+                    // unreached while the drive could not advance any execution
+                    // past its first command. The heartbeat makes a stuck peer an
+                    // ordinary read error, which this already knew how to handle.
+                    crate::metrics::record_events_consumer_redial("wal");
                     crate::metrics::set_state_builder_healthy(false);
                     tracing::warn!(%addr, %error, "state-builder WAL feed dropped; resubscribing from 0");
                     break;

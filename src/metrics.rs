@@ -269,6 +269,27 @@ pub struct WorkerMetrics {
     /// drain now rebuilds the full index from the retained `noetl_events` WAL on
     /// every boot; this gauge going **> 0** after a restart is the rehydration
     /// proof.
+    /// How many EHDB writer hosts sealed on the graceful shutdown path, and how
+    /// many there were to seal (noetl/ai-meta#226).
+    ///
+    /// A partial seal used to be observable only on the *next* boot, as a
+    /// `clamped=true` resume over a log that had come back below its own
+    /// persisted cursor — i.e. after the records were already gone. These make
+    /// it a scrape: `sealed < hosts` on a terminating pod means an unsealed
+    /// tail. The pair is written once, immediately before exit; a pod that
+    /// terminates without ever setting them never reached the seal at all.
+    /// Reattaches to an events face after its connection was found dead
+    /// (noetl/ai-meta#225), partitioned by `face` (`group_claim` = :9104,
+    /// `wal` = :9108).
+    ///
+    /// Before #225 neither face could *detect* a half-open connection, so this
+    /// counter could not have moved even while the consumers were wedged and
+    /// `noetl.event` had gone 3h24m without a write. A rising count around a
+    /// writer restart is the reattach working; a flat count while a group cursor
+    /// is not advancing is the wedge.
+    pub events_consumer_redials_total: IntCounterVec,
+    pub shutdown_hosts_sealed: IntGauge,
+    pub shutdown_hosts_total: IntGauge,
     pub state_builder_indexed_executions: IntGauge,
     /// Total events resident across all chains in the pool-side WAL index
     /// (noetl/ai-meta#166).  The `654 executions × ~27 events` headline of the
@@ -951,6 +972,37 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_wal_events_total.clone()))
             .expect("register state_builder_wal_events_total");
 
+        let events_consumer_redials_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_events_consumer_redials_total",
+                "Reattaches to an events face after its connection was found dead \
+                 (noetl/ai-meta#225), partitioned by face.",
+            ),
+            &["face"],
+        )
+        .expect("events_consumer_redials_total metric");
+        registry
+            .register(Box::new(events_consumer_redials_total.clone()))
+            .expect("register events_consumer_redials_total");
+
+        let shutdown_hosts_sealed = IntGauge::new(
+            "noetl_worker_shutdown_hosts_sealed",
+            "EHDB writer hosts that sealed on the graceful shutdown path (noetl/ai-meta#226). Compare against noetl_worker_shutdown_hosts_total: sealed < total means an unsealed tail whose next resume will clamp.",
+        )
+        .expect("shutdown_hosts_sealed metric");
+        registry
+            .register(Box::new(shutdown_hosts_sealed.clone()))
+            .expect("register shutdown_hosts_sealed");
+
+        let shutdown_hosts_total = IntGauge::new(
+            "noetl_worker_shutdown_hosts_total",
+            "EHDB writer hosts this process was asked to seal on shutdown (noetl/ai-meta#226).",
+        )
+        .expect("shutdown_hosts_total metric");
+        registry
+            .register(Box::new(shutdown_hosts_total.clone()))
+            .expect("register shutdown_hosts_total");
+
         let state_builder_indexed_executions = IntGauge::new(
             "noetl_worker_state_builder_indexed_executions",
             "Executions currently held in the pool-side WAL index (noetl/ai-meta#119 rehydration proof; >0 after a restart means the index rebuilt from the retained WAL).",
@@ -1349,6 +1401,9 @@ impl WorkerMetrics {
             state_builder_drive_builds_total,
             state_builder_drive_wait_total,
             state_builder_tail_total,
+            events_consumer_redials_total,
+            shutdown_hosts_sealed,
+            shutdown_hosts_total,
             state_builder_indexed_executions,
             state_builder_index_events,
             state_builder_index_bytes,
@@ -1743,6 +1798,27 @@ pub fn record_result_producer_stage(outcome: &str) {
 
 /// Record `n` events consumed from the `noetl_events` WAL by the off-server
 /// state builder (noetl/ai-meta#115 Phase 4).
+/// Count a reattach to an events face after its connection was found dead
+/// (noetl/ai-meta#225). `face` is `group_claim` (:9104) or `wal` (:9108).
+pub fn record_events_consumer_redial(face: &str) {
+    WorkerMetrics::global()
+        .events_consumer_redials_total
+        .with_label_values(&[face])
+        .inc();
+}
+
+/// Record the outcome of the graceful writer seal (noetl/ai-meta#226).
+///
+/// Written once, immediately before exit. A terminating pod whose
+/// `noetl_worker_shutdown_hosts_sealed` is below its
+/// `noetl_worker_shutdown_hosts_total` — or which never wrote them at all — left
+/// an unsealed tail, and the next incarnation's resume over that log will clamp.
+pub fn record_shutdown_seal(sealed: usize, hosts: usize) {
+    let m = WorkerMetrics::global();
+    m.shutdown_hosts_sealed.set(sealed as i64);
+    m.shutdown_hosts_total.set(hosts as i64);
+}
+
 pub fn record_state_builder_wal_events(n: u64) {
     if n > 0 {
         WorkerMetrics::global()

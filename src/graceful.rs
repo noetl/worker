@@ -30,8 +30,13 @@
 //! before exiting. The sequence is:
 //!
 //! ```text
-//!   stop accepting ingest  ->  quiesce  ->  persist cursor  ->  seal and hold
+//!   stop accepting ingest  ->  quiesce  ->  persist cursor  ->  seal and close
 //! ```
+//!
+//! A process that hosts more than one writer runs those phases **across every
+//! host at once** — every ingest stops, then one quiesce, then every cursor,
+//! then every seal — rather than finishing one host before starting the next.
+//! See [`seal_all`] for why host-at-a-time is not merely slower but lossy.
 //!
 //! ## Stop accepting, then quiesce
 //!
@@ -81,21 +86,40 @@
 //! (or the bounded deadline expires, which is logged). "Stop accepting" is a
 //! completed step by the time the sequence moves on, not a request in flight.
 //!
-//! ## Seal and hold
+//! ## Seal and close
 //!
 //! The quiesce window is a mitigation, not a guarantee, so the seal itself
-//! closes the hole: [`Sealable::seal_and_hold`] seals the active part and then
-//! **deliberately leaks the engine mutex guard**. `FeedWriter::append_batch`
-//! takes that same mutex, so any publisher that arrives after the seal blocks
-//! forever and is *never acked*. An un-acked publish is exactly the case the
-//! contract already handles — the server's publish redial-retry republishes it
-//! to the replacement writer (noetl/server#290). The alternative, releasing the
-//! lock, lets a post-seal append open a new active part that the next
+//! closes the hole: [`Sealable::seal_and_hold`] seals the active part and closes
+//! the writer, after which every append fails. A refused publish is exactly the
+//! case the contract already handles — the server's publish redial-retry
+//! republishes it to the replacement writer (noetl/server#290). The alternative,
+//! doing nothing, lets a post-seal append open a new active part that the next
 //! incarnation cannot see: acked and lost, which is the bug.
 //!
-//! Leaking a lock is only sound because this runs on the terminal path, tens of
-//! milliseconds before the process exits. [`WriterShutdown::run`] must never be
-//! called on a worker that intends to keep serving.
+//! ### This used to leak the engine mutex guard, and it cost us the events log
+//!
+//! The first version of this closed the same hole by `std::mem::forget`ing the
+//! guard so the mutex was never released — any post-seal appender blocked on it
+//! forever and could never be acked. Correct on paper, and it passed every idle
+//! test. Under load it lost data (noetl/ai-meta#226).
+//!
+//! `FeedWriter::append_batch` takes a **`std::sync::Mutex`**, *blocking*, from
+//! inside an async task. Parking appenders on it therefore parks tokio worker
+//! threads, and there are only as many of those as CPUs — two, on the prod
+//! worker. With a backlog in flight at SIGTERM the runtime had no threads left,
+//! so [`seal_all`] never reached the second host and the events log went out
+//! unsealed: the reopened log came back 390 records below its persisted cursor
+//! and every consumer group resumed `clamped=true`. Worker threads also drive
+//! the timer, so `main`'s 15 s budget could not fire either — the shutdown ate
+//! the clock that was supposed to bound it, which is why the prod log ends
+//! mid-sequence with no expiry line and no `Worker stopped`.
+//!
+//! `FeedWriter::seal_and_close` keeps the guarantee with a flag set before the
+//! lock is taken and re-checked under it, and releases the lock. Nothing blocks;
+//! a post-seal publisher gets an error it can act on instead of a hang.
+//!
+//! This still runs only on the terminal path. [`seal_all`] must never be called
+//! on a worker that intends to keep serving — the writers do not reopen.
 //!
 //! # What this does NOT fix
 //!
@@ -110,14 +134,17 @@
 //! an ehdb-side accessor. Sessions/requests written in the last unsealed part
 //! are lost on restart. Tracked as a follow-up.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-use ehdb_l0::{Dataset, L0Engine};
+use ehdb_feed::FeedWriter;
+use ehdb_l0::Dataset;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 /// How long to let already-accepted publishers finish after the listener
 /// closes, before sealing. Short: the seal-and-hold below is the actual
@@ -279,39 +306,61 @@ impl StopHandle {
 
 type BoxFut = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
+/// One host's seal work, detached from its borrowed [`WriterShutdown`] so the
+/// whole set can be moved onto a single blocking thread.
+type HostSeal = (&'static str, u32, Vec<Arc<dyn Sealable>>);
+
 /// An L0 engine that must be sealed before the process exits.
 pub trait Sealable: Send + Sync + 'static {
-    /// Seal the active part, wait for its upload, and then keep the engine
-    /// locked so nothing can append (and therefore nothing can be *acked*)
-    /// afterwards. See the module docs for why the lock is never released.
+    /// Seal the active part, wait for its upload, and close the writer so
+    /// nothing can append — and therefore nothing can be *acked* — afterwards.
+    ///
+    /// Must **not** hold a lock past its own return. See
+    /// [`EngineSeal::seal_and_hold`] for the incident that rule comes from.
     fn seal_and_hold(&self) -> Result<()>;
 }
 
-/// [`Sealable`] over a `FeedWriter`'s engine handle.
+/// [`Sealable`] over a `FeedWriter`.
 pub struct EngineSeal<D: Dataset> {
-    engine: Arc<Mutex<L0Engine<D>>>,
+    writer: Arc<FeedWriter<D>>,
 }
 
-impl<D: Dataset> EngineSeal<D> {
-    pub fn new(engine: Arc<Mutex<L0Engine<D>>>) -> Self {
-        Self { engine }
+impl<D> EngineSeal<D>
+where
+    D: Dataset,
+    D::Record: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
+    pub fn new(writer: Arc<FeedWriter<D>>) -> Self {
+        Self { writer }
     }
 }
 
 impl<D> Sealable for EngineSeal<D>
 where
     D: Dataset + Send + Sync + 'static,
+    D::Record: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    /// **This used to leak the engine's `MutexGuard`, and that cost us the
+    /// events log (noetl/ai-meta#226).**
+    ///
+    /// The old shape was `engine.lock()` → `flush_and_wait_uploads()` →
+    /// `std::mem::forget(guard)`, holding the lock through process exit so no
+    /// append could be acked after the seal. It does stop appends — by parking
+    /// every appender on a mutex that is never released. Every append path in
+    /// `ehdb-feed` runs inside an async task and takes that `std::sync::Mutex`
+    /// *blocking*, so each parked appender burns a whole tokio worker thread.
+    /// Under load there are more parked appenders than worker threads, the
+    /// runtime starves, and [`seal_all`] never gets to the **second** host —
+    /// which is exactly what prod's shutdown log shows: `hosts=2`, one seal,
+    /// then silence. Worker threads also drive the timer, so `main`'s 15 s
+    /// budget could not fire either.
+    ///
+    /// `FeedWriter::seal_and_close` keeps the same guarantee with a flag
+    /// re-checked under the lock, and releases the lock. A post-seal append now
+    /// fails fast — a better contract than hanging, since the publisher retries
+    /// against the replacement writer.
     fn seal_and_hold(&self) -> Result<()> {
-        let mut guard = self
-            .engine
-            .lock()
-            .map_err(|_| anyhow!("L0 engine mutex poisoned before the shutdown seal"))?;
-        guard.flush_and_wait_uploads()?;
-        // Deliberate: hold the engine lock through process exit so no append
-        // can be acked after the seal. See the module docs.
-        std::mem::forget(guard);
-        Ok(())
+        self.writer.seal_and_close().map_err(Into::into)
     }
 }
 
@@ -348,69 +397,181 @@ impl WriterShutdown {
         }
     }
 
-    /// Run the full sequence. Never panics: a shutdown path that unwinds is
-    /// worse than one that logs and continues to the next step, because the
-    /// steps are independent and the later ones matter more.
-    pub async fn run(&self) {
+    /// Phase 1 — close this host's ingest listener: no new publisher
+    /// connections. **Awaits** the faces reporting their listeners closed, so
+    /// the seal cannot run underneath a still-accepting acceptor. Returning from
+    /// a bare `send` here is what left the ordering unproven, and with
+    /// `notify_waiters` the signal could be lost outright.
+    async fn stop_ingest(&self) {
         let (label, shard) = (self.label, self.shard);
-
-        // 1. Close the ingest listener: no new publisher connections. This
-        //    **awaits** the faces reporting their listeners closed, so the seal
-        //    below cannot run underneath a still-accepting acceptor. Returning
-        //    from a bare `send` here is what left the ordering unproven, and
-        //    with `notify_waiters` the signal could be lost outright.
-        if let Some(stop) = &self.stop_ingest {
-            let report = stop.stop(stop_deadline()).await;
-            if report.timed_out {
-                tracing::warn!(
-                    label,
-                    shard,
-                    stopped = ?report.stopped,
-                    timeout_ms = stop_deadline().as_millis() as u64,
-                    "EHDB {label} face(s) did not confirm their listener closed before \
-                     the deadline — sealing anyway, but a publisher may still be \
-                     accepted during the seal"
-                );
-            } else {
-                tracing::info!(
-                    label,
-                    shard,
-                    faces = ?report.stopped,
-                    "EHDB {label} ingest listener closed"
-                );
-            }
-
-            // 2. Let already-accepted publishers land and get acked. Their
-            //    connections are owned by tasks inside `ehdb-feed` and cannot be
-            //    reached from here, so this window is what lets their appends
-            //    reach the *pre-seal* part. Anything that misses it blocks on the
-            //    held engine lock below and is never acked.
-            tokio::time::sleep(quiesce()).await;
+        let Some(stop) = &self.stop_ingest else {
+            return;
+        };
+        let report = stop.stop(stop_deadline()).await;
+        if report.timed_out {
+            tracing::warn!(
+                label,
+                shard,
+                stopped = ?report.stopped,
+                timeout_ms = stop_deadline().as_millis() as u64,
+                "EHDB {label} face(s) did not confirm their listener closed before \
+                 the deadline — sealing anyway, but a publisher may still be \
+                 accepted during the seal"
+            );
+        } else {
+            tracing::info!(
+                label,
+                shard,
+                faces = ?report.stopped,
+                "EHDB {label} ingest listener closed"
+            );
         }
+    }
 
-        // 3. Cursor first: it is cheap, and a cursor behind the log is always
-        //    safe while a log behind the cursor needs the resume clamp.
+    /// Phase 3 — persist the claim/group cursor. Cheap, and a cursor behind the
+    /// log is always safe while a log behind the cursor needs the resume clamp.
+    async fn persist_cursor(&self) {
+        let (label, shard) = (self.label, self.shard);
         match (self.persist_cursor)().await {
             Ok(()) => tracing::info!(label, shard, "EHDB {label} cursor persisted on shutdown"),
             Err(error) => {
                 tracing::warn!(label, shard, %error, "EHDB {label} cursor persist failed")
             }
         }
-
-        // 4. Seal, and hold the engine closed through exit.
-        for sealable in &self.sealables {
-            let sealable = Arc::clone(sealable);
-            // `flush_and_wait_uploads` blocks on the uploader's condvar, so keep
-            // it off the async worker threads.
-            match tokio::task::spawn_blocking(move || sealable.seal_and_hold()).await {
-                Ok(Ok(())) => tracing::info!(label, shard, "EHDB {label} log sealed on shutdown"),
-                Ok(Err(error)) => tracing::warn!(label, shard, %error, "EHDB {label} seal failed"),
-                Err(error) => {
-                    tracing::warn!(label, shard, %error, "EHDB {label} seal task failed")
-                }
-            }
-        }
     }
+
+    /// Run the full sequence for this host alone. Kept for single-host callers
+    /// and tests; multi-host processes must use [`seal_all`], which interleaves
+    /// the phases across hosts rather than finishing one host before starting
+    /// the next.
+    pub async fn run(&self) {
+        seal_all(std::slice::from_ref(self)).await;
+    }
+}
+
+/// What [`seal_all`] achieved. Logged, and returned so a caller can assert on it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SealReport {
+    /// Hosts whose every engine sealed cleanly.
+    pub sealed: usize,
+    /// Hosts the sequence was asked to seal.
+    pub hosts: usize,
+}
+
+impl SealReport {
+    /// Did every host seal? The only outcome that makes the next incarnation's
+    /// resume exact.
+    pub fn complete(&self) -> bool {
+        self.sealed == self.hosts
+    }
+}
+
+/// Seal **every** writer host this process owns, before the process exits
+/// (noetl/ai-meta#209, #226).
+///
+/// # Why the phases interleave across hosts
+///
+/// The obvious shape — `for host in hosts { host.run().await }` — is what
+/// shipped in v5.92.0, and under load it sealed the command bus and never
+/// reached the events feed. Two independent reasons, both fixed here:
+///
+/// 1. **The old seal held a lock through exit** and starved the runtime, so the
+///    loop's own continuation was never polled again. That is fixed in
+///    [`EngineSeal::seal_and_hold`], which no longer holds anything.
+/// 2. **Even with a well-behaved seal, host-at-a-time is the wrong order.**
+///    Host 1's whole sequence — including its `stop_deadline` and its quiesce —
+///    runs before host 2's ingest is so much as told to stop, so host 2 keeps
+///    accepting and appending for the entire time host 1 takes, and then spends
+///    its own budget from a standing start. `main`'s 15 s budget is shared, so a
+///    slow first host can consume the budget the second one needed. Stopping
+///    every ingest first also means the single quiesce window covers all hosts
+///    at once instead of being paid per host.
+///
+/// So the order is: stop **every** ingest → quiesce **once** → persist **every**
+/// cursor → seal **every** engine.
+///
+/// The seal phase runs on **one** blocking thread for all hosts. `spawn_blocking`
+/// per host would put a scheduler round-trip between them, which is precisely
+/// the gap the old code died in; one task means that once sealing starts,
+/// nothing outside it has to be scheduled for it to finish.
+pub async fn seal_all(hosts: &[WriterShutdown]) -> SealReport {
+    if hosts.is_empty() {
+        return SealReport::default();
+    }
+    tracing::info!(hosts = hosts.len(), "sealing EHDB writer hosts before exit");
+
+    // 1. Every ingest listener closes before any of them quiesces or seals.
+    futures::future::join_all(hosts.iter().map(|h| h.stop_ingest())).await;
+
+    // 2. One quiesce for all of them: let already-accepted publishers land and
+    //    get acked. Their connections are owned by tasks inside `ehdb-feed` and
+    //    cannot be reached from here, so this window is what lets their appends
+    //    reach the *pre-seal* part. Anything that misses it is refused by the
+    //    closed writer below and republished to the replacement.
+    //
+    //    Skipped when no host bound an ingest face — there is nothing in flight.
+    if hosts.iter().any(|h| h.stop_ingest.is_some()) {
+        tokio::time::sleep(quiesce()).await;
+    }
+
+    // 3. Cursors, concurrently — independent per host, and all cheap.
+    futures::future::join_all(hosts.iter().map(|h| h.persist_cursor())).await;
+
+    // 4. Seal every host on one blocking thread. `flush_and_wait_uploads` blocks
+    //    on the uploader's condvar, so it must not run on an async worker.
+    let hosts_len = hosts.len();
+    let sealables: Vec<HostSeal> = hosts
+        .iter()
+        .map(|h| (h.label, h.shard, h.sealables.clone()))
+        .collect();
+    let sealed = tokio::task::spawn_blocking(move || {
+        sealables
+            .into_iter()
+            .filter(|(label, shard, sealables)| {
+                let mut all = true;
+                for sealable in sealables {
+                    match sealable.seal_and_hold() {
+                        Ok(()) => {
+                            tracing::info!(label, shard, "EHDB {label} log sealed on shutdown")
+                        }
+                        Err(error) => {
+                            all = false;
+                            tracing::error!(label, shard, %error, "EHDB {label} seal failed");
+                        }
+                    }
+                }
+                all
+            })
+            .count()
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::error!(%error, "EHDB seal task panicked — no host is known to have sealed");
+        0
+    });
+
+    let report = SealReport {
+        sealed,
+        hosts: hosts_len,
+    };
+    // A partial seal used to be invisible until the *next* boot reported
+    // `clamped=true` on a log below its own cursor. Say it here, at ERROR, while
+    // the operator is still watching the pod terminate (noetl/ai-meta#226).
+    if report.complete() {
+        tracing::info!(
+            hosts = report.hosts,
+            "EHDB writer hosts all sealed — shutdown complete"
+        );
+    } else {
+        tracing::error!(
+            sealed = report.sealed,
+            hosts = report.hosts,
+            "EHDB writer hosts did NOT all seal — the unsealed tail of the \
+             unsealed host(s) will be lost and their next resume will clamp"
+        );
+    }
+    crate::metrics::record_shutdown_seal(report.sealed, report.hosts);
+    report
 }
 
 /// Wrap a face's `serve_*` future so firing its [`StopSignal`] closes its
@@ -490,6 +651,7 @@ fn report_face_exit(face: &'static str, result: std::io::Result<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A `Sealable` that records how many times it sealed.
