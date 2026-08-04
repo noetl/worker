@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.95.2](https://github.com/noetl/worker/compare/v5.95.1...v5.95.2) (2026-08-04)
+
+### Bug Fixes
+
+* **sink:** send the internal-API bearer on sink-state posts ([b3e718d](https://github.com/noetl/worker/commit/b3e718d1be7fb9efe44273a9d31b2b7aca4ca1ab)), closes [#199](https://github.com/noetl/worker/issues/199) [noetl/ai-meta#199](https://github.com/noetl/ai-meta/issues/199)
+
 ## [5.95.1](https://github.com/noetl/worker/compare/v5.95.0...v5.95.1) (2026-08-04)
 
 ### Bug Fixes
