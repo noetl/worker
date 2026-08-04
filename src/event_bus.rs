@@ -384,6 +384,16 @@ pub async fn spawn_event_writer_host(
         std::fs::create_dir_all(&kv_dir)?;
         let kv_substrate: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&kv_dir)?);
         let store = ehdb_l0::KvStore::open(ehdb_l0::KvStore::config(&kv_dir), kv_substrate)?;
+        // noetl/ai-meta#209 — the KV face is the THIRD L0 engine in this pod and
+        // the last one without startup visibility. It holds sessions and request
+        // state, so an unsealed part it replays after an unclean exit is exactly
+        // the "sessions survived a crash" question an operator will ask, and
+        // until now nothing answered it either way.
+        tracing::info!(
+            dir = %kv_dir.display(),
+            recovered_active_records = store.engine().metrics().snapshot().recovered_active_records,
+            "EHDB KV engine opened (recovered_active_records>0 means an unsealed part was replayed after an unclean exit)"
+        );
         let kv = Arc::new(ehdb_feed::KvCoordinator::new(store));
         // noetl/ai-meta#209 — the KV face joins the shutdown sequence. It is
         // constructed after the `WriterShutdown` above (the feed writer binds
