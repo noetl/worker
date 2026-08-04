@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.93.1](https://github.com/noetl/worker/compare/v5.93.0...v5.93.1) (2026-08-04)
+
+### Bug Fixes
+
+* **metrics:** expose the crash-recovery counter on the writer's /metrics ([5e52344](https://github.com/noetl/worker/commit/5e52344054903e75e62b1286bcd7e5138e51047c)), closes [#206](https://github.com/noetl/worker/issues/206) [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209)
+
 ## [5.93.0](https://github.com/noetl/worker/compare/v5.92.2...v5.93.0) (2026-08-04)
 
 ### Features
