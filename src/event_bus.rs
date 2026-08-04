@@ -425,6 +425,34 @@ async fn render_event_metrics(coordinator: &GroupCoordinator<D1EventLog>) -> Str
             "ehdb_events_group_lag{{group=\"{group}\"}} {lag}\n"
         ));
     }
+    // noetl/ai-meta#230 — how far the FEED has got, independent of consumption.
+    //
+    // `group_lag == 0` is the gate in the T3/T4 cutover work and in every
+    // paired-evidence check since, and it reads **identically** whether the
+    // consumers drained a real burst or nothing was ever published. There was no
+    // series that could tell those apart, so a gate run during a quiet window
+    // passed having verified nothing.
+    //
+    // That is not hypothetical: `should_publish` excludes system-pool playbooks
+    // by design (they drain the stream), and prod's steady state is an hourly
+    // `system/scheduled_cleanup` plus a 3-minute watchdog — so long stretches
+    // produce zero feed movement, entirely correctly. A check sampled in one of
+    // those windows sees `0 0 0` and looks green. It cost a wrongly-filed bug
+    // (#229) before this series existed.
+    //
+    // The tip is `committed + lag` for any group: every group consumes the same
+    // feed, so they agree, and `max` is taken only to be robust to a torn read
+    // across the two values. Being a monotonic gauge, a gate can assert "tip
+    // advanced by N **and** lag returned to 0" — which an idle window cannot
+    // satisfy.
+    let tip = lags
+        .iter()
+        .map(|(_, committed, lag)| committed.saturating_add(*lag))
+        .max()
+        .unwrap_or(0);
+    out.push_str("# HELP ehdb_events_feed_tip Records appended to the events feed, independent of consumption — advances on publish even when every group is at lag 0. Assert tip-advance AND lag-0 together; lag-0 alone cannot distinguish a drained feed from an empty one (noetl/ai-meta#230).\n");
+    out.push_str("# TYPE ehdb_events_feed_tip gauge\n");
+    out.push_str(&format!("ehdb_events_feed_tip {tip}\n"));
     out.push_str(
         "# HELP ehdb_events_cursor_errors Failed group-cursor persists (progress not durable).\n",
     );
@@ -591,7 +619,66 @@ mod tests {
             );
         }
         assert!(body.contains("ehdb_events_cursor_errors 0"));
+        // noetl/ai-meta#230 — the feed tip must be on the FIRST scrape, at zero.
+        // A series that only materialises once non-zero cannot distinguish "no
+        // appends yet" from "this build lacks the metric", which is the same
+        // ambiguity that made lag-0 unusable as a gate in the first place.
+        assert!(
+            body.contains("ehdb_events_feed_tip 0"),
+            "the feed tip must be exposed from the first scrape, at 0, in:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ehdb_events_feed_tip gauge"),
+            "a series without a TYPE line is not scrapeable in:\n{body}"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// noetl/ai-meta#230 — the tip is what makes a paired-evidence gate
+    /// falsifiable: it advances on publish even while every group sits at lag 0,
+    /// so "tip advanced by N AND lag 0" cannot be satisfied by an idle window
+    /// the way bare "lag 0" can.
+    ///
+    /// Asserted on the arithmetic rather than a live feed, because the property
+    /// under test is that the tip is derived from `committed + lag` and is
+    /// therefore consumption-independent.
+    #[test]
+    fn the_feed_tip_is_consumption_independent() {
+        // Three groups on one feed at different consumption points; the feed has
+        // carried 100 records in every case.
+        let lags: Vec<(String, u64, u64)> = vec![
+            ("noetl_materializer".into(), 100, 0),        // fully drained
+            ("noetl_result_materializer".into(), 60, 40), // mid-drain
+            ("noetl_state_materializer".into(), 0, 100),  // untouched
+        ];
+        let tip = lags
+            .iter()
+            .map(|(_, c, l)| c.saturating_add(*l))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            tip, 100,
+            "the tip must report what the feed carried, not what was consumed"
+        );
+
+        // The case the gate has to catch: everything at lag 0 because nothing
+        // was ever published. Bare lag-0 is indistinguishable from the first row
+        // above; the tip is not.
+        let empty: Vec<(String, u64, u64)> = vec![
+            ("noetl_materializer".into(), 0, 0),
+            ("noetl_result_materializer".into(), 0, 0),
+            ("noetl_state_materializer".into(), 0, 0),
+        ];
+        let empty_tip = empty
+            .iter()
+            .map(|(_, c, l)| c.saturating_add(*l))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(empty_tip, 0);
+        assert_ne!(
+            tip, empty_tip,
+            "a drained feed and an empty feed must not read the same"
+        );
     }
 }
 
