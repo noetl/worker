@@ -199,6 +199,11 @@ impl Command {
 }
 
 /// HTTP client for control plane API.
+/// Env var carrying the bearer for `/api/internal/*` — the same one
+/// `materializer.rs` and `client/tls.rs` use. Named once so a rename cannot
+/// silently re-mute the sink-state feed (noetl/ai-meta#199).
+pub const INTERNAL_TOKEN_ENV: &str = "NOETL_INTERNAL_API_TOKEN";
+
 /// Which half of the sink-state contract a post carries
 /// (noetl/ai-meta#199 Slice A).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,7 +514,25 @@ impl ControlPlaneClient {
             action.path_segment()
         );
         let body = serde_json::json!({ "execution_id": execution_id });
-        match self.client.post(&url).json(&body).send().await {
+        // `/api/internal/*` is token-gated. Without the bearer the server
+        // answers **403 Forbidden**, which `post_sink_state` swallows by design
+        // (it must never fail a connector step) — so the omission was silent
+        // apart from the counter and the warning below, and the gate simply
+        // never saw an execution.
+        //
+        // Same convention as the materializer's `/api/internal/events/project`
+        // (`materializer.rs`) and `client/tls.rs`: `NOETL_INTERNAL_API_TOKEN` as
+        // a bearer. Absent in-cluster on some deployments, where the server
+        // trusts the pod network — hence `Option`, and no auth header rather
+        // than an empty one, which would be rejected differently.
+        let mut req = self.client.post(&url).json(&body);
+        if let Some(token) = std::env::var(INTERNAL_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.is_empty())
+        {
+            req = req.bearer_auth(token);
+        }
+        match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 crate::metrics::record_sink_state_post(action.path_segment(), "ok");
             }
@@ -1232,6 +1255,31 @@ pub struct SubscriptionStatus {
 #[cfg(test)]
 mod tests_sink_state {
     use super::SinkStateAction;
+
+    /// noetl/ai-meta#199 Slice A — `/api/internal/*` is token-gated, and
+    /// omitting the bearer is **silent**: the server answers 403, and
+    /// `post_sink_state` swallows failures by design so a connector step is
+    /// never failed by bookkeeping. The only evidence was a WARN and a counter,
+    /// and the gate saw nothing for it.
+    ///
+    /// This pins the env var name against `materializer.rs` and
+    /// `client/tls.rs`, so renaming one without the others breaks a test rather
+    /// than silently re-muting the feed.
+    #[test]
+    fn sink_state_uses_the_same_internal_token_var_as_the_other_internal_calls() {
+        // The name is load-bearing; assert it literally.
+        assert_eq!(super::INTERNAL_TOKEN_ENV, "NOETL_INTERNAL_API_TOKEN");
+    }
+
+    /// An empty token must be treated as absent, not sent as an empty bearer —
+    /// the two are rejected differently and the second is harder to diagnose.
+    #[test]
+    fn an_empty_token_is_treated_as_absent() {
+        let resolved = |v: Option<&str>| v.map(str::to_string).filter(|t| !t.is_empty());
+        assert_eq!(resolved(None), None);
+        assert_eq!(resolved(Some("")), None);
+        assert_eq!(resolved(Some("tok")), Some("tok".to_string()));
+    }
 
     /// noetl/ai-meta#199 Slice A — the URL segment and the metric label come
     /// from one function so they can never drift. A `mark` counted as a
