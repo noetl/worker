@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.95.0](https://github.com/noetl/worker/compare/v5.94.0...v5.95.0) (2026-08-04)
+
+### Features
+
+* **sink:** write sink-state to the server's feed, not just the local index ([31fea22](https://github.com/noetl/worker/commit/31fea22f6601066ab54d71efeaec4c4dc77e026e)), closes [noetl/server#286](https://github.com/noetl/server/issues/286) [#286](https://github.com/noetl/worker/issues/286) [noetl/ai-meta#199](https://github.com/noetl/ai-meta/issues/199)
+
 ## [5.94.0](https://github.com/noetl/worker/compare/v5.93.1...v5.94.0) (2026-08-04)
 
 ### Features
