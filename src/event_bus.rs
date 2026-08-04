@@ -345,7 +345,7 @@ pub async fn spawn_event_writer_host(
                     Ok(())
                 })
             }),
-            vec![Arc::new(crate::graceful::EngineSeal::new(writer.engine()))],
+            vec![Arc::new(crate::graceful::EngineSeal::new(writer.clone()))],
         )
     };
     tokio::spawn(watch_cursor_errors(coordinator.clone()));
@@ -781,6 +781,14 @@ async fn claim_loop(
                     }
                 }
                 Err(error) => {
+                    // noetl/ai-meta#225: before the events face carried keepalive
+                    // and a negotiated heartbeat this arm was **unreachable** on
+                    // a half-open socket — the read never returned, so the
+                    // consumer parked silently while `noetl.event` stopped being
+                    // written and every health signal stayed green. Reaching it
+                    // is the fix working; the counter is how that is visible in
+                    // prod, where the group cursor's freeze was the only symptom.
+                    crate::metrics::record_events_consumer_redial("group_claim");
                     tracing::warn!(group, %error, "events-feed claim failed; redialing");
                     break;
                 }

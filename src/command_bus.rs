@@ -242,7 +242,7 @@ pub async fn spawn_writer_host(
                     Ok(())
                 })
             }),
-            vec![Arc::new(crate::graceful::EngineSeal::new(writer.engine()))],
+            vec![Arc::new(crate::graceful::EngineSeal::new(writer.clone()))],
         )
     };
 

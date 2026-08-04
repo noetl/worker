@@ -221,17 +221,18 @@ impl Worker {
     /// does: the seal deliberately holds each engine's lock through exit so no
     /// append can be acked after its log was sealed, which means the writer is
     /// unusable afterwards by design. See [`crate::graceful`].
+    /// Under load this used to seal the first host and never reach the second
+    /// (noetl/ai-meta#226). It was a `for host { host.run().await }` loop, which
+    /// is wrong twice over: the old seal held an engine lock through exit and
+    /// starved the runtime so the loop's own continuation was never polled
+    /// again, and host-at-a-time leaves host 2 accepting and appending for the
+    /// whole time host 1 takes while they share one 15 s budget.
+    /// [`crate::graceful::seal_all`] interleaves the phases across every host
+    /// instead — stop all ingest, quiesce once, persist all cursors, seal all
+    /// engines on one blocking thread — and says so, loudly, if any host is left
+    /// unsealed.
     pub async fn shutdown(&self) {
-        if self.writer_shutdowns.is_empty() {
-            return;
-        }
-        tracing::info!(
-            hosts = self.writer_shutdowns.len(),
-            "sealing EHDB writer hosts before exit"
-        );
-        for shutdown in &self.writer_shutdowns {
-            shutdown.run().await;
-        }
+        crate::graceful::seal_all(&self.writer_shutdowns).await;
     }
 
     /// Run the worker.
