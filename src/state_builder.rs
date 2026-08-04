@@ -2246,8 +2246,27 @@ pub fn rehydrate_on_miss_enabled() -> bool {
 }
 
 /// Resolved config for a targeted WAL cold-rebuild (noetl/ai-meta#166 §5.2).
+///
+/// noetl/ai-meta#227: this used to describe a NATS JetStream pull only. The
+/// internal bus was deleted on 2026-08-01, so on an EHDB platform every
+/// rehydrate died at `DNS error: failed to lookup address information` and
+/// returned 0 — which the caller records as `rehydrate{outcome="empty"}`. In
+/// prod that was **100% of attempts**: 491/486 `empty`, `served` not once. With
+/// `event_scans_total` held at 0 by design (RFC #115 tenet 3), `chain_walk` is
+/// the only reader and this is its only recovery, so a chain gap after a writer
+/// restart was permanent and the drive retried forever.
+///
+/// The EHDB path below replays the same retained events feed the live drain
+/// consumes (`NOETL_EVENT_BUS_WAL_ADDR`), so a miss is recoverable again.
 #[derive(Clone)]
 pub struct RehydrateConfig {
+    /// noetl/ai-meta#227 — which transport to replay from. Mirrors
+    /// `DrainConfig::source`; `Ehdb` uses `wal_addr`, `Nats` the fields below.
+    pub source: crate::event_bus::EventSourceMode,
+    /// `NOETL_EVENT_BUS_WAL_ADDR` — the writer's WAL fan-out face (EHDB only).
+    pub wal_addr: Option<String>,
+    /// `NOETL_EVENT_BUS_SHARD` (EHDB only).
+    pub shard: u32,
     pub nats_url: String,
     pub nats_user: Option<String>,
     pub nats_password: Option<String>,
@@ -2268,6 +2287,25 @@ impl RehydrateConfig {
     pub fn from_env(nats_url: &str) -> Self {
         let (nats_url, nats_user, nats_password) = parse_nats_credentials(nats_url);
         Self {
+            // Tolerant, unlike `DrainConfig` — this runs on the drive's miss
+            // path, not the startup path, so an unreadable value must not take
+            // the worker down mid-request. It falls back to the drain's own
+            // source, and the EHDB arm additionally requires `wal_addr`, so a
+            // misconfiguration degrades to today's behaviour instead of
+            // panicking. The fail-loud gate for this variable is
+            // `DrainConfig::from_env` (noetl/ai-meta#221).
+            source: crate::event_bus::EventSourceMode::from_env_strict(
+                "NOETL_STATE_BUILDER_SOURCE",
+            )
+            .unwrap_or(crate::event_bus::EventSourceMode::Ehdb),
+            wal_addr: std::env::var("NOETL_EVENT_BUS_WAL_ADDR")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            shard: std::env::var("NOETL_EVENT_BUS_SHARD")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0),
             nats_url,
             nats_user,
             nats_password,
@@ -2298,6 +2336,12 @@ pub async fn rehydrate_execution_from_wal(
     index: &SharedWalIndex,
     execution_id: i64,
 ) -> usize {
+    // noetl/ai-meta#227 — replay from whichever transport actually carries the
+    // retained log. Before this, the function was NATS-only and on an EHDB
+    // platform every call failed at DNS and returned 0.
+    if cfg.source.is_ehdb() {
+        return rehydrate_execution_from_ehdb(cfg, index, execution_id).await;
+    }
     let deadline = Instant::now() + Duration::from_millis(cfg.deadline_ms);
     let connect = async {
         let client = match (&cfg.nats_user, &cfg.nats_password) {
@@ -2372,6 +2416,109 @@ pub async fn rehydrate_execution_from_wal(
         // An empty pull means the retained window is fully scanned (caught up).
         if got == 0 {
             break;
+        }
+    }
+    applied
+}
+
+/// The EHDB arm of [`rehydrate_execution_from_wal`] (noetl/ai-meta#227).
+///
+/// Replays the retained events feed from cursor 0 over the writer's raw WAL
+/// fan-out face — the *same* source and the *same* `apply` the live drain uses
+/// (`run_drain_loop_ehdb`), so the two cannot drift in what they index — keeping
+/// only `execution_id`'s events so a miss-path recovery cannot re-grow the index
+/// back to the full retained window that eviction just freed.
+///
+/// Bounded by `deadline_ms` and `max_messages`, and any error returns the count
+/// applied so far: like the NATS arm, this can never make a miss worse than the
+/// fallback that follows it — it only ADDS events to the index.
+async fn rehydrate_execution_from_ehdb(
+    cfg: &RehydrateConfig,
+    index: &SharedWalIndex,
+    execution_id: i64,
+) -> usize {
+    let Some(addr) = cfg.wal_addr.as_deref() else {
+        // Same shape as the NATS connect failure: warn and let the caller fall
+        // back. `DrainConfig::from_env` is the fail-loud gate for this.
+        tracing::warn!(
+            execution_id,
+            "state-builder cold-rebuild skipped: source=ehdb but NOETL_EVENT_BUS_WAL_ADDR is unset \
+             (noetl/ai-meta#227)"
+        );
+        return 0;
+    };
+    let deadline = Instant::now() + Duration::from_millis(cfg.deadline_ms);
+
+    // The connect must be inside the budget too. A TCP connect to an
+    // unreachable writer blocks for the OS timeout — measured at 75s against a
+    // 500ms deadline in `ehdb_rehydrate_is_bounded_when_the_writer_is_unreachable`
+    // — and this runs on the drive's miss path, so an unbounded connect is
+    // exactly the #130/#156-class latency regression the budget exists to
+    // prevent. `deadline_ms` now bounds connect + replay, not just replay.
+    let connect = ehdb_feed::FeedSubscription::connect(addr, cfg.shard, 0);
+    let mut sub =
+        match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), connect)
+            .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    execution_id, %addr, %error,
+                    "state-builder cold-rebuild subscribe failed (noetl/ai-meta#227)"
+                );
+                return 0;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    execution_id, %addr, deadline_ms = cfg.deadline_ms,
+                    "state-builder cold-rebuild subscribe timed out (noetl/ai-meta#227)"
+                );
+                return 0;
+            }
+        };
+
+    let mut applied = 0usize;
+    let mut scanned = 0u64;
+    while Instant::now() < deadline && scanned < cfg.max_messages {
+        // Each read is bounded by whatever budget is left, for the same reason
+        // the connect is: a stuck peer must not park the drive's miss path.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let records: Vec<ehdb_l0::EventRecord> =
+            match tokio::time::timeout(remaining, sub.recv_batch()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        execution_id, %addr, %error,
+                        "state-builder cold-rebuild feed dropped mid-replay (noetl/ai-meta#227)"
+                    );
+                    break;
+                }
+                Err(_elapsed) => break,
+            };
+        // An empty batch means the retained window is fully replayed. The live
+        // drain sleeps and keeps going; a one-shot rehydrate is done.
+        if records.is_empty() {
+            break;
+        }
+        for record in &records {
+            scanned += 1;
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&record.payload) else {
+                continue;
+            };
+            if payload.get("execution_id").and_then(|v| v.as_i64()) != Some(execution_id) {
+                continue;
+            }
+            {
+                let mut idx = index.lock().await;
+                idx.apply(&payload);
+            }
+            applied += 1;
+            if scanned >= cfg.max_messages {
+                break;
+            }
         }
     }
     applied
@@ -3742,5 +3889,107 @@ mod t217_ehdb_drain_tests {
         }
         assert!(batch.touched.is_empty(), "junk must not touch an execution");
         assert!(batch.terminals.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod t227_rehydrate_transport_tests {
+    use super::*;
+
+    /// noetl/ai-meta#227 — the whole defect in one assertion.
+    ///
+    /// `RehydrateConfig` used to describe a NATS JetStream pull only, so on an
+    /// EHDB platform (NATS deleted 2026-08-01) every cold-rebuild died at
+    /// `DNS error: failed to lookup address information` and returned 0. The
+    /// caller records that as `rehydrate{outcome="empty"}` — 491/486 in prod,
+    /// with `served` not appearing once.
+    ///
+    /// The config must now resolve the EHDB transport, or the fix cannot engage.
+    /// `RehydrateConfig::from_env` reads process env, and cargo runs tests in
+    /// threads, so the two env-reading cases here must not interleave.
+    static T227_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn rehydrate_config_resolves_the_ehdb_transport() {
+        let _g = T227_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("NOETL_STATE_BUILDER_SOURCE", "ehdb");
+        std::env::set_var("NOETL_EVENT_BUS_WAL_ADDR", "writer.noetl.svc:9108");
+        std::env::set_var("NOETL_EVENT_BUS_SHARD", "3");
+
+        let cfg = RehydrateConfig::from_env("");
+        assert!(cfg.source.is_ehdb(), "source=ehdb must select the EHDB arm");
+        assert_eq!(cfg.wal_addr.as_deref(), Some("writer.noetl.svc:9108"));
+        assert_eq!(cfg.shard, 3, "replays the pool's own shard, not always 0");
+
+        std::env::remove_var("NOETL_STATE_BUILDER_SOURCE");
+        std::env::remove_var("NOETL_EVENT_BUS_WAL_ADDR");
+        std::env::remove_var("NOETL_EVENT_BUS_SHARD");
+    }
+
+    /// NEGATIVE CONTROL for the above: with the legacy source the NATS arm must
+    /// still be selected, so this fix cannot silently re-point a NATS platform.
+    #[test]
+    fn rehydrate_config_keeps_the_nats_arm_for_the_legacy_source() {
+        let _g = T227_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("NOETL_STATE_BUILDER_SOURCE", "nats");
+        let cfg = RehydrateConfig::from_env("nats://example:4222");
+        assert!(!cfg.source.is_ehdb(), "source=nats must keep the NATS arm");
+        assert_eq!(cfg.nats_url, "nats://example:4222");
+        std::env::remove_var("NOETL_STATE_BUILDER_SOURCE");
+    }
+
+    /// The EHDB arm must fail *soft* when the address is missing — the drive's
+    /// miss path must degrade to the existing fallback, never panic mid-request.
+    /// `DrainConfig::from_env` is the fail-loud gate for this variable (#221).
+    #[tokio::test]
+    async fn ehdb_rehydrate_without_an_address_returns_zero_and_does_not_panic() {
+        let cfg = RehydrateConfig {
+            source: crate::event_bus::EventSourceMode::Ehdb,
+            wal_addr: None,
+            shard: 0,
+            nats_url: String::new(),
+            nats_user: None,
+            nats_password: None,
+            stream: EVENT_STREAM.to_string(),
+            batch: 500,
+            poll_ms: 50,
+            deadline_ms: 100,
+            max_messages: 10,
+        };
+        let index: SharedWalIndex = SharedWalIndex::new(WalEventIndex::new());
+        assert_eq!(
+            rehydrate_execution_from_ehdb(&cfg, &index, 42).await,
+            0,
+            "missing wal_addr degrades to the fallback, it does not panic"
+        );
+    }
+
+    /// An unreachable writer must be bounded by the deadline and return 0 —
+    /// the miss path can never become a latency regression (#130/#156 class).
+    #[tokio::test]
+    async fn ehdb_rehydrate_is_bounded_when_the_writer_is_unreachable() {
+        let cfg = RehydrateConfig {
+            source: crate::event_bus::EventSourceMode::Ehdb,
+            // Reserved TEST-NET-1 address: connect cannot succeed.
+            wal_addr: Some("192.0.2.1:9108".to_string()),
+            shard: 0,
+            nats_url: String::new(),
+            nats_user: None,
+            nats_password: None,
+            stream: EVENT_STREAM.to_string(),
+            batch: 500,
+            poll_ms: 50,
+            deadline_ms: 500,
+            max_messages: 10,
+        };
+        let index: SharedWalIndex = SharedWalIndex::new(WalEventIndex::new());
+        let started = Instant::now();
+        let applied = rehydrate_execution_from_ehdb(&cfg, &index, 42).await;
+        assert_eq!(applied, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "bounded, not a hang: took {:?}",
+            started.elapsed()
+        );
     }
 }
