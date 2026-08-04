@@ -257,6 +257,14 @@ pub async fn spawn_event_writer_host(
         L0Config::d1(&dir).with_shard_count(config.shard_count.max(1)),
         store,
     )?;
+    // noetl/ai-meta#209 — same startup visibility for the EVENTS engine; the
+    // command bus is not the only log a crash can leave unsealed.
+    let recovered_at_open = engine.metrics().snapshot().recovered_active_records;
+    tracing::info!(
+        shard = config.shard,
+        recovered_active_records = recovered_at_open,
+        "EHDB events-feed engine opened (recovered_active_records>0 means an unsealed part was replayed after an unclean exit)"
+    );
     let writer = Arc::new(FeedWriter::new(engine));
 
     // noetl/ai-meta#209: the host owns the ingest face's lifetime, so shutdown
