@@ -9,6 +9,6 @@ pub mod tls;
 
 pub use control_plane::{
     BatchExecuteResponse, BatchItemOutcome, ClaimResult, Command, ControlPlaneClient, Credential,
-    CredentialHttpError, DispatchItem, ExecutorEvent, SubscriptionStatus,
+    CredentialHttpError, DispatchItem, ExecutorEvent, SinkStateAction, SubscriptionStatus,
 };
 pub use sealed::{open as sealed_open, SealedEnvelope, SEAL_ALG, SEAL_V};
