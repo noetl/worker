@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.92.2](https://github.com/noetl/worker/compare/v5.92.1...v5.92.2) (2026-08-04)
+
+### Bug Fixes
+
+* **state-builder:** rehydrate-on-miss still spoke NATS, so it never recovered a chain ([f3ab9ed](https://github.com/noetl/worker/commit/f3ab9ed5c44f9f4e3e46cd376b2956c12e3e04bf)), closes [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227) [noetl/ai-meta#166](https://github.com/noetl/ai-meta/issues/166) [#227](https://github.com/noetl/worker/issues/227) [#115](https://github.com/noetl/worker/issues/115) [#130](https://github.com/noetl/worker/issues/130) [#156](https://github.com/noetl/worker/issues/156) [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+
 ## [5.92.1](https://github.com/noetl/worker/compare/v5.92.0...v5.92.1) (2026-08-04)
 
 ### Bug Fixes
