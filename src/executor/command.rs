@@ -1046,6 +1046,34 @@ impl CommandExecutor {
         // becomes the envelope status — projectors group by status
         // to compute success/failure rates per step.
         let completion_status = tool_result.status.to_string();
+        // noetl/ai-meta#227 part B — record on the event that this step is
+        // parked, not finished.
+        //
+        // On the `pending_callback` path above the worker deliberately skips its
+        // own `call.done` and returns, freeing the slot while an external system
+        // works (execution-model "Callback / hook rule").  The terminal arrives
+        // later via `POST /api/internal/container-callback/…`.
+        //
+        // The problem that creates: from the event log alone, an execution
+        // parked on a six-hour callback is indistinguishable from one whose DAG
+        // ran out of successors — both show a `command.completed`, no
+        // outstanding claim, and an arbitrarily old newest event.  The
+        // non-convergence sweep
+        // (`noetl-server: handlers::nonconvergence_sweep`) keys on exactly that
+        // staleness, so without a marker it would terminate healthy parked work.
+        //
+        // Stamping the flag here gives the sweep a *positive* signal to exclude
+        // on, rather than an inference.  Additive and backward-compatible: the
+        // field is simply absent on every other path, and the sweep reads its
+        // absence as "not parked", never as "parked".
+        let pending_callback = matches!(tool_result.pending_callback, Some(true));
+        let mut completed_ctx = serde_json::json!({
+            "command_id": command.command_id.clone(),
+            "status": tool_result.status.to_string(),
+        });
+        if pending_callback {
+            completed_ctx["pending_callback"] = serde_json::Value::Bool(true);
+        }
         self.emit_event_via(
             &dispatch_client,
             "command.completed",
@@ -1053,10 +1081,7 @@ impl CommandExecutor {
             &completion_status,
             command.execution_id,
             command.attempts,
-            serde_json::json!({
-                "command_id": command.command_id.clone(),
-                "status": tool_result.status.to_string(),
-            }),
+            completed_ctx,
         )
         .await?;
 
