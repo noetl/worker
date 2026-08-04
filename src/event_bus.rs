@@ -332,7 +332,7 @@ pub async fn spawn_event_writer_host(
     // noetl/ai-meta#209: built here, run by `Worker::shutdown` from `main`'s
     // signal branch. Replaces the detached SIGTERM handler that raced `main`'s
     // own — and that only checkpointed cursors, never sealing the log.
-    let shutdown = {
+    let mut shutdown = {
         let coordinator = coordinator.clone();
         WriterShutdown::new(
             "events-feed",
@@ -377,6 +377,11 @@ pub async fn spawn_event_writer_host(
         let kv_substrate: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&kv_dir)?);
         let store = ehdb_l0::KvStore::open(ehdb_l0::KvStore::config(&kv_dir), kv_substrate)?;
         let kv = Arc::new(ehdb_feed::KvCoordinator::new(store));
+        // noetl/ai-meta#209 — the KV face joins the shutdown sequence. It is
+        // constructed after the `WriterShutdown` above (the feed writer binds
+        // first), which is why the shutdown takes a late registration rather
+        // than the whole set up front.
+        shutdown.push_sealable(Arc::new(crate::graceful::KvSeal::new(kv.clone())));
         // Reclaim lapsed entries; correctness already comes from the read-side
         // TTL filter, so this only bounds the log's growth.
         kv.clone()
