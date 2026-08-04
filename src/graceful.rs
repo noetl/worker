@@ -129,10 +129,12 @@
 //! acked. Closing that needs L0-level replay of the local active part on open,
 //! an `ehdb-l0` change tracked separately on the same issue.
 //!
-//! The KV face is also still unsealed: `ehdb_feed::KvCoordinator` keeps its
-//! `KvStore` private with no public flush, so the worker cannot seal it without
-//! an ehdb-side accessor. Sessions/requests written in the last unsealed part
-//! are lost on restart. Tracked as a follow-up.
+//! The KV face **is** now sealed ([`KvSeal`]): `ehdb_feed::KvCoordinator`
+//! exposes `flush_and_wait`, and the events host registers it via
+//! [`WriterShutdown::push_sealable`] (late, because the KV store is constructed
+//! after the shutdown is built). Since the L0 active-part recovery in the same
+//! issue an unsealed KV part is also *replayed* on the next open rather than
+//! destroyed, so the crash path no longer loses sessions/requests either.
 
 use anyhow::Result;
 use std::future::Future;
@@ -320,6 +322,44 @@ pub trait Sealable: Send + Sync + 'static {
     fn seal_and_hold(&self) -> Result<()>;
 }
 
+/// [`Sealable`] over an `ehdb_feed::KvCoordinator` (noetl/ai-meta#209).
+///
+/// The KV face was the last unsealed engine on the events host: the coordinator
+/// held its `KvStore` privately with no flush, so a host could seal its feed
+/// writers on SIGTERM and still leave sessions and request state sitting in an
+/// unsealed part. `KvCoordinator::flush_and_wait` now exposes it.
+///
+/// Since the L0 active-part recovery in the same issue an unsealed KV part is
+/// *replayed* on the next open rather than destroyed, so this is no longer the
+/// difference between kept and lost. It is still the difference between durable
+/// in the object store and recoverable by any replica, versus local-only on a
+/// volume that may not come back.
+pub struct KvSeal {
+    kv: Arc<ehdb_feed::KvCoordinator>,
+}
+
+impl KvSeal {
+    pub fn new(kv: Arc<ehdb_feed::KvCoordinator>) -> Self {
+        Self { kv }
+    }
+}
+
+impl Sealable for KvSeal {
+    /// `Handle::block_on` is correct here and `block_in_place` is not:
+    /// [`seal_all`] runs every sealable inside `spawn_blocking`, which is a
+    /// blocking thread and **not** an async context, so blocking on the handle
+    /// is permitted and cannot stall a runtime worker.
+    ///
+    /// Holds no lock past its own return — the guard lives inside
+    /// `flush_and_wait` — so it does not repeat the leaked-`MutexGuard` incident
+    /// documented on [`EngineSeal::seal_and_hold`].
+    fn seal_and_hold(&self) -> Result<()> {
+        let kv = Arc::clone(&self.kv);
+        tokio::runtime::Handle::current().block_on(async move { kv.flush_and_wait().await })?;
+        Ok(())
+    }
+}
+
 /// [`Sealable`] over a `FeedWriter`.
 pub struct EngineSeal<D: Dataset> {
     writer: Arc<FeedWriter<D>>,
@@ -395,6 +435,17 @@ impl WriterShutdown {
             persist_cursor,
             sealables,
         }
+    }
+
+    /// Register another engine to seal on shutdown (noetl/ai-meta#209).
+    ///
+    /// Exists because the KV face is constructed *after* the host builds its
+    /// `WriterShutdown` — the events host binds its feed writer, builds the
+    /// shutdown, and only then opens the KV store. Without this the KV engine
+    /// simply could not be reached from the shutdown sequence, whatever the
+    /// coordinator exposed.
+    pub fn push_sealable(&mut self, sealable: Arc<dyn Sealable>) {
+        self.sealables.push(sealable);
     }
 
     /// Phase 1 — close this host's ingest listener: no new publisher
@@ -683,6 +734,64 @@ mod tests {
                  will never observe (noetl/ai-meta#209 defect 2)"
             ),
         }
+    }
+
+    /// noetl/ai-meta#209 — a late registration is sealed like any other engine.
+    ///
+    /// The KV face is constructed *after* its host builds the `WriterShutdown`,
+    /// so without `push_sealable` it could not be reached from the shutdown
+    /// sequence at all. This asserts the registration actually takes part in the
+    /// seal rather than being accepted and dropped.
+    #[tokio::test]
+    async fn a_late_registered_sealable_is_sealed_too() {
+        no_quiesce();
+        let early = Arc::new(AtomicUsize::new(0));
+        let late = Arc::new(AtomicUsize::new(0));
+
+        let mut host = WriterShutdown::new(
+            "test-host",
+            0,
+            None,
+            Box::new(|| Box::pin(async { Ok(()) })),
+            vec![Arc::new(CountingSeal(Arc::clone(&early)))],
+        );
+        host.push_sealable(Arc::new(CountingSeal(Arc::clone(&late))));
+
+        let report = seal_all(&[host]).await;
+        assert!(report.complete(), "host must report as sealed");
+        assert_eq!(early.load(Ordering::SeqCst), 1, "the engine bound up front");
+        assert_eq!(
+            late.load(Ordering::SeqCst),
+            1,
+            "the late registration must be sealed too, or the KV face is silently skipped"
+        );
+    }
+
+    /// A late registration that FAILS must fail the host, not be swallowed —
+    /// otherwise an unsealed KV face would report as a clean shutdown.
+    #[tokio::test]
+    async fn a_failing_late_sealable_fails_the_host() {
+        no_quiesce();
+        struct Failing;
+        impl Sealable for Failing {
+            fn seal_and_hold(&self) -> Result<()> {
+                Err(anyhow!("kv seal failed"))
+            }
+        }
+        let mut host = WriterShutdown::new(
+            "test-host",
+            0,
+            None,
+            Box::new(|| Box::pin(async { Ok(()) })),
+            vec![],
+        );
+        host.push_sealable(Arc::new(Failing));
+
+        let report = seal_all(&[host]).await;
+        assert!(
+            !report.complete(),
+            "a failed seal must be visible, not reported as a clean shutdown"
+        );
     }
 
     /// The ordering is the whole fix: ingest must be told to stop *before* the
