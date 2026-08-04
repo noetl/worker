@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.95.1](https://github.com/noetl/worker/compare/v5.95.0...v5.95.1) (2026-08-04)
+
+### Bug Fixes
+
+* **diag:** give the KV engine the same crash-recovery visibility as the others ([0ddc7c6](https://github.com/noetl/worker/commit/0ddc7c6d4decb7128c6f99f3eb6fa51c3b321e56)), closes [worker#219](https://github.com/noetl/worker/issues/219) [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209)
+
 ## [5.95.0](https://github.com/noetl/worker/compare/v5.94.0...v5.95.0) (2026-08-04)
 
 ### Features
