@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.93.0](https://github.com/noetl/worker/compare/v5.92.2...v5.93.0) (2026-08-04)
+
+### Features
+
+* **events:** mark command.completed when a step is parked on a callback ([0ee2754](https://github.com/noetl/worker/commit/0ee2754b491aa2ddc12a946ebec73fcc64c1f7f7)), closes [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227) [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+* **shutdown:** seal the KV face too — it was the last unsealed engine ([61246b2](https://github.com/noetl/worker/commit/61246b2b93ea8737dcd314c81015e1c9bdd0c119)), closes [noetl/ehdb#313](https://github.com/noetl/ehdb/issues/313) [#209](https://github.com/noetl/worker/issues/209) [#226](https://github.com/noetl/worker/issues/226) [noetl/ai-meta#209](https://github.com/noetl/ai-meta/issues/209)
+
 ## [5.92.2](https://github.com/noetl/worker/compare/v5.92.1...v5.92.2) (2026-08-04)
 
 ### Bug Fixes
