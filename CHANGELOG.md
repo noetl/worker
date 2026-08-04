@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.94.0](https://github.com/noetl/worker/compare/v5.93.1...v5.94.0) (2026-08-04)
+
+### Features
+
+* **metrics:** expose the events-feed tip so lag-0 gates become falsifiable ([e9f40f4](https://github.com/noetl/worker/commit/e9f40f482d604721373e203ee6e6fecece4f8db2)), closes [ai-meta#229](https://github.com/noetl/ai-meta/issues/229) [noetl/ai-meta#230](https://github.com/noetl/ai-meta/issues/230)
+
 ## [5.93.1](https://github.com/noetl/worker/compare/v5.93.0...v5.93.1) (2026-08-04)
 
 ### Bug Fixes
