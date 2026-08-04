@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.92.1](https://github.com/noetl/worker/compare/v5.92.0...v5.92.1) (2026-08-04)
+
+### Bug Fixes
+
+* **ehdb:** seal every writer host under load, and give the events consumers liveness ([d622046](https://github.com/noetl/worker/commit/d622046c08e31392d0c399d97f2c207299355432)), closes [noetl/ai-meta#223](https://github.com/noetl/ai-meta/issues/223) [noetl/ai-meta#226](https://github.com/noetl/ai-meta/issues/226) [noetl/ai-meta#225](https://github.com/noetl/ai-meta/issues/225) [#208](https://github.com/noetl/worker/issues/208) [noetl/ai-meta#224](https://github.com/noetl/ai-meta/issues/224) [noetl/ai-meta#225](https://github.com/noetl/ai-meta/issues/225) [noetl/ai-meta#226](https://github.com/noetl/ai-meta/issues/226)
+
 ## [5.91.3](https://github.com/noetl/worker/compare/v5.91.2...v5.91.3) (2026-08-03)
 
 ### Bug Fixes
