@@ -176,6 +176,27 @@ pub async fn spawn_writer_host(
         L0Config::d1(&dir).with_shard_count(config.shard_count.max(1)),
         store,
     )?;
+    // noetl/ai-meta#209 — say, at startup, whether the engine replayed an
+    // unsealed active part left by a crash.
+    //
+    // This exists because the metric alone could not answer it. A live writer
+    // reported `ehdb_l0_recovered_active_records = 0` after three hard kills
+    // with a verified 18-frame unsealed part, while the records demonstrably
+    // survived (a new sealed part covering exactly the missing range appeared on
+    // restart). The same engine code recovers that same file's real bytes 18/18
+    // in a test. So either the path does not run in this binary or something
+    // else replays the tail — and with no log line there was no way to tell
+    // which, only more inference.
+    //
+    // A counter that reads 0 cannot distinguish "did not run" from "ran and
+    // found nothing"; a line that always prints can.
+    let recovered_at_open = engine.metrics().snapshot().recovered_active_records;
+    tracing::info!(
+        shard = config.shard,
+        dir = %dir.display(),
+        recovered_active_records = recovered_at_open,
+        "EHDB command-bus engine opened (recovered_active_records>0 means an unsealed part was replayed after an unclean exit)"
+    );
     let writer = Arc::new(FeedWriter::new(engine));
 
     // noetl/ai-meta#209: the host owns the ingest face's lifetime now. The
