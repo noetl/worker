@@ -354,6 +354,24 @@ fn render_integrity(m: &ehdb_l0::metrics::L0MetricsSnapshot) -> String {
     out.push_str("# HELP ehdb_l0_appends Total appends to this writer's log — the denominator for the counter above.\n");
     out.push_str("# TYPE ehdb_l0_appends counter\n");
     out.push_str(&format!("ehdb_l0_appends {}\n", m.appends));
+    // noetl/ai-meta#209 — records replayed from an unsealed active part left by
+    // a crash.  Exposed for the same reason as the counter above: the recovery
+    // exists in the engine and is asserted in ehdb's tests, but until it is on
+    // this endpoint it is unobservable in production, and an end-to-end SIGKILL
+    // test can only report "the metric is absent" — which is indistinguishable
+    // from "nothing was recovered".  That is exactly how the first post-fix run
+    // of `sigkill-writer.sh` failed to prove anything.
+    //
+    // A NON-ZERO value is not an error: it means the process did not exit
+    // cleanly (a clean shutdown seals, leaving nothing to replay), and the count
+    // is how many acked records would have been LOST before the fix.  Zero after
+    // a graceful roll is the expected reading.
+    out.push_str("# HELP ehdb_l0_recovered_active_records Records replayed from an unsealed active part after a hard kill (noetl/ai-meta#209). Non-zero means the process did not exit cleanly; the count is what would previously have been lost.\n");
+    out.push_str("# TYPE ehdb_l0_recovered_active_records counter\n");
+    out.push_str(&format!(
+        "ehdb_l0_recovered_active_records {}\n",
+        m.recovered_active_records
+    ));
     out
 }
 
@@ -638,5 +656,43 @@ mod tests {
         assert_ne!(member_id("worker-a"), 0);
         assert_eq!(member_id("worker-a"), member_id("worker-a"));
         assert_ne!(member_id("worker-a"), member_id("worker-b"));
+    }
+
+    /// noetl/ai-meta#209 — the recovery counter has to be ON this endpoint.
+    ///
+    /// It existed in the engine and was asserted in ehdb's own tests, but was
+    /// never rendered here, so in production it was unobservable: an end-to-end
+    /// SIGKILL run could only report "the metric is absent", which is
+    /// indistinguishable from "nothing was recovered". That is exactly how the
+    /// first post-fix run of `sigkill-writer.sh` failed to prove anything.
+    #[test]
+    fn integrity_exposition_carries_the_crash_recovery_counter() {
+        let mut m = ehdb_l0::metrics::L0Metrics::new().snapshot();
+        m.recovered_active_records = 7;
+        m.out_of_order_appends = 0;
+        m.appends = 41;
+        let out = render_integrity(&m);
+
+        assert!(
+            out.contains("ehdb_l0_recovered_active_records 7"),
+            "the recovered-records series must be exposed with its value:\n{out}"
+        );
+        assert!(
+            out.contains("# TYPE ehdb_l0_recovered_active_records counter"),
+            "a series without a TYPE line is not scrapeable as a counter:\n{out}"
+        );
+        // The pre-existing series must survive alongside it.
+        assert!(out.contains("ehdb_l0_out_of_order_appends 0"));
+        assert!(out.contains("ehdb_l0_appends 41"));
+    }
+
+    /// Zero must still be rendered. A counter that only appears once non-zero
+    /// cannot distinguish "clean shutdown, nothing to recover" from "this build
+    /// does not have the metric" — which is the ambiguity that cost a test run.
+    #[test]
+    fn the_recovery_counter_is_rendered_even_at_zero() {
+        let m = ehdb_l0::metrics::L0Metrics::new().snapshot();
+        assert_eq!(m.recovered_active_records, 0);
+        assert!(render_integrity(&m).contains("ehdb_l0_recovered_active_records 0"));
     }
 }
