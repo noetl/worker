@@ -1066,14 +1066,11 @@ impl CommandExecutor {
         // on, rather than an inference.  Additive and backward-compatible: the
         // field is simply absent on every other path, and the sweep reads its
         // absence as "not parked", never as "parked".
-        let pending_callback = matches!(tool_result.pending_callback, Some(true));
-        let mut completed_ctx = serde_json::json!({
-            "command_id": command.command_id.clone(),
-            "status": tool_result.status.to_string(),
-        });
-        if pending_callback {
-            completed_ctx["pending_callback"] = serde_json::Value::Bool(true);
-        }
+        let completed_ctx = command_completed_context(
+            &command.command_id,
+            &tool_result.status.to_string(),
+            matches!(tool_result.pending_callback, Some(true)),
+        );
         self.emit_event_via(
             &dispatch_client,
             "command.completed",
@@ -1924,7 +1921,10 @@ impl CommandExecutor {
             };
         }
 
-        let playbook = args.get("playbook").cloned().unwrap_or(serde_json::Value::Null);
+        let playbook = args
+            .get("playbook")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let trigger_event_type = args.get("trigger_event_type").and_then(|v| v.as_str());
         // RFC #115 Phase 5: the server stamps the atomic-item-context flag on the
         // dispatch args; forward it onto the from_events drive input so the
@@ -2119,7 +2119,9 @@ impl CommandExecutor {
                                 if wal != bytes {
                                     crate::metrics::record_state_equivalence_mismatch();
                                     crate::metrics::record_state_shard_read("fallback");
-                                    crate::metrics::record_state_builder_drive("served_shard_mismatch");
+                                    crate::metrics::record_state_builder_drive(
+                                        "served_shard_mismatch",
+                                    );
                                     tracing::warn!(
                                         execution_id,
                                         applied,
@@ -2168,9 +2170,8 @@ impl CommandExecutor {
         // concurrency so a miss storm can't fan out into many WAL scans.
         if self.rehydrate_on_miss {
             if let Ok(_permit) = self.rehydrate_gate.try_acquire() {
-                let cfg = crate::state_builder::RehydrateConfig::from_env(
-                    &self.state_builder_nats_url,
-                );
+                let cfg =
+                    crate::state_builder::RehydrateConfig::from_env(&self.state_builder_nats_url);
                 let applied = crate::state_builder::rehydrate_execution_from_wal(
                     &cfg,
                     &self.state_builder_index,
@@ -2252,7 +2253,9 @@ enum OffserverDispatch {
 /// the plug-in is the JSON bytes of `config.args` (or `config.input`, empty if
 /// absent).
 #[cfg(feature = "wasm-plugin")]
-fn wasm_config_to_ref(config: &serde_json::Value) -> Result<(String, u32, String, Vec<u8>), String> {
+fn wasm_config_to_ref(
+    config: &serde_json::Value,
+) -> Result<(String, u32, String, Vec<u8>), String> {
     let plugin = config
         .get("plugin")
         .ok_or("wasm tool config missing `plugin`")?;
@@ -2438,7 +2441,10 @@ fn stamp_logical_uri(
     step: &str,
     render_context: &std::collections::HashMap<String, serde_json::Value>,
 ) {
-    let Some(reference) = result_obj.get_mut("reference").and_then(|r| r.as_object_mut()) else {
+    let Some(reference) = result_obj
+        .get_mut("reference")
+        .and_then(|r| r.as_object_mut())
+    else {
         return;
     };
     if reference.get("kind").and_then(|k| k.as_str()) != Some("result_ref") {
@@ -2562,7 +2568,8 @@ async fn resolve_context_references(
         Some(serde_json::Value::Object(steps)) => steps
             .iter()
             .filter_map(|(name, result)| {
-                reference_locators(result).map(|(legacy, canonical)| (name.clone(), legacy, canonical))
+                reference_locators(result)
+                    .map(|(legacy, canonical)| (name.clone(), legacy, canonical))
             })
             .collect(),
         _ => return,
@@ -2592,30 +2599,32 @@ async fn resolve_context_references(
         // from object store by URN. On any miss/error it returns None and we fall
         // back fail-safe to the authoritative `resolve_ref` below — never a hard
         // failure, never silent loss (OQ6).
-        let fetched: anyhow::Result<Option<serde_json::Value>> =
-            match (resolve_by_urn, canonical.as_deref()) {
-                (true, Some(canon)) => {
-                    match crate::result_resolver::resolve_by_urn(client, canon).await {
-                        Some(data) => {
-                            tracing::debug!(step = %name, uri = canon, "resolved over-budget result by URN (#104 Phase C)");
-                            // Phase D: the authoritative tier served this result.
-                            if mint_authoritative {
-                                crate::metrics::record_result_mint_authoritative("tier");
-                            }
-                            Ok(Some(data))
+        let fetched: anyhow::Result<Option<serde_json::Value>> = match (
+            resolve_by_urn,
+            canonical.as_deref(),
+        ) {
+            (true, Some(canon)) => {
+                match crate::result_resolver::resolve_by_urn(client, canon).await {
+                    Some(data) => {
+                        tracing::debug!(step = %name, uri = canon, "resolved over-budget result by URN (#104 Phase C)");
+                        // Phase D: the authoritative tier served this result.
+                        if mint_authoritative {
+                            crate::metrics::record_result_mint_authoritative("tier");
                         }
-                        None => {
-                            // Phase D: tier miss → fall back to the dual-written
-                            // `result_store` (reversible rollback path).
-                            if mint_authoritative {
-                                crate::metrics::record_result_mint_authoritative("legacy_fallback");
-                            }
-                            client.resolve_ref(&uri).await
+                        Ok(Some(data))
+                    }
+                    None => {
+                        // Phase D: tier miss → fall back to the dual-written
+                        // `result_store` (reversible rollback path).
+                        if mint_authoritative {
+                            crate::metrics::record_result_mint_authoritative("legacy_fallback");
                         }
+                        client.resolve_ref(&uri).await
                     }
                 }
-                _ => client.resolve_ref(&uri).await,
-            };
+            }
+            _ => client.resolve_ref(&uri).await,
+        };
         match fetched {
             Ok(Some(data)) => {
                 // OQ6 shape parity (#104 Phase C, B1): the authoritative
@@ -2698,8 +2707,8 @@ fn accessor_paths(template_src: &str, name: &str) -> Vec<Vec<String>> {
         let start = i + pos;
         let end = start + name_bytes.len();
         i = end; // advance regardless of match outcome
-        // Left boundary: previous char must not be part of a longer identifier
-        // or a member access (`other.name` is a field of `other`, not `name`).
+                 // Left boundary: previous char must not be part of a longer identifier
+                 // or a member access (`other.name` is a field of `other`, not `name`).
         if start > 0 {
             let prev = bytes[start - 1];
             if is_ident(prev) || prev == b'.' {
@@ -2822,8 +2831,7 @@ fn path_satisfiable(summary: &serde_json::Value, path: &[String]) -> bool {
 /// `{columns, rows:[…], _ref}`) has non-locator keys and is NOT a stub, so its
 /// behavior is unchanged.
 fn is_reference_stub(o: &serde_json::Map<String, serde_json::Value>) -> bool {
-    let has_locator =
-        o.contains_key("_ref") || o.contains_key("_store") || o.contains_key("_uri");
+    let has_locator = o.contains_key("_ref") || o.contains_key("_store") || o.contains_key("_uri");
     if !has_locator {
         return false;
     }
@@ -2941,6 +2949,31 @@ fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
     summarise_value(context, 0, &mut budget)
 }
 
+/// Build the `command.completed` event context.
+///
+/// Extracted so the `pending_callback` marker is testable — it decides whether
+/// the server's non-convergence sweep may terminate this execution
+/// (noetl/ai-meta#227 part B), and a marker that silently stopped being written
+/// would look exactly like a healthy execution that finished.
+///
+/// The field is **omitted** rather than set to `false` on the normal path, so
+/// every event emitted before this existed reads identically to one emitted
+/// after it. The sweep treats absence as "not parked", never as "parked".
+fn command_completed_context(
+    command_id: &str,
+    status: &str,
+    pending_callback: bool,
+) -> serde_json::Value {
+    let mut ctx = serde_json::json!({
+        "command_id": command_id,
+        "status": status,
+    });
+    if pending_callback {
+        ctx["pending_callback"] = serde_json::Value::Bool(true);
+    }
+    ctx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3000,17 +3033,16 @@ mod tests {
             }}
         });
         assert_eq!(
-            reference_locators(&result).map(|(legacy, _)| legacy).as_deref(),
+            reference_locators(&result)
+                .map(|(legacy, _)| legacy)
+                .as_deref(),
             Some("noetl://execution/1/result/drain/9")
         );
         let full = serde_json::json!({ "messages": [{"id": 1}, {"id": 2}], "count": 2 });
         splice_resolved(&mut result, full.clone());
         // The reference is gone; the full data sits where the orchestrator reads it.
         assert!(reference_locators(&result).is_none());
-        assert_eq!(
-            result.pointer("/context/result/context/data"),
-            Some(&full)
-        );
+        assert_eq!(result.pointer("/context/result/context/data"), Some(&full));
         // flat_with_data exposes both `{{ step.field }}` and `{{ step.data.field }}`.
         let flat = flat_with_data(&full);
         assert_eq!(flat["count"], serde_json::json!(2));
@@ -3067,7 +3099,10 @@ mod tests {
         // Only the first row is kept — not all 800.
         assert_eq!(ex["data"]["rows"].as_array().unwrap().len(), 1);
         // Per-row bulk string collapsed; the extract stays under budget.
-        assert_eq!(ex["data"]["rows"][0]["payload"]["_len"], serde_json::json!(1000));
+        assert_eq!(
+            ex["data"]["rows"][0]["payload"]["_len"],
+            serde_json::json!(1000)
+        );
         assert!(
             ex.to_string().len() <= MAX_EXTRACTED_BYTES,
             "extracted must stay bounded, got {} bytes",
@@ -3085,7 +3120,10 @@ mod tests {
         assert!(paths.contains(&vec!["status".to_string()]));
         assert!(paths.contains(&vec!["_ref".to_string()]));
         assert!(paths.contains(&vec!["rows".to_string(), "0".to_string(), "id".to_string()]));
-        assert!(paths.contains(&vec![]), "bare {{ start }} → whole-object bind");
+        assert!(
+            paths.contains(&vec![]),
+            "bare {{ start }} → whole-object bind"
+        );
         // No spurious accessor from `other.start`.
         assert_eq!(paths.iter().filter(|p| p.is_empty()).count(), 1);
     }
@@ -3113,7 +3151,11 @@ mod tests {
             "_ref": "noetl://execution/1/result/lazy/9",
         });
         let tpl = r#"{"data":"{{ lazy_load_full_data.data }}"}"#;
-        assert!(step_needs_bulk_resolution(tpl, "lazy_load_full_data", Some(&summary)));
+        assert!(step_needs_bulk_resolution(
+            tpl,
+            "lazy_load_full_data",
+            Some(&summary)
+        ));
     }
 
     #[test]
@@ -3125,9 +3167,14 @@ mod tests {
 
     #[test]
     fn whole_object_bind_forces_resolution() {
-        let summary = serde_json::json!({ "data": { "rows": [{ "id": 1 }] }, "_ref": "noetl://x/y/z/1" });
+        let summary =
+            serde_json::json!({ "data": { "rows": [{ "id": 1 }] }, "_ref": "noetl://x/y/z/1" });
         let tpl = r#"{"all":"{{ build_batch_plan }}"}"#;
-        assert!(step_needs_bulk_resolution(tpl, "build_batch_plan", Some(&summary)));
+        assert!(step_needs_bulk_resolution(
+            tpl,
+            "build_batch_plan",
+            Some(&summary)
+        ));
     }
 
     #[test]
@@ -3139,7 +3186,11 @@ mod tests {
             "items": [{ "id": 0 }], "_ref": "noetl://x/y/z/1",
         });
         let tpl = r#"{"n":"{{ load_kv_data.count | default(0) }}"}"#;
-        assert!(!step_needs_bulk_resolution(tpl, "load_kv_data", Some(&summary)));
+        assert!(!step_needs_bulk_resolution(
+            tpl,
+            "load_kv_data",
+            Some(&summary)
+        ));
     }
 
     #[test]
@@ -3203,7 +3254,10 @@ mod tests {
             "data": { "generate_rows": { "columns": ["id"], "rows": [[0], [1]] } },
             "status": "success"
         })));
-        assert!(flat.get("rows").is_some(), "rows lifted so {{ start.rows }} resolves");
+        assert!(
+            flat.get("rows").is_some(),
+            "rows lifted so {{ start.rows }} resolves"
+        );
 
         // Multi-tool envelope is left unchanged (tool-keyed shape preserved).
         let multi = json!({
@@ -3234,12 +3288,16 @@ mod tests {
             serde_json::json!("noetl://default/default/results/325/load_next_facility/2/4/1")
         );
         // The existing physical `ref` is left intact.
-        assert_eq!(obj["reference"]["ref"], serde_json::json!("noetl://execution/325/result/s/9"));
+        assert_eq!(
+            obj["reference"]["ref"],
+            serde_json::json!("noetl://execution/325/result/s/9")
+        );
     }
 
     #[test]
     fn stamps_frame0_row0_for_non_cursor_step() {
-        let mut obj = serde_json::json!({ "status": "COMPLETED", "reference": { "kind": "result_ref" } });
+        let mut obj =
+            serde_json::json!({ "status": "COMPLETED", "reference": { "kind": "result_ref" } });
         // No cursor coords in render_context → 0/0.
         stamp_logical_uri(&mut obj, 7, "s", &std::collections::HashMap::new());
         assert_eq!(
@@ -3321,18 +3379,39 @@ mod tests {
     #[test]
     fn barrier_gate_flag_off_never_checks() {
         // Flag off → never consult the tier, regardless of side-effect class.
-        assert!(!side_effect_barrier_should_check(false, &tc("http", serde_json::json!({}))));
-        assert!(!side_effect_barrier_should_check(false, &task_seq(&["python"])));
-        assert!(!side_effect_barrier_should_check(false, &task_seq(&["noop"])));
+        assert!(!side_effect_barrier_should_check(
+            false,
+            &tc("http", serde_json::json!({}))
+        ));
+        assert!(!side_effect_barrier_should_check(
+            false,
+            &task_seq(&["python"])
+        ));
+        assert!(!side_effect_barrier_should_check(
+            false,
+            &task_seq(&["noop"])
+        ));
     }
 
     #[test]
     fn barrier_gate_only_side_effecting_when_on() {
         // Flag on → check side-effecting commands, skip pure ones.
-        assert!(side_effect_barrier_should_check(true, &tc("http", serde_json::json!({}))));
-        assert!(side_effect_barrier_should_check(true, &tc("postgres", serde_json::json!({}))));
-        assert!(!side_effect_barrier_should_check(true, &tc("rhai", serde_json::json!({}))));
-        assert!(!side_effect_barrier_should_check(true, &tc("noop", serde_json::json!({}))));
+        assert!(side_effect_barrier_should_check(
+            true,
+            &tc("http", serde_json::json!({}))
+        ));
+        assert!(side_effect_barrier_should_check(
+            true,
+            &tc("postgres", serde_json::json!({}))
+        ));
+        assert!(!side_effect_barrier_should_check(
+            true,
+            &tc("rhai", serde_json::json!({}))
+        ));
+        assert!(!side_effect_barrier_should_check(
+            true,
+            &tc("noop", serde_json::json!({}))
+        ));
     }
 
     #[test]
@@ -3347,14 +3426,23 @@ mod tests {
         assert!(command_is_side_effecting(&task_seq(&["python"])));
         assert!(command_is_side_effecting(&task_seq(&["rhai", "http"])));
         // An empty / uninspectable task_sequence is conservatively side-effecting.
-        assert!(command_is_side_effecting(&tc("task_sequence", serde_json::json!({}))));
+        assert!(command_is_side_effecting(&tc(
+            "task_sequence",
+            serde_json::json!({})
+        )));
         assert!(command_is_side_effecting(&tc(
             "task_sequence",
             serde_json::json!({ "tool_config": [] })
         )));
         // A non-wrapped command is classified by its own kind.
-        assert!(command_is_side_effecting(&tc("postgres", serde_json::json!({}))));
-        assert!(!command_is_side_effecting(&tc("noop", serde_json::json!({}))));
+        assert!(command_is_side_effecting(&tc(
+            "postgres",
+            serde_json::json!({})
+        )));
+        assert!(!command_is_side_effecting(&tc(
+            "noop",
+            serde_json::json!({})
+        )));
     }
 
     /// A `task_sequence` wrapping one sub-task of `kind` carrying an explicit
@@ -3372,9 +3460,15 @@ mod tests {
     fn command_declares_sink_only_on_explicit_marker() {
         // noetl/ai-meta#199 Slice A: the sink signal is author-declared, never
         // inferred from tool kind — a connector kind alone is NOT a sink.
-        assert!(!command_declares_sink(&tc("postgres", serde_json::json!({}))));
+        assert!(!command_declares_sink(&tc(
+            "postgres",
+            serde_json::json!({})
+        )));
         assert!(!command_declares_sink(&tc("http", serde_json::json!({}))));
-        assert!(!command_declares_sink(&tc("transfer", serde_json::json!({}))));
+        assert!(!command_declares_sink(&tc(
+            "transfer",
+            serde_json::json!({})
+        )));
         // A read-shaped connector step with sink:false stays un-confirmed.
         assert!(!command_declares_sink(&tc(
             "postgres",
@@ -3417,7 +3511,10 @@ mod tests {
         );
         assert!(command_declares_sink(&mixed));
         // An empty / uninspectable task_sequence is NOT a sink (fail-safe).
-        assert!(!command_declares_sink(&tc("task_sequence", serde_json::json!({}))));
+        assert!(!command_declares_sink(&tc(
+            "task_sequence",
+            serde_json::json!({})
+        )));
         assert!(!command_declares_sink(&tc(
             "task_sequence",
             serde_json::json!({ "tool_config": [] })
@@ -3449,7 +3546,10 @@ mod tests {
             "input": { "x": 1 }
         });
         let (_, _, _, input2) = wasm_config_to_ref(&cfg2).unwrap();
-        assert_eq!(input2, serde_json::to_vec(&serde_json::json!({ "x": 1 })).unwrap());
+        assert_eq!(
+            input2,
+            serde_json::to_vec(&serde_json::json!({ "x": 1 })).unwrap()
+        );
 
         // An explicit `entry` (the worker-driven orchestrator's `run_state`) parses.
         let cfg3 = serde_json::json!({
@@ -3772,10 +3872,17 @@ mod tests {
             "exit_code": 0,
             "duration_ms": 12,
         });
-        let result =
-            build_call_done_result(&context, "COMPLETED", 42, "greet", &std::collections::HashMap::new(), cache.as_ref(), &client)
-                .await
-                .unwrap();
+        let result = build_call_done_result(
+            &context,
+            "COMPLETED",
+            42,
+            "greet",
+            &std::collections::HashMap::new(),
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
         assert_eq!(result["status"], "COMPLETED");
         assert_eq!(result["context"]["stdout"], "hello");
         assert_eq!(result["context"]["exit_code"], 0);
@@ -4286,18 +4393,32 @@ mod tests {
         // ">" (strictly greater) semantics by checking a result
         // smaller and a result larger than the threshold.
         let small = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES - 100) });
-        let small_result =
-            build_call_done_result(&small, "COMPLETED", 1, "s", &std::collections::HashMap::new(), cache.as_ref(), &client)
-                .await
-                .unwrap();
+        let small_result = build_call_done_result(
+            &small,
+            "COMPLETED",
+            1,
+            "s",
+            &std::collections::HashMap::new(),
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
         assert!(small_result.get("context").is_some());
         assert!(small_result.get("reference").is_none());
 
         let large = serde_json::json!({ "x": "a".repeat(INLINE_CONTEXT_MAX_BYTES + 100) });
-        let large_result =
-            build_call_done_result(&large, "COMPLETED", 1, "l", &std::collections::HashMap::new(), cache.as_ref(), &client)
-                .await
-                .unwrap();
+        let large_result = build_call_done_result(
+            &large,
+            "COMPLETED",
+            1,
+            "l",
+            &std::collections::HashMap::new(),
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .unwrap();
         assert!(large_result.get("context").is_none());
         assert!(large_result.get("reference").is_some());
     }
@@ -4470,6 +4591,40 @@ mod tests {
         let (ns, name) = extract_job_handle(&r).expect("handle present");
         assert_eq!(ns, "noetl");
         assert_eq!(name, "noetl-container-train-42-abcde");
+    }
+
+    /// noetl/ai-meta#227 part B — the marker the server's sweep excludes on.
+    ///
+    /// Without it, an execution parked on a callback is indistinguishable in the
+    /// event log from one whose DAG ran out of successors, and the sweep would
+    /// terminate healthy parked work.
+    #[test]
+    fn command_completed_context_marks_a_parked_step() {
+        let ctx = command_completed_context("eid:step:1", "success", true);
+        assert_eq!(ctx["command_id"], "eid:step:1");
+        assert_eq!(ctx["status"], "success");
+        assert_eq!(
+            ctx["pending_callback"],
+            serde_json::Value::Bool(true),
+            "a parked step must carry the marker the sweep looks for"
+        );
+    }
+
+    /// The normal path must be byte-identical to what was emitted before the
+    /// marker existed — the field is OMITTED, not set to false, so no consumer
+    /// can start distinguishing old events from new ones.
+    #[test]
+    fn command_completed_context_omits_the_marker_on_the_normal_path() {
+        let ctx = command_completed_context("eid:step:1", "success", false);
+        assert!(
+            ctx.get("pending_callback").is_none(),
+            "absent, not false: {ctx}"
+        );
+        assert_eq!(
+            ctx,
+            serde_json::json!({"command_id": "eid:step:1", "status": "success"}),
+            "unchanged from the pre-marker shape"
+        );
     }
 
     #[test]
