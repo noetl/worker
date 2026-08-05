@@ -3672,41 +3672,80 @@ mod tests {
     /// (especially when running with `--test-threads=1` for
     /// repeatability), turning what should be a single failure into
     /// a cascade.
+    /// Serialises every test that mutates process environment.
+    ///
+    /// `cargo test` runs tests on a thread pool; it does **not** serialise
+    /// them.  An earlier SAFETY note here claimed the opposite, and the tests
+    /// raced accordingly: `cargo test --lib keychain` failed 1-5 of its tests
+    /// per run (which of them varied), while the same set passed 15/15 under
+    /// `--test-threads=1`.  The full suite stayed green only because 568 tests
+    /// spread across the pool rarely collide — luck, not correctness, and it
+    /// degrades as env-touching tests are added.
+    ///
+    /// Reentrant via a thread-local depth count so one test can hold several
+    /// guards at once (three is the common case here) without deadlocking,
+    /// while every other env-touching test waits.  `std::sync::ReentrantLock`
+    /// would say this directly but is still unstable on this toolchain.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    thread_local! {
+        static ENV_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Outermost guard on this thread takes the lock; inner ones ride it.
+    fn env_lock_acquire() -> Option<std::sync::MutexGuard<'static, ()>> {
+        ENV_DEPTH.with(|d| {
+            let depth = d.get();
+            d.set(depth + 1);
+            if depth == 0 {
+                // A poisoned lock means some other env test panicked; the env
+                // is still restored by that test's Drop, so recover rather
+                // than cascade a second failure.
+                Some(ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                None
+            }
+        })
+    }
+
     struct EnvGuard {
         key: String,
         prev: Option<String>,
+        // Held for the guard's whole life, including the restore in `drop`
+        // (Drop::drop runs before fields are dropped, so the lock outlives it).
+        _lock: Option<std::sync::MutexGuard<'static, ()>>,
     }
 
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
+            let _lock = env_lock_acquire();
             let prev = std::env::var(key).ok();
-            // SAFETY: process is single-threaded for these tests via
-            // the module-level serialisation cargo test enforces.
+            // SAFETY: ENV_LOCK is held for as long as this guard lives, so no
+            // other env-mutating test runs concurrently.
             unsafe { std::env::set_var(key, value) };
-            Self {
-                key: key.to_string(),
-                prev,
-            }
+            Self { key: key.to_string(), prev, _lock }
         }
 
         fn unset(key: &str) -> Self {
+            let _lock = env_lock_acquire();
             let prev = std::env::var(key).ok();
+            // SAFETY: as in `set` — ENV_LOCK is held for the guard's lifetime.
             unsafe { std::env::remove_var(key) };
-            Self {
-                key: key.to_string(),
-                prev,
-            }
+            Self { key: key.to_string(), prev, _lock }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
+            // SAFETY: still inside the ENV_LOCK critical section — `_lock` is a
+            // field, and fields drop after this body runs.
             unsafe {
                 match &self.prev {
                     Some(v) => std::env::set_var(&self.key, v),
                     None => std::env::remove_var(&self.key),
                 }
             }
+            ENV_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         }
     }
 
