@@ -280,6 +280,7 @@ async fn run_loop_ehdb(config: MaterializerConfig) -> Result<()> {
             // Nothing materializable — ack to advance the cursor, else the same
             // batch poison-loops forever.
             if let Err(error) = source.ack(&sort_keys).await {
+                crate::metrics::record_materializer_ack_failed("non_event_batch");
                 tracing::warn!(%error, "materializer ack failed on a non-event batch");
             }
             continue;
@@ -293,6 +294,7 @@ async fn run_loop_ehdb(config: MaterializerConfig) -> Result<()> {
                         // The rows ARE durable; only the ack failed. Those
                         // records redeliver and `events/project` dedupes them by
                         // event_id, so this costs a repeat, never a row.
+                        crate::metrics::record_materializer_ack_failed("after_project");
                         tracing::warn!(%error, "materializer ack failed after a durable project");
                         0
                     }
@@ -361,6 +363,7 @@ async fn run_loop_nats(config: MaterializerConfig) -> Result<()> {
         let outcome = match source.poll(&opts).await {
             Ok(o) => o,
             Err(e) => {
+                crate::metrics::record_materializer_drain_failed();
                 tracing::warn!(error = %e, "materializer drain failed; backing off");
                 tokio::time::sleep(config.error_backoff).await;
                 continue;
@@ -420,6 +423,7 @@ async fn run_loop_nats(config: MaterializerConfig) -> Result<()> {
                     .await
                     .unwrap_or_default();
                 if !report.is_clean() {
+                    crate::metrics::record_materializer_ack_failed("per_handle");
                     tracing::warn!(
                         errors = ?report.errors,
                         "materializer ack reported per-handle errors"

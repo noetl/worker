@@ -177,6 +177,26 @@ pub struct WorkerMetrics {
     /// Distinct from `noetl_worker_result_materializer_skipped_total`, which
     /// belongs to the RESULT materializer.  The names differ by one word.
     pub materializer_skipped_total: IntCounter,
+    /// Materializer ack failures, by the stage they happened at.
+    ///
+    /// The three stages differ sharply in consequence, which is why they are
+    /// separated rather than counted together:
+    ///
+    /// - `non_event_batch` — the ack that advances past a batch with nothing
+    ///   materializable.  Its own comment says the batch "poison-loops forever"
+    ///   without it, so a sustained rate here is a STALLED materializer.
+    /// - `after_project` — the rows are already durable and only the ack
+    ///   failed, so the records redeliver and `events/project` dedupes them by
+    ///   event_id.  Costs a repeat, never a row.
+    /// - `per_handle` — a partial ack within an otherwise successful batch.
+    pub materializer_ack_failed_total: IntCounterVec,
+    /// Drain polls that failed outright, after which the loop backs off.
+    ///
+    /// Unlabelled so it is present at 0 without any activity: under the
+    /// publish-only gate a materializer that cannot drain is a durable log that
+    /// stops being written, and that must not be one of the metrics you cannot
+    /// see.
+    pub materializer_drain_failed_total: IntCounter,
     /// Why a cold-rebuild replay loop stopped, by reason.
     ///
     /// Four different conditions `break` out of that loop identically, and only
@@ -931,6 +951,32 @@ impl WorkerMetrics {
             .register(Box::new(materializer_skipped_total.clone()))
             .expect("register materializer_skipped_total");
 
+        let materializer_ack_failed_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_materializer_ack_failed_total",
+                "Materializer ack failures by stage — non_event_batch means a poison-loop (noetl/ai-meta#238).",
+            ),
+            &["stage"],
+        )
+        .expect("materializer_ack_failed_total metric");
+        registry
+            .register(Box::new(materializer_ack_failed_total.clone()))
+            .expect("register materializer_ack_failed_total");
+        for stage in MATERIALIZER_ACK_STAGES {
+            materializer_ack_failed_total
+                .with_label_values(&[stage])
+                .inc_by(0);
+        }
+
+        let materializer_drain_failed_total = IntCounter::new(
+            "noetl_worker_materializer_drain_failed_total",
+            "Materializer drain polls that failed outright (noetl/ai-meta#238).",
+        )
+        .expect("materializer_drain_failed_total metric");
+        registry
+            .register(Box::new(materializer_drain_failed_total.clone()))
+            .expect("register materializer_drain_failed_total");
+
         let state_builder_replay_end_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_state_builder_replay_end_total",
@@ -1555,6 +1601,8 @@ impl WorkerMetrics {
             materializer_acked_total,
             materializer_project_errors_total,
             materializer_skipped_total,
+            materializer_ack_failed_total,
+            materializer_drain_failed_total,
             state_builder_replay_end_total,
             materializer_cycle_duration_seconds,
             result_materializer_drained_total,
@@ -1890,6 +1938,23 @@ pub fn record_state_builder_replay_end(reason: &str) {
         .state_builder_replay_end_total
         .with_label_values(&[reason])
         .inc();
+}
+
+/// The stages at which a materializer ack can fail.
+pub const MATERIALIZER_ACK_STAGES: [&str; 3] =
+    ["non_event_batch", "after_project", "per_handle"];
+
+/// Record one materializer ack failure at `stage`.
+pub fn record_materializer_ack_failed(stage: &str) {
+    WorkerMetrics::global()
+        .materializer_ack_failed_total
+        .with_label_values(&[stage])
+        .inc();
+}
+
+/// Record one failed materializer drain poll.
+pub fn record_materializer_drain_failed() {
+    WorkerMetrics::global().materializer_drain_failed_total.inc();
 }
 
 /// Record `n` drained messages that could not be materialised.
@@ -2662,6 +2727,49 @@ mod tests {
                 "{reason} must be pinned at 0"
             );
         }
+    }
+
+    /// Every materializer ack/drain failure path must record, and all series be
+    /// readable at 0.
+    ///
+    /// `non_event_batch` is the one that matters most: the code's own comment
+    /// says that without that ack the batch "poison-loops forever", so a
+    /// sustained rate there is a stalled materializer — and under the
+    /// publish-only gate a stalled materializer is a durable log that stops
+    /// being written.
+    #[test]
+    fn materializer_ack_and_drain_failures_are_counted() {
+        let src = include_str!("materializer.rs");
+        for (needle, stage) in [
+            ("materializer ack failed on a non-event batch", "non_event_batch"),
+            ("materializer ack failed after a durable project", "after_project"),
+            ("materializer ack reported per-handle errors", "per_handle"),
+        ] {
+            assert!(src.contains(needle), "the {stage} warning should still exist");
+            assert!(
+                src.contains(&format!("record_materializer_ack_failed(\"{stage}\")")),
+                "{stage} must be recorded"
+            );
+        }
+        assert!(
+            src.contains("record_materializer_drain_failed()"),
+            "a failed drain poll must be recorded"
+        );
+
+        let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
+        for stage in MATERIALIZER_ACK_STAGES {
+            assert!(
+                text.lines().any(|l| l
+                    .starts_with("noetl_worker_materializer_ack_failed_total{")
+                    && l.contains(&format!("stage=\"{stage}\""))),
+                "{stage} must be pinned at 0"
+            );
+        }
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("noetl_worker_materializer_drain_failed_total ")),
+            "the unlabelled drain counter must be present at 0"
+        );
     }
 
     /// Both skip sites in the materializer must record, and the counter must be
