@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.98.0](https://github.com/noetl/worker/compare/v5.97.0...v5.98.0) (2026-08-05)
+
+### Features
+
+* **metrics:** count event emissions abandoned after every retry ([16181fc](https://github.com/noetl/worker/commit/16181fc01e8ab37aeda7c45ca21f6acf491cffb7)), closes [noetl/server#309](https://github.com/noetl/server/issues/309) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [5.97.0](https://github.com/noetl/worker/compare/v5.96.0...v5.97.0) (2026-08-05)
 
 ### Features
