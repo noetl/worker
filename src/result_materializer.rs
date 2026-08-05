@@ -658,6 +658,53 @@ mod tests {
 
     /// A worker over-budget `call.done` shape (reference nested under the event
     /// result), with both the legacy `ref` and the canonical `uri`.
+    /// Serialises the two tests that mutate this module's env vars.
+    ///
+    /// `cargo test` runs tests on a thread pool and env vars are process-wide.
+    /// `enabled_default_off_and_from_env_none` clears the flags that
+    /// `mint_authoritative_alone_spawns_authoritative_writer` is setting, so the
+    /// latter failed in **11 of 12** filtered runs.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const SCOPED_VARS: &[&str] = &[
+        "NOETL_RESULT_MATERIALIZER_ENABLED",
+        "NOETL_RESULT_MATERIALIZER_SOURCE",
+        "NOETL_RESULT_MINT_AUTHORITATIVE",
+        "NOETL_RESULT_TIER_DR",
+    ];
+
+    /// Snapshots [`SCOPED_VARS`] on construction and restores them on drop, so a
+    /// failing assertion cannot leave flags set for whichever test takes the
+    /// lock next.
+    struct EnvScope {
+        saved: Vec<(&'static str, Option<String>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn env_scope() -> EnvScope {
+        // A poisoned lock means a previous test panicked; its EnvScope still
+        // ran, so recover rather than cascade a second failure.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EnvScope {
+            saved: SCOPED_VARS
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect(),
+            _guard: guard,
+        }
+    }
+
     fn over_budget_row(uri: &str) -> serde_json::Value {
         serde_json::json!({
             "event_id": 1, "execution_id": 325, "timestamp": "2026-06-22T10:11:12Z",
@@ -776,6 +823,7 @@ mod tests {
 
     #[test]
     fn enabled_default_off_and_from_env_none() {
+        let _env = env_scope();
         std::env::remove_var("NOETL_RESULT_MATERIALIZER_ENABLED");
         assert!(!enabled());
         let cfg = WorkerConfig {
@@ -847,6 +895,7 @@ mod tests {
 
     #[test]
     fn mint_authoritative_alone_spawns_authoritative_writer() {
+        let _env = env_scope();
         // Phase D (#104): NOETL_RESULT_MINT_AUTHORITATIVE alone (without
         // NOETL_RESULT_MATERIALIZER_ENABLED) spawns the materializer AS the
         // authoritative tier writer.
