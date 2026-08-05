@@ -578,7 +578,19 @@ impl ControlPlaneClient {
                     tokio::time::sleep(delay).await;
                     delay = std::cmp::min(delay * 2, Duration::from_secs(10));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Abandoned after the retry window.  Both callers are the
+                    // container-poll resume path, where a lost `call.done`
+                    // means the execution never continues — it simply stops,
+                    // with no terminal event to notice (noetl/ai-meta#227).
+                    //
+                    // Recorded here rather than at the call sites so every
+                    // caller is covered, and on the SAME counter as the
+                    // emitter's abandon path, so "an event was given up on"
+                    // is one number regardless of which emit path took it.
+                    crate::metrics::record_event_emit_failed(&event.event_type.to_string());
+                    return Err(e);
+                }
             }
         }
 

@@ -177,6 +177,15 @@ pub struct WorkerMetrics {
     /// Distinct from `noetl_worker_result_materializer_skipped_total`, which
     /// belongs to the RESULT materializer.  The names differ by one word.
     pub materializer_skipped_total: IntCounter,
+    /// Why a cold-rebuild replay loop stopped, by reason.
+    ///
+    /// Four different conditions `break` out of that loop identically, and only
+    /// one of them is a defect: `feed_error` means the feed dropped mid-replay,
+    /// so the rebuilt state is INCOMPLETE.  The other three are ordinary
+    /// termination.  Without this they are indistinguishable, and the code
+    /// comment at that site already cites noetl/ai-meta#227 — stalled
+    /// executions whose re-issued command does not advance them.
+    pub state_builder_replay_end_total: IntCounterVec,
     /// One materializer drain→project→ack cycle latency.
     pub materializer_cycle_duration_seconds: Histogram,
 
@@ -920,6 +929,23 @@ impl WorkerMetrics {
             .register(Box::new(materializer_skipped_total.clone()))
             .expect("register materializer_skipped_total");
 
+        let state_builder_replay_end_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_replay_end_total",
+                "Why a cold-rebuild replay stopped — only feed_error means the state is incomplete (noetl/ai-meta#227).",
+            ),
+            &["reason"],
+        )
+        .expect("state_builder_replay_end_total metric");
+        registry
+            .register(Box::new(state_builder_replay_end_total.clone()))
+            .expect("register state_builder_replay_end_total");
+        for reason in STATE_BUILDER_REPLAY_END_REASONS {
+            state_builder_replay_end_total
+                .with_label_values(&[reason])
+                .inc_by(0);
+        }
+
         let materializer_cycle_duration_seconds = Histogram::with_opts(HistogramOpts::new(
             "noetl_worker_materializer_cycle_duration_seconds",
             "Latency of one materializer drain→project→ack cycle.",
@@ -1527,6 +1553,7 @@ impl WorkerMetrics {
             materializer_acked_total,
             materializer_project_errors_total,
             materializer_skipped_total,
+            state_builder_replay_end_total,
             materializer_cycle_duration_seconds,
             result_materializer_drained_total,
             result_materializer_writes_total,
@@ -1847,6 +1874,22 @@ pub fn record_materializer_cycle(
 /// Record a materializer project failure — the batch is NOT acked and will
 /// redeliver after the consumer's ack-wait. This is the no-loss guarantee's
 /// observability surface.
+/// Every reason a cold-rebuild replay loop terminates.
+///
+/// `feed_error` is the only one that indicates incomplete state; the rest are
+/// ordinary termination and exist so that a rise in `feed_error` is legible
+/// against them rather than in isolation.
+pub const STATE_BUILDER_REPLAY_END_REASONS: [&str; 4] =
+    ["complete", "deadline", "max_messages", "feed_error"];
+
+/// Record why one cold-rebuild replay stopped.
+pub fn record_state_builder_replay_end(reason: &str) {
+    WorkerMetrics::global()
+        .state_builder_replay_end_total
+        .with_label_values(&[reason])
+        .inc();
+}
+
 /// Record `n` drained messages that could not be materialised.
 pub fn record_materializer_skipped(n: u64) {
     WorkerMetrics::global().materializer_skipped_total.inc_by(n);
@@ -2560,6 +2603,56 @@ mod tests {
             lines.iter().any(|l| l.contains("test.emit_failed.beta") && l.trim_end().ends_with(" 1")),
             "beta must show 1 abandonment; got {lines:?}"
         );
+    }
+
+    /// Every `break` out of the cold-rebuild replay loop must record a reason.
+    ///
+    /// The point of the metric is that four conditions leave that loop
+    /// identically and only `feed_error` means the state is incomplete.  An
+    /// uninstrumented exit does not merely lose a count — it makes the ratio
+    /// wrong, so `feed_error` looks rarer than it is.
+    #[test]
+    fn replay_end_covers_every_loop_exit() {
+        let src = include_str!("state_builder.rs");
+        let recorded = src.matches("record_state_builder_replay_end(").count();
+        assert_eq!(
+            recorded, 5,
+            "all five replay-loop exits must record; found {recorded}"
+        );
+        let mut seen: Vec<&str> = Vec::new();
+        let call = "record_state_builder_replay_end(";
+        let mut rest = src;
+        while let Some(i) = rest.find(call) {
+            rest = &rest[i + call.len()..];
+            if let Some(q1) = rest.find('"') {
+                let after = &rest[q1 + 1..];
+                if let Some(q2) = after.find('"') {
+                    let lit = &after[..q2];
+                    if !seen.contains(&lit) {
+                        seen.push(lit);
+                    }
+                }
+            }
+        }
+        for lit in &seen {
+            assert!(
+                STATE_BUILDER_REPLAY_END_REASONS.contains(lit),
+                "{lit:?} is recorded but not pinned"
+            );
+        }
+        assert!(
+            seen.contains(&"feed_error"),
+            "the incomplete-state reason must be instrumented; got {seen:?}"
+        );
+        let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
+        for reason in STATE_BUILDER_REPLAY_END_REASONS {
+            assert!(
+                text.lines().any(|l| l
+                    .starts_with("noetl_worker_state_builder_replay_end_total{")
+                    && l.contains(&format!("reason=\"{reason}\""))),
+                "{reason} must be pinned at 0"
+            );
+        }
     }
 
     /// Both skip sites in the materializer must record, and the counter must be

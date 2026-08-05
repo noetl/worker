@@ -2428,6 +2428,7 @@ pub async fn rehydrate_execution_from_wal(
             }
             applied += 1;
             if scanned >= cfg.max_messages {
+                crate::metrics::record_state_builder_replay_end("max_messages");
                 break;
             }
         }
@@ -2502,23 +2503,29 @@ async fn rehydrate_execution_from_ehdb(
         // the connect is: a stuck peer must not park the drive's miss path.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            crate::metrics::record_state_builder_replay_end("deadline");
             break;
         }
         let records: Vec<ehdb_l0::EventRecord> =
             match tokio::time::timeout(remaining, sub.recv_batch()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(error)) => {
+                    crate::metrics::record_state_builder_replay_end("feed_error");
                     tracing::warn!(
                         execution_id, %addr, %error,
                         "state-builder cold-rebuild feed dropped mid-replay (noetl/ai-meta#227)"
                     );
                     break;
                 }
-                Err(_elapsed) => break,
+                Err(_elapsed) => {
+                    crate::metrics::record_state_builder_replay_end("deadline");
+                    break;
+                }
             };
         // An empty batch means the retained window is fully replayed. The live
         // drain sleeps and keeps going; a one-shot rehydrate is done.
         if records.is_empty() {
+            crate::metrics::record_state_builder_replay_end("complete");
             break;
         }
         for record in &records {
