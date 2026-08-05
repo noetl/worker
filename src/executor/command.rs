@@ -4652,7 +4652,6 @@ mod tests {
     /// Without it, an execution parked on a callback is indistinguishable in the
     /// event log from one whose DAG ran out of successors, and the sweep would
     /// terminate healthy parked work.
-    #[test]
     /// noetl/ai-meta#186 Bug 2. `args` means two different things depending on
     /// the tool: a variables map for python/shell, the container's argv for
     /// `kind: container`. Injecting the step-input map into a container step
@@ -4673,6 +4672,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn command_completed_context_marks_a_parked_step() {
         let ctx = command_completed_context("eid:step:1", "success", true);
         assert_eq!(ctx["command_id"], "eid:step:1");
