@@ -84,6 +84,16 @@ pub struct WorkerMetrics {
     pub event_emit_retries_total: IntCounterVec,
     /// Emissions abandoned after exhausting retries (noetl/ai-meta#238).
     pub event_emit_failed_total: IntCounterVec,
+    /// Always 1; the `version` label identifies the running binary.
+    ///
+    /// `Registry::gather` prunes empty metric families, so a labelled metric is
+    /// ABSENT from `/metrics` until a child series exists — every counter here
+    /// is invisible until it first fires, and absent cannot be told apart from
+    /// "this binary is too old to have the metric".  Pinning known label values
+    /// settles that per metric, but `event_emit_failed_total{event_type}` takes
+    /// a free-form String and cannot be pinned at all.  This gauge settles it
+    /// once for the whole process (noetl/ai-meta#238).
+    pub build_info: IntGaugeVec,
     pub concurrent_dispatches: IntGauge,
     pub nats_consumer_pending: IntGaugeVec,
     pub nats_consumer_ack_pending: IntGaugeVec,
@@ -551,6 +561,23 @@ impl WorkerMetrics {
         registry
             .register(Box::new(event_emit_failed_total.clone()))
             .expect("register event_emit_failed_total");
+
+        let build_info = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_build_info",
+                "Always 1; the version label identifies the running binary (noetl/ai-meta#238).",
+            ),
+            &["version"],
+        )
+        .expect("build_info metric");
+        registry
+            .register(Box::new(build_info.clone()))
+            .expect("register build_info");
+        // Set here rather than in a startup hook: an empty family is pruned at
+        // gather time, so a registered-but-unset gauge is still absent.
+        build_info
+            .with_label_values(&[env!("CARGO_PKG_VERSION")])
+            .set(1);
 
         let concurrent_dispatches = IntGauge::new(
             "noetl_worker_concurrent_dispatches",
@@ -1422,6 +1449,7 @@ impl WorkerMetrics {
             event_emit_duration_seconds,
             event_emit_retries_total,
             event_emit_failed_total,
+            build_info,
             concurrent_dispatches,
             nats_consumer_pending,
             nats_consumer_ack_pending,
@@ -2495,6 +2523,26 @@ mod tests {
         );
     }
 
+    /// The gauge exists to be readable when every other metric is absent, so it
+    /// must be present with no prior activity — and `event_emit_failed_total`
+    /// above is exactly the case it covers: a free-form `event_type` label that
+    /// cannot be pinned, leaving the metric invisible until something fails.
+    #[test]
+    fn build_info_publishes_the_crate_version() {
+        let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("noetl_worker_build_info{"))
+            .expect("build_info series must exist without any prior activity");
+        assert!(
+            line.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+            "build_info must carry the crate version; got {line:?}"
+        );
+        assert!(
+            line.trim_end().ends_with(" 1"),
+            "build_info must read 1; got {line:?}"
+        );
+    }
 }
 
 #[cfg(test)]

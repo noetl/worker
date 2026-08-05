@@ -531,8 +531,26 @@ pub fn reset() {
 mod tests {
     use super::*;
 
+    /// Both tests below drive the same process-global accumulator: they
+    /// `reset()` it, record into it, then assert on `render_lines()`.  Cargo
+    /// runs tests in parallel threads inside one process, so without this lock
+    /// `readiness_render_shape` can record between the other test's `reset()`
+    /// and its `assert!(render_lines().is_empty())` — which failed roughly one
+    /// run in six, and passed on the retry that anyone would reach for first.
+    ///
+    /// The state mutex inside `state()` does not help: each individual call is
+    /// atomic, but the reset-then-assert *sequence* is not.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Poison-tolerant: an unrelated panicking test must not cascade into
+    /// every other test in this module.
+    fn serialised() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn disabled_records_nothing() {
+        let _guard = serialised();
         reset();
         record_readiness("disabled", true, false, 0.0);
         record_dataplane("append", "disabled", true, false, 0.0);
@@ -549,6 +567,7 @@ mod tests {
 
     #[test]
     fn readiness_render_shape() {
+        let _guard = serialised();
         reset();
         record_readiness("ready", true, false, 0.001234);
         let text = render_lines().join("\n");
