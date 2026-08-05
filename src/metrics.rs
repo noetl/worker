@@ -600,18 +600,20 @@ impl WorkerMetrics {
         let ehdb_claim_reconnect_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_ehdb_claim_reconnect_total",
-                "EHDB claim-coordinator reconnects on the command path, by reason (noetl/ai-meta#238).",
+                "EHDB claim-coordinator reconnects, by feed and reason (noetl/ai-meta#238).",
             ),
-            &["reason"],
+            &["feed", "reason"],
         )
         .expect("ehdb_claim_reconnect_total metric");
         registry
             .register(Box::new(ehdb_claim_reconnect_total.clone()))
             .expect("register ehdb_claim_reconnect_total");
-        for reason in EHDB_CLAIM_RECONNECT_REASONS {
-            ehdb_claim_reconnect_total
-                .with_label_values(&[reason])
-                .inc_by(0);
+        for feed in EHDB_CLAIM_FEEDS {
+            for reason in EHDB_CLAIM_RECONNECT_REASONS {
+                ehdb_claim_reconnect_total
+                    .with_label_values(&[feed, reason])
+                    .inc_by(0);
+            }
         }
 
         let build_info = IntGaugeVec::new(
@@ -2175,11 +2177,18 @@ pub fn record_state_builder_chain_hops(hops: usize) {
 /// before keepalive + heartbeat landed.
 pub const EHDB_CLAIM_RECONNECT_REASONS: [&str; 2] = ["connect_failed", "claim_next_failed"];
 
+/// The two claim feeds a worker holds.
+///
+/// Both reconnect identically and both were log-only, but conflating them
+/// would hide WHICH feed is flapping — and they fail for different reasons:
+/// the command feed stalls dispatch, the events feed stalls the materializer.
+pub const EHDB_CLAIM_FEEDS: [&str; 2] = ["commands", "events"];
+
 /// Record one EHDB claim-coordinator reconnect.
-pub fn record_ehdb_claim_reconnect(reason: &str) {
+pub fn record_ehdb_claim_reconnect(feed: &str, reason: &str) {
     WorkerMetrics::global()
         .ehdb_claim_reconnect_total
-        .with_label_values(&[reason])
+        .with_label_values(&[feed, reason])
         .inc();
 }
 
@@ -2694,39 +2703,31 @@ mod tests {
     /// invisible to monitoring.  A reason that is recorded but unpinned is
     /// absent until it first fires, which on a rare failure path may be never.
     #[test]
-    fn ehdb_claim_reconnect_literals_are_all_pinned() {
-        let src = include_str!("command_bus.rs");
-        let call = "record_ehdb_claim_reconnect(";
-        let mut found: Vec<&str> = Vec::new();
-        let mut rest = src;
-        while let Some(i) = rest.find(call) {
-            rest = &rest[i + call.len()..];
-            if let Some(q1) = rest.find('"') {
-                let after = &rest[q1 + 1..];
-                if let Some(q2) = after.find('"') {
-                    found.push(&after[..q2]);
-                }
-            }
-        }
-        assert_eq!(
-            found.len(),
-            2,
-            "expected both reconnect sites to be instrumented; got {found:?}"
-        );
-        for lit in &found {
-            assert!(
-                EHDB_CLAIM_RECONNECT_REASONS.contains(lit),
-                "record_ehdb_claim_reconnect(\"{lit}\") is recorded but not pinned"
-            );
+    fn ehdb_claim_reconnect_covers_both_feeds() {
+        // Both feeds reconnect identically and both were log-only.  Asserting
+        // per-feed site counts means instrumenting one feed and not the other
+        // fails here, rather than leaving half the signal missing while the
+        // metric looks present.
+        for (file, feed, want) in [
+            (include_str!("command_bus.rs"), "commands", 2usize),
+            (include_str!("event_bus.rs"), "events", 2usize),
+        ] {
+            let n = file
+                .matches(&format!("record_ehdb_claim_reconnect(\"{feed}\""))
+                .count();
+            assert_eq!(n, want, "{feed} feed must record at {want} site(s); found {n}");
         }
         let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
-        for reason in EHDB_CLAIM_RECONNECT_REASONS {
-            assert!(
-                text.lines().any(|l| l
-                    .starts_with("noetl_worker_ehdb_claim_reconnect_total{")
-                    && l.contains(&format!("reason=\"{reason}\""))),
-                "{reason} must be pinned at 0 before any reconnect"
-            );
+        for feed in EHDB_CLAIM_FEEDS {
+            for reason in EHDB_CLAIM_RECONNECT_REASONS {
+                assert!(
+                    text.lines().any(|l| l
+                        .starts_with("noetl_worker_ehdb_claim_reconnect_total{")
+                        && l.contains(&format!("feed=\"{feed}\""))
+                        && l.contains(&format!("reason=\"{reason}\""))),
+                    "{feed}/{reason} must be pinned at 0"
+                );
+            }
         }
     }
 
