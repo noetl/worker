@@ -82,6 +82,19 @@ pub struct WorkerMetrics {
     pub event_emit_retries_total: IntCounterVec,
     /// Emissions abandoned after exhausting retries (noetl/ai-meta#238).
     pub event_emit_failed_total: IntCounterVec,
+    /// Claim-coordinator reconnects on the EHDB command path, by reason.
+    ///
+    /// The EHDB claim loop is how every command reaches this worker post-T5.
+    /// Both of its failure paths retried with a `tracing::warn!` and nothing
+    /// else, so "how often is the worker losing its claim connection?" could
+    /// only be answered by scraping logs.  Measured on one production pod:
+    /// **85 such warnings in 24h**, all invisible to monitoring.
+    ///
+    /// noetl/ai-meta#208 is the quiet version of this exact failure — a
+    /// restarted writer left the claim read parked forever and dispatch stopped
+    /// with nothing logged anywhere, for ~2.4 days.  That fix added the log
+    /// line; this adds the signal (`agents/rules/observability.md` Principle 2).
+    pub ehdb_claim_reconnect_total: IntCounterVec,
     /// Always 1; the `version` label identifies the running binary.
     ///
     /// `Registry::gather` prunes empty metric families, so a labelled metric is
@@ -557,6 +570,23 @@ impl WorkerMetrics {
         registry
             .register(Box::new(event_emit_failed_total.clone()))
             .expect("register event_emit_failed_total");
+
+        let ehdb_claim_reconnect_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_ehdb_claim_reconnect_total",
+                "EHDB claim-coordinator reconnects on the command path, by reason (noetl/ai-meta#238).",
+            ),
+            &["reason"],
+        )
+        .expect("ehdb_claim_reconnect_total metric");
+        registry
+            .register(Box::new(ehdb_claim_reconnect_total.clone()))
+            .expect("register ehdb_claim_reconnect_total");
+        for reason in EHDB_CLAIM_RECONNECT_REASONS {
+            ehdb_claim_reconnect_total
+                .with_label_values(&[reason])
+                .inc_by(0);
+        }
 
         let build_info = IntGaugeVec::new(
             prometheus::Opts::new(
@@ -1445,6 +1475,7 @@ impl WorkerMetrics {
             event_emit_duration_seconds,
             event_emit_retries_total,
             event_emit_failed_total,
+            ehdb_claim_reconnect_total,
             build_info,
             concurrent_dispatches,
             result_store_put_duration_seconds,
@@ -2060,6 +2091,23 @@ pub fn record_state_builder_chain_hops(hops: usize) {
         .observe(hops as f64);
 }
 
+/// Every `reason` the EHDB claim path reconnects for, taken from its call sites
+/// in `command_bus.rs`.
+///
+/// `connect_failed` is the coordinator being unreachable when a fresh claim
+/// connection is opened; `claim_next_failed` is an established connection
+/// dying mid-read, which is the case noetl/ai-meta#208 could not detect at all
+/// before keepalive + heartbeat landed.
+pub const EHDB_CLAIM_RECONNECT_REASONS: [&str; 2] = ["connect_failed", "claim_next_failed"];
+
+/// Record one EHDB claim-coordinator reconnect.
+pub fn record_ehdb_claim_reconnect(reason: &str) {
+    WorkerMetrics::global()
+        .ehdb_claim_reconnect_total
+        .with_label_values(&[reason])
+        .inc();
+}
+
 /// Every `outcome` the off-server DRIVE build records, taken from the call
 /// sites in `executor/command.rs` rather than from prose.
 ///
@@ -2480,6 +2528,49 @@ mod tests {
             lines.iter().any(|l| l.contains("test.emit_failed.beta") && l.trim_end().ends_with(" 1")),
             "beta must show 1 abandonment; got {lines:?}"
         );
+    }
+
+    /// Both reconnect reasons must be pinned and readable at 0.
+    ///
+    /// This path is why the metric exists: it retried with a log line and
+    /// nothing else, so a production pod emitting 85 of them in 24h was
+    /// invisible to monitoring.  A reason that is recorded but unpinned is
+    /// absent until it first fires, which on a rare failure path may be never.
+    #[test]
+    fn ehdb_claim_reconnect_literals_are_all_pinned() {
+        let src = include_str!("command_bus.rs");
+        let call = "record_ehdb_claim_reconnect(";
+        let mut found: Vec<&str> = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(call) {
+            rest = &rest[i + call.len()..];
+            if let Some(q1) = rest.find('"') {
+                let after = &rest[q1 + 1..];
+                if let Some(q2) = after.find('"') {
+                    found.push(&after[..q2]);
+                }
+            }
+        }
+        assert_eq!(
+            found.len(),
+            2,
+            "expected both reconnect sites to be instrumented; got {found:?}"
+        );
+        for lit in &found {
+            assert!(
+                EHDB_CLAIM_RECONNECT_REASONS.contains(lit),
+                "record_ehdb_claim_reconnect(\"{lit}\") is recorded but not pinned"
+            );
+        }
+        let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
+        for reason in EHDB_CLAIM_RECONNECT_REASONS {
+            assert!(
+                text.lines().any(|l| l
+                    .starts_with("noetl_worker_ehdb_claim_reconnect_total{")
+                    && l.contains(&format!("reason=\"{reason}\""))),
+                "{reason} must be pinned at 0 before any reconnect"
+            );
+        }
     }
 
     /// Every outcome literal passed at a call site must be pinned.

@@ -548,6 +548,7 @@ impl CommandSource for EhdbCommandSource {
                 {
                     Ok(c) => self.pull = Some(c),
                     Err(e) => {
+                        crate::metrics::record_ehdb_claim_reconnect("connect_failed");
                         tracing::warn!(claim_addr = %self.claim_addr, error = %e, "EHDB claim connect failed; retrying");
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         continue;
@@ -568,6 +569,7 @@ impl CommandSource for EhdbCommandSource {
                     // noetl/ai-meta#208 defect 1). Before that a restarted writer
                     // left this read parked forever, so dispatch stopped with
                     // nothing logged anywhere.
+                    crate::metrics::record_ehdb_claim_reconnect("claim_next_failed");
                     tracing::warn!(
                         claim_addr = %self.claim_addr,
                         member = self.member,
