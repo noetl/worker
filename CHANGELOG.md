@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.106.0](https://github.com/noetl/worker/compare/v5.105.0...v5.106.0) (2026-08-05)
+
+### Features
+
+* **metrics:** count claim failures — the signal for an unbounded retry spin ([a773d2d](https://github.com/noetl/worker/commit/a773d2d99c1f068c82198b0d1fdcef1227fdabad)), closes [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [5.105.0](https://github.com/noetl/worker/compare/v5.104.0...v5.105.0) (2026-08-05)
 
 ### Features
