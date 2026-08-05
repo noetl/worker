@@ -490,6 +490,12 @@ impl Worker {
         // a stretched backoff, but a *flapping* reconnect that never recovers still
         // walks the backoff up to the 10s ceiling.
         let mut reconnect_backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
+        // Separate from `reconnect_backoff` on purpose (noetl/ai-meta#244).
+        // That one tracks CONNECTION health and resets on a healthy pull; a
+        // claim failure is application-level, and sharing the counter would let
+        // a failing command delay reconnects (or a reconnect shorten the pause
+        // that stops the spin).  Reset on any successful claim below.
+        let mut claim_fail_backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
 
         loop {
             // Wait for available slot
@@ -535,6 +541,8 @@ impl Worker {
 
             match outcome {
                 ClaimOutcome::Claimed(command) => {
+                    // A claim succeeded → whatever was failing has cleared.
+                    claim_fail_backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
                     tracing::debug!(
                         command_id = %command.command_id,
                         execution_id = command.execution_id,
@@ -706,6 +714,15 @@ impl Worker {
                     if let Some(e) = nack_err {
                         self.on_loop_error("nack", &e, &mut reconnect_backoff).await;
                     }
+                    // noetl/ai-meta#244: the nack above makes this command immediately
+                    // re-claimable, so without a pause a persistently failing command is
+                    // re-claimed at once and the cycle repeats — measured at ~1000
+                    // iterations/second, 7,324 failures before the set drained.  The
+                    // nack-failure path beside this one already backed off; the
+                    // claim-failure path did not.
+                    tokio::time::sleep(claim_fail_backoff).await;
+                    claim_fail_backoff =
+                        (claim_fail_backoff * 2).min(crate::state_builder::REBUILD_BACKOFF_MAX);
                 }
             }
         }
