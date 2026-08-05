@@ -868,6 +868,7 @@ async fn claim_loop(
                 c
             }
             Err(error) => {
+                crate::metrics::record_ehdb_claim_reconnect("events", "connect_failed");
                 tracing::warn!(%claim_addr, group, %error, "events-feed claim connect failed; retrying");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -901,6 +902,7 @@ async fn claim_loop(
                     // is the fix working; the counter is how that is visible in
                     // prod, where the group cursor's freeze was the only symptom.
                     crate::metrics::record_events_consumer_redial("group_claim");
+                    crate::metrics::record_ehdb_claim_reconnect("events", "claim_next_failed");
                     tracing::warn!(group, %error, "events-feed claim failed; redialing");
                     break;
                 }
