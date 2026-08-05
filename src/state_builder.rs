@@ -1271,6 +1271,8 @@ pub async fn build_offserver_input(
     expected_head: Option<i64>,
     atomic_item_context: bool,
 ) -> Option<Vec<u8>> {
+    // noetl/ai-meta#156 — wall clock for the build, observed under the outcome label below.
+    let build_started_at = std::time::Instant::now();
     let (outcome, spine, resolved_trigger_type) = {
         let mut idx = index.lock().await;
         // Build the spine rooted at the server's authoritative chain tip
@@ -1311,6 +1313,22 @@ pub async fn build_offserver_input(
     };
     // Record the cache outcome (the same labels the shadow loop records) so the
     // authoritative path's hit/incremental/cold distribution is observable.
+    //
+    // noetl/ai-meta#156 also records how LONG each outcome took, under the same
+    // label.  The counter alone says which path was taken, not what it cost, and
+    // the per-hop drive-build floor this issue is chasing is a cost — measurable
+    // in kind but, until now, not on prod.  Labelling by outcome keeps the cheap
+    // cache hit from burying the cold-rebuild tail in an aggregate quantile.
+    let build_label = match outcome {
+        AdvanceOutcome::CacheHit => "cache_hit",
+        AdvanceOutcome::Incremental(_) => "incremental",
+        AdvanceOutcome::ColdRebuild(_) => "cold_rebuild",
+        AdvanceOutcome::Incomplete => "incomplete",
+    };
+    crate::metrics::record_state_builder_build_duration(
+        build_label,
+        build_started_at.elapsed().as_secs_f64(),
+    );
     match outcome {
         AdvanceOutcome::CacheHit => crate::metrics::record_state_builder_build("cache_hit"),
         AdvanceOutcome::Incremental(_) => crate::metrics::record_state_builder_build("incremental"),

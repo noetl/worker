@@ -237,6 +237,12 @@ pub struct WorkerMetrics {
     /// builder falls back to the server). The cache-effectiveness + correctness
     /// surface for Phase 4.
     pub state_builder_builds_total: IntCounterVec,
+    /// Wall time of one off-server state build, labelled by the SAME outcome as
+    /// `state_builder_builds_total` (noetl/ai-meta#156).  The counter says how
+    /// often each path is taken; this says what each costs.  Without it the
+    /// per-hop drive-build floor is unmeasurable on prod, which is the reason
+    /// #156 could quantify latency in kind but not in production.
+    pub state_builder_build_duration_seconds: HistogramVec,
     /// Chain-walk depth (events on the spine) per cold rebuild — the analogue of
     /// the server's `noetl_state_build_chain_hops` (server#245), now off-server.
     pub state_builder_chain_hops: Histogram,
@@ -1168,6 +1174,26 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_builds_total.clone()))
             .expect("register state_builder_builds_total");
 
+        // Buckets span the observed range: a cache hit is sub-millisecond, a
+        // cold rebuild over a large event log has been seen in the seconds.
+        // A single histogram with the outcome label makes the expensive path
+        // separable from the cheap one — an aggregate p95 over all outcomes
+        // hides exactly the cold-rebuild tail #156 is chasing.
+        let state_builder_build_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_worker_state_builder_build_duration_seconds",
+                "Off-server state build wall time by outcome (noetl/ai-meta#156).",
+            )
+            .buckets(vec![
+                0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["outcome"],
+        )
+        .expect("state_builder_build_duration_seconds metric");
+        registry
+            .register(Box::new(state_builder_build_duration_seconds.clone()))
+            .expect("register state_builder_build_duration_seconds");
+
         let state_builder_chain_hops = Histogram::with_opts(
             HistogramOpts::new(
                 "noetl_worker_state_builder_chain_hops",
@@ -1419,6 +1445,7 @@ impl WorkerMetrics {
             state_builder_wal_events_total,
             state_builder_event_scans_total,
             state_builder_builds_total,
+            state_builder_build_duration_seconds,
             state_builder_chain_hops,
             state_builder_drive_builds_total,
             state_builder_drive_wait_total,
@@ -1979,6 +2006,15 @@ pub fn record_state_builder_build(outcome: &str) {
         .inc();
 }
 
+/// Record the wall time of one off-server state build, under the same outcome
+/// label as [`record_state_builder_build`].
+pub fn record_state_builder_build_duration(outcome: &str, secs: f64) {
+    WorkerMetrics::global()
+        .state_builder_build_duration_seconds
+        .with_label_values(&[outcome])
+        .observe(secs);
+}
+
 /// Record the chain-walk depth of one off-server cold rebuild.
 pub fn record_state_builder_chain_hops(hops: usize) {
     WorkerMetrics::global()
@@ -2399,5 +2435,59 @@ mod tests {
         assert!(text.contains("# TYPE noetl_worker_result_store_put_bytes_total counter"));
         assert!(text.contains("# HELP noetl_worker_result_store_put_errors_total"));
         assert!(text.contains("# TYPE noetl_worker_result_store_put_errors_total counter"));
+    }
+}
+
+#[cfg(test)]
+mod state_build_latency_tests {
+    use super::*;
+
+    /// noetl/ai-meta#156 acceptance item 1: per-hop build latency must be
+    /// observable **labelled by cache outcome**. An aggregate quantile over all
+    /// outcomes is useless here — cache hits are sub-millisecond and dominate by
+    /// count, so they bury the cold-rebuild tail that is the actual floor.
+    #[test]
+    fn build_duration_is_recorded_per_outcome() {
+        for (o, secs) in [("cache_hit", 0.0004), ("incremental", 0.02), ("cold_rebuild", 3.5)] {
+            record_state_builder_build_duration(o, secs);
+        }
+        let out = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
+        assert!(
+            out.contains("noetl_worker_state_builder_build_duration_seconds"),
+            "the histogram must be exported"
+        );
+        for o in ["cache_hit", "incremental", "cold_rebuild"] {
+            assert!(
+                out.contains(&format!("outcome=\"{o}\"")),
+                "outcome {o} must appear as a label"
+            );
+        }
+    }
+
+    /// The bucket range must actually span the observed values, or the tail is
+    /// recorded as +Inf and the number that matters is unreadable. #156 reports
+    /// a kind floor around 265ms and prod hops in the seconds.
+    #[test]
+    fn buckets_span_sub_millisecond_to_seconds() {
+        record_state_builder_build_duration("cold_rebuild", 4.0);
+        record_state_builder_build_duration("cache_hit", 0.0006);
+        let out = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
+        // Scope the assertion to THIS metric's own bucket lines. Asserting on a
+        // bare `le="0.001"` passes on any histogram in the registry, so it
+        // cannot fail — the first version of this test did exactly that and
+        // stayed green when the metric was renamed away.
+        let mine: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("noetl_worker_state_builder_build_duration_seconds_bucket"))
+            .collect();
+        assert!(!mine.is_empty(), "the histogram must export bucket lines");
+        assert!(
+            mine.iter().any(|l| l.contains("le=\"0.001\"")),
+            "need a sub-millisecond bucket: a cache hit must not land in the first bucket with everything else"
+        );
+        assert!(
+            mine.iter().any(|l| l.contains("le=\"5\"") || l.contains("le=\"5.0\"")),
+            "need a multi-second bucket: a cold rebuild must not collapse into +Inf"
+        );
     }
 }
