@@ -1,6 +1,7 @@
 //! NoETL Worker Pool binary.
 //!
-//! Runs a worker that receives commands via NATS and executes tools.
+//! Runs a worker that receives commands over the EHDB command bus and
+//! executes tools.
 
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};

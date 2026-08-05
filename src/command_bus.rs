@@ -1,7 +1,11 @@
 //! **L1 T4 — the EHDB command bus (worker side, flag-gated).**
 //!
-//! Behind `NOETL_COMMAND_BUS` (default `nats`, unchanged). Two responsibilities,
-//! both opt-in:
+//! Behind `NOETL_COMMAND_BUS`.
+//!
+//! ⚠ The cutover is done: every prod workload sets `NOETL_COMMAND_BUS=ehdb`
+//! explicitly and NATS is deleted (noetl/ai-meta#194 T5). The **code default
+//! is still `nats`**, which now names a transport that does not exist — see
+//! noetl/ai-meta#243. Two responsibilities, both opt-in:
 //!
 //! - **Host** (the system-pool worker that owns a shard, `NOETL_COMMAND_BUS_HOST`):
 //!   opens the shard's durable command-log `FeedWriter` and spawns its three
@@ -471,7 +475,8 @@ pub struct EhdbCommandSource {
 
 /// EHDB ack handle: the claimed command's global sort key + the notification
 /// metadata (`execution_id` / `command_id` / … for WARN/ERROR correlation, per
-/// `observability.md` Principle 4 — the EHDB twin of [`NatsAckHandle`]).
+/// `observability.md` Principle 4 — the EHDB twin of the old `NatsAckHandle`,
+/// which was deleted with `src/nats/` at T5).
 #[derive(Debug, Clone)]
 pub struct EhdbAckHandle {
     pub sort_key: u64,

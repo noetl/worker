@@ -4,7 +4,8 @@
 //! ## What this is
 //!
 //! All replicas of a worker pool bind the **same** durable JetStream pull
-//! consumer ([`crate::nats::subscriber`]), so today an off-server drive
+//! consumer (formerly `crate::nats::subscriber`, deleted at T5), so an
+//! off-server drive
 //! command (`__orchestrate__`) is delivered to whichever replica pulls it
 //! first — with **no execution affinity**. A hop for execution `E`
 //! frequently lands on a replica that does not have `E` warm in its

@@ -1,8 +1,10 @@
 //! **L1 T3 — the EHDB events feed (worker side, flag-gated).**
 //!
-//! The sibling of [`crate::command_bus`] for the *events* path — the
-//! `noetl.events.>` fan-out that still binds NATS and is the last real blocker
-//! before T5 (noetl/ai-meta#212). Behind `NOETL_EVENT_BUS_HOST`, default off.
+//! The sibling of [`crate::command_bus`] for the *events* path. It replaced the
+//! `noetl.events.>` fan-out, which was the last consumer binding NATS
+//! (noetl/ai-meta#212) — T5 has since removed NATS entirely
+//! (noetl/ai-meta#194). Behind `NOETL_EVENT_BUS_HOST`, default off: prod runs
+//! the writer as its own StatefulSet rather than in-process.
 //!
 //! **What rides this feed.** The server publishes every `noetl.event` here; four
 //! consumers read it. Three are named durable groups (`noetl_materializer`,

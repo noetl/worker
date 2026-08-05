@@ -2,7 +2,8 @@
 //!
 //! R-1.2 PR-2d-2: command pulling is now driven through the
 //! `noetl_executor::worker::source::CommandSource` trait via
-//! [`crate::nats::NatsCommandSource`].  `Worker::process_commands`
+//! the command source in [`crate::dispatch`] (the transport-neutral half of
+//! the deleted `src/nats/` module).  `Worker::process_commands`
 //! is generic over the trait's `next()` + `ack()` / `nack()`
 //! lifecycle, so unit tests can swap in
 //! `noetl_executor::worker::source::tests::MockSource` to drive
