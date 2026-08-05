@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.100.0](https://github.com/noetl/worker/compare/v5.99.1...v5.100.0) (2026-08-05)
+
+### Features
+
+* **metrics:** pin the off-server state-builder outcome series ([a8b40bb](https://github.com/noetl/worker/commit/a8b40bbb9070a7c70aeccddcdf885c0e9bdc23c5)), closes [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+
 ## [5.99.1](https://github.com/noetl/worker/compare/v5.99.0...v5.99.1) (2026-08-05)
 
 ### Bug Fixes
