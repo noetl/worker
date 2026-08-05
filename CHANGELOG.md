@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.99.0](https://github.com/noetl/worker/compare/v5.98.1...v5.99.0) (2026-08-05)
+
+### Features
+
+* **metrics:** publish build_info, and serialise the ehdb metrics tests ([829150e](https://github.com/noetl/worker/commit/829150efdbd6e895fbd281b12b2a91038590937d))
+
 ## [5.98.1](https://github.com/noetl/worker/compare/v5.98.0...v5.98.1) (2026-08-05)
 
 ### Bug Fixes
