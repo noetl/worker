@@ -688,6 +688,7 @@ impl Worker {
                     }
                 }
                 ClaimOutcome::Failed(error) => {
+                    crate::metrics::record_claim_failed();
                     tracing::error!(
                         execution_id = ack.notification.execution_id,
                         command_id = %ack.notification.command_id,

@@ -177,6 +177,15 @@ pub struct WorkerMetrics {
     /// Distinct from `noetl_worker_result_materializer_skipped_total`, which
     /// belongs to the RESULT materializer.  The names differ by one word.
     pub materializer_skipped_total: IntCounter,
+    /// Commands whose claim FAILED and were nacked for redelivery.
+    ///
+    /// Unlabelled and always present, because the interesting reading is a
+    /// RATE: this path nacks for immediate redelivery with no delay, so a
+    /// command that consistently fails to claim spins at full speed.  Measured
+    /// on kind: 2000 of the last 2000 log lines were this one message.  Until
+    /// now the only signal was that flood — which is exactly the wrong medium,
+    /// since the flood is itself the symptom.
+    pub claim_failed_total: IntCounter,
     /// Materializer ack failures, by the stage they happened at.
     ///
     /// The three stages differ sharply in consequence, which is why they are
@@ -951,6 +960,15 @@ impl WorkerMetrics {
             .register(Box::new(materializer_skipped_total.clone()))
             .expect("register materializer_skipped_total");
 
+        let claim_failed_total = IntCounter::new(
+            "noetl_worker_claim_failed_total",
+            "Commands whose claim failed and were nacked for redelivery (noetl/ai-meta#238).",
+        )
+        .expect("claim_failed_total metric");
+        registry
+            .register(Box::new(claim_failed_total.clone()))
+            .expect("register claim_failed_total");
+
         let materializer_ack_failed_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_materializer_ack_failed_total",
@@ -1601,6 +1619,7 @@ impl WorkerMetrics {
             materializer_acked_total,
             materializer_project_errors_total,
             materializer_skipped_total,
+            claim_failed_total,
             materializer_ack_failed_total,
             materializer_drain_failed_total,
             state_builder_replay_end_total,
@@ -1955,6 +1974,11 @@ pub fn record_materializer_ack_failed(stage: &str) {
 /// Record one failed materializer drain poll.
 pub fn record_materializer_drain_failed() {
     WorkerMetrics::global().materializer_drain_failed_total.inc();
+}
+
+/// Record one command whose claim failed.
+pub fn record_claim_failed() {
+    WorkerMetrics::global().claim_failed_total.inc();
 }
 
 /// Record `n` drained messages that could not be materialised.
