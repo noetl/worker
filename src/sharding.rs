@@ -328,16 +328,25 @@ mod tests {
 
     #[test]
     fn shard_for_matches_server_pinned_vectors() {
-        // These MUST equal `noetl-server` `sharding::shard_for` for the
-        // same inputs — the two implementations agree on ownership or
-        // cooperative steering never converges. Recomputed here from the
-        // same algorithm (XxHash64 seed 0 over LE bytes); if a twox-hash
-        // major bump changes the output, this and the server's pinned
-        // test both fail together.
-        let mut h = XxHash64::with_seed(0);
-        h.write(&320816801799737344_i64.to_le_bytes());
-        let expected = (h.finish() % 16) as u32;
-        assert_eq!(shard_for(320816801799737344, 16), expected);
+        // Cross-repo parity guard.  These are the SAME LITERALS pinned in
+        // `noetl-server` `sharding::tests::shard_for_matches_worker_pinned_vectors`.
+        //
+        // This test used to RECOMPUTE the expected value here with XxHash64 and
+        // compare `shard_for` against it.  That could only fail if `shard_for`
+        // disagreed with itself: a twox-hash major bump changes both sides of
+        // the assertion together, so it passed while the server's literal test
+        // failed — the opposite of the "both fail together" the comment claimed.
+        // It also covered one vector where the server pins six.
+        //
+        // Do NOT edit these literals to "fix" a failure.  A change here means
+        // the two implementations diverged, and a command would be published to
+        // a shard subject no worker consumes.
+        assert_eq!(shard_for(320_816_801_799_737_344, 16), 14);
+        assert_eq!(shard_for(1, 4), 1);
+        assert_eq!(shard_for(42, 4), 3);
+        assert_eq!(shard_for(325, 4), 0);
+        assert_eq!(shard_for(325, 8), 4);
+        assert_eq!(shard_for(i64::MAX, 4), 0);
     }
 
     #[test]
