@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.104.0](https://github.com/noetl/worker/compare/v5.103.0...v5.104.0) (2026-08-05)
+
+### Features
+
+* **metrics:** cover the events feed too, and label reconnects by feed ([12fdedf](https://github.com/noetl/worker/commit/12fdedfa1e8ea65676ce983256fee5c43fc078bb)), closes [worker#236](https://github.com/noetl/worker/issues/236) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#208](https://github.com/noetl/ai-meta/issues/208)
+
 ## [5.103.0](https://github.com/noetl/worker/compare/v5.102.0...v5.103.0) (2026-08-05)
 
 ### Features
