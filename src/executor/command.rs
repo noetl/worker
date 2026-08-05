@@ -562,7 +562,28 @@ impl CommandExecutor {
             if let Some(map) = cfg.as_object_mut() {
                 map.entry("kind".to_string())
                     .or_insert_with(|| serde_json::json!(command.tool_kind));
-                if !map.contains_key("args") {
+                // noetl/ai-meta#186 Bug 2 — this injection is tool-kind aware.
+                //
+                // For the generic tools (python, shell, …) `args` is a VARIABLES
+                // MAP, and defaulting it from the step input is what makes
+                // `{{ args.x }}` work without the author restating it.  For
+                // `kind: container` the very same key means the container's
+                // COMMAND-LINE ARGV — `ContainerConfig.args: Option<Vec<String>>`
+                // — so injecting an object here produced:
+                //
+                //   Invalid container config: invalid type: map, expected a sequence
+                //
+                // on every container step that did not declare `args:` itself.
+                // That is why `container_callback_happy_path` (which declares
+                // one) worked while anything else failed, and why the
+                // `container_postgres_init` fixture carried a defensive
+                // `args: []`.
+                //
+                // Two fields sharing a name and meaning different things, so the
+                // fix is to know which tools mean argv rather than to make the
+                // container tool tolerate a map — a map silently coerced into
+                // argv would be worse than the error.
+                if !map.contains_key("args") && !tool_kind_treats_args_as_argv(&command.tool_kind) {
                     if let Some(args) = command.input.get("args") {
                         map.insert("args".to_string(), args.clone());
                     }
@@ -2979,6 +3000,19 @@ fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
 /// The field is **omitted** rather than set to `false` on the normal path, so
 /// every event emitted before this existed reads identically to one emitted
 /// after it. The sweep treats absence as "not parked", never as "parked".
+/// Does this tool kind read `args` as a container command line rather than as a
+/// variables map?
+///
+/// Kept as an explicit list rather than inferred, because the two meanings are
+/// indistinguishable from the worker's side — it has no tool schema to consult.
+/// A tool added here opts OUT of the step-input `args` default; everything else
+/// keeps the long-standing behaviour untouched.
+///
+/// noetl/ai-meta#186 Bug 2.
+fn tool_kind_treats_args_as_argv(kind: &str) -> bool {
+    matches!(kind, "container")
+}
+
 fn command_completed_context(
     command_id: &str,
     status: &str,
@@ -4619,6 +4653,26 @@ mod tests {
     /// event log from one whose DAG ran out of successors, and the sweep would
     /// terminate healthy parked work.
     #[test]
+    /// noetl/ai-meta#186 Bug 2. `args` means two different things depending on
+    /// the tool: a variables map for python/shell, the container's argv for
+    /// `kind: container`. Injecting the step-input map into a container step
+    /// produced `invalid type: map, expected a sequence` on every container
+    /// step that did not declare `args:` itself — which is why only
+    /// `container_callback_happy_path` worked.
+    #[test]
+    fn args_injection_skips_tools_that_read_args_as_argv() {
+        assert!(
+            tool_kind_treats_args_as_argv("container"),
+            "container reads args as argv, so the step-input map must not be injected"
+        );
+        for generic in ["python", "shell", "http", "postgres", "duckdb", "task_sequence"] {
+            assert!(
+                !tool_kind_treats_args_as_argv(generic),
+                "{generic} reads args as a variables map — the default must keep working"
+            );
+        }
+    }
+
     fn command_completed_context_marks_a_parked_step() {
         let ctx = command_completed_context("eid:step:1", "success", true);
         assert_eq!(ctx["command_id"], "eid:step:1");
