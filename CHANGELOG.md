@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.105.0](https://github.com/noetl/worker/compare/v5.104.0...v5.105.0) (2026-08-05)
+
+### Features
+
+* **metrics:** count every materializer ack and drain failure ([c97fa71](https://github.com/noetl/worker/commit/c97fa71b3d69ba1e7d1788e253747778f1fbf76d)), closes [worker#237](https://github.com/noetl/worker/issues/237) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [5.104.0](https://github.com/noetl/worker/compare/v5.103.0...v5.104.0) (2026-08-05)
 
 ### Features
