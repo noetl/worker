@@ -160,6 +160,23 @@ pub struct WorkerMetrics {
     /// Project failures: the batch was NOT acked and will redeliver. This is
     /// the durability-event counter — the metric that proves no silent loss.
     pub materializer_project_errors_total: IntCounter,
+    /// Drained messages that carried no `event_id`, so no envelope could be
+    /// built and nothing was projected.
+    ///
+    /// Under `NOETL_EVENT_INGEST_PUBLISH_ONLY` the materializer is the SOLE
+    /// writer of `noetl.event`, so a skipped message is an event that never
+    /// reaches the durable log — and the batch is acked regardless, so it is
+    /// gone from the feed too.  Before this the only trace was a
+    /// `tracing::warn!`, the same shape as noetl/ai-meta#208: a real loss
+    /// visible only to whoever happened to be reading logs.
+    ///
+    /// Unlabelled deliberately.  A plain `IntCounter` is always present in
+    /// `/metrics` at 0, where a labelled one would be absent until the first
+    /// skip — the exact ambiguity being removed everywhere else today.
+    ///
+    /// Distinct from `noetl_worker_result_materializer_skipped_total`, which
+    /// belongs to the RESULT materializer.  The names differ by one word.
+    pub materializer_skipped_total: IntCounter,
     /// One materializer drain→project→ack cycle latency.
     pub materializer_cycle_duration_seconds: Histogram,
 
@@ -894,6 +911,15 @@ impl WorkerMetrics {
             .register(Box::new(materializer_project_errors_total.clone()))
             .expect("register materializer_project_errors_total");
 
+        let materializer_skipped_total = IntCounter::new(
+            "noetl_worker_materializer_skipped_total",
+            "Drained messages with no event_id — never projected into noetl.event (noetl/ai-meta#238).",
+        )
+        .expect("materializer_skipped_total metric");
+        registry
+            .register(Box::new(materializer_skipped_total.clone()))
+            .expect("register materializer_skipped_total");
+
         let materializer_cycle_duration_seconds = Histogram::with_opts(HistogramOpts::new(
             "noetl_worker_materializer_cycle_duration_seconds",
             "Latency of one materializer drain→project→ack cycle.",
@@ -1500,6 +1526,7 @@ impl WorkerMetrics {
             materializer_duplicates_total,
             materializer_acked_total,
             materializer_project_errors_total,
+            materializer_skipped_total,
             materializer_cycle_duration_seconds,
             result_materializer_drained_total,
             result_materializer_writes_total,
@@ -1820,6 +1847,11 @@ pub fn record_materializer_cycle(
 /// Record a materializer project failure — the batch is NOT acked and will
 /// redeliver after the consumer's ack-wait. This is the no-loss guarantee's
 /// observability surface.
+/// Record `n` drained messages that could not be materialised.
+pub fn record_materializer_skipped(n: u64) {
+    WorkerMetrics::global().materializer_skipped_total.inc_by(n);
+}
+
 pub fn record_materializer_project_error() {
     WorkerMetrics::global()
         .materializer_project_errors_total
@@ -2527,6 +2559,38 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("test.emit_failed.beta") && l.trim_end().ends_with(" 1")),
             "beta must show 1 abandonment; got {lines:?}"
+        );
+    }
+
+    /// Both skip sites in the materializer must record, and the counter must be
+    /// present at 0 without any activity.
+    ///
+    /// Under the publish-only gate the materializer is the sole writer of
+    /// `noetl.event`, so a skipped message is an event that never reaches the
+    /// durable log — and the batch is acked anyway.  Instrumenting only one of
+    /// the two sites would halve a loss signal while looking instrumented.
+    #[test]
+    fn materializer_skipped_is_counted_at_every_skip_site() {
+        let src = include_str!("materializer.rs");
+        let warn_sites = src.matches("materializer skipped messages with no event_id").count();
+        let recorded = src.matches("record_materializer_skipped(").count();
+        assert!(warn_sites > 0, "the skip warning should still exist");
+        assert_eq!(
+            recorded, warn_sites,
+            "every skip site must record: {warn_sites} warning(s), {recorded} recorder call(s)"
+        );
+
+        let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("noetl_worker_materializer_skipped_total ")),
+            "an unlabelled counter must be present at 0 with no activity"
+        );
+        // Name collision guard: the RESULT materializer has its own skipped
+        // counter, and the two differ by one word.
+        assert!(
+            text.contains("noetl_worker_result_materializer_skipped_total"),
+            "the result-materializer counter must remain distinct and present"
         );
     }
 
