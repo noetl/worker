@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.102.0](https://github.com/noetl/worker/compare/v5.101.0...v5.102.0) (2026-08-05)
+
+### Features
+
+* **metrics:** count materializer skips — the one path that silently drops an event ([0616213](https://github.com/noetl/worker/commit/06162134a86bcb8379112194c96b337385bb0f01)), closes [noetl/ai-meta#208](https://github.com/noetl/ai-meta/issues/208) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#208](https://github.com/noetl/ai-meta/issues/208)
+
 ## [5.101.0](https://github.com/noetl/worker/compare/v5.100.0...v5.101.0) (2026-08-05)
 
 ### Features
