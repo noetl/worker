@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.95.3](https://github.com/noetl/worker/compare/v5.95.2...v5.95.3) (2026-08-05)
+
+### Bug Fixes
+
+* **executor:** don't inject the step-input map into a container's argv ([12376f0](https://github.com/noetl/worker/commit/12376f0a169329c32b03bdf321b2612295e7be0d)), closes [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186) [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186)
+
 ## [5.95.2](https://github.com/noetl/worker/compare/v5.95.1...v5.95.2) (2026-08-04)
 
 ### Bug Fixes
