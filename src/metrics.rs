@@ -186,6 +186,24 @@ pub struct WorkerMetrics {
     /// now the only signal was that flood — which is exactly the wrong medium,
     /// since the flood is itself the symptom.
     pub claim_failed_total: IntCounter,
+    /// Tool results that carry a provider-level error while the tool itself
+    /// returned successfully (noetl/ai-meta#246).
+    ///
+    /// An MCP provider that cannot reach its upstream — a 403 fetching its
+    /// credential, a 4xx from the vendor API — still returns a well-formed
+    /// `ToolResult` with `status = success`.  The failure lives *inside* the
+    /// payload as the MCP-standard `isError: true`, so the executor emits
+    /// `call.done` and the execution completes.  Four production providers
+    /// were dead for an unknown period behind exactly this shape.
+    ///
+    /// Unlabelled deliberately: a labelled counter is absent until it fires,
+    /// and a signal for silent failure must not itself be silent.  The tool
+    /// kind and the provider's error code go on the WARN line beside it.
+    ///
+    /// This counter does NOT change the execution outcome — whether such a
+    /// result should terminate the step is a semantic decision tracked on
+    /// noetl/ai-meta#246.
+    pub tool_result_error_total: IntCounter,
     /// Materializer ack failures, by the stage they happened at.
     ///
     /// The three stages differ sharply in consequence, which is why they are
@@ -969,6 +987,15 @@ impl WorkerMetrics {
             .register(Box::new(claim_failed_total.clone()))
             .expect("register claim_failed_total");
 
+        let tool_result_error_total = IntCounter::new(
+            "noetl_worker_tool_result_error_total",
+            "Tool results carrying a provider-level error despite a successful tool status (noetl/ai-meta#246).",
+        )
+        .expect("tool_result_error_total metric");
+        registry
+            .register(Box::new(tool_result_error_total.clone()))
+            .expect("register tool_result_error_total");
+
         let materializer_ack_failed_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_materializer_ack_failed_total",
@@ -1620,6 +1647,7 @@ impl WorkerMetrics {
             materializer_project_errors_total,
             materializer_skipped_total,
             claim_failed_total,
+            tool_result_error_total,
             materializer_ack_failed_total,
             materializer_drain_failed_total,
             state_builder_replay_end_total,
@@ -1979,6 +2007,12 @@ pub fn record_materializer_drain_failed() {
 /// Record one command whose claim failed.
 pub fn record_claim_failed() {
     WorkerMetrics::global().claim_failed_total.inc();
+}
+
+/// Record one tool result that carried a provider-level error while the tool
+/// itself reported success (noetl/ai-meta#246).
+pub fn record_tool_result_error() {
+    WorkerMetrics::global().tool_result_error_total.inc();
 }
 
 /// Record `n` drained messages that could not be materialised.
@@ -2486,6 +2520,30 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+
+    /// noetl/ai-meta#246 — the counter must be SERVED at 0 before it ever
+    /// fires, not merely registered.
+    ///
+    /// `Registry::gather` prunes metric families that have no children, so a
+    /// metric can be constructed, registered, and still be absent from
+    /// `/metrics` until something increments it — which makes "healthy" and
+    /// "not measuring" indistinguishable to any alert keyed on it.  A signal
+    /// for silent failure must not itself be silent, so this counter is
+    /// unlabelled and therefore present from construction.
+    ///
+    /// Deliberately touches NO recorder: calling `record_tool_result_error()`
+    /// here would itself create the series and mask exactly the defect this
+    /// test exists to catch.  That masking is not hypothetical — it is how
+    /// server#327 shipped an absent counter behind a passing unit test.
+    #[test]
+    fn tool_result_error_total_is_served_before_it_fires() {
+        let metrics = WorkerMetrics::new();
+        let rendered = String::from_utf8(metrics.encode()).expect("utf8 metrics");
+        assert!(
+            rendered.contains("noetl_worker_tool_result_error_total 0"),
+            "counter must be present at 0 on a fresh registry; /metrics was:\n{rendered}"
+        );
+    }
     use super::*;
     use noetl_executor::worker::source::Command;
 

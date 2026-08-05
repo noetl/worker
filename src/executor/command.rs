@@ -949,6 +949,23 @@ impl CommandExecutor {
                         }
                     }
                 } else {
+                    // noetl/ai-meta#246 — the tool succeeded, but its payload may
+                    // carry a provider-level failure.  Count it and say so on a
+                    // WARN.  The emitted event is deliberately left unchanged:
+                    // whether such a result should terminate the step, and
+                    // whether it is retryable, is a semantic decision that issue
+                    // still has to make.  Measuring it is what makes the decision
+                    // answerable — today the condition is invisible.
+                    if let Some(summary) = provider_error_summary(&result_obj, 12) {
+                        crate::metrics::record_tool_result_error();
+                        tracing::warn!(
+                            execution_id = command.execution_id,
+                            step = %command.step,
+                            tool = %tool_config.kind,
+                            summary = %summary,
+                            "tool reported success but its result carries a provider error (noetl/ai-meta#246)",
+                        );
+                    }
                     self.emit_event_via(
                         &dispatch_client,
                         "call.done",
@@ -1552,6 +1569,50 @@ struct ShmPayload {
     /// Row count for the `IpcHint.row_count` field.  Only populated
     /// for the tabular path.
     row_count: Option<u64>,
+}
+
+/// Find an MCP-standard `isError: true` marker anywhere in a tool result
+/// payload (noetl/ai-meta#246).
+///
+/// A provider playbook that cannot reach its upstream still returns a
+/// well-formed *successful* `ToolResult`; the failure is reported inside the
+/// payload, per the MCP content convention, as `isError: true` alongside a
+/// human-readable summary.  The executor is otherwise blind to it and emits
+/// `call.done`, so the execution completes and every status-based observer
+/// reads the run as healthy.  Four production MCP providers were dead for an
+/// unknown period behind exactly this shape.
+///
+/// `isError` is the predicate rather than the looser `status: "error"` /
+/// `ok: false` markers that accompany it, because those two spellings occur
+/// freely inside legitimate business payloads (an upstream API's own
+/// per-item status, say) and would make this counter noisy.  `isError` is an
+/// MCP protocol field and does not appear on success — verified against live
+/// production payloads for both a working provider and a failing one.
+///
+/// Returns the provider's summary text when found, for the WARN line.
+/// Depth-bounded: result payloads can be large, and an unbounded walk on the
+/// dispatch hot path is a cost this diagnostic does not justify.
+fn provider_error_summary(value: &serde_json::Value, depth: u8) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("isError") == Some(&serde_json::Value::Bool(true)) {
+                let summary = map
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| map.get("error").and_then(|v| v.as_str()))
+                    .unwrap_or("(no summary in payload)");
+                return Some(summary.chars().take(300).collect());
+            }
+            map.values().find_map(|v| provider_error_summary(v, depth - 1))
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().find_map(|v| provider_error_summary(v, depth - 1))
+        }
+        _ => None,
+    }
 }
 
 /// Build the `payload.result` object for a `call.done` event,
@@ -3992,6 +4053,63 @@ mod tests {
         assert!(executor.tool_registry.has("shell"));
         assert!(executor.tool_registry.has("http"));
         assert!(executor.tool_registry.has("rhai"));
+    }
+
+    /// noetl/ai-meta#246 — the detector must fire on the real production
+    /// failure shape and stay silent on the real success shape.  Both
+    /// fragments below are trimmed from live `call.done` payloads captured
+    /// from prod on 2026-08-05: `automation/agents/mcp/google-places`
+    /// returning HTTP 403, and `automation/agents/mcp/duffel` returning 200.
+    ///
+    /// Both executions reported `status: COMPLETED` — which is the defect.
+    #[test]
+    fn provider_error_summary_detects_live_failure_shape() {
+        let failing = serde_json::json!({
+            "context": { "result": { "context": { "data": {
+                "_meta": { "backend": "google-places", "status_code": 403 },
+                "control_data": { "ok": false },
+                "isError": true,
+                "status": "error",
+                "summary": "Places searchText failed HTTP 403: Caller does not have required permission"
+            }}}}
+        });
+        let found = provider_error_summary(&failing, 12).expect("must detect the live failure shape");
+        assert!(found.contains("403"), "summary should carry the provider text, got {found:?}");
+    }
+
+    #[test]
+    fn provider_error_summary_silent_on_live_success_shape() {
+        let ok = serde_json::json!({
+            "context": { "result": { "context": { "data": {
+                "_meta": { "backend": "duffel", "places_total": 20, "status_code": 200 },
+                "control_data": { "ok": true, "places": [{ "iata_code": "CDG" }] },
+                "content": [{ "text": "20 Duffel place suggestion(s)", "type": "text" }]
+            }}}}
+        });
+        assert!(provider_error_summary(&ok, 12).is_none());
+    }
+
+    /// A payload whose own data legitimately contains the *words* the looser
+    /// markers use must not be counted — this is why `isError` is the
+    /// predicate rather than `status == "error"` or `ok == false`.
+    #[test]
+    fn provider_error_summary_ignores_business_data_that_merely_says_error() {
+        let noisy = serde_json::json!({
+            "context": { "data": { "rows": [
+                { "vendor_status": "error", "status": "error", "ok": false }
+            ]}}
+        });
+        assert!(provider_error_summary(&noisy, 12).is_none());
+    }
+
+    /// The walk is depth-bounded, so a marker deeper than the budget is not
+    /// found.  Locks the bound in: if someone lowers it, the dispatch path
+    /// silently stops seeing real failures.
+    #[test]
+    fn provider_error_summary_respects_depth_bound() {
+        let deep = serde_json::json!({ "a": { "b": { "c": { "isError": true } } } });
+        assert!(provider_error_summary(&deep, 12).is_some());
+        assert!(provider_error_summary(&deep, 2).is_none());
     }
 
     /// Branch 1 — small tool result rides the inline
