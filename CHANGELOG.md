@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.97.0](https://github.com/noetl/worker/compare/v5.96.0...v5.97.0) (2026-08-05)
+
+### Features
+
+* **keychain:** fail loudly on an unresolved alias behind NOETL_KEYCHAIN_STRICT ([9cc9700](https://github.com/noetl/worker/commit/9cc9700222d34eddeafc7f41cc82c8f170572178)), closes [noetl/ai-meta#151](https://github.com/noetl/ai-meta/issues/151) [#151](https://github.com/noetl/worker/issues/151) [noetl/ai-meta#236](https://github.com/noetl/ai-meta/issues/236) [noetl/ai-meta#151](https://github.com/noetl/ai-meta/issues/151)
+* **state-builder:** record per-hop build latency labelled by cache outcome ([2a9f616](https://github.com/noetl/worker/commit/2a9f6163bdddbf09400d9dbbac39eedbf3d6d2a2)), closes [noetl/ai-meta#156](https://github.com/noetl/ai-meta/issues/156) [#156](https://github.com/noetl/worker/issues/156) [#156](https://github.com/noetl/worker/issues/156) [noetl/ai-meta#156](https://github.com/noetl/ai-meta/issues/156)
+
 ## [5.96.0](https://github.com/noetl/worker/compare/v5.95.3...v5.96.0) (2026-08-05)
 
 ### Features
