@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.107.0](https://github.com/noetl/worker/compare/v5.106.1...v5.107.0) (2026-08-05)
+
+### Features
+
+* count tool results that carry a provider error despite succeeding ([964388a](https://github.com/noetl/worker/commit/964388a37b3b850facb2b6c2cd15d6ff3345cd7c)), closes [noetl/ai-meta#246](https://github.com/noetl/ai-meta/issues/246) [server#327](https://github.com/noetl/server/issues/327) [noetl/ai-meta#246](https://github.com/noetl/ai-meta/issues/246)
+
 ## [5.106.1](https://github.com/noetl/worker/compare/v5.106.0...v5.106.1) (2026-08-05)
 
 ### Bug Fixes
