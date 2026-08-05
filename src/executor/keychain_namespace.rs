@@ -30,6 +30,80 @@ use serde_json::Value;
 
 use crate::client::ControlPlaneClient;
 
+/// `NOETL_KEYCHAIN_STRICT` — fail the command when a referenced
+/// `keychain.<alias>` cannot be resolved, instead of leaving it undefined.
+///
+/// **Default off**, so today's behaviour is unchanged.
+///
+/// Why the lenient default is a real problem (noetl/ai-meta#151): an
+/// unresolved alias leaves the template undefined, which renders to an EMPTY
+/// STRING. A step then sends `Authorization: Bearer ` and the third party
+/// answers `401 invalid_authorization_header` — a failure that surfaces as a
+/// remote auth error, in a different component, with the actual cause (an
+/// alias that did not resolve) visible only in a worker WARN the playbook
+/// author never sees. That is the precise shape #151 was filed for.
+///
+/// Why it is nonetheless off by default: turning it on converts a silent
+/// degradation into a hard step failure, and a playbook that references an
+/// alias it does not strictly need would start failing. That is the right
+/// end state, but it is a behaviour change that wants a deliberate flip
+/// rather than arriving with an image bump.
+pub const STRICT_ENV: &str = "NOETL_KEYCHAIN_STRICT";
+
+/// Is strict keychain resolution enabled?
+pub fn strict_enabled() -> bool {
+    std::env::var(STRICT_ENV)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+/// Why a referenced alias did not make it into the namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnresolvedAlias {
+    /// The server has no such credential (404).
+    NotFound(String),
+    /// The fetch itself failed (transport, auth, 5xx).
+    FetchFailed(String, String),
+}
+
+impl UnresolvedAlias {
+    pub fn alias(&self) -> &str {
+        match self {
+            UnresolvedAlias::NotFound(a) => a,
+            UnresolvedAlias::FetchFailed(a, _) => a,
+        }
+    }
+}
+
+/// Render the operator-facing explanation for a set of unresolved aliases.
+///
+/// Says what will happen (the empty-string render and its downstream 401)
+/// rather than only what failed — the message exists because the symptom
+/// otherwise appears in a different system.
+pub fn unresolved_message(unresolved: &[UnresolvedAlias]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for u in unresolved {
+        match u {
+            UnresolvedAlias::NotFound(a) => {
+                parts.push(format!("`{a}` (no such credential on the server)"))
+            }
+            UnresolvedAlias::FetchFailed(a, e) => parts.push(format!("`{a}` (fetch failed: {e})")),
+        }
+    }
+    format!(
+        "keychain alias(es) referenced by this step could not be resolved: {}. \
+         A `{{{{ keychain.<alias>.<field> }}}}` reference to an unresolved alias renders to an \
+         EMPTY STRING, so the step would send an empty credential (typically producing a 401 \
+         from the remote service, not an error here). Check the alias name and that the \
+         execution's credentials grant access to it.",
+        parts.join(", ")
+    )
+}
+
+
 /// Scan `template_src` for the distinct keychain aliases referenced as
 /// `keychain.<alias>` (the second path segment after the `keychain`
 /// namespace).  Deliberately dependency-free (no regex crate): the
@@ -97,12 +171,13 @@ pub async fn inject_keychain_namespace(
     template_src: &str,
     client: &ControlPlaneClient,
     execution_id: i64,
-) {
+) -> Vec<UnresolvedAlias> {
     let aliases = referenced_aliases(template_src);
     if aliases.is_empty() {
-        return;
+        return Vec::new();
     }
 
+    let mut unresolved: Vec<UnresolvedAlias> = Vec::new();
     let mut resolved = serde_json::Map::new();
     let mut resolved_names: Vec<String> = Vec::new();
     for alias in &aliases {
@@ -119,6 +194,7 @@ pub async fn inject_keychain_namespace(
                     "keychain.namespace: alias referenced by a `keychain.*` template did not \
                      resolve (server 404); leaving it undefined",
                 );
+                unresolved.push(UnresolvedAlias::NotFound(alias.clone()));
             }
             Err(e) => {
                 tracing::warn!(
@@ -128,12 +204,13 @@ pub async fn inject_keychain_namespace(
                     "keychain.namespace: fetch for a referenced `keychain.*` alias failed; \
                      leaving it undefined",
                 );
+                unresolved.push(UnresolvedAlias::FetchFailed(alias.clone(), e.to_string()));
             }
         }
     }
 
     if resolved.is_empty() {
-        return;
+        return unresolved;
     }
 
     // Per observability.md Principle 1: log the alias NAMES resolved into
@@ -157,6 +234,8 @@ pub async fn inject_keychain_namespace(
             variables.insert("keychain".to_string(), Value::Object(resolved));
         }
     }
+
+    unresolved
 }
 
 /// Resolve the deferred `{{ keychain.<alias>.<field>… }}` templates in a tool
@@ -337,5 +416,83 @@ mod tests {
         let mut vars: HashMap<String, Value> = HashMap::new();
         inject_keychain_namespace(&mut vars, "no templates here", &client, 42).await;
         assert!(!vars.contains_key("keychain"));
+    }
+}
+
+#[cfg(test)]
+mod strict_mode_tests {
+    use super::*;
+
+    /// noetl/ai-meta#151's third acceptance criterion. An unresolved alias
+    /// renders to an EMPTY STRING, so the step sends an empty credential and the
+    /// failure surfaces as a 401 from the remote service — in a different
+    /// component, with the real cause only in a worker WARN the playbook author
+    /// never reads. The message has to say that, not just "not found".
+    #[test]
+    fn the_message_explains_the_empty_render_not_just_the_miss() {
+        let msg = unresolved_message(&[UnresolvedAlias::NotFound("duffel_token".into())]);
+        assert!(msg.contains("duffel_token"), "must name the alias");
+        assert!(
+            msg.contains("EMPTY STRING"),
+            "must say the reference renders empty — that is the non-obvious part"
+        );
+        assert!(
+            msg.contains("401"),
+            "must connect it to the symptom the author will actually see"
+        );
+    }
+
+    /// A fetch failure and a 404 are different operator actions — a missing
+    /// credential is an authoring/provisioning fix, a fetch failure is an
+    /// availability problem. The message must not collapse them.
+    #[test]
+    fn fetch_failure_and_not_found_read_differently() {
+        let nf = unresolved_message(&[UnresolvedAlias::NotFound("a".into())]);
+        let ff = unresolved_message(&[UnresolvedAlias::FetchFailed("a".into(), "503".into())]);
+        assert!(nf.contains("no such credential"));
+        assert!(ff.contains("fetch failed") && ff.contains("503"));
+        assert_ne!(nf, ff);
+    }
+
+    /// Every unresolved alias is named — reporting only the first would hide
+    /// work from an operator fixing them in one pass.
+    #[test]
+    fn all_unresolved_aliases_are_named() {
+        let msg = unresolved_message(&[
+            UnresolvedAlias::NotFound("alpha".into()),
+            UnresolvedAlias::FetchFailed("beta".into(), "timeout".into()),
+        ]);
+        assert!(msg.contains("alpha") && msg.contains("beta"));
+    }
+
+    /// The flag must default OFF, or an image bump silently converts a
+    /// degradation into a hard failure across every playbook that references a
+    /// keychain alias.
+    #[test]
+    fn strict_is_off_by_default_and_accepts_the_usual_spellings() {
+        // Not set -> off. (Serialised via a unique var name per assertion to
+        // avoid cross-test env races.)
+        std::env::remove_var(STRICT_ENV);
+        assert!(!strict_enabled(), "default MUST be off");
+
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            std::env::set_var(STRICT_ENV, on);
+            assert!(strict_enabled(), "{on:?} should enable strict");
+        }
+        for off in ["0", "false", "no", "off", ""] {
+            std::env::set_var(STRICT_ENV, off);
+            assert!(!strict_enabled(), "{off:?} should NOT enable strict");
+        }
+        std::env::remove_var(STRICT_ENV);
+    }
+
+    /// `alias()` is what the ERROR log reports; it must work for both variants.
+    #[test]
+    fn alias_accessor_covers_both_variants() {
+        assert_eq!(UnresolvedAlias::NotFound("x".into()).alias(), "x");
+        assert_eq!(
+            UnresolvedAlias::FetchFailed("y".into(), "e".into()).alias(),
+            "y"
+        );
     }
 }

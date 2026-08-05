@@ -501,13 +501,40 @@ impl CommandExecutor {
         // templates reference no keychain aliases.  Skipped entirely for the
         // orchestrate drive so no secret ever enters the drive's context.
         if !is_drive {
-            super::keychain_namespace::inject_keychain_namespace(
+            let unresolved = super::keychain_namespace::inject_keychain_namespace(
                 &mut ctx.variables,
                 &template_src,
                 &dispatch_client,
                 command.execution_id,
             )
             .await;
+
+            // noetl/ai-meta#151 third acceptance criterion: "a playbook author
+            // should get a clear failure, not a silent empty token, when the
+            // chosen shape can't resolve."
+            //
+            // Lenient (default) keeps today's behaviour: the alias is left
+            // undefined, the template renders EMPTY, and the step sends an empty
+            // credential — surfacing as a 401 from the remote service rather than
+            // as an error here. Strict turns that into a step failure naming the
+            // alias.
+            //
+            // Off by default because flipping it converts a silent degradation
+            // into a hard failure, which is the right end state but wants a
+            // deliberate flip rather than arriving with an image bump.
+            if !unresolved.is_empty()
+                && super::keychain_namespace::strict_enabled()
+            {
+                let msg = super::keychain_namespace::unresolved_message(&unresolved);
+                tracing::error!(
+                    execution_id = command.execution_id,
+                    step = %command.step,
+                    aliases = ?unresolved.iter().map(|u| u.alias()).collect::<Vec<_>>(),
+                    "keychain.namespace: refusing to run the step with unresolved aliases \
+                     (NOETL_KEYCHAIN_STRICT)",
+                );
+                return Err(anyhow::anyhow!(msg));
+            }
         }
 
         // Emit command.started event.  R-1.2 PR-EE-3: `step` +
