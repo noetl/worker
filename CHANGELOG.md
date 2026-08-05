@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.103.0](https://github.com/noetl/worker/compare/v5.102.0...v5.103.0) (2026-08-05)
+
+### Features
+
+* **metrics:** both P1 data-loss paths in the worker ([91bf0a2](https://github.com/noetl/worker/commit/91bf0a2aa95f42f5f7e9d43511d40dd172edaa6f))
+
 ## [5.102.0](https://github.com/noetl/worker/compare/v5.101.0...v5.102.0) (2026-08-05)
 
 ### Features
