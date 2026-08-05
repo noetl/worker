@@ -19,6 +19,22 @@ path = "src/main.rs"
 # for a lean worker without wasmtime.
 default = ["wasm-plugin"]
 wasm-plugin = ["dep:wasmtime"]
+# DuckDB integration — passthrough to `noetl-tools/duckdb-integration`.  The
+# worker POOL executes `duckdb` / `ducklake` tool steps at runtime (e2e fixtures
+# dispatch `kind: duckdb` to the worker via `/api/execute --runtime distributed`),
+# so the SHIPPED worker image MUST keep the DuckDB engine.  noetl-tools gates the
+# DuckDB C++ amalgamation (`libduckdb-sys`, a multi-hour compile) behind its own
+# non-default `duckdb-integration` feature (noetl/ai-meta#185); this passthrough
+# is how the worker opts back in.
+#
+# Deliberately NOT in `default`: a plain `cargo build` / test loop stays fast
+# (no C++ compile), while the container image build enables it explicitly via
+# `--features duckdb-integration` in the Dockerfile.  This is the anti-drift
+# guarantee: when the worker re-pins to noetl-tools >= 3.20.0 (where duckdb
+# became optional), the Dockerfile flag keeps the shipped image's duckdb
+# capability instead of silently dropping it.  REQUIRES noetl-tools >= 3.20.0
+# (the version that introduced the `duckdb-integration` feature).
+duckdb-integration = ["noetl-tools/duckdb-integration"]
 
 [dependencies]
 # WASM plug-in host (optional; enabled by the `wasm-plugin` feature).
