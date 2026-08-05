@@ -547,7 +547,8 @@ impl WorkerMetrics {
             .expect("register concurrent_dispatches");
 
         // NATS consumer-lag gauges — populated by a periodic poll task
-        // (see `crate::nats::lag_poller`).  `pending` is the backlog
+        // (formerly `crate::nats::lag_poller`, deleted at T5 — nothing calls
+        // this recorder now, see noetl/ai-meta#242).  `pending` is the backlog
         // the worker hasn't seen yet; `ack_pending` is live in-flight
         // work.  Together they're the queue-depth signal KEDA reads
         // to decide whether to scale.

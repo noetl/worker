@@ -17,7 +17,8 @@
 //!   `tool_config` is extracted via `command.input.get("tool_config")`;
 //!   `cases` via `command.input.get("cases")`.
 //!
-//! Per `nats::source::NatsCommandSource::translate`, the executor's
+//! Per the command-source translate step (formerly
+//! `nats::source::NatsCommandSource::translate`, now [`crate::dispatch`]), the executor's
 //! Command is a lossless mapping of the worker's Command.
 
 use anyhow::Result;
@@ -2384,7 +2385,7 @@ fn plugin_outcome_to_tool_result(
 /// — a stable, derivable name independent of the physical store.
 ///
 /// The fan-out coordinate comes from `__cursor_frame` / `__cursor_row` in the
-/// command's `render_context` — the worker's [`crate::nats::source`] `translate`
+/// command's `render_context` — the worker's [`crate::dispatch`] `translate`
 /// copies them there from the dispatched command's `metadata.cursor` (the
 /// orchestrator stamps body commands with `{phase:"body", frame, row}`), since
 /// the executor `Command` carries `render_context` but not the raw metadata.

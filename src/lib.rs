@@ -1,9 +1,11 @@
 //! NoETL Worker Pool
 //!
-//! Executes workflow commands received from the control plane via NATS.
+//! Executes workflow commands received from the control plane over the EHDB
+//! command bus. NATS was the original transport and was deleted at T5
+//! (noetl/ai-meta#194); nothing here talks to it any more.
 //!
 //! This crate provides:
-//! - NATS JetStream subscriber for command notifications
+//! - EHDB command-bus consumer for command notifications
 //! - Control plane HTTP client for command fetching and event emission
 //! - Command executor with tool dispatch
 //! - Case/when/then evaluation
