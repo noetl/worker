@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.106.1](https://github.com/noetl/worker/compare/v5.106.0...v5.106.1) (2026-08-05)
+
+### Bug Fixes
+
+* **claim:** bounded backoff on the claim-failure path ([278aa01](https://github.com/noetl/worker/commit/278aa0131c63384e4991d0df9ea06106ab42ad26)), closes [noetl/ai-meta#244](https://github.com/noetl/ai-meta/issues/244)
+
 ## [5.106.0](https://github.com/noetl/worker/compare/v5.105.0...v5.106.0) (2026-08-05)
 
 ### Features
