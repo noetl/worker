@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.98.1](https://github.com/noetl/worker/compare/v5.98.0...v5.98.1) (2026-08-05)
+
+### Bug Fixes
+
+* **container:** warn when the completion-poll flag is set but unrecognised ([b841ccd](https://github.com/noetl/worker/commit/b841ccd3ac88347a4a0e8bd774059fa1a561081b)), closes [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186) [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186)
+
 ## [5.98.0](https://github.com/noetl/worker/compare/v5.97.0...v5.98.0) (2026-08-05)
 
 ### Features
