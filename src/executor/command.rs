@@ -1476,14 +1476,29 @@ fn container_completion_poll_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NOETL_CONTAINER_COMPLETION_POLL")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false)
+        let raw = match std::env::var("NOETL_CONTAINER_COMPLETION_POLL") {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let trimmed = raw.trim().to_ascii_lowercase();
+        let on = matches!(trimmed.as_str(), "1" | "true" | "yes" | "on");
+        // A value that is set but unrecognised silently means OFF, and the
+        // shape people reach for first is a cadence — `=2` reads as "poll every
+        // 2s" and disables the poll instead.  The failure is invisible: the
+        // container step parks and nothing ever resumes it, which looks like a
+        // hung execution rather than a config typo.  The cadence lives in
+        // NOETL_CONTAINER_POLL_INTERVAL_SECS.
+        if !on && !trimmed.is_empty() && trimmed != "0" && trimmed != "false" &&
+            trimmed != "no" && trimmed != "off"
+        {
+            tracing::warn!(
+                value = %raw,
+                "NOETL_CONTAINER_COMPLETION_POLL is set to an unrecognised value \
+                 and is therefore OFF; accepted: 1/true/yes/on. Set the cadence \
+                 with NOETL_CONTAINER_POLL_INTERVAL_SECS instead."
+            );
+        }
+        on
     })
 }
 
