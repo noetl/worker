@@ -155,6 +155,9 @@ impl EventEmitter {
                 }
                 Err(e) => {
                     let total_duration = emit_start.elapsed();
+                    // Countable, not just loggable: an abandoned emission means
+                    // this event never reached the durable log (noetl/ai-meta#238).
+                    crate::metrics::record_event_emit_failed(&event.event_type.to_string());
                     tracing::error!(
                         target: "noetl.performance",
                         event_type = %event.event_type,

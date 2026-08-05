@@ -17,6 +17,7 @@
 //! | `noetl_worker_dispatch_errors_total` | counter | `tool_kind` | Per-tool failure rate |
 //! | `noetl_worker_event_emit_duration_seconds` | histogram | `event_type` | Event-log write latency to the control plane |
 //! | `noetl_worker_event_emit_retries_total` | counter | `event_type` | Retry rate on flaky control-plane writes |
+//! | `noetl_worker_event_emit_failed_total` | counter | `event_type` | Emissions ABANDONED after every retry — the event never reached the durable log. |
 //! | `noetl_worker_concurrent_dispatches` | gauge | — | Live count of in-flight dispatches (semaphore depth) |
 //! | `noetl_worker_nats_consumer_pending` | gauge | `stream`, `consumer` | JetStream messages not yet delivered to a consumer (backlog the worker hasn't seen yet) |
 //! | `noetl_worker_nats_consumer_ack_pending` | gauge | `stream`, `consumer` | Messages delivered but not yet ack'd (live in-flight work) |
@@ -81,6 +82,8 @@ pub struct WorkerMetrics {
     pub dispatch_errors_total: IntCounterVec,
     pub event_emit_duration_seconds: HistogramVec,
     pub event_emit_retries_total: IntCounterVec,
+    /// Emissions abandoned after exhausting retries (noetl/ai-meta#238).
+    pub event_emit_failed_total: IntCounterVec,
     pub concurrent_dispatches: IntGauge,
     pub nats_consumer_pending: IntGaugeVec,
     pub nats_consumer_ack_pending: IntGaugeVec,
@@ -536,6 +539,18 @@ impl WorkerMetrics {
         registry
             .register(Box::new(event_emit_retries_total.clone()))
             .expect("register event_emit_retries_total");
+
+        let event_emit_failed_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_event_emit_failed_total",
+                "Event emissions abandoned after every retry — the event never reached the durable log.",
+            ),
+            &["event_type"],
+        )
+        .expect("event_emit_failed_total metric");
+        registry
+            .register(Box::new(event_emit_failed_total.clone()))
+            .expect("register event_emit_failed_total");
 
         let concurrent_dispatches = IntGauge::new(
             "noetl_worker_concurrent_dispatches",
@@ -1406,6 +1421,7 @@ impl WorkerMetrics {
             dispatch_errors_total,
             event_emit_duration_seconds,
             event_emit_retries_total,
+            event_emit_failed_total,
             concurrent_dispatches,
             nats_consumer_pending,
             nats_consumer_ack_pending,
@@ -1543,6 +1559,20 @@ pub fn record_dispatch(tool_kind: &str, duration_seconds: f64, error: bool) {
 }
 
 /// Record one event emission to the control plane.
+/// Record an event emission ABANDONED after every retry.
+///
+/// `record_event_emit` covers the success path and counts retries; nothing
+/// counted the give-up.  That distinction matters here more than on most paths:
+/// a failed emission means the event never reached the durable log, so the
+/// execution's history has a hole and no later read can tell.  Retries rising
+/// is a flaky control plane; this rising is data loss.
+pub fn record_event_emit_failed(event_type: &str) {
+    WorkerMetrics::global()
+        .event_emit_failed_total
+        .with_label_values(&[event_type])
+        .inc();
+}
+
 pub fn record_event_emit(event_type: &str, duration_seconds: f64, retries: u32) {
     let m = WorkerMetrics::global();
     m.event_emit_duration_seconds
@@ -2437,6 +2467,34 @@ mod tests {
         assert!(text.contains("# HELP noetl_worker_result_store_put_errors_total"));
         assert!(text.contains("# TYPE noetl_worker_result_store_put_errors_total counter"));
     }
+
+    /// noetl/ai-meta#238 — an emission abandoned after every retry must be
+    /// COUNTABLE.  `event_emit_retries_total` counts retries, which rise
+    /// whenever the control plane is flaky; only this counter distinguishes
+    /// "retried and eventually succeeded" from "gave up and the event is gone".
+    #[test]
+    fn abandoned_event_emissions_are_counted_by_type() {
+        record_event_emit_failed("test.emit_failed.alpha");
+        record_event_emit_failed("test.emit_failed.alpha");
+        record_event_emit_failed("test.emit_failed.beta");
+
+        let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
+        // Scoped to this metric's own lines so the assertion cannot pass on
+        // another metric that happens to carry an event_type label.
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("noetl_worker_event_emit_failed_total{"))
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("test.emit_failed.alpha") && l.trim_end().ends_with(" 2")),
+            "alpha must show 2 abandonments; got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("test.emit_failed.beta") && l.trim_end().ends_with(" 1")),
+            "beta must show 1 abandonment; got {lines:?}"
+        );
+    }
+
 }
 
 #[cfg(test)]
