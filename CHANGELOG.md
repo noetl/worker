@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.101.0](https://github.com/noetl/worker/compare/v5.100.0...v5.101.0) (2026-08-05)
+
+### Features
+
+* **metrics:** count EHDB claim-coordinator reconnects — prod logs 85/day of them ([95b068b](https://github.com/noetl/worker/commit/95b068be2046c9021d721f7082f9c0ce9642a2d5)), closes [noetl/ai-meta#208](https://github.com/noetl/ai-meta/issues/208) [#208](https://github.com/noetl/worker/issues/208) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#208](https://github.com/noetl/ai-meta/issues/208)
+
 ## [5.100.0](https://github.com/noetl/worker/compare/v5.99.1...v5.100.0) (2026-08-05)
 
 ### Features
