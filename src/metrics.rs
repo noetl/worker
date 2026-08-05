@@ -1248,6 +1248,29 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_drive_wait_total.clone()))
             .expect("register state_builder_drive_wait_total");
 
+        // Off-server state-builder outcome series, pinned at 0 for the same
+        // reason (noetl/ai-meta#238).  These three specifically, because
+        // noetl/ai-meta#227 names `drive_builds{outcome="fallback_incomplete"}`
+        // and `drive_wait{outcome="timeout"}` as the signals for root-causing
+        // why a re-issued command does not advance a stalled execution — and
+        // an absent counter reads the same as a zero one, so neither could be
+        // concluded from.
+        for outcome in STATE_BUILDER_DRIVE_OUTCOMES {
+            state_builder_drive_builds_total
+                .with_label_values(&[outcome])
+                .inc_by(0);
+        }
+        for outcome in STATE_BUILDER_DRIVE_WAIT_OUTCOMES {
+            state_builder_drive_wait_total
+                .with_label_values(&[outcome])
+                .inc_by(0);
+        }
+        for outcome in STATE_BUILDER_BUILD_OUTCOMES {
+            state_builder_builds_total
+                .with_label_values(&[outcome])
+                .inc_by(0);
+        }
+
         let state_builder_tail_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_state_builder_tail_total",
@@ -2037,8 +2060,33 @@ pub fn record_state_builder_chain_hops(hops: usize) {
         .observe(hops as f64);
 }
 
-/// Record one off-server DRIVE build outcome (`served` | `fallback_incomplete` |
-/// `fallback_disabled`) — RFC #115 Phase 4 cutover.
+/// Every `outcome` the off-server DRIVE build records, taken from the call
+/// sites in `executor/command.rs` rather than from prose.
+///
+/// The doc here previously listed three (`served`, `fallback_incomplete`,
+/// `fallback_disabled`) while the code recorded seven — including
+/// `served_shard_mismatch`, which is the interesting one.  Pinning from that
+/// comment would have left four outcomes permanently unreadable, so
+/// `drive_outcome_literals_are_all_pinned` checks this list against the source.
+pub const STATE_BUILDER_DRIVE_OUTCOMES: [&str; 7] = [
+    "served",
+    "served_rehydrated",
+    "served_shard",
+    "served_shard_mismatch",
+    "stateless_retry",
+    "fallback_incomplete",
+    "fallback_disabled",
+];
+
+/// Every `outcome` the DRIVE build-retry wait records.
+pub const STATE_BUILDER_DRIVE_WAIT_OUTCOMES: [&str; 2] = ["woken", "timeout"];
+
+/// Every `outcome` the state-builder build records.
+pub const STATE_BUILDER_BUILD_OUTCOMES: [&str; 4] =
+    ["cache_hit", "incremental", "cold_rebuild", "incomplete"];
+
+/// Record one off-server DRIVE build outcome.  See
+/// [`STATE_BUILDER_DRIVE_OUTCOMES`] for the full set.
 pub fn record_state_builder_drive(outcome: &str) {
     WorkerMetrics::global()
         .state_builder_drive_builds_total
@@ -2432,6 +2480,64 @@ mod tests {
             lines.iter().any(|l| l.contains("test.emit_failed.beta") && l.trim_end().ends_with(" 1")),
             "beta must show 1 abandonment; got {lines:?}"
         );
+    }
+
+    /// Every outcome literal passed at a call site must be pinned.
+    ///
+    /// The source is embedded with `include_str!`, so this reads the real call
+    /// sites at compile time rather than trusting a doc comment — which is the
+    /// specific thing that failed here: the recorder's doc listed three
+    /// outcomes while the code recorded seven.  Add a literal without adding it
+    /// to the const and this test fails, instead of that outcome being absent
+    /// from /metrics until it first occurs.
+    #[test]
+    fn drive_outcome_literals_are_all_pinned() {
+        fn literals<'a>(src: &'a str, call: &str) -> Vec<&'a str> {
+            let mut out = Vec::new();
+            let needle = format!("{call}(\"");
+            let mut rest = src;
+            while let Some(i) = rest.find(&needle) {
+                rest = &rest[i + needle.len()..];
+                if let Some(end) = rest.find('"') {
+                    out.push(&rest[..end]);
+                }
+            }
+            out
+        }
+
+        let command_rs = include_str!("executor/command.rs");
+        let state_builder_rs = include_str!("state_builder.rs");
+
+        for (src, call, pinned) in [
+            (
+                command_rs,
+                "record_state_builder_drive",
+                &STATE_BUILDER_DRIVE_OUTCOMES[..],
+            ),
+            (
+                command_rs,
+                "record_state_builder_drive_wait",
+                &STATE_BUILDER_DRIVE_WAIT_OUTCOMES[..],
+            ),
+            (
+                state_builder_rs,
+                "record_state_builder_build",
+                &STATE_BUILDER_BUILD_OUTCOMES[..],
+            ),
+        ] {
+            let found = literals(src, call);
+            assert!(
+                !found.is_empty(),
+                "{call}: found no literals — the extraction broke, which would make this \
+                 test pass vacuously"
+            );
+            for lit in &found {
+                assert!(
+                    pinned.contains(lit),
+                    "{call}(\"{lit}\") is recorded but not pinned; add it to the const"
+                );
+            }
+        }
     }
 
     /// The gauge exists to be readable when every other metric is absent, so it
