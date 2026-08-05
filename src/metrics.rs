@@ -2828,6 +2828,44 @@ mod tests {
         );
     }
 
+    /// The claim-failure path must PAUSE before the next attempt.
+    ///
+    /// The nack makes the command immediately re-claimable, so with no sleep a
+    /// persistently failing command spins at full speed — measured at ~1000
+    /// iterations/second, 7,324 failures before the set drained
+    /// (noetl/ai-meta#244).  The nack-FAILURE path beside it already backed
+    /// off; only the claim-failure path did not, which is what made it look
+    /// deliberate rather than missing.
+    ///
+    /// Asserts on the source because the behaviour is a sleep, which a unit
+    /// test cannot observe without making the loop testable in isolation.
+    #[test]
+    fn claim_failure_path_backs_off() {
+        let src = include_str!("worker.rs");
+        let i = src
+            .find("ClaimOutcome::Failed(error) => {")
+            .expect("the Failed arm must exist");
+        let arm = &src[i..i + 1800];
+        assert!(
+            arm.contains("tokio::time::sleep(claim_fail_backoff)"),
+            "the claim-failure arm must sleep before looping"
+        );
+        assert!(
+            arm.contains("REBUILD_BACKOFF_MAX"),
+            "the backoff must be BOUNDED — an unbounded one turns a blip into a stall"
+        );
+        // And it must reset, or one failure permanently slows every later claim.
+        assert!(
+            src.contains("claim_fail_backoff = crate::state_builder::REBUILD_BACKOFF_MIN"),
+            "a successful claim must reset the backoff"
+        );
+        // Separate from the connection backoff, deliberately.
+        assert!(
+            src.contains("let mut claim_fail_backoff"),
+            "claim backoff must be its own variable, not reconnect_backoff"
+        );
+    }
+
     /// Both reconnect reasons must be pinned and readable at 0.
     ///
     /// This path is why the metric exists: it retried with a log line and
