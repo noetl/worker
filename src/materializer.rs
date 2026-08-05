@@ -256,6 +256,7 @@ async fn run_loop_ehdb(config: MaterializerConfig) -> Result<()> {
         let sort_keys: Vec<u64> = drained_batch.iter().map(|d| d.sort_key).collect();
         let (events, skipped) = build_envelopes_from_payloads(&payloads);
         if skipped > 0 {
+            crate::metrics::record_materializer_skipped(skipped as u64);
             tracing::warn!(
                 skipped,
                 drained,
@@ -374,6 +375,7 @@ async fn run_loop_nats(config: MaterializerConfig) -> Result<()> {
 
         let (events, skipped) = build_envelopes(&outcome.messages);
         if skipped > 0 {
+            crate::metrics::record_materializer_skipped(skipped as u64);
             tracing::warn!(
                 skipped,
                 drained,
