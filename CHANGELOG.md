@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.96.0](https://github.com/noetl/worker/compare/v5.95.3...v5.96.0) (2026-08-05)
+
+### Features
+
+* **build:** keep DuckDB in the worker image via duckdb-integration passthrough ([e4aae0b](https://github.com/noetl/worker/commit/e4aae0b45bbf14ec617983bc576c11a1c67fd060)), closes [noetl/ai-meta#185](https://github.com/noetl/ai-meta/issues/185) [noetl/ai-meta#185](https://github.com/noetl/ai-meta/issues/185)
+
 ## [5.95.3](https://github.com/noetl/worker/compare/v5.95.2...v5.95.3) (2026-08-05)
 
 ### Bug Fixes
