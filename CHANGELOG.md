@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.99.1](https://github.com/noetl/worker/compare/v5.99.0...v5.99.1) (2026-08-05)
+
+### Bug Fixes
+
+* **metrics:** remove the NATS consumer-lag gauges — nothing can write them ([774ab1e](https://github.com/noetl/worker/commit/774ab1e1870be60d1e3a341659d1d2618fa1e97c)), closes [noetl/ops#252](https://github.com/noetl/ops/issues/252) [noetl/ai-meta#242](https://github.com/noetl/ai-meta/issues/242) [noetl/ai-meta#242](https://github.com/noetl/ai-meta/issues/242)
+
 ## [5.99.0](https://github.com/noetl/worker/compare/v5.98.1...v5.99.0) (2026-08-05)
 
 ### Features
