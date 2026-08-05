@@ -19,8 +19,6 @@
 //! | `noetl_worker_event_emit_retries_total` | counter | `event_type` | Retry rate on flaky control-plane writes |
 //! | `noetl_worker_event_emit_failed_total` | counter | `event_type` | Emissions ABANDONED after every retry — the event never reached the durable log. |
 //! | `noetl_worker_concurrent_dispatches` | gauge | — | Live count of in-flight dispatches (semaphore depth) |
-//! | `noetl_worker_nats_consumer_pending` | gauge | `stream`, `consumer` | JetStream messages not yet delivered to a consumer (backlog the worker hasn't seen yet) |
-//! | `noetl_worker_nats_consumer_ack_pending` | gauge | `stream`, `consumer` | Messages delivered but not yet ack'd (live in-flight work) |
 //! | `noetl_worker_result_store_put_duration_seconds` | histogram | — | Durable result-store PUT latency (the cross-node reference path on `call.done` events) |
 //! | `noetl_worker_result_store_put_bytes_total` | counter | — | Total bytes staged in the durable result store |
 //! | `noetl_worker_result_store_put_errors_total` | counter | — | Durable result-store PUT failures (fall back to shm-cache-only or status-only) |
@@ -95,8 +93,6 @@ pub struct WorkerMetrics {
     /// once for the whole process (noetl/ai-meta#238).
     pub build_info: IntGaugeVec,
     pub concurrent_dispatches: IntGauge,
-    pub nats_consumer_pending: IntGaugeVec,
-    pub nats_consumer_ack_pending: IntGaugeVec,
     pub result_store_put_duration_seconds: Histogram,
     pub result_store_put_bytes_total: IntCounter,
     pub result_store_put_errors_total: IntCounter,
@@ -588,35 +584,12 @@ impl WorkerMetrics {
             .register(Box::new(concurrent_dispatches.clone()))
             .expect("register concurrent_dispatches");
 
-        // NATS consumer-lag gauges — populated by a periodic poll task
-        // (formerly `crate::nats::lag_poller`, deleted at T5 — nothing calls
-        // this recorder now, see noetl/ai-meta#242).  `pending` is the backlog
-        // the worker hasn't seen yet; `ack_pending` is live in-flight
-        // work.  Together they're the queue-depth signal KEDA reads
-        // to decide whether to scale.
-        let nats_consumer_pending = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "noetl_worker_nats_consumer_pending",
-                "JetStream messages not yet delivered to a consumer.",
-            ),
-            &["stream", "consumer"],
-        )
-        .expect("nats_consumer_pending metric");
-        registry
-            .register(Box::new(nats_consumer_pending.clone()))
-            .expect("register nats_consumer_pending");
-
-        let nats_consumer_ack_pending = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "noetl_worker_nats_consumer_ack_pending",
-                "JetStream messages delivered to a consumer but not yet ack'd.",
-            ),
-            &["stream", "consumer"],
-        )
-        .expect("nats_consumer_ack_pending metric");
-        registry
-            .register(Box::new(nats_consumer_ack_pending.clone()))
-            .expect("register nats_consumer_ack_pending");
+        // The NATS consumer-lag gauges were removed here (noetl/ai-meta#242).
+        // They measured JetStream consumer depth, and T5 deleted JetStream —
+        // their poller (`crate::nats::lag_poller`) went with it, so the pair
+        // could only ever read whatever they held at the moment the poller was
+        // removed.  The KEDA queue-depth signal is now `ehdb_events_group_lag`,
+        // scraped from the writer.
 
         // Durable result-store metrics — populated on the over-budget
         // `call.done` path inside `executor::command::build_call_done_result`.
@@ -1451,8 +1424,6 @@ impl WorkerMetrics {
             event_emit_failed_total,
             build_info,
             concurrent_dispatches,
-            nats_consumer_pending,
-            nats_consumer_ack_pending,
             result_store_put_duration_seconds,
             result_store_put_bytes_total,
             result_store_put_errors_total,
@@ -1706,21 +1677,6 @@ pub fn inc_concurrent_dispatches() {
 /// Drop the in-flight dispatches gauge when a permit is released.
 pub fn dec_concurrent_dispatches() {
     WorkerMetrics::global().concurrent_dispatches.dec();
-}
-
-/// Update the NATS consumer-lag gauges for one (`stream`, `consumer`)
-/// pair.  Called by the periodic lag poller after fetching consumer
-/// info from JetStream.  Both values are `i64` because the underlying
-/// `IntGaugeVec` takes signed values; the JetStream API returns
-/// `u64` so this is a `try_into` away in the caller.
-pub fn record_nats_consumer_lag(stream: &str, consumer: &str, pending: i64, ack_pending: i64) {
-    let m = WorkerMetrics::global();
-    m.nats_consumer_pending
-        .with_label_values(&[stream, consumer])
-        .set(pending);
-    m.nats_consumer_ack_pending
-        .with_label_values(&[stream, consumer])
-        .set(ack_pending);
 }
 
 /// Record one successful durable result-store PUT.  `bytes` is the
@@ -2368,51 +2324,6 @@ mod tests {
         assert!(text.contains("# TYPE noetl_worker_pulls_total counter"));
         // The counter value line must include the outcome label.
         assert!(text.contains("noetl_worker_pulls_total{outcome=\"claimed\"}"));
-    }
-
-    /// `record_nats_consumer_lag` is the only path that touches the
-    /// new gauges; this test exercises it directly + verifies the
-    /// label set is what the dashboard / KEDA expects.
-    #[test]
-    fn record_nats_consumer_lag_updates_both_gauges() {
-        let m = WorkerMetrics::global();
-        record_nats_consumer_lag("noetl_commands", "worker-pool", 42, 7);
-        let pending = m
-            .nats_consumer_pending
-            .with_label_values(&["noetl_commands", "worker-pool"])
-            .get();
-        let ack_pending = m
-            .nats_consumer_ack_pending
-            .with_label_values(&["noetl_commands", "worker-pool"])
-            .get();
-        assert_eq!(pending, 42);
-        assert_eq!(ack_pending, 7);
-
-        // Re-recording overwrites the previous sample (gauges
-        // aren't cumulative).
-        record_nats_consumer_lag("noetl_commands", "worker-pool", 100, 3);
-        let pending2 = m
-            .nats_consumer_pending
-            .with_label_values(&["noetl_commands", "worker-pool"])
-            .get();
-        assert_eq!(pending2, 100);
-    }
-
-    /// The two new gauges appear in the encoded Prometheus output
-    /// with the `stream` + `consumer` labels.  Locks in the wire
-    /// format the KEDA prometheus-trigger scrapes.
-    #[test]
-    fn nats_consumer_lag_gauges_emit_in_prometheus_text() {
-        record_nats_consumer_lag("noetl_commands", "worker-pool", 5, 2);
-        let bytes = WorkerMetrics::global().encode();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("# HELP noetl_worker_nats_consumer_pending"));
-        assert!(text.contains("# TYPE noetl_worker_nats_consumer_pending gauge"));
-        assert!(text.contains(
-            "noetl_worker_nats_consumer_pending{consumer=\"worker-pool\",stream=\"noetl_commands\"}"
-        ));
-        assert!(text.contains("# HELP noetl_worker_nats_consumer_ack_pending"));
-        assert!(text.contains("# TYPE noetl_worker_nats_consumer_ack_pending gauge"));
     }
 
     /// noetl/ai-meta#43 Round 4 — `pending_callback` skip counter.
