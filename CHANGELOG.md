@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.108.0](https://github.com/noetl/worker/compare/v5.107.1...v5.108.0) (2026-08-06)
+
+### Features
+
+* count successful claims so a wedged worker pool is detectable ([053ac83](https://github.com/noetl/worker/commit/053ac83abca98175cf779808f2df306f9376e37c)), closes [noetl/ai-meta#249](https://github.com/noetl/ai-meta/issues/249) [noetl/ai-meta#249](https://github.com/noetl/ai-meta/issues/249) [noetl/ai-meta#249](https://github.com/noetl/ai-meta/issues/249)
+
 ## [5.107.1](https://github.com/noetl/worker/compare/v5.107.0...v5.107.1) (2026-08-06)
 
 ### Bug Fixes
