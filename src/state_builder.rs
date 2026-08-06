@@ -810,6 +810,33 @@ impl WalEventIndex {
         if self.sink_gate.mark(execution_id) {
             crate::metrics::record_sink_gate_marked();
         }
+        crate::metrics::set_sink_gate_pending(self.sink_gate.pending_count());
+    }
+
+    /// Clear a mark WITHOUT asserting the context was sunk (noetl/ai-meta#248).
+    ///
+    /// [`Self::confirm_sunk`] means "the customer's system of record has it".
+    /// This means "the sink attempt is over and it did not succeed" — the tool
+    /// returned a non-success result, the tool errored, or the real completion
+    /// moved to an async callback that this process will never observe.
+    ///
+    /// The two must stay distinct. Reporting a failed sink as `confirmed` would
+    /// tell the GC gates that un-sunk context is safe to reclaim; keeping the
+    /// mark forever would retain it for the lifetime of the process, and the
+    /// pending set has no TTL and no sweep, so nothing would ever prune it.
+    /// Releasing restores the pre-gate behaviour for that one execution — its
+    /// context becomes reclaimable by the ordinary terminal/TTL paths — which is
+    /// exactly what happens today with the gate off, and is strictly better than
+    /// an unbounded leak.
+    ///
+    /// Returns true if it had been retained.
+    pub fn release_pending_sink(&mut self, execution_id: i64, reason: &str) -> bool {
+        let was_pending = self.sink_gate.confirm(execution_id);
+        if was_pending {
+            crate::metrics::record_sink_gate_released(reason);
+        }
+        crate::metrics::set_sink_gate_pending(self.sink_gate.pending_count());
+        was_pending
     }
 
     /// Record that an execution's cached business context was sunk to the
@@ -837,6 +864,7 @@ impl WalEventIndex {
         if was_pending {
             crate::metrics::record_sink_gate_confirmed();
         }
+        crate::metrics::set_sink_gate_pending(self.sink_gate.pending_count());
         was_pending
     }
 
@@ -3505,6 +3533,79 @@ mod tests {
             "evict proceeds normally when the gate is off"
         );
         assert!(idx.chain(100).is_none());
+    }
+
+    /// noetl/ai-meta#248 — a release clears the block WITHOUT claiming the
+    /// context was sunk.
+    ///
+    /// The distinction is the whole point: `confirm_sunk` tells the GC gates the
+    /// customer store has the data, while a failed sink must clear the block
+    /// without making that claim. Both leave the execution evictable; only one
+    /// asserts durability.
+    #[test]
+    fn sink_gate_release_clears_the_block_without_confirming() {
+        let mut idx = WalEventIndex::new();
+        idx.enable_sink_gate_for_test();
+        idx.apply_at(&started(1, 100), Instant::now());
+        idx.mark_pending_sink(100);
+        assert!(idx.sink_blocked(100), "marked execution is eviction-blocked");
+        assert_eq!(idx.sink_pending_count(), 1);
+
+        assert!(
+            idx.release_pending_sink(100, "released_failed"),
+            "release reports it was pending"
+        );
+        assert!(!idx.sink_blocked(100), "release clears the block");
+        assert_eq!(idx.sink_pending_count(), 0, "the retained set must not leak");
+    }
+
+    /// noetl/ai-meta#248 — the leak, stated as an invariant.
+    ///
+    /// A sink step's attempt can end four ways: clean success, a non-success
+    /// result, an error, or a hand-off to an async callback this process never
+    /// observes. Before the fix only the first cleared the mark, and the pending
+    /// set has no TTL and no sweep — so the other three retained the execution
+    /// for the lifetime of the process, growing monotonically with every failed
+    /// sink. This asserts every outcome converges on an empty set.
+    #[test]
+    fn sink_gate_every_terminal_outcome_clears_the_mark() {
+        for (eid, reason) in [
+            (100_i64, "released_failed"),
+            (200, "released_pending_callback"),
+            (300, "released_error"),
+        ] {
+            let mut idx = WalEventIndex::new();
+            idx.enable_sink_gate_for_test();
+            idx.apply_at(&started(1, eid), Instant::now());
+            idx.mark_pending_sink(eid);
+            assert_eq!(idx.sink_pending_count(), 1, "{reason}: marked");
+            idx.release_pending_sink(eid, reason);
+            assert_eq!(
+                idx.sink_pending_count(),
+                0,
+                "{reason}: must not leave the execution retained"
+            );
+        }
+
+        // ...and the success path still confirms rather than releases.
+        let mut idx = WalEventIndex::new();
+        idx.enable_sink_gate_for_test();
+        idx.apply_at(&started(1, 400), Instant::now());
+        idx.mark_pending_sink(400);
+        assert!(idx.confirm_sunk(400), "success path still confirms");
+        assert_eq!(idx.sink_pending_count(), 0);
+    }
+
+    /// noetl/ai-meta#248 — releasing something that was never marked is a no-op
+    /// and must not report success, so an accidental double-release cannot be
+    /// mistaken for a real one in the metrics.
+    #[test]
+    fn sink_gate_release_of_unmarked_execution_is_a_noop() {
+        let mut idx = WalEventIndex::new();
+        idx.enable_sink_gate_for_test();
+        idx.apply_at(&started(1, 100), Instant::now());
+        assert!(!idx.release_pending_sink(100, "released_failed"));
+        assert_eq!(idx.sink_pending_count(), 0);
     }
 
     #[test]

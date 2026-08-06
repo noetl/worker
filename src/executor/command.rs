@@ -992,10 +992,38 @@ impl CommandExecutor {
                 // `pending_callback` path, where the terminal result (and thus the
                 // real sink completion) arrives later via the async callback, not
                 // here. No-op on the index when the gate is off.
-                if is_sink_step
-                    && result.is_success()
-                    && !matches!(result.pending_callback, Some(true))
-                {
+                // noetl/ai-meta#248 — EVERY outcome must clear the mark. The mark
+                // is taken for the DURATION of the sink attempt, and the pending
+                // set has no TTL and no sweep, so any outcome that leaves it set
+                // retains that execution for the lifetime of the process.
+                // Previously only clean success cleared it, which leaked on the
+                // two most likely paths: a sink that failed, and a sink whose
+                // completion moved to an async callback.
+                if is_sink_step && !result.is_success() {
+                    // The attempt is over and it did not sink. RELEASE rather
+                    // than confirm — confirming would tell the GC gates that
+                    // un-sunk context is reclaimable. Releasing restores the
+                    // ordinary terminal/TTL behaviour for this one execution,
+                    // which is exactly what the gate-off default already does.
+                    crate::metrics::record_sink_signal(&tool_config.kind, "release");
+                    self.state_builder_index
+                        .lock()
+                        .await
+                        .release_pending_sink(command.execution_id, "released_failed");
+                } else if is_sink_step && matches!(result.pending_callback, Some(true)) {
+                    // The real completion arrives via the async callback, which
+                    // this process will never observe — the durable path is the
+                    // external watcher, and this pod may not even be alive by
+                    // then. Do not hold a block that nothing here can clear.
+                    crate::metrics::record_sink_signal(&tool_config.kind, "release");
+                    self.state_builder_index
+                        .lock()
+                        .await
+                        .release_pending_sink(
+                            command.execution_id,
+                            "released_pending_callback",
+                        );
+                } else if is_sink_step && result.is_success() {
                     crate::metrics::record_sink_signal(&tool_config.kind, "confirm");
                     self.state_builder_index
                         .lock()
@@ -1017,6 +1045,19 @@ impl CommandExecutor {
                 result
             }
             Err(e) => {
+                // noetl/ai-meta#248 — the third leak path, and the one with no
+                // release at all before this: the tool ERRORED, so neither the
+                // success confirm nor the non-success release above ever runs.
+                // A sink step that errors is precisely the case an operator
+                // most expects to be retried, and it was the case that pinned
+                // the execution in the retained set permanently.
+                if is_sink_step {
+                    crate::metrics::record_sink_signal(&tool_config.kind, "release");
+                    self.state_builder_index
+                        .lock()
+                        .await
+                        .release_pending_sink(command.execution_id, "released_error");
+                }
                 // Emit call.error event
                 self.emit_event_via(
                     &dispatch_client,
@@ -3134,6 +3175,52 @@ fn command_completed_context(
 
 #[cfg(test)]
 mod tests {
+
+    /// noetl/ai-meta#248 — the sink mark must be cleared on EVERY outcome.
+    ///
+    /// This asserts the call sites, not just the primitive, because the leak was
+    /// a *missing call*, not a broken function: `release_pending_sink` can be
+    /// perfect and the gate still leaks if a path forgets to call it. Counting
+    /// the reasons rather than merely finding the identifier is deliberate —
+    /// wiring one of three paths would otherwise look instrumented while leaking
+    /// on the other two.
+    ///
+    /// Fails on the pre-fix source, which had zero release call sites.
+    #[test]
+    fn every_sink_outcome_has_a_release_call_site() {
+        // Scan ONLY the non-test source. Including the test module would make
+        // this guard match its own literals below — it would then pass with the
+        // call sites deleted, which is the exact failure mode it exists to
+        // catch. (Verified: with the naive scan, removing a release call site
+        // still passed.)
+        let full = include_str!("command.rs");
+        let src = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("command.rs must have a module-level #[cfg(test)] block");
+        assert!(
+            !src.contains("mod tests"),
+            "the test module leaked into the scanned region"
+        );
+        for reason in [
+            "released_failed",
+            "released_pending_callback",
+            "released_error",
+        ] {
+            assert!(
+                src.contains(reason),
+                "no release call site for {reason}: a sink ending that way would \
+                 stay in the retained set for the lifetime of the process, and \
+                 nothing prunes it (no TTL, no sweep)"
+            );
+        }
+        // The success path must still CONFIRM, not release — confirming asserts
+        // durability that a released (failed) sink has not earned.
+        assert!(
+            src.contains("confirm_sunk(command.execution_id)"),
+            "the success path must still confirm"
+        );
+    }
     use super::*;
     use axum::{extract::Path, http::StatusCode as AxumStatus, routing::put, Json, Router};
 
