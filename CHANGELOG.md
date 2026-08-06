@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.108.1](https://github.com/noetl/worker/compare/v5.108.0...v5.108.1) (2026-08-06)
+
+### Bug Fixes
+
+* error events must name the cause, not just the context ([383bda2](https://github.com/noetl/worker/commit/383bda2a533246881e99ead7adcfb7a4ba51d697)), closes [noetl/ai-meta#250](https://github.com/noetl/ai-meta/issues/250)
+
 ## [5.108.0](https://github.com/noetl/worker/compare/v5.107.1...v5.108.0) (2026-08-06)
 
 ### Features
