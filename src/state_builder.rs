@@ -643,14 +643,29 @@ impl EvictionPolicy {
 /// no-op and eviction behaves exactly as before, so a worker carrying this code
 /// is behavior-neutral until an operator opts in.
 ///
-/// The **sink-confirmation signal wiring** — who calls [`WalEventIndex::mark_pending_sink`]
-/// when un-sunk business context enters the cache, and [`WalEventIndex::confirm_sunk`]
-/// when a playbook connector step (transfer / artifact / postgres / http) confirms
-/// the customer-store write — plus extending the gate to the Feather result-tier
-/// GC (#104) and the durable-segment GC (#254), is a tracked follow-up. This
-/// slice lands the **gating primitive** on the primary transient cache (the WAL
-/// index) + its proof. Enabling the flag before the confirm signal is wired would
-/// retain terminal context indefinitely, so it stays off until the wiring lands.
+/// The **sink-confirmation signal wiring** landed in noetl/ai-meta#199 Slice A:
+/// `executor::command` calls [`WalEventIndex::mark_pending_sink`] when a step
+/// declaring `sink: true` begins, and [`WalEventIndex::confirm_sunk`] when it
+/// succeeds.  Extending the gate to the Feather result-tier GC (#104) and the
+/// durable-segment GC (#254) remains a follow-up.
+///
+/// An earlier version of this note said the flag "stays off until the wiring
+/// lands".  The wiring landed, but the note stayed — and so read as satisfied
+/// while the more specific hazard it warned about was still live: the wiring
+/// covered only clean success, so a sink that FAILED, ERRORED, or handed off to
+/// an async callback was marked and never cleared.  With no TTL and no sweep
+/// over `pending`, those entries were retained for the lifetime of the process
+/// (noetl/ai-meta#248).  [`WalEventIndex::release_pending_sink`] now closes every
+/// one of those outcomes, and `noetl_worker_sink_gate_pending_executions`
+/// publishes the retained-set size, so a regression shows up as a rising number
+/// rather than as unexplained cache growth.
+///
+/// **Still not safe to enable**, for a reason outside this crate: the server's
+/// `noetl.sink_pending` feed (which gates the server-side result-tier GC) has
+/// only `mark` / `confirm` endpoints and no `release`, so the two GCs would
+/// still disagree about a failed sink — and `post_sink_state` needs the
+/// internal-API bearer from ops#246, absent in production.  Prerequisites are
+/// tracked on noetl/ai-meta#248.
 #[derive(Debug, Clone, Default)]
 pub struct SinkGate {
     enabled: bool,
