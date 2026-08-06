@@ -541,6 +541,7 @@ impl Worker {
 
             match outcome {
                 ClaimOutcome::Claimed(command) => {
+                    crate::metrics::record_claim_succeeded();
                     // A claim succeeded → whatever was failing has cleared.
                     claim_fail_backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
                     tracing::debug!(
