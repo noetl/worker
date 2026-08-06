@@ -186,6 +186,24 @@ pub struct WorkerMetrics {
     /// now the only signal was that flood — which is exactly the wrong medium,
     /// since the flood is itself the symptom.
     pub claim_failed_total: IntCounter,
+    /// Commands successfully claimed (noetl/ai-meta#249).
+    ///
+    /// The exact counterpart of [`Self::claim_failed_total`], and the reason it
+    /// exists: the live claim loop recorded only the FAILURE side. The success
+    /// side had no monotonic counter at all — `concurrent_dispatches` is a gauge
+    /// that returns to 0, and `dispatch_duration_seconds_count` is labelled by
+    /// `tool_kind`, so a pod that has never dispatched has no series.
+    ///
+    /// Without this, "the pool is failing claims AND doing no work" — a poison
+    /// command wedging a worker, which halts throughput silently — was not
+    /// expressible as an alert. `ClaimFailureSpin` keys on a rate over 5/s and
+    /// so catches only the loud version; the wedge retries once per backoff
+    /// interval (~0.1/s) and stops all work.
+    ///
+    /// Unlabelled, so it is present at 0 from construction: an alert asserting
+    /// "zero successful claims" must be able to read a 0 rather than an absent
+    /// series, which is precisely the distinction the wedge depends on.
+    pub claim_succeeded_total: IntCounter,
     /// Tool results that carry a provider-level error while the tool itself
     /// returned successfully (noetl/ai-meta#246).
     ///
@@ -996,6 +1014,15 @@ impl WorkerMetrics {
             .register(Box::new(claim_failed_total.clone()))
             .expect("register claim_failed_total");
 
+        let claim_succeeded_total = IntCounter::new(
+            "noetl_worker_claim_succeeded_total",
+            "Commands successfully claimed — the success counterpart used to detect a wedged pool (noetl/ai-meta#249).",
+        )
+        .expect("claim_succeeded_total metric");
+        registry
+            .register(Box::new(claim_succeeded_total.clone()))
+            .expect("register claim_succeeded_total");
+
         let tool_result_error_total = IntCounter::new(
             "noetl_worker_tool_result_error_total",
             "Tool results carrying a provider-level error despite a successful tool status (noetl/ai-meta#246).",
@@ -1676,6 +1703,7 @@ impl WorkerMetrics {
             materializer_project_errors_total,
             materializer_skipped_total,
             claim_failed_total,
+            claim_succeeded_total,
             tool_result_error_total,
             materializer_ack_failed_total,
             materializer_drain_failed_total,
@@ -2037,6 +2065,11 @@ pub fn record_materializer_drain_failed() {
 /// Record one command whose claim failed.
 pub fn record_claim_failed() {
     WorkerMetrics::global().claim_failed_total.inc();
+}
+
+/// Record one command successfully claimed (noetl/ai-meta#249).
+pub fn record_claim_succeeded() {
+    WorkerMetrics::global().claim_succeeded_total.inc();
 }
 
 /// Record one tool result that carried a provider-level error while the tool
@@ -2586,6 +2619,56 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+
+    /// noetl/ai-meta#249 — the throughput-stall alert needs BOTH sides of the
+    /// claim outcome present at 0 before anything happens.
+    ///
+    /// The alert is `increase(claim_failed_total) > 0 AND
+    /// increase(claim_succeeded_total) == 0`. The second half is only
+    /// expressible if the success counter exists while it is still zero — which
+    /// is exactly the state a wedged pool is in. A labelled or lazily-created
+    /// success metric would be ABSENT there, and `== 0` would match nothing, so
+    /// the alert could never fire on the condition it exists to catch.
+    ///
+    /// Touches no recorder deliberately: incrementing here would create the
+    /// series and mask the defect.
+    #[test]
+    fn both_claim_outcome_counters_are_served_at_zero() {
+        let metrics = WorkerMetrics::new();
+        let rendered = String::from_utf8(metrics.encode()).expect("utf8 metrics");
+        for series in [
+            "noetl_worker_claim_failed_total 0",
+            "noetl_worker_claim_succeeded_total 0",
+        ] {
+            assert!(
+                rendered.contains(series),
+                "{series} must be present at 0 on a fresh registry; /metrics was:\n{rendered}"
+            );
+        }
+    }
+
+    /// The success counter must be recorded on the claim-success path.
+    ///
+    /// Asserts the call site, not just the function: a counter that exists and
+    /// is never incremented reads identically to a pool doing no work, which
+    /// would make the stall alert fire constantly. Scans non-test source only so
+    /// the guard cannot match its own literals.
+    #[test]
+    fn claim_success_is_recorded_on_the_claim_path() {
+        let full = include_str!("worker.rs");
+        let src = full
+            .split_once("\n#[cfg(test)]")
+            .map_or(full, |(b, _)| b);
+        assert!(
+            src.contains("record_claim_succeeded()"),
+            "the Claimed arm must record a success, or claim_succeeded_total stays \
+             at 0 forever and the stall alert fires on healthy load"
+        );
+        assert!(
+            src.contains("record_claim_failed()"),
+            "the failure side must still be recorded"
+        );
+    }
 
     /// noetl/ai-meta#248 — the pending gauge and every pinned outcome must be
     /// SERVED before any of them fires.
