@@ -420,6 +420,15 @@ pub struct WorkerMetrics {
     /// context was sunk to the customer store and the chain dropped), `retained`
     /// (an eviction skipped because the chain's context is not yet sunk).
     pub sink_gate_events_total: IntCounterVec,
+    /// Executions currently retained pending a sink confirmation
+    /// (noetl/ai-meta#248).
+    ///
+    /// The counters above say what the gate *did*; this says how much it is
+    /// *holding right now*.  Without it a mark that never clears is invisible
+    /// until it shows up as unexplained cache growth — which is exactly how the
+    /// leak this metric exists for would have been found.  Unlabelled, so it is
+    /// present at 0 from construction rather than appearing only once non-zero.
+    pub sink_gate_pending_executions: IntGauge,
     /// Sink-confirmation signals the connector-step wiring emits
     /// (noetl/ai-meta#199 Slice A), labeled by `tool_kind` and `signal`
     /// (`mark` when a declared sink step dispatches, `confirm` when it succeeds).
@@ -1273,6 +1282,26 @@ impl WorkerMetrics {
             .register(Box::new(sink_gate_events_total.clone()))
             .expect("register sink_gate_events_total");
 
+        // noetl/ai-meta#248 — pin every `outcome` this metric can take.  A
+        // labelled family is pruned by `Registry::gather` until a child exists,
+        // so an un-fired outcome is ABSENT rather than 0 and an alert keyed on
+        // it cannot tell "healthy" from "not measuring".  The set is closed, so
+        // it can be pinned exhaustively.
+        for outcome in SINK_GATE_OUTCOMES {
+            sink_gate_events_total
+                .with_label_values(&[outcome])
+                .inc_by(0);
+        }
+
+        let sink_gate_pending_executions = IntGauge::new(
+            "noetl_worker_sink_gate_pending_executions",
+            "Executions currently eviction-blocked pending a sink confirmation (noetl/ai-meta#248).",
+        )
+        .expect("sink_gate_pending_executions metric");
+        registry
+            .register(Box::new(sink_gate_pending_executions.clone()))
+            .expect("register sink_gate_pending_executions");
+
         let sink_signal_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_sink_signal_total",
@@ -1680,6 +1709,7 @@ impl WorkerMetrics {
             state_builder_evictions_total,
             autosink_total,
             sink_gate_events_total,
+            sink_gate_pending_executions,
             sink_signal_total,
             sink_state_post_total,
             state_builder_rehydrate_total,
@@ -2204,6 +2234,42 @@ pub fn record_sink_gate_confirmed() {
         .inc();
 }
 
+/// Every `outcome` value `sink_gate_events_total` can take (noetl/ai-meta#248).
+///
+/// Kept beside the recorders so a new outcome cannot be added without landing
+/// in the pinned set — the guard test asserts the two agree.
+pub const SINK_GATE_OUTCOMES: [&str; 6] = [
+    "marked",
+    "confirmed",
+    "retained",
+    "released_failed",
+    "released_pending_callback",
+    "released_error",
+];
+
+/// A mark was cleared WITHOUT the context having been sunk (noetl/ai-meta#248).
+///
+/// The gate marks an execution for the duration of a sink attempt.  When that
+/// attempt ends any way other than clean success — the tool returned a
+/// non-success result, the tool errored, or the real completion moved to an
+/// async callback this process will never observe — the mark must still be
+/// cleared, or it is retained for the lifetime of the process and the gate
+/// leaks.  `reason` distinguishes the three, because they differ in what an
+/// operator should do about them.
+pub fn record_sink_gate_released(reason: &str) {
+    WorkerMetrics::global()
+        .sink_gate_events_total
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Publish the current size of the retained set.
+pub fn set_sink_gate_pending(n: usize) {
+    WorkerMetrics::global()
+        .sink_gate_pending_executions
+        .set(n as i64);
+}
+
 /// An eviction was skipped because the chain's business context is not yet sunk.
 pub fn record_sink_gate_retained() {
     WorkerMetrics::global()
@@ -2520,6 +2586,58 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+
+    /// noetl/ai-meta#248 — the pending gauge and every pinned outcome must be
+    /// SERVED before any of them fires.
+    ///
+    /// `Registry::gather` prunes families with no children, so a labelled
+    /// outcome is absent until it happens — and an operator watching for a leak
+    /// cannot distinguish "no releases yet" from "this build does not measure
+    /// releases". The gauge is unlabelled and the outcome set is closed, so both
+    /// can be present from construction.
+    ///
+    /// Touches no recorder: calling one would create the series and mask exactly
+    /// the defect this guards.
+    #[test]
+    fn sink_gate_pending_gauge_and_outcomes_are_served_before_firing() {
+        let metrics = WorkerMetrics::new();
+        let rendered = String::from_utf8(metrics.encode()).expect("utf8 metrics");
+        assert!(
+            rendered.contains("noetl_worker_sink_gate_pending_executions 0"),
+            "the pending gauge must be present at 0 on a fresh registry"
+        );
+        for outcome in SINK_GATE_OUTCOMES {
+            let series = format!("noetl_worker_sink_gate_events_total{{outcome=\"{outcome}\"}} 0");
+            assert!(
+                rendered.contains(&series),
+                "outcome {outcome} must be pinned at 0; /metrics was:\n{rendered}"
+            );
+        }
+    }
+
+    /// The pinned set and the reasons the code actually passes must agree.
+    ///
+    /// A reason that is recorded but not pinned reintroduces the absent-series
+    /// bug for that value alone, while the rest read 0 and look complete.
+    #[test]
+    fn sink_gate_pinned_outcomes_match_the_call_sites() {
+        // Non-test source only — scanning the test module would let this guard
+        // match the literals in command.rs's own guard test rather than the real
+        // call sites.
+        let cmd_full = include_str!("executor/command.rs");
+        let cmd = cmd_full
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("command.rs must have a module-level #[cfg(test)] block");
+        for reason in ["released_failed", "released_pending_callback", "released_error"] {
+            assert!(
+                SINK_GATE_OUTCOMES.contains(&reason),
+                "{reason} is passed at a call site but is not in SINK_GATE_OUTCOMES, \
+                 so it would be absent from /metrics until it first fires"
+            );
+            assert!(cmd.contains(reason), "{reason} is pinned but never recorded");
+        }
+    }
 
     /// noetl/ai-meta#246 — the counter must be SERVED at 0 before it ever
     /// fires, not merely registered.
