@@ -1069,7 +1069,7 @@ impl CommandExecutor {
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
                         "call_index": ctx.call_index,
-                        "error": e.to_string(),
+                        "error": format!("{e:#}"),
                     }),
                 )
                 .await?;
@@ -1084,7 +1084,7 @@ impl CommandExecutor {
                     command.attempts,
                     serde_json::json!({
                         "command_id": command.command_id.clone(),
-                        "error": e.to_string(),
+                        "error": format!("{e:#}"),
                     }),
                 )
                 .await?;
@@ -1451,7 +1451,14 @@ impl CommandExecutor {
                 serde_json::json!({
                     "command_id": command.command_id.clone(),
                     "call_index": call_index,
-                    "error": error.to_string(),
+                    // `{:#}` renders the FULL anyhow chain, not just the
+                    // outermost context.  `to_string()` emitted only
+                    // "malformed tool config (pre-dispatch deserialization)"
+                    // and DISCARDED the serde detail naming the offending
+                    // field — so an operator saw that a tool config was bad
+                    // but not which key, and had to bisect the YAML by hand
+                    // to find it (noetl/ai-meta#250).
+                    "error": format!("{error:#}"),
                 }),
             )
             .await?;
@@ -1467,7 +1474,7 @@ impl CommandExecutor {
                 command.attempts,
                 serde_json::json!({
                     "command_id": command.command_id.clone(),
-                    "error": error.to_string(),
+                    "error": format!("{error:#}"),
                 }),
             )
             .await?;
@@ -3175,6 +3182,72 @@ fn command_completed_context(
 
 #[cfg(test)]
 mod tests {
+
+    /// noetl/ai-meta#250 — a pre-dispatch failure must name WHAT was malformed.
+    ///
+    /// `anyhow::Error::to_string()` renders only the outermost context, so a
+    /// tool config that fails to deserialize reported exactly
+    /// "malformed tool config (pre-dispatch deserialization)" — true, terminal,
+    /// and useless: it does not say which key. Two e2e fixtures failed this way
+    /// and the cause (a nested `auth:` map where the schema wants an alias) had
+    /// to be found by reading the YAML by hand.
+    ///
+    /// `{:#}` renders the whole chain. This asserts the distinction directly, so
+    /// a revert to `to_string()` fails rather than silently losing the detail
+    /// again.
+    #[test]
+    fn predispatch_error_rendering_keeps_the_underlying_cause() {
+        let root = serde_json::from_str::<serde_json::Value>("{ not json")
+            .expect_err("must fail to parse");
+        let err = anyhow::Error::new(root)
+            .context("malformed tool config (pre-dispatch deserialization)");
+
+        let terse = err.to_string();
+        let full = format!("{err:#}");
+
+        assert_eq!(
+            terse, "malformed tool config (pre-dispatch deserialization)",
+            "to_string() drops the cause — this is the behaviour being fixed"
+        );
+        assert!(
+            full.len() > terse.len() && full.starts_with(&terse),
+            "the emitted string must extend the context with the cause, got {full:?}"
+        );
+    }
+
+    /// ...and the emit site must actually use it.
+    ///
+    /// The test above proves what `{:#}` does; it would keep passing if the call
+    /// site reverted to `to_string()`, because it never reads the source. This
+    /// asserts the call site itself — the distinction that makes the guard bite.
+    /// Non-test source only, so it cannot match its own literals.
+    #[test]
+    fn predispatch_emit_site_uses_the_full_chain() {
+        let full_src = include_str!("command.rs");
+        let src = full_src
+            .split_once("\n#[cfg(test)]")
+            .map_or(full_src, |(b, _)| b);
+        assert!(
+            src.contains(r#""error": format!("{error:#}")"#),
+            "the pre-dispatch call.error payload must render the full chain, or the \
+             serde detail naming the bad key is discarded again"
+        );
+        // ALL error-emit payloads, not just the one that motivated this. The
+        // pre-dispatch path emits a `call.error` AND a `command.failed`; fixing
+        // one leaves the other dropping the cause, so a reader who happens to
+        // look at the wrong event still learns nothing.
+        assert_eq!(
+            src.matches(r#""error": format!("{error:#}")"#).count()
+                + src.matches(r#""error": format!("{e:#}")"#).count(),
+            4,
+            "all four error-emit payloads must render the full chain"
+        );
+        assert!(
+            !src.contains(r#""error": error.to_string()"#)
+                && !src.contains(r#""error": e.to_string()"#),
+            "a to_string() emit site would silently drop the cause"
+        );
+    }
 
     /// noetl/ai-meta#248 — the sink mark must be cleared on EVERY outcome.
     ///
