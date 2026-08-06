@@ -116,17 +116,6 @@ pub enum AffinityDecision {
 }
 
 impl AffinityDecision {
-    /// Stable metric label for `noetl_worker_affinity_decisions_total`.
-    /// [`AffinityDecision::NotApplicable`] returns `None` — it is not
-    /// recorded (it would swamp the counter with every tool command).
-    pub fn metric_label(self) -> Option<&'static str> {
-        match self {
-            AffinityDecision::NotApplicable => None,
-            AffinityDecision::Owned => Some("owned"),
-            AffinityDecision::Redirect => Some("redirected"),
-            AffinityDecision::ForcedLocal => Some("forced_local"),
-        }
-    }
 }
 
 /// Execution-affinity routing configuration for one stateful worker
@@ -435,17 +424,4 @@ mod tests {
         assert_eq!(c.decide(true, eid, 99), AffinityDecision::ForcedLocal);
     }
 
-    #[test]
-    fn metric_labels_are_stable() {
-        assert_eq!(AffinityDecision::NotApplicable.metric_label(), None);
-        assert_eq!(AffinityDecision::Owned.metric_label(), Some("owned"));
-        assert_eq!(
-            AffinityDecision::Redirect.metric_label(),
-            Some("redirected")
-        );
-        assert_eq!(
-            AffinityDecision::ForcedLocal.metric_label(),
-            Some("forced_local")
-        );
-    }
 }

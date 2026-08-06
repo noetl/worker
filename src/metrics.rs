@@ -69,12 +69,6 @@ pub fn outcome_label(outcome: &ClaimOutcome) -> &'static str {
 pub struct WorkerMetrics {
     pub registry: Registry,
     pub pulls_total: IntCounterVec,
-    /// Execution-affinity routing decisions (noetl/ai-meta#166 Phase 4),
-    /// partitioned by `decision` ∈ {owned, redirected, forced_local}. Only
-    /// drive commands under a multi-shard, affinity-enabled pool are
-    /// recorded; `owned` is the affinity-hit numerator, `redirected` +
-    /// `forced_local` the miss/steer counts.
-    pub affinity_decisions_total: IntCounterVec,
     pub pull_duration_seconds: Histogram,
     pub dispatch_duration_seconds: HistogramVec,
     pub dispatch_errors_total: IntCounterVec,
@@ -577,19 +571,6 @@ impl WorkerMetrics {
         registry
             .register(Box::new(pulls_total.clone()))
             .expect("register pulls_total");
-
-        let affinity_decisions_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "noetl_worker_affinity_decisions_total",
-                "Execution-affinity routing decisions for drive commands \
-                 (noetl/ai-meta#166 Phase 4), partitioned by decision.",
-            ),
-            &["decision"],
-        )
-        .expect("affinity_decisions_total metric");
-        registry
-            .register(Box::new(affinity_decisions_total.clone()))
-            .expect("register affinity_decisions_total");
 
         let pull_duration_seconds = Histogram::with_opts(
             HistogramOpts::new(
@@ -1669,7 +1650,6 @@ impl WorkerMetrics {
         Self {
             registry,
             pulls_total,
-            affinity_decisions_total,
             pull_duration_seconds,
             dispatch_duration_seconds,
             dispatch_errors_total,
@@ -1791,18 +1771,6 @@ pub fn record_pull(outcome: &ClaimOutcome, duration_seconds: f64) {
         .with_label_values(&[outcome_label(outcome)])
         .inc();
     m.pull_duration_seconds.observe(duration_seconds);
-}
-
-/// Record an execution-affinity routing decision (noetl/ai-meta#166 Phase 4).
-/// `decision` is one of `owned` / `redirected` / `forced_local`
-/// ([`crate::sharding::AffinityDecision::metric_label`]); the not-applicable
-/// case is not recorded (it is every tool command and would swamp the
-/// counter).
-pub fn record_affinity_decision(decision: &str) {
-    WorkerMetrics::global()
-        .affinity_decisions_total
-        .with_label_values(&[decision])
-        .inc();
 }
 
 /// Record one completed dispatch.  `error` is `true` if the tool
@@ -2619,6 +2587,36 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+
+    /// noetl/ai-meta#242 — `affinity_decisions_total` stays deleted.
+    ///
+    /// It counted an execution-affinity *routing decision*. The steering block
+    /// that made those decisions went with T5, so the counter measured a
+    /// behaviour the system no longer exhibits: registered, documented, and
+    /// permanently zero. A reader asking "is affinity redirecting anything?"
+    /// would have read that absence as "no redirects" — the right answer for
+    /// the wrong reason.
+    ///
+    /// If affinity routing is ever restored, the counter comes back in the same
+    /// commit as the code that makes the decision. A metric introduced ahead of
+    /// its caller is indistinguishable from a broken one, which is how this one
+    /// survived.
+    #[test]
+    fn affinity_decision_metric_is_gone() {
+        let metrics = WorkerMetrics::new();
+        let rendered = String::from_utf8(metrics.encode()).expect("utf8 metrics");
+        assert!(
+            !rendered.contains("noetl_worker_affinity_decisions_total"),
+            "the affinity decision metric was deleted in #242; reintroducing it \
+             requires a live caller in the same change"
+        );
+        let src = include_str!("metrics.rs");
+        let non_test = src.split_once("\n#[cfg(test)]").map_or(src, |(b, _)| b);
+        assert!(
+            !non_test.contains("record_affinity_decision"),
+            "the recorder was deleted; it had no caller"
+        );
+    }
 
     /// noetl/ai-meta#249 — the throughput-stall alert needs BOTH sides of the
     /// claim outcome present at 0 before anything happens.
