@@ -166,6 +166,27 @@ jobs:
   publish-ar:
     runs-on: ubuntu-latest
     needs: [verify-version]
+    # noetl/ai-meta#211 — STOPGAP, not a fix.
+    #
+    # This job cannot succeed: the build SA
+    # (gh-actions-cloudbuild@shastaratech-noetl-prod) holds only
+    # cloudbuild.builds.editor + logging.viewer, neither of which carries
+    # `serviceusage.services.use`, so `gcloud builds submit` is forbidden from the
+    # _cloudbuild staging bucket. Fixing that needs a human IAM grant.
+    #
+    # Until then its failure marked the WHOLE release run red — on every release,
+    # in every repo — while the images published perfectly via the crane GHCR->AR
+    # path the runbooks actually use. A permanently-red pipeline is not a neutral
+    # cost: it teaches everyone to ignore red releases, so the next genuine
+    # failure gets ignored too.
+    #
+    # `continue-on-error` keeps the job running and visible (still red on the job
+    # itself, so the gap stays obvious) while restoring the signal value of the
+    # run's overall status.
+    #
+    # REMOVE THIS LINE when #211 is resolved either way — grant the role and this
+    # job becomes real, or retire the job and this line goes with it.
+    continue-on-error: true
     if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_CLOUDBUILD_SA != '' }}
     permissions:
       contents: read
