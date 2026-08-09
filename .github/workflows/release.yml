@@ -184,7 +184,13 @@ jobs:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'shastaratech-noetl-prod' }}
         run: |
           set -euo pipefail
+          # An explicit staging dir skips gcloud's bucket-DISCOVERY call
+          # (GET /storage/v1/b?prefix=...), which needs project-level
+          # storage.buckets.list.  The build SA has bucket-scoped objectAdmin, so
+          # buckets.get returns 200 and the list 403s.  Same fix as
+          # noetl/server#339.  See noetl/ai-meta#211.
           gcloud builds submit \
+            --gcs-source-staging-dir="gs://${PROJECT_ID}_cloudbuild/source" \
             --project="${PROJECT_ID}" \
             --region=us-central1 \
             --config=cloudbuild.yaml \
