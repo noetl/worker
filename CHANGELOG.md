@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.108.2](https://github.com/noetl/worker/compare/v5.108.1...v5.108.2) (2026-08-10)
+
+### Bug Fixes
+
+* **claim:** park poison commands to dead-letter instead of nacking for ever ([b56e225](https://github.com/noetl/worker/commit/b56e225146567a7df0b65b1462917ce7e83acec0)), closes [noetl/ai-meta#244](https://github.com/noetl/ai-meta/issues/244) [noetl/ai-meta#249](https://github.com/noetl/ai-meta/issues/249)
+
 ## [5.108.1](https://github.com/noetl/worker/compare/v5.108.0...v5.108.1) (2026-08-06)
 
 ### Bug Fixes
