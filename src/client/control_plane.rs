@@ -103,6 +103,19 @@ pub struct CredentialHttpError {
     pub body: String,
 }
 
+/// Marker prefix on a [`ClaimResult::Failed`] that can never succeed
+/// (noetl/ai-meta#249).
+///
+/// A 404 from the claim endpoint means the command has no row in
+/// `noetl.command`: retrying is futile and, because the worker nacks for
+/// redelivery, it blocks every message behind it.  A typed
+/// `ClaimOutcome::Unresolvable` would be cleaner, but `ClaimOutcome` lives in
+/// the `noetl-executor` crate and adding a variant there costs a crates.io
+/// release; this marker is produced and consumed inside this repo, so it is an
+/// internal contract rather than a cross-repo one.  Typed variant tracked as
+/// follow-up cleanup on noetl/ai-meta#249.
+pub const CLAIM_UNRESOLVABLE: &str = "UNRESOLVABLE:";
+
 /// Result of claiming a command.
 #[derive(Debug, Clone)]
 pub enum ClaimResult {
@@ -414,6 +427,16 @@ impl ControlPlaneClient {
             | StatusCode::GATEWAY_TIMEOUT => {
                 let body = response.text().await.unwrap_or_default();
                 Ok(ClaimResult::RetryLater(body))
+            }
+            // noetl/ai-meta#249 — no row in `noetl.command`; this claim can never
+            // succeed, so mark it so the worker can park it instead of nacking
+            // it back onto the head of the queue for ever.
+            s @ StatusCode::NOT_FOUND => {
+                let body = response.text().await.unwrap_or_default();
+                Ok(ClaimResult::Failed(format!(
+                    "{}Status {}: {}",
+                    CLAIM_UNRESOLVABLE, s, body
+                )))
             }
             status => {
                 let body = response.text().await.unwrap_or_default();

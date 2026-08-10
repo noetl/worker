@@ -696,6 +696,35 @@ impl Worker {
                         self.on_loop_error("nack", &e, &mut reconnect_backoff).await;
                     }
                 }
+                ClaimOutcome::Failed(error)
+                    if dead_letter_enabled()
+                        && error.starts_with(crate::client::CLAIM_UNRESOLVABLE) =>
+                {
+                    // noetl/ai-meta#249 — no row in `noetl.command`; the claim can
+                    // never succeed.  Nacking puts it back at the head of the queue
+                    // and blocks everything behind it (measured: 30 claim failures /
+                    // 0 successes in 5 minutes on a wedged pool).
+                    //
+                    // ACK to park it.  Never a silent drop: always paired with a
+                    // counter and an ERROR log carrying the ids.
+                    crate::metrics::record_claim_dead_lettered();
+                    tracing::error!(
+                        execution_id = ack.notification.execution_id,
+                        command_id = %ack.notification.command_id,
+                        step = %ack.notification.step,
+                        error = %error,
+                        "Poison command parked to dead-letter: no row in noetl.command \
+                         (noetl/ai-meta#249)"
+                    );
+                    let ack_err = {
+                        let source = self.source.lock().await;
+                        source.ack(ack).await.err()
+                    };
+                    drop(permit);
+                    if let Some(e) = ack_err {
+                        self.on_loop_error("ack", &e, &mut reconnect_backoff).await;
+                    }
+                }
                 ClaimOutcome::Failed(error) => {
                     crate::metrics::record_claim_failed();
                     tracing::error!(
@@ -842,6 +871,23 @@ fn warm_orchestrate_enabled() -> bool {
                 || crate::materializer::enabled()
         }
     }
+}
+
+/// Is poison-command dead-lettering enabled? (noetl/ai-meta#249)
+///
+/// Default OFF.  Enabling changes DELIVERY GUARANTEES: a command that would have
+/// been redelivered for ever is instead acked and parked.  That is the point — an
+/// unresolvable claim blocks the whole stream — but it is a semantics change and
+/// must be a deliberate flip, not a side effect of a deploy.
+fn dead_letter_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_CLAIM_DEAD_LETTER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]

@@ -113,7 +113,11 @@ pub enum FetchPlan {
 
 impl RateGovernor {
     /// Build from the optional caps.  `now` seeds the token bucket.
-    pub fn new(max_in_flight: Option<u32>, max_dispatch_per_sec: Option<u32>, now: Instant) -> Self {
+    pub fn new(
+        max_in_flight: Option<u32>,
+        max_dispatch_per_sec: Option<u32>,
+        now: Instant,
+    ) -> Self {
         RateGovernor {
             max_in_flight,
             bucket: max_dispatch_per_sec.map(|r| TokenBucket::new(r, now)),
@@ -206,7 +210,10 @@ mod tests {
         b.consume_at(4, now);
         let w = b.wait_for_one(now);
         // need 1 token at 4/sec → 250ms
-        assert!(w >= Duration::from_millis(240) && w <= Duration::from_millis(260), "{w:?}");
+        assert!(
+            w >= Duration::from_millis(240) && w <= Duration::from_millis(260),
+            "{w:?}"
+        );
     }
 
     #[test]
@@ -228,7 +235,10 @@ mod tests {
         let now = t0();
         let mut g = RateGovernor::new(Some(10), None, now);
         match g.plan_fetch(100, now) {
-            FetchPlan::Fetch { batch, newly_limited } => {
+            FetchPlan::Fetch {
+                batch,
+                newly_limited,
+            } => {
                 assert_eq!(batch, 10);
                 assert!(newly_limited, "first clamp is the off->on edge");
             }
@@ -236,7 +246,10 @@ mod tests {
         }
         // Second call still clamped but no longer "newly" limited.
         match g.plan_fetch(100, now) {
-            FetchPlan::Fetch { batch, newly_limited } => {
+            FetchPlan::Fetch {
+                batch,
+                newly_limited,
+            } => {
                 assert_eq!(batch, 10);
                 assert!(!newly_limited);
             }
@@ -251,7 +264,10 @@ mod tests {
         // without clamping; the *throttle* is then the clean off→on edge.
         let mut g = RateGovernor::new(None, Some(5), now);
         match g.plan_fetch(5, now) {
-            FetchPlan::Fetch { batch, newly_limited } => {
+            FetchPlan::Fetch {
+                batch,
+                newly_limited,
+            } => {
                 assert_eq!(batch, 5);
                 assert!(!newly_limited, "full batch fetched, not yet limited");
             }
@@ -260,7 +276,10 @@ mod tests {
         g.record_fetched(5, now);
         // Budget exhausted → throttle (backpressure, source keeps backlog).
         match g.plan_fetch(5, now) {
-            FetchPlan::Throttle { wait, newly_limited } => {
+            FetchPlan::Throttle {
+                wait,
+                newly_limited,
+            } => {
                 assert!(wait > Duration::ZERO);
                 assert!(newly_limited, "throttle is the off->on edge here");
             }

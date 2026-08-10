@@ -451,7 +451,10 @@ pub fn render_lines() -> Vec<String> {
             "# HELP noetl_worker_ehdb_query_last_ok Last EHDB tier-query result (1=ok)".to_string(),
         );
         lines.push("# TYPE noetl_worker_ehdb_query_last_ok gauge".to_string());
-        lines.push(format!("noetl_worker_ehdb_query_last_ok {}", s.query.last_a));
+        lines.push(format!(
+            "noetl_worker_ehdb_query_last_ok {}",
+            s.query.last_a
+        ));
         lines.push(
             "# HELP noetl_worker_ehdb_query_last_degraded Last EHDB tier-query degraded flag"
                 .to_string(),

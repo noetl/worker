@@ -1116,7 +1116,13 @@ mod tests {
         let e = worker_env(log.to_str().unwrap(), "primary");
         // Phase 9 tier 4: primary is activated, so a primary put serves the object
         // op authoritatively from EHDB (not refused).  Parity holds.
-        let r = mirror_put(&e, STATE_KEY, b"arrow-ipc-bytes", &Default::default(), false);
+        let r = mirror_put(
+            &e,
+            STATE_KEY,
+            b"arrow-ipc-bytes",
+            &Default::default(),
+            false,
+        );
         assert_eq!(r.mode, ObjectMode::Primary);
         assert_eq!(r.outcome, ObjectOutcome::ServedPrimary, "{:?}", r.detail);
         assert_eq!(r.version, Some(1));
@@ -1275,7 +1281,10 @@ mod tests {
     #[test]
     fn runtime_hook_env_arms_only_for_enabled_shadow_data_plane() {
         let armed = runtime_hook_env(&worker_env("/tmp/obj-hook.jsonl", "shadow"));
-        assert!(armed.is_some(), "shadow+enabled worker must arm the object hook");
+        assert!(
+            armed.is_some(),
+            "shadow+enabled worker must arm the object hook"
+        );
     }
 
     #[test]

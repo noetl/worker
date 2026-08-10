@@ -103,7 +103,6 @@ pub fn unresolved_message(unresolved: &[UnresolvedAlias]) -> String {
     )
 }
 
-
 /// Scan `template_src` for the distinct keychain aliases referenced as
 /// `keychain.<alias>` (the second path segment after the `keychain`
 /// namespace).  Deliberately dependency-free (no regex crate): the

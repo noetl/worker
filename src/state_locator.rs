@@ -21,7 +21,7 @@
 //! adds the read path, the URN can be promoted into `noetl-locator` so writer and
 //! reader stay in lockstep (the same lifecycle the result locator followed).
 
-use noetl_tools::locator::{shard_key, CellPlacement, DEFAULT_TENANT, DEFAULT_PROJECT};
+use noetl_tools::locator::{shard_key, CellPlacement, DEFAULT_PROJECT, DEFAULT_TENANT};
 
 /// The `kind` segment for execution state-shard assets (parallel to the result
 /// locator's `results`).
@@ -113,7 +113,13 @@ impl StateCoordinates {
     /// reconstruct the key from the URI's `execution_id` alone, no carried date —
     /// the same derivable-not-carried contract the result tier uses); `ext` is
     /// the payload extension (`feather`).
-    pub fn physical_key(&self, placement: &CellPlacement, date: &str, seal: ShardSeal, ext: &str) -> String {
+    pub fn physical_key(
+        &self,
+        placement: &CellPlacement,
+        date: &str,
+        seal: ShardSeal,
+        ext: &str,
+    ) -> String {
         format!(
             "noetl/env={env}/region={region}/cell={cell}/shard={shard}/\
              tenant={tenant}/project={project}/date={date}/execution={eid}/\
@@ -140,8 +146,14 @@ mod tests {
     #[test]
     fn logical_uri_open_and_sealed() {
         let c = StateCoordinates::new(Some("muno"), Some("travel"), 325);
-        assert_eq!(c.logical_uri(ShardSeal::Open), "noetl://muno/travel/state/325/open");
-        assert_eq!(c.logical_uri(ShardSeal::Sealed), "noetl://muno/travel/state/325/sealed");
+        assert_eq!(
+            c.logical_uri(ShardSeal::Open),
+            "noetl://muno/travel/state/325/open"
+        );
+        assert_eq!(
+            c.logical_uri(ShardSeal::Sealed),
+            "noetl://muno/travel/state/325/sealed"
+        );
     }
 
     #[test]
@@ -149,7 +161,10 @@ mod tests {
         let c = StateCoordinates::new(None, None, 7);
         assert_eq!(c.tenant, "default");
         assert_eq!(c.project, "default");
-        assert_eq!(c.logical_uri(ShardSeal::Open), "noetl://default/default/state/7/open");
+        assert_eq!(
+            c.logical_uri(ShardSeal::Open),
+            "noetl://default/default/state/7/open"
+        );
     }
 
     #[test]

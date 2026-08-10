@@ -36,8 +36,8 @@
 use anyhow::{Context, Result};
 use noetl_tools::spool::{
     probe_downstream, Admission, CircuitDecision, CircuitRegistry, GcsBackend, LocalDiskBackend,
-    NatsObjectBackend, S3Backend, SpoolBackend, SpoolBackendKind, SpoolEngine, SpoolItem, SpoolMode,
-    SpoolSpec,
+    NatsObjectBackend, S3Backend, SpoolBackend, SpoolBackendKind, SpoolEngine, SpoolItem,
+    SpoolMode, SpoolSpec,
 };
 use noetl_tools::tools::source::{DispatchPlan, PolledMessage};
 
@@ -193,16 +193,28 @@ impl SpoolRuntime {
                     .get_credential(&alias, subscription_id)
                     .await
                     .with_context(|| format!("resolve s3 spool credential '{alias}'"))?
-                    .with_context(|| format!("s3 spool credential '{alias}' not found in keychain"))?;
+                    .with_context(|| {
+                        format!("s3 spool credential '{alias}' not found in keychain")
+                    })?;
                 let s3 = S3Creds::from_credential(&alias, &cred)?;
                 let prefix = format!("{subscription_path}/spool");
                 let dlq_prefix = format!("{subscription_path}/dlq");
                 let backend = S3Backend::new(
-                    &bucket, &prefix, &s3.endpoint, &s3.region, &s3.access_key, &s3.secret_key,
+                    &bucket,
+                    &prefix,
+                    &s3.endpoint,
+                    &s3.region,
+                    &s3.access_key,
+                    &s3.secret_key,
                     s3.session_token.clone(),
                 );
                 let dlq = S3Backend::new(
-                    &bucket, &dlq_prefix, &s3.endpoint, &s3.region, &s3.access_key, &s3.secret_key,
+                    &bucket,
+                    &dlq_prefix,
+                    &s3.endpoint,
+                    &s3.region,
+                    &s3.access_key,
+                    &s3.secret_key,
                     s3.session_token.clone(),
                 );
                 // Circuit state is in-memory for the out-of-cluster S3 path
@@ -335,11 +347,7 @@ impl SpoolRuntime {
     /// Route one message: dispatch when closed, spool when open. Returns the
     /// [`Routing`] the caller acts on (the caller dispatches on
     /// [`Routing::Dispatch`]).
-    pub async fn route_message(
-        &mut self,
-        msg: &PolledMessage,
-        plan: &DispatchPlan,
-    ) -> Routing {
+    pub async fn route_message(&mut self, msg: &PolledMessage, plan: &DispatchPlan) -> Routing {
         let (downstream, decision) = self.route(plan);
         match decision {
             // Closed → dispatch; HalfOpen probe is also a dispatch attempt
@@ -729,7 +737,13 @@ impl SpoolRuntime {
         }
     }
 
-    async fn emit(&self, execution_id: i64, event_type: &str, status: &str, context: serde_json::Value) {
+    async fn emit(
+        &self,
+        execution_id: i64,
+        event_type: &str,
+        status: &str,
+        context: serde_json::Value,
+    ) {
         let event = ExecutorEvent {
             execution_id,
             event_type: event_type.to_string(),

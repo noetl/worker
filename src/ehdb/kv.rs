@@ -331,7 +331,10 @@ fn resolve_contract(
     Ok(contract)
 }
 
-pub(crate) fn driver_from(contract: &EhdbContract, opts: &KvOptions) -> LocalReferenceKvStateDriver {
+pub(crate) fn driver_from(
+    contract: &EhdbContract,
+    opts: &KvOptions,
+) -> LocalReferenceKvStateDriver {
     LocalReferenceKvStateDriver::new(
         contract.local_reference_log.clone().expect("log present"),
         tenant_of(opts),
@@ -1278,7 +1281,10 @@ mod tests {
     #[test]
     fn runtime_hook_env_arms_only_for_enabled_shadow_data_plane() {
         let armed = runtime_hook_env(&worker_env("/tmp/kv-hook.jsonl", "shadow"));
-        assert!(armed.is_some(), "shadow+enabled worker must arm the KV hook");
+        assert!(
+            armed.is_some(),
+            "shadow+enabled worker must arm the KV hook"
+        );
     }
 
     #[test]

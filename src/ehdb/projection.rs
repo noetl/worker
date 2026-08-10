@@ -908,7 +908,8 @@ fn fold_window_authoritative(inputs: &[ProjectionEventInput]) -> Vec<Authoritati
     use std::collections::BTreeMap;
     // (event_count, latest_status, terminal_status) per execution, ordered by id
     // (BTreeMap) so the fold is deterministic.
-    let mut by_exec: BTreeMap<&str, (usize, Option<String>, Option<&'static str>)> = BTreeMap::new();
+    let mut by_exec: BTreeMap<&str, (usize, Option<String>, Option<&'static str>)> =
+        BTreeMap::new();
     for ev in inputs {
         let entry = by_exec
             .entry(ev.execution_id.as_str())
@@ -923,15 +924,17 @@ fn fold_window_authoritative(inputs: &[ProjectionEventInput]) -> Vec<Authoritati
     }
     by_exec
         .into_iter()
-        .map(|(exec, (count, latest, terminal))| AuthoritativeExecutionState {
-            execution_id: exec.to_string(),
-            status: terminal
-                .map(|s| s.to_string())
-                .or(latest)
-                .unwrap_or_else(|| DEFAULT_RUNNING_STATUS.to_string()),
-            event_count: count,
-            terminal: terminal.is_some(),
-        })
+        .map(
+            |(exec, (count, latest, terminal))| AuthoritativeExecutionState {
+                execution_id: exec.to_string(),
+                status: terminal
+                    .map(|s| s.to_string())
+                    .or(latest)
+                    .unwrap_or_else(|| DEFAULT_RUNNING_STATUS.to_string()),
+                event_count: count,
+                terminal: terminal.is_some(),
+            },
+        )
         .collect()
 }
 
@@ -1461,7 +1464,12 @@ mod tests {
 
     // --- live cadence hook (noetl/ehdb#234 runtime integration) -------------
 
-    fn payload(event_id: i64, exec: i64, event_type: &str, status: Option<&str>) -> serde_json::Value {
+    fn payload(
+        event_id: i64,
+        exec: i64,
+        event_type: &str,
+        status: Option<&str>,
+    ) -> serde_json::Value {
         let mut obj = serde_json::json!({
             "event_id": event_id,
             "execution_id": exec,

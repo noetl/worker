@@ -14,6 +14,7 @@ pub mod autosink;
 pub mod client;
 pub mod command_bus;
 pub mod config;
+pub mod dispatch;
 pub mod ehdb;
 pub mod event_bus;
 pub mod events;
@@ -22,7 +23,6 @@ pub mod graceful;
 pub mod materializer;
 pub mod metrics;
 pub mod metrics_server;
-pub mod dispatch;
 /// WASM plug-in host for the system worker pool (noetl/ai-meta#105). Gated
 /// behind the `wasm-plugin` feature while it is an unwired skeleton.
 #[cfg(feature = "wasm-plugin")]

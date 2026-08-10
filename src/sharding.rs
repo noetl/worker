@@ -115,8 +115,7 @@ pub enum AffinityDecision {
     ForcedLocal,
 }
 
-impl AffinityDecision {
-}
+impl AffinityDecision {}
 
 /// Execution-affinity routing configuration for one stateful worker
 /// replica. Resolved once from env at source construction
@@ -165,8 +164,8 @@ impl AffinityConfig {
         let shard_index = env_u32("NOETL_SHARD_INDEX", 0);
         let shard_count = env_u32("NOETL_SHARD_COUNT", 1).max(1);
         let enabled = env_bool("NOETL_STATE_AFFINITY_ROUTE", false);
-        let max_redirects = env_i64("NOETL_STATE_AFFINITY_MAX_REDIRECTS", DEFAULT_MAX_REDIRECTS)
-            .max(0);
+        let max_redirects =
+            env_i64("NOETL_STATE_AFFINITY_MAX_REDIRECTS", DEFAULT_MAX_REDIRECTS).max(0);
         let nak_delay = Duration::from_millis(env_u64(
             "NOETL_STATE_AFFINITY_NAK_DELAY_MS",
             DEFAULT_NAK_DELAY_MS,
@@ -423,5 +422,4 @@ mod tests {
         assert_eq!(c.decide(true, eid, 3), AffinityDecision::ForcedLocal);
         assert_eq!(c.decide(true, eid, 99), AffinityDecision::ForcedLocal);
     }
-
 }

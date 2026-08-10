@@ -515,7 +515,9 @@ impl WasmPluginHost {
             .write(&mut store, in_ptr as usize, input)
             .map_err(|e| PluginError::Memory(e.to_string()))?;
 
-        let packed = run.call(&mut store, (in_ptr, len)).map_err(PluginError::Invoke)?;
+        let packed = run
+            .call(&mut store, (in_ptr, len))
+            .map_err(PluginError::Invoke)?;
         let out_ptr = ((packed >> 32) & 0xffff_ffff) as usize;
         let out_len = (packed & 0xffff_ffff) as usize;
 
@@ -601,10 +603,9 @@ impl PluginSource for MapPluginSource {
     async fn fetch(&self, key: &PluginKey) -> Result<Vec<u8>, PluginError> {
         self.fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.modules
-            .get(key)
-            .cloned()
-            .ok_or_else(|| PluginError::NotLoaded(format!("{}@{} not in source", key.path, key.version)))
+        self.modules.get(key).cloned().ok_or_else(|| {
+            PluginError::NotLoaded(format!("{}@{} not in source", key.path, key.version))
+        })
     }
 
     async fn resolve(&self, path: &str, version: u32) -> Result<(String, Vec<u8>), PluginError> {
@@ -660,12 +661,10 @@ impl PluginSource for HttpPluginSource {
             key.version,
             key.digest,
         );
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| PluginError::Source(format!("GET {}@{}: {e}", key.path, key.version)))?;
+        let resp =
+            self.client.get(&url).send().await.map_err(|e| {
+                PluginError::Source(format!("GET {}@{}: {e}", key.path, key.version))
+            })?;
         let status = resp.status();
         if status.is_success() {
             let bytes = resp
@@ -769,10 +768,9 @@ impl BufferingCapabilities {
 
 impl HostCapabilities for BufferingCapabilities {
     fn event_publish(&mut self, payload: &[u8]) -> Result<(), String> {
-        self.sink
-            .lock()
-            .unwrap()
-            .push(CapIntent::EventPublish { payload: payload.to_vec() });
+        self.sink.lock().unwrap().push(CapIntent::EventPublish {
+            payload: payload.to_vec(),
+        });
         Ok(())
     }
     fn result_put(&mut self, key: &str, payload: &[u8]) -> Result<(), String> {
@@ -1030,8 +1028,7 @@ pub async fn apply_intents(
                 }
             }
             CapIntent::EventPublish { payload } => {
-                match serde_json::from_slice::<crate::client::ExecutorEvent>(&payload)
-                {
+                match serde_json::from_slice::<crate::client::ExecutorEvent>(&payload) {
                     Ok(event) => match client.emit_event(event).await {
                         Ok(()) => report.events_published += 1,
                         Err(e) => report.errors.push(format!("event_publish: {e}")),
@@ -1096,8 +1093,20 @@ mod tests {
         assert_eq!(h.cached_len(), 2);
 
         // Both versions coexist and behave per their own code.
-        assert_eq!(h.invoke(&v1, 10).unwrap(), PluginOutcome { output: 20, emitted: vec![42] });
-        assert_eq!(h.invoke(&v2, 10).unwrap(), PluginOutcome { output: 30, emitted: vec![99] });
+        assert_eq!(
+            h.invoke(&v1, 10).unwrap(),
+            PluginOutcome {
+                output: 20,
+                emitted: vec![42]
+            }
+        );
+        assert_eq!(
+            h.invoke(&v2, 10).unwrap(),
+            PluginOutcome {
+                output: 30,
+                emitted: vec![99]
+            }
+        );
 
         // Hot-reload: install v2, evict v1 — clean swap, no restart.
         h.evict_other_versions("system/reference", &v2);
@@ -1122,7 +1131,10 @@ mod tests {
         h.load(&key, ROGUE_WAT).unwrap();
         // ... but cannot instantiate: the ungranted import is unresolved, so the
         // capability ring blocks it by construction.
-        assert!(matches!(h.invoke(&key, 0), Err(PluginError::Instantiate { .. })));
+        assert!(matches!(
+            h.invoke(&key, 0),
+            Err(PluginError::Instantiate { .. })
+        ));
     }
 
     #[test]
@@ -1131,7 +1143,10 @@ mod tests {
         let mut h = host();
         let key = PluginKey::new("system/no_run", 1, "sha-n");
         h.load(&key, NO_RUN_WAT).unwrap();
-        assert!(matches!(h.invoke(&key, 0), Err(PluginError::MissingExport(_))));
+        assert!(matches!(
+            h.invoke(&key, 0),
+            Err(PluginError::MissingExport(_))
+        ));
     }
 
     #[test]
@@ -1199,7 +1214,10 @@ mod tests {
         let key = PluginKey::new("system/echo", 1, "sha-e");
         h.load(&key, ECHO_PLUGIN_WAT).unwrap();
         let out = h.invoke_bytes(&key, &enc.bytes).unwrap();
-        assert_eq!(out, enc.bytes, "Arrow IPC buffer must survive the boundary intact");
+        assert_eq!(
+            out, enc.bytes,
+            "Arrow IPC buffer must survive the boundary intact"
+        );
     }
 
     #[test]
@@ -1237,15 +1255,24 @@ mod tests {
     }
     impl HostCapabilities for RecordingCapabilities {
         fn event_publish(&mut self, p: &[u8]) -> Result<(), String> {
-            self.calls.lock().unwrap().push(("event_publish".into(), String::new(), p.to_vec()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("event_publish".into(), String::new(), p.to_vec()));
             Ok(())
         }
         fn result_put(&mut self, k: &str, p: &[u8]) -> Result<(), String> {
-            self.calls.lock().unwrap().push(("result_put".into(), k.into(), p.to_vec()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("result_put".into(), k.into(), p.to_vec()));
             Ok(())
         }
         fn object_put(&mut self, k: &str, p: &[u8]) -> Result<(), String> {
-            self.calls.lock().unwrap().push(("object_put".into(), k.into(), p.to_vec()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("object_put".into(), k.into(), p.to_vec()));
             Ok(())
         }
     }
@@ -1285,7 +1312,9 @@ mod tests {
 
         let rec = RecordingCapabilities::default();
         let log = rec.calls.clone();
-        let out = h.invoke_bytes_with(&key, b"ignored", Box::new(rec)).unwrap();
+        let out = h
+            .invoke_bytes_with(&key, b"ignored", Box::new(rec))
+            .unwrap();
 
         // status 0 (CAP_OK) returned to the plug-in, little-endian.
         assert_eq!(out, vec![0, 0, 0, 0]);
@@ -1294,7 +1323,11 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0],
-            ("object_put".to_string(), "obj/k".to_string(), b"DATA".to_vec())
+            (
+                "object_put".to_string(),
+                "obj/k".to_string(),
+                b"DATA".to_vec()
+            )
         );
     }
 
@@ -1396,8 +1429,7 @@ mod tests {
                 (call $emit (i32.const 99))
                 (i32.mul (local.get $x) (i32.const 3))))
         "#;
-        let src =
-            RepublishSource::new(vec![("sha-a", REFERENCE_PLUGIN_WAT), ("sha-b", REV_B_WAT)]);
+        let src = RepublishSource::new(vec![("sha-a", REFERENCE_PLUGIN_WAT), ("sha-b", REV_B_WAT)]);
         let mut h = host();
 
         // First dispatch resolves rev A → compiles → behaves as A.
@@ -1422,7 +1454,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(key_b.version, 1, "same version");
-        assert_ne!(key_a.digest, key_b.digest, "new digest = hot-reload trigger");
+        assert_ne!(
+            key_a.digest, key_b.digest,
+            "new digest = hot-reload trigger"
+        );
         assert_eq!(h.compiles(), 2, "the republished bytes compiled fresh");
         assert_eq!(
             h.invoke(&key_b, 10).unwrap(),
@@ -1580,7 +1615,11 @@ mod tests {
             .run_by_ref_entry("system/two-entry", 1, b"x", "run_state")
             .await
             .unwrap();
-        assert_eq!(run_state.output, vec![0xBB], "entry path invokes `run_state`");
+        assert_eq!(
+            run_state.output,
+            vec![0xBB],
+            "entry path invokes `run_state`"
+        );
 
         // A missing export surfaces a clear error, not a panic.
         let missing = dispatcher
@@ -1758,13 +1797,15 @@ mod tests {
             )
             .route(
                 "/api/internal/objects/{*key}",
-                put(move |AxPath(key): AxPath<String>, _body: axum::body::Bytes| {
-                    let objects = objects.clone();
-                    async move {
-                        objects.lock().unwrap().push(key);
-                        Json(serde_json::json!({ "key": "k", "digest": "d", "bytes": 1 }))
-                    }
-                }),
+                put(
+                    move |AxPath(key): AxPath<String>, _body: axum::body::Bytes| {
+                        let objects = objects.clone();
+                        async move {
+                            objects.lock().unwrap().push(key);
+                            Json(serde_json::json!({ "key": "k", "digest": "d", "bytes": 1 }))
+                        }
+                    },
+                ),
             )
             .route("/api/events", post(|| async { StatusCode::OK }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1797,14 +1838,21 @@ mod tests {
 
         assert_eq!(report.objects_stored, 1);
         assert_eq!(report.results_stored, 1);
-        assert!(report.errors.is_empty(), "unexpected errors: {:?}", report.errors);
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
 
         // object_put → the object store endpoint at its §7 key; result_put → put_result.
         assert!(objects
             .lock()
             .unwrap()
             .contains(&"noetl/results/ref/0/0/1.feather".to_string()));
-        assert!(results.lock().unwrap().contains(&"load_facility".to_string()));
+        assert!(results
+            .lock()
+            .unwrap()
+            .contains(&"load_facility".to_string()));
     }
 
     #[tokio::test]

@@ -154,7 +154,12 @@ impl CellRegistry {
             .find(|c| c.cell == self.default_cell)
             .or_else(|| self.cells.first())?;
         let shard = coords.shard_key(self.shard_count.max(1));
-        Some(CellPlacement::new(&entry.env, &entry.region, &entry.cell, shard))
+        Some(CellPlacement::new(
+            &entry.env,
+            &entry.region,
+            &entry.cell,
+            shard,
+        ))
     }
 }
 
