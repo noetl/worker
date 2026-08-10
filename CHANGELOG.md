@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.110.0](https://github.com/noetl/worker/compare/v5.109.1...v5.110.0) (2026-08-10)
+
+### Features
+
+* **ehdb:** tier-service skeleton — a face that does not exist unless a flag is set ([dd8d793](https://github.com/noetl/worker/commit/dd8d79312daa5f526523948d86e1a43156fbfb8d)), closes [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#247](https://github.com/noetl/ai-meta/issues/247)
+
 ## [5.109.1](https://github.com/noetl/worker/compare/v5.109.0...v5.109.1) (2026-08-10)
 
 ### Bug Fixes
