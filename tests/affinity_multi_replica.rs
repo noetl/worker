@@ -113,11 +113,11 @@ fn run_pool(replicas: u32, executions: i64, hops: u32, cfg: AffinityConfig) -> R
         for hop in 0..hops {
             // Compete for the delivery, honouring affinity redirects.
             let mut attempt: i64 = 1; // JetStream `delivered` starts at 1.
-            // Replicas currently in their NAK-delay backoff window for THIS
-            // message — they NAK'd with `Nak(Some(delay))` so they won't see
-            // the redelivery until the delay elapses, giving the still-eager
-            // owner a window to pull it. Faithful to the delayed-NAK
-            // mechanism; excluded from the next competing pull.
+                                      // Replicas currently in their NAK-delay backoff window for THIS
+                                      // message — they NAK'd with `Nak(Some(delay))` so they won't see
+                                      // the redelivery until the delay elapses, giving the still-eager
+                                      // owner a window to pull it. Faithful to the delayed-NAK
+                                      // mechanism; excluded from the next competing pull.
             let mut backoff: HashSet<u32> = HashSet::new();
             loop {
                 let replica = pick_delivery(execution_id, hop, attempt, replicas, &backoff);

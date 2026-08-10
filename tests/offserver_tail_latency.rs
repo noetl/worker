@@ -76,7 +76,11 @@ fn chain_payloads(n: i64) -> Vec<serde_json::Value> {
 /// The same enable-before-check append-signal wait loop the worker runs in
 /// `resolve_offserver_orchestrate_input`. Returns the time to a served build, or
 /// `None` if the budget elapsed first (→ the server's 8s reconcile cliff).
-async fn time_to_serve(index: &SharedWalIndex, expected_head: i64, playbook: &serde_json::Value) -> Option<Duration> {
+async fn time_to_serve(
+    index: &SharedWalIndex,
+    expected_head: i64,
+    playbook: &serde_json::Value,
+) -> Option<Duration> {
     let budget = Duration::from_millis(RETRY_MS * RETRY_ATTEMPTS as u64);
     let per_wait = Duration::from_millis(RETRY_MS);
     let start = Instant::now();
@@ -144,7 +148,11 @@ fn stats(mut xs: Vec<Duration>) -> (Duration, Duration, Duration, f64) {
     let p95 = pctl(&xs, 0.95);
     let max = *xs.last().unwrap_or(&Duration::ZERO);
     let mean = xs.iter().map(|d| d.as_secs_f64()).sum::<f64>() / xs.len().max(1) as f64;
-    let var = xs.iter().map(|d| (d.as_secs_f64() - mean).powi(2)).sum::<f64>() / xs.len().max(1) as f64;
+    let var = xs
+        .iter()
+        .map(|d| (d.as_secs_f64() - mean).powi(2))
+        .sum::<f64>()
+        / xs.len().max(1) as f64;
     (p50, p95, max, var.sqrt())
 }
 
@@ -174,10 +182,19 @@ async fn tail_attach_serves_without_drain() {
     // Drain has NOT delivered the tip → the build cannot complete the chain to
     // `expected_head`, exactly as today under drain lag.
     let before = build_offserver_input(
-        &index, EXEC, &playbook, Some("command.completed"), Some(head), Some(head), false,
+        &index,
+        EXEC,
+        &playbook,
+        Some("command.completed"),
+        Some(head),
+        Some(head),
+        false,
     )
     .await;
-    assert!(before.is_none(), "warm-but-short index must not serve the new head");
+    assert!(
+        before.is_none(),
+        "warm-but-short index must not serve the new head"
+    );
 
     // The server-attached tail (the #156 worker hot path) — apply it up front.
     {
@@ -187,10 +204,19 @@ async fn tail_attach_serves_without_drain() {
         }
     }
     let after = build_offserver_input(
-        &index, EXEC, &playbook, Some("command.completed"), Some(head), Some(head), false,
+        &index,
+        EXEC,
+        &playbook,
+        Some("command.completed"),
+        Some(head),
+        Some(head),
+        false,
     )
     .await;
-    assert!(after.is_some(), "after applying the attached tail the build must serve, drain-independent");
+    assert!(
+        after.is_some(),
+        "after applying the attached tail the build must serve, drain-independent"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -209,13 +235,22 @@ async fn offserver_tail_attach_collapses_per_hop_variance() {
     let sweep = [0usize, 1_000, 4_000, 8_000, 16_000, 24_000];
     let trials = 10usize;
 
-    println!("\n#156 off-server per-hop time-to-serve — drain-only (BEFORE) vs tail-attach (AFTER)");
+    println!(
+        "\n#156 off-server per-hop time-to-serve — drain-only (BEFORE) vs tail-attach (AFTER)"
+    );
     println!("  warm index to id {warm_to}, hop tail = {TAIL} events, drive budget = {}ms, drain {}µs/event",
         RETRY_MS * RETRY_ATTEMPTS as u64, DRAIN_PER_EVENT.as_micros());
-    println!("  (a 'miss' = budget elapsed before serve → server falls to the 8s reconcile tick)\n");
-    println!("  {:>8} | {:^42} | {:^28}", "global", "BEFORE (drain-only)", "AFTER (tail-attach)");
-    println!("  {:>8} | {:>7} {:>7} {:>7} {:>6} {:>5} | {:>7} {:>7} {:>5} {:>5}",
-        "backlog", "p50ms", "p95ms", "maxms", "sd", "miss", "p50ms", "p95ms", "sd", "miss");
+    println!(
+        "  (a 'miss' = budget elapsed before serve → server falls to the 8s reconcile tick)\n"
+    );
+    println!(
+        "  {:>8} | {:^42} | {:^28}",
+        "global", "BEFORE (drain-only)", "AFTER (tail-attach)"
+    );
+    println!(
+        "  {:>8} | {:>7} {:>7} {:>7} {:>6} {:>5} | {:>7} {:>7} {:>5} {:>5}",
+        "backlog", "p50ms", "p95ms", "maxms", "sd", "miss", "p50ms", "p95ms", "sd", "miss"
+    );
     println!("  {:-<8}-+-{:-<42}-+-{:-<28}", "", "", "");
 
     for &b in &sweep {
@@ -240,7 +275,9 @@ async fn offserver_tail_attach_collapses_per_hop_variance() {
                     before_miss += 1;
                     // Record the cliff so percentiles reflect it: 8s reconcile +
                     // the budget already spent.
-                    before.push(Duration::from_millis(8_000 + RETRY_MS * RETRY_ATTEMPTS as u64));
+                    before.push(Duration::from_millis(
+                        8_000 + RETRY_MS * RETRY_ATTEMPTS as u64,
+                    ));
                 }
             }
 
@@ -262,7 +299,11 @@ async fn offserver_tail_attach_collapses_per_hop_variance() {
                     g.apply(p);
                 }
             }
-            after.push(time_to_serve(&idx2, head, &playbook).await.expect("tail-attach always serves"));
+            after.push(
+                time_to_serve(&idx2, head, &playbook)
+                    .await
+                    .expect("tail-attach always serves"),
+            );
         }
 
         let (bp50, bp95, bmax, bsd) = stats(before);
@@ -275,9 +316,15 @@ async fn offserver_tail_attach_collapses_per_hop_variance() {
         // The result: tail-attach serves with zero misses and p95 far below the
         // drain-only arm once the backlog is non-trivial.
         if b >= 16_000 {
-            assert!(before_miss > 0, "high global load must push the drain-only arm past budget (the cliff)");
+            assert!(
+                before_miss > 0,
+                "high global load must push the drain-only arm past budget (the cliff)"
+            );
         }
-        assert!(ap95 < bp95 || b == 0, "tail-attach p95 must not exceed drain-only p95 under load");
+        assert!(
+            ap95 < bp95 || b == 0,
+            "tail-attach p95 must not exceed drain-only p95 under load"
+        );
     }
     println!();
 }

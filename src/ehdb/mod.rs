@@ -112,6 +112,42 @@ pub mod vector;
 pub type EnvMap = HashMap<String, String>;
 
 /// Snapshot the current process environment into an [`EnvMap`].
+/// Warn — once per tier per process — that a tier is configured `primary` while
+/// no authoritative serve path exists in this binary.
+///
+/// `primary` is accepted and treated as `shadow` (the tier keeps mirroring and
+/// parity-checking) rather than rejected, because refusing to start on a config
+/// a previous build accepted would turn a misconfiguration into an outage. But
+/// it must not be silent: before noetl/ai-meta#247 the same setting quietly
+/// disarmed the mirror and served nothing, and the only way to notice was to
+/// observe that a counter had stopped moving.
+///
+/// Rate-limited to one line per tier because this sits on the per-event hot
+/// path — `logging.md` forbids per-event INFO/WARN volume.
+pub fn warn_primary_not_wired(tier: &str) {
+    use std::sync::Mutex;
+    use std::collections::HashSet;
+    static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut g = match WARNED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let set = g.get_or_insert_with(HashSet::new);
+    if !set.insert(tier.to_string()) {
+        return;
+    }
+    crate::ehdb::metrics::record_primary_not_wired(tier);
+    tracing::warn!(
+        tier = tier,
+        "NOETL_EHDB_{} is set to `primary`, but this build has no authoritative \
+         serve path for it (serve_primary_cycle is only reachable from \
+         bin/ehdb-selfcheck).  Treating the tier as `shadow`: it keeps mirroring \
+         and parity-checking, and the incumbent remains authoritative.  See \
+         noetl/ai-meta#247.",
+        tier.to_uppercase()
+    );
+}
+
 pub fn process_env() -> EnvMap {
     std::env::vars().collect()
 }
