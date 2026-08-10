@@ -290,6 +290,25 @@ pub async fn spawn_event_writer_host(
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed ingest listener up");
     }
 
+    // EHDB tier service (ai-meta#257 PR 1) — the writer-fronted face for the
+    // storage tiers.  Hosted here because this is the process that owns the
+    // durable volumes and already fronts both buses.
+    //
+    // Skeleton only: it answers `health` and serves no tier data yet.  Absent
+    // unless NOETL_EHDB_TIER_SERVICE_BIND is set, so a build with the flag unset
+    // opens no socket and is byte-identical to one without this face.
+    if let Some(tier_cfg) = crate::ehdb::tier_service::TierServiceConfig::from_env() {
+        let listener = TcpListener::bind(tier_cfg.bind).await?;
+        let addr = tier_cfg.bind;
+        tokio::spawn(crate::ehdb::tier_service::serve_tier(listener));
+        tracing::info!(
+            %addr,
+            shard = config.shard,
+            protocol = crate::ehdb::tier_service::PROTOCOL_VERSION,
+            "EHDB tier service listener up (skeleton: health only, serves no tier data)"
+        );
+    }
+
     let coordinator = Arc::new(GroupCoordinator::new(
         writer.clone(),
         config.shard,
