@@ -189,6 +189,22 @@ pub fn record_primary_not_wired(tier: &str) {
     }
 }
 
+/// Record one tier-service **client** operation (ai-meta#257 PR 2).
+///
+/// Routed into the existing `dataplane` family with an explicit
+/// `operation="tier_client.<op>"` label rather than a new family, so it renders
+/// through the same path and adds no registry surface.  Absent entirely until
+/// the client is configured, which is the inertness property PR 2 asserts.
+pub fn record_tier_client(op: &str, outcome: &str, ok: bool, degraded: bool, duration_seconds: f64) {
+    record_dataplane(
+        &format!("tier_client.{op}"),
+        outcome,
+        ok,
+        degraded,
+        duration_seconds,
+    );
+}
+
 pub fn record_eventlog(
     operation: &str,
     outcome: &str,
