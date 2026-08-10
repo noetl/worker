@@ -44,7 +44,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use noetl_tools::spool::SpoolSpec;
-use noetl_tools::tools::source::{AckMode, DirectiveSpec, DispatchPlan, PollOptions, PolledMessage};
+use noetl_tools::tools::source::{
+    AckMode, DirectiveSpec, DispatchPlan, PollOptions, PolledMessage,
+};
 use noetl_tools::tools::{build_source, SubscriptionConfig};
 use noetl_tools::ExecutionContext;
 
@@ -255,8 +257,8 @@ pub fn parse_spec(yaml: &serde_yaml::Value) -> Result<ParsedSpec> {
     // spool block (RFC §8, Phase 4) — optional; absent → off.
     let spool = match spec.get("spool") {
         Some(s) => {
-            let json = serde_json::to_value(s)
-                .context("subscription spec 'spool' is not serializable")?;
+            let json =
+                serde_json::to_value(s).context("subscription spec 'spool' is not serializable")?;
             SpoolSpec::parse(Some(&json))
                 .map_err(|e| anyhow::anyhow!("invalid subscription 'spool' block: {e}"))?
         }
@@ -319,7 +321,10 @@ pub fn build_payload(
         "message".to_string(),
         serde_json::to_value(msg).unwrap_or(serde_json::Value::Null),
     );
-    payload.insert("subscription".to_string(), serde_json::json!(subscription_path));
+    payload.insert(
+        "subscription".to_string(),
+        serde_json::json!(subscription_path),
+    );
     payload.insert("source".to_string(), serde_json::json!(source));
 
     let primary = match payload_from {
@@ -489,7 +494,11 @@ impl SubscriptionRuntime {
             .await;
 
         // 5. Drain + deactivate on the way out (best-effort).
-        if let Err(e) = self.client.subscription_lifecycle(subscription_id, "drain").await {
+        if let Err(e) = self
+            .client
+            .subscription_lifecycle(subscription_id, "drain")
+            .await
+        {
             tracing::warn!(subscription_id, error = %e, "drain transition failed on shutdown");
         }
         if let Err(e) = self
@@ -598,9 +607,15 @@ impl SubscriptionRuntime {
             // exhausted it returns Throttle and we skip the poll entirely so the
             // unfetched messages stay in the source (no loss, source redelivers).
             let fetch_batch = match governor.plan_fetch(spec.batch, std::time::Instant::now()) {
-                FetchPlan::Throttle { wait, newly_limited } => {
+                FetchPlan::Throttle {
+                    wait,
+                    newly_limited,
+                } => {
                     if newly_limited {
-                        crate::metrics::record_subscription_rate_limited(source_name, "dispatch_rate");
+                        crate::metrics::record_subscription_rate_limited(
+                            source_name,
+                            "dispatch_rate",
+                        );
                         self.emit_rate_limited(subscription_id, "dispatch_rate", &spec.limits)
                             .await;
                         tracing::info!(
@@ -617,9 +632,15 @@ impl SubscriptionRuntime {
                     }
                     continue;
                 }
-                FetchPlan::Fetch { batch, newly_limited } => {
+                FetchPlan::Fetch {
+                    batch,
+                    newly_limited,
+                } => {
                     if newly_limited {
-                        crate::metrics::record_subscription_rate_limited(source_name, "max_in_flight");
+                        crate::metrics::record_subscription_rate_limited(
+                            source_name,
+                            "max_in_flight",
+                        );
                         self.emit_rate_limited(subscription_id, "max_in_flight", &spec.limits)
                             .await;
                         tracing::info!(
@@ -674,7 +695,8 @@ impl SubscriptionRuntime {
             // through the spool/circuit.  A message whose downstream circuit is
             // open is durably buffered here (already acked by the poll → no
             // loss); the rest are collected as dispatch-eligible.
-            let mut eligible: Vec<(usize, DispatchPlan)> = Vec::with_capacity(outcome.messages.len());
+            let mut eligible: Vec<(usize, DispatchPlan)> =
+                Vec::with_capacity(outcome.messages.len());
             for (idx, msg) in outcome.messages.iter().enumerate() {
                 let plan = spec.directives.resolve(&msg.headers);
                 if let Some(s) = spool.as_deref_mut() {
@@ -740,7 +762,12 @@ impl SubscriptionRuntime {
             }
             crate::metrics::record_subscription_batch(source_name, received, dispatched, errors);
             if spooled > 0 {
-                tracing::info!(subscription_id, source = source_name, spooled, "messages buffered to spool (circuit open)");
+                tracing::info!(
+                    subscription_id,
+                    source = source_name,
+                    spooled,
+                    "messages buffered to spool (circuit open)"
+                );
             }
         }
         Ok(())
@@ -775,10 +802,18 @@ impl SubscriptionRuntime {
                     .execution_pool_override
                     .clone()
                     .or_else(|| spec.default_pool.clone());
-                let trace = plan.trace.as_ref().and_then(|t| serde_json::to_value(t).ok());
+                let trace = plan
+                    .trace
+                    .as_ref()
+                    .and_then(|t| serde_json::to_value(t).ok());
                 let dedup = dedup_block(&spec.dedup, plan, msg);
-                let payload =
-                    build_payload(msg, &spec.payload_from, plan, &self.subscription_path, source_name);
+                let payload = build_payload(
+                    msg,
+                    &spec.payload_from,
+                    plan,
+                    &self.subscription_path,
+                    source_name,
+                );
                 crate::client::DispatchItem::new(
                     &playbook,
                     payload,
@@ -897,7 +932,13 @@ impl SubscriptionRuntime {
         // subscription declared `dedup.enabled: true`.
         let dedup = dedup_block(&spec.dedup, plan, msg);
 
-        let payload = build_payload(msg, &spec.payload_from, plan, &self.subscription_path, source_name);
+        let payload = build_payload(
+            msg,
+            &spec.payload_from,
+            plan,
+            &self.subscription_path,
+            source_name,
+        );
 
         let exec_span = tracing::info_span!(
             "subscription.dispatch",
@@ -1136,7 +1177,9 @@ spec:
         ))
         .unwrap();
         // No headers block → resolving any headers is a no-op.
-        let plan = spec.directives.resolve(&json!({ "x-anything": "v" }).as_object().unwrap().clone());
+        let plan = spec
+            .directives
+            .resolve(&json!({ "x-anything": "v" }).as_object().unwrap().clone());
         assert!(plan.is_noop());
         assert_eq!(spec.payload_from, "message.json");
     }
@@ -1149,7 +1192,13 @@ spec:
         .unwrap();
         let m = msg(json!({ "order_id": 42, "amount": 9 }), json!({}));
         let plan = spec.directives.resolve(&m.headers);
-        let payload = build_payload(&m, &spec.payload_from, &plan, "subscriptions/orders", "nats");
+        let payload = build_payload(
+            &m,
+            &spec.payload_from,
+            &plan,
+            "subscriptions/orders",
+            "nats",
+        );
         // Body merged to top level.
         assert_eq!(payload["order_id"], 42);
         assert_eq!(payload["amount"], 9);
@@ -1221,7 +1270,10 @@ spec:
             "kind: Subscription\nspec:\n  source: nats\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  dedup: { enabled: true }\n",
         ))
         .unwrap();
-        assert_eq!(spec.dedup.as_ref().unwrap().window_secs, DEFAULT_DEDUP_WINDOW_SECS);
+        assert_eq!(
+            spec.dedup.as_ref().unwrap().window_secs,
+            DEFAULT_DEDUP_WINDOW_SECS
+        );
     }
 
     #[test]
@@ -1268,7 +1320,10 @@ spec:
 "#,
         ))
         .unwrap();
-        let m = msg(json!({}), json!({ "x-noetl-route": "domain/fraud", "x-noetl-pool": "priority" }));
+        let m = msg(
+            json!({}),
+            json!({ "x-noetl-route": "domain/fraud", "x-noetl-pool": "priority" }),
+        );
         let plan = spec.directives.resolve(&m.headers);
         assert_eq!(plan.playbook_override.as_deref(), Some("domain/fraud"));
         assert_eq!(plan.execution_pool_override.as_deref(), Some("priority"));

@@ -198,6 +198,13 @@ pub struct WorkerMetrics {
     /// "zero successful claims" must be able to read a 0 rather than an absent
     /// series, which is precisely the distinction the wedge depends on.
     pub claim_succeeded_total: IntCounter,
+    /// Poison commands parked to dead-letter instead of nacked forever
+    /// (noetl/ai-meta#249).
+    ///
+    /// Unlabelled, so it is present at 0 from construction: parking is meant
+    /// to be *observable*, and an absent series is indistinguishable from a
+    /// binary that cannot park at all.
+    pub claim_dead_lettered_total: IntCounter,
     /// Tool results that carry a provider-level error while the tool itself
     /// returned successfully (noetl/ai-meta#246).
     ///
@@ -1004,6 +1011,15 @@ impl WorkerMetrics {
             .register(Box::new(claim_succeeded_total.clone()))
             .expect("register claim_succeeded_total");
 
+        let claim_dead_lettered_total = IntCounter::new(
+            "noetl_worker_claim_dead_lettered_total",
+            "Poison commands parked to dead-letter rather than redelivered forever (noetl/ai-meta#249).",
+        )
+        .expect("claim_dead_lettered_total metric");
+        registry
+            .register(Box::new(claim_dead_lettered_total.clone()))
+            .expect("register claim_dead_lettered_total");
+
         let tool_result_error_total = IntCounter::new(
             "noetl_worker_tool_result_error_total",
             "Tool results carrying a provider-level error despite a successful tool status (noetl/ai-meta#246).",
@@ -1684,6 +1700,7 @@ impl WorkerMetrics {
             materializer_skipped_total,
             claim_failed_total,
             claim_succeeded_total,
+            claim_dead_lettered_total,
             tool_result_error_total,
             materializer_ack_failed_total,
             materializer_drain_failed_total,
@@ -2014,8 +2031,7 @@ pub fn record_state_builder_replay_end(reason: &str) {
 }
 
 /// The stages at which a materializer ack can fail.
-pub const MATERIALIZER_ACK_STAGES: [&str; 3] =
-    ["non_event_batch", "after_project", "per_handle"];
+pub const MATERIALIZER_ACK_STAGES: [&str; 3] = ["non_event_batch", "after_project", "per_handle"];
 
 /// Record one materializer ack failure at `stage`.
 pub fn record_materializer_ack_failed(stage: &str) {
@@ -2027,12 +2043,22 @@ pub fn record_materializer_ack_failed(stage: &str) {
 
 /// Record one failed materializer drain poll.
 pub fn record_materializer_drain_failed() {
-    WorkerMetrics::global().materializer_drain_failed_total.inc();
+    WorkerMetrics::global()
+        .materializer_drain_failed_total
+        .inc();
 }
 
 /// Record one command whose claim failed.
 pub fn record_claim_failed() {
     WorkerMetrics::global().claim_failed_total.inc();
+}
+
+/// Record one poison command parked to dead-letter (noetl/ai-meta#249).
+///
+/// Always paired with an ERROR log carrying the ids — parking must never be a
+/// silent drop.
+pub fn record_claim_dead_lettered() {
+    WorkerMetrics::global().claim_dead_lettered_total.inc();
 }
 
 /// Record one command successfully claimed (noetl/ai-meta#249).
@@ -2654,9 +2680,7 @@ mod tests {
     #[test]
     fn claim_success_is_recorded_on_the_claim_path() {
         let full = include_str!("worker.rs");
-        let src = full
-            .split_once("\n#[cfg(test)]")
-            .map_or(full, |(b, _)| b);
+        let src = full.split_once("\n#[cfg(test)]").map_or(full, |(b, _)| b);
         assert!(
             src.contains("record_claim_succeeded()"),
             "the Claimed arm must record a success, or claim_succeeded_total stays \
@@ -2710,13 +2734,20 @@ mod tests {
             .split_once("\n#[cfg(test)]")
             .map(|(before, _)| before)
             .expect("command.rs must have a module-level #[cfg(test)] block");
-        for reason in ["released_failed", "released_pending_callback", "released_error"] {
+        for reason in [
+            "released_failed",
+            "released_pending_callback",
+            "released_error",
+        ] {
             assert!(
                 SINK_GATE_OUTCOMES.contains(&reason),
                 "{reason} is passed at a call site but is not in SINK_GATE_OUTCOMES, \
                  so it would be absent from /metrics until it first fires"
             );
-            assert!(cmd.contains(reason), "{reason} is pinned but never recorded");
+            assert!(
+                cmd.contains(reason),
+                "{reason} is pinned but never recorded"
+            );
         }
     }
 
@@ -2951,11 +2982,15 @@ mod tests {
             .filter(|l| l.starts_with("noetl_worker_event_emit_failed_total{"))
             .collect();
         assert!(
-            lines.iter().any(|l| l.contains("test.emit_failed.alpha") && l.trim_end().ends_with(" 2")),
+            lines
+                .iter()
+                .any(|l| l.contains("test.emit_failed.alpha") && l.trim_end().ends_with(" 2")),
             "alpha must show 2 abandonments; got {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("test.emit_failed.beta") && l.trim_end().ends_with(" 1")),
+            lines
+                .iter()
+                .any(|l| l.contains("test.emit_failed.beta") && l.trim_end().ends_with(" 1")),
             "beta must show 1 abandonment; got {lines:?}"
         );
     }
@@ -3002,9 +3037,10 @@ mod tests {
         let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
         for reason in STATE_BUILDER_REPLAY_END_REASONS {
             assert!(
-                text.lines().any(|l| l
-                    .starts_with("noetl_worker_state_builder_replay_end_total{")
-                    && l.contains(&format!("reason=\"{reason}\""))),
+                text.lines().any(
+                    |l| l.starts_with("noetl_worker_state_builder_replay_end_total{")
+                        && l.contains(&format!("reason=\"{reason}\""))
+                ),
                 "{reason} must be pinned at 0"
             );
         }
@@ -3022,11 +3058,20 @@ mod tests {
     fn materializer_ack_and_drain_failures_are_counted() {
         let src = include_str!("materializer.rs");
         for (needle, stage) in [
-            ("materializer ack failed on a non-event batch", "non_event_batch"),
-            ("materializer ack failed after a durable project", "after_project"),
+            (
+                "materializer ack failed on a non-event batch",
+                "non_event_batch",
+            ),
+            (
+                "materializer ack failed after a durable project",
+                "after_project",
+            ),
             ("materializer ack reported per-handle errors", "per_handle"),
         ] {
-            assert!(src.contains(needle), "the {stage} warning should still exist");
+            assert!(
+                src.contains(needle),
+                "the {stage} warning should still exist"
+            );
             assert!(
                 src.contains(&format!("record_materializer_ack_failed(\"{stage}\")")),
                 "{stage} must be recorded"
@@ -3040,9 +3085,10 @@ mod tests {
         let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
         for stage in MATERIALIZER_ACK_STAGES {
             assert!(
-                text.lines().any(|l| l
-                    .starts_with("noetl_worker_materializer_ack_failed_total{")
-                    && l.contains(&format!("stage=\"{stage}\""))),
+                text.lines().any(
+                    |l| l.starts_with("noetl_worker_materializer_ack_failed_total{")
+                        && l.contains(&format!("stage=\"{stage}\""))
+                ),
                 "{stage} must be pinned at 0"
             );
         }
@@ -3063,7 +3109,9 @@ mod tests {
     #[test]
     fn materializer_skipped_is_counted_at_every_skip_site() {
         let src = include_str!("materializer.rs");
-        let warn_sites = src.matches("materializer skipped messages with no event_id").count();
+        let warn_sites = src
+            .matches("materializer skipped messages with no event_id")
+            .count();
         let recorded = src.matches("record_materializer_skipped(").count();
         assert!(warn_sites > 0, "the skip warning should still exist");
         assert_eq!(
@@ -3142,16 +3190,20 @@ mod tests {
             let n = file
                 .matches(&format!("record_ehdb_claim_reconnect(\"{feed}\""))
                 .count();
-            assert_eq!(n, want, "{feed} feed must record at {want} site(s); found {n}");
+            assert_eq!(
+                n, want,
+                "{feed} feed must record at {want} site(s); found {n}"
+            );
         }
         let text = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
         for feed in EHDB_CLAIM_FEEDS {
             for reason in EHDB_CLAIM_RECONNECT_REASONS {
                 assert!(
-                    text.lines().any(|l| l
-                        .starts_with("noetl_worker_ehdb_claim_reconnect_total{")
-                        && l.contains(&format!("feed=\"{feed}\""))
-                        && l.contains(&format!("reason=\"{reason}\""))),
+                    text.lines().any(
+                        |l| l.starts_with("noetl_worker_ehdb_claim_reconnect_total{")
+                            && l.contains(&format!("feed=\"{feed}\""))
+                            && l.contains(&format!("reason=\"{reason}\""))
+                    ),
                     "{feed}/{reason} must be pinned at 0"
                 );
             }
@@ -3248,7 +3300,11 @@ mod state_build_latency_tests {
     /// count, so they bury the cold-rebuild tail that is the actual floor.
     #[test]
     fn build_duration_is_recorded_per_outcome() {
-        for (o, secs) in [("cache_hit", 0.0004), ("incremental", 0.02), ("cold_rebuild", 3.5)] {
+        for (o, secs) in [
+            ("cache_hit", 0.0004),
+            ("incremental", 0.02),
+            ("cold_rebuild", 3.5),
+        ] {
             record_state_builder_build_duration(o, secs);
         }
         let out = String::from_utf8(WorkerMetrics::global().encode()).unwrap();
@@ -3286,7 +3342,8 @@ mod state_build_latency_tests {
             "need a sub-millisecond bucket: a cache hit must not land in the first bucket with everything else"
         );
         assert!(
-            mine.iter().any(|l| l.contains("le=\"5\"") || l.contains("le=\"5.0\"")),
+            mine.iter()
+                .any(|l| l.contains("le=\"5\"") || l.contains("le=\"5.0\"")),
             "need a multi-second bucket: a cold rebuild must not collapse into +Inf"
         );
     }

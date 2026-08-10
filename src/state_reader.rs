@@ -69,7 +69,11 @@ pub fn shard_read_verify_enabled() -> bool {
 
 fn env_truthy(name: &str) -> bool {
     matches!(
-        std::env::var(name).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        std::env::var(name)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "1" | "true" | "yes" | "on"
     )
 }
@@ -136,7 +140,11 @@ pub async fn cold_load_from_shard(
                         }
                     }
                 }
-                return if applied > 0 { ColdLoad::Applied(applied) } else { ColdLoad::Empty };
+                return if applied > 0 {
+                    ColdLoad::Applied(applied)
+                } else {
+                    ColdLoad::Empty
+                };
             }
             // 404 for this seal → try the next seal key.
             Ok(None) => continue,
@@ -159,8 +167,15 @@ fn decode_shard_payloads(bytes: &[u8]) -> Option<Vec<serde_json::Value>> {
     for batch in &batches {
         // Address the payload column by NAME (schema-order-independent), so a
         // future column re-order in the writer can't silently mis-read.
-        let col_idx = batch.schema().fields().iter().position(|f| f.name() == "payload")?;
-        let arr = batch.column(col_idx).as_any().downcast_ref::<StringArray>()?;
+        let col_idx = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "payload")?;
+        let arr = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()?;
         for r in 0..batch.num_rows() {
             if arr.is_null(r) {
                 continue;
@@ -203,9 +218,9 @@ mod tests {
                     p.get("event_type"),
                     p.get("node_name"),
                     p.get("status"),
-                    serde_json::Value::Null,          // result_ref
-                    serde_json::Value::Null,          // extracted
-                    serde_json::to_string(p).unwrap() // payload (verbatim slim)
+                    serde_json::Value::Null,           // result_ref
+                    serde_json::Value::Null,           // extracted
+                    serde_json::to_string(p).unwrap()  // payload (verbatim slim)
                 ])
             })
             .collect();
@@ -240,7 +255,9 @@ mod tests {
             "columns": ["event_id", "event_type"],
             "rows": [[1, "playbook_started"]],
         });
-        let bytes = noetl_tools::arrow_codec::try_encode_tabular_json(&tabular).unwrap().bytes;
+        let bytes = noetl_tools::arrow_codec::try_encode_tabular_json(&tabular)
+            .unwrap()
+            .bytes;
         assert!(decode_shard_payloads(&bytes).is_none());
     }
 
@@ -269,9 +286,10 @@ mod tests {
                 idx.apply(p);
             }
         }
-        let wal_bytes = build_offserver_input(&wal_index, 325, &playbook, None, Some(2), Some(2), false)
-            .await
-            .expect("WAL path serves");
+        let wal_bytes =
+            build_offserver_input(&wal_index, 325, &playbook, None, Some(2), Some(2), false)
+                .await
+                .expect("WAL path serves");
 
         // Cold-load: decode the shard payloads into a FRESH index and build the
         // same spine. Byte-identical to the WAL path (equivalence by construction).
@@ -284,9 +302,10 @@ mod tests {
                 idx.apply(p);
             }
         }
-        let shard_out = build_offserver_input(&shard_index, 325, &playbook, None, Some(2), Some(2), false)
-            .await
-            .expect("shard path serves");
+        let shard_out =
+            build_offserver_input(&shard_index, 325, &playbook, None, Some(2), Some(2), false)
+                .await
+                .expect("shard path serves");
 
         assert_eq!(
             wal_bytes, shard_out,

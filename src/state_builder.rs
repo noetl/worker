@@ -3563,7 +3563,10 @@ mod tests {
         idx.enable_sink_gate_for_test();
         idx.apply_at(&started(1, 100), Instant::now());
         idx.mark_pending_sink(100);
-        assert!(idx.sink_blocked(100), "marked execution is eviction-blocked");
+        assert!(
+            idx.sink_blocked(100),
+            "marked execution is eviction-blocked"
+        );
         assert_eq!(idx.sink_pending_count(), 1);
 
         assert!(
@@ -3571,7 +3574,11 @@ mod tests {
             "release reports it was pending"
         );
         assert!(!idx.sink_blocked(100), "release clears the block");
-        assert_eq!(idx.sink_pending_count(), 0, "the retained set must not leak");
+        assert_eq!(
+            idx.sink_pending_count(),
+            0,
+            "the retained set must not leak"
+        );
     }
 
     /// noetl/ai-meta#248 — the leak, stated as an invariant.

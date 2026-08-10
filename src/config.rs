@@ -227,7 +227,10 @@ mod t218_filter_rename_tests {
         // subject, from which no pool resolves — so the worker refuses to start
         // rather than silently joining `shared`. A manifest with the key present
         // but empty is exactly how this would otherwise recur.
-        assert_eq!(resolve(Some("  "), None, "noetl.commands"), "noetl.commands");
+        assert_eq!(
+            resolve(Some("  "), None, "noetl.commands"),
+            "noetl.commands"
+        );
         assert_eq!(resolve(Some(""), None, "noetl.commands"), "noetl.commands");
         assert_eq!(
             crate::dispatch::segment_from_filter("noetl.commands"),

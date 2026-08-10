@@ -83,7 +83,10 @@ pub async fn stage(client: &ControlPlaneClient, canonical_uri: &str, payload: &V
         // No registry → cannot derive a stable key. Decline rather than guess;
         // the materializer (CellSeed-seeded) still writes the tier.
         crate::metrics::record_result_producer_stage("skip_registry");
-        tracing::debug!(execution_id = eid, "producer-stage: cell registry unavailable; skipping (materializer covers it)");
+        tracing::debug!(
+            execution_id = eid,
+            "producer-stage: cell registry unavailable; skipping (materializer covers it)"
+        );
         return;
     };
 
@@ -226,8 +229,15 @@ mod tests {
         stage(&client, uri, &payload).await;
 
         // (1) The producer wrote the tier object — `object_put` was called.
-        let key = put_key.lock().unwrap().clone().expect("stage must PUT the object");
-        assert!(key.ends_with("/results/load/2/4/1.feather"), "key tail: {key}");
+        let key = put_key
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("stage must PUT the object");
+        assert!(
+            key.ends_with("/results/load/2/4/1.feather"),
+            "key tail: {key}"
+        );
 
         // (2) Byte-identical: the staged bytes equal the shared `decide_tier`
         // encode the materializer would write.
@@ -240,7 +250,9 @@ mod tests {
         // (3) §7 key matches the resolve-by-URN read path: reconstruct the key the
         // resolver derives from the SAME URI + the SAME (now-cached) registry.
         let coords = coords_from_uri(uri).unwrap();
-        let placement = crate::result_resolver::placement_for(&client, &coords).await.unwrap();
+        let placement = crate::result_resolver::placement_for(&client, &coords)
+            .await
+            .unwrap();
         let date = crate::snowflake::date_partition(coords.execution_id);
         assert_eq!(
             key,
@@ -249,7 +261,13 @@ mod tests {
         );
 
         // (4) result_store was NOT touched — the tier write is decoupled.
-        assert!(!resolve_hit.load(Ordering::SeqCst), "stage must NOT read result_store");
-        assert!(!result_put_hit.load(Ordering::SeqCst), "stage must NOT write result_store");
+        assert!(
+            !resolve_hit.load(Ordering::SeqCst),
+            "stage must NOT read result_store"
+        );
+        assert!(
+            !result_put_hit.load(Ordering::SeqCst),
+            "stage must NOT write result_store"
+        );
     }
 }

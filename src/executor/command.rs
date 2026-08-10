@@ -523,9 +523,7 @@ impl CommandExecutor {
             // Off by default because flipping it converts a silent degradation
             // into a hard failure, which is the right end state but wants a
             // deliberate flip rather than arriving with an image bump.
-            if !unresolved.is_empty()
-                && super::keychain_namespace::strict_enabled()
-            {
+            if !unresolved.is_empty() && super::keychain_namespace::strict_enabled() {
                 let msg = super::keychain_namespace::unresolved_message(&unresolved);
                 tracing::error!(
                     execution_id = command.execution_id,
@@ -1019,10 +1017,7 @@ impl CommandExecutor {
                     self.state_builder_index
                         .lock()
                         .await
-                        .release_pending_sink(
-                            command.execution_id,
-                            "released_pending_callback",
-                        );
+                        .release_pending_sink(command.execution_id, "released_pending_callback");
                 } else if is_sink_step && result.is_success() {
                     crate::metrics::record_sink_signal(&tool_config.kind, "confirm");
                     self.state_builder_index
@@ -1553,8 +1548,12 @@ fn container_completion_poll_enabled() -> bool {
         // container step parks and nothing ever resumes it, which looks like a
         // hung execution rather than a config typo.  The cadence lives in
         // NOETL_CONTAINER_POLL_INTERVAL_SECS.
-        if !on && !trimmed.is_empty() && trimmed != "0" && trimmed != "false" &&
-            trimmed != "no" && trimmed != "off"
+        if !on
+            && !trimmed.is_empty()
+            && trimmed != "0"
+            && trimmed != "false"
+            && trimmed != "no"
+            && trimmed != "off"
         {
             tracing::warn!(
                 value = %raw,
@@ -1654,11 +1653,12 @@ fn provider_error_summary(value: &serde_json::Value, depth: u8) -> Option<String
                     .unwrap_or("(no summary in payload)");
                 return Some(summary.chars().take(300).collect());
             }
-            map.values().find_map(|v| provider_error_summary(v, depth - 1))
+            map.values()
+                .find_map(|v| provider_error_summary(v, depth - 1))
         }
-        serde_json::Value::Array(items) => {
-            items.iter().find_map(|v| provider_error_summary(v, depth - 1))
-        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|v| provider_error_summary(v, depth - 1)),
         _ => None,
     }
 }
@@ -3987,7 +3987,11 @@ mod tests {
             // SAFETY: ENV_LOCK is held for as long as this guard lives, so no
             // other env-mutating test runs concurrently.
             unsafe { std::env::set_var(key, value) };
-            Self { key: key.to_string(), prev, _lock }
+            Self {
+                key: key.to_string(),
+                prev,
+                _lock,
+            }
         }
 
         fn unset(key: &str) -> Self {
@@ -3995,7 +3999,11 @@ mod tests {
             let prev = std::env::var(key).ok();
             // SAFETY: as in `set` — ENV_LOCK is held for the guard's lifetime.
             unsafe { std::env::remove_var(key) };
-            Self { key: key.to_string(), prev, _lock }
+            Self {
+                key: key.to_string(),
+                prev,
+                _lock,
+            }
         }
     }
 
@@ -4233,8 +4241,12 @@ mod tests {
                 "summary": "Places searchText failed HTTP 403: Caller does not have required permission"
             }}}}
         });
-        let found = provider_error_summary(&failing, 12).expect("must detect the live failure shape");
-        assert!(found.contains("403"), "summary should carry the provider text, got {found:?}");
+        let found =
+            provider_error_summary(&failing, 12).expect("must detect the live failure shape");
+        assert!(
+            found.contains("403"),
+            "summary should carry the provider text, got {found:?}"
+        );
     }
 
     #[test]
@@ -5024,7 +5036,14 @@ mod tests {
             tool_kind_treats_args_as_argv("container"),
             "container reads args as argv, so the step-input map must not be injected"
         );
-        for generic in ["python", "shell", "http", "postgres", "duckdb", "task_sequence"] {
+        for generic in [
+            "python",
+            "shell",
+            "http",
+            "postgres",
+            "duckdb",
+            "task_sequence",
+        ] {
             assert!(
                 !tool_kind_treats_args_as_argv(generic),
                 "{generic} reads args as a variables map — the default must keep working"

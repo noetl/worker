@@ -149,7 +149,11 @@ pub fn spawn(cfg: AutoSinkConfig, worker_id: String, index: SharedWalIndex) -> J
 /// Run one observe pass: snapshot the resident set, classify each execution by
 /// the pure policy, record metrics. **Never writes.** Returns the pass accounting
 /// (also for the unit test / a future selfcheck verb).
-pub async fn run_once(cfg: &AutoSinkConfig, worker_id: &str, index: &SharedWalIndex) -> ObservePass {
+pub async fn run_once(
+    cfg: &AutoSinkConfig,
+    worker_id: &str,
+    index: &SharedWalIndex,
+) -> ObservePass {
     let snapshot = index.resident_snapshot().await;
     let mut pass = ObservePass::default();
     for (_eid, bytes, sink_blocked) in &snapshot {
@@ -276,8 +280,15 @@ mod tests {
         };
         let pass = run_once(&cfg, "test-worker", &index).await;
         assert_eq!(pass.candidates, 2, "100 and 300 are candidates");
-        assert_eq!(pass.skipped_explicit, 1, "200 is skipped (explicit sink owns it)");
+        assert_eq!(
+            pass.skipped_explicit, 1,
+            "200 is skipped (explicit sink owns it)"
+        );
         // The index is untouched — observe-only writes nothing anywhere.
-        assert_eq!(index.resident_snapshot().await.len(), 3, "no execution dropped");
+        assert_eq!(
+            index.resident_snapshot().await.len(),
+            3,
+            "no execution dropped"
+        );
     }
 }

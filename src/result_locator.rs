@@ -213,7 +213,11 @@ mod tests {
             }
         });
         let tier = decide_tier(&envelope);
-        assert_eq!(tier.kind, TierKind::Feather, "data.<tool> rowset should tier as Feather");
+        assert_eq!(
+            tier.kind,
+            TierKind::Feather,
+            "data.<tool> rowset should tier as Feather"
+        );
         assert_eq!(tier.media, FEATHER_MEDIA);
         assert!(!tier.bytes.is_empty());
     }
@@ -221,7 +225,8 @@ mod tests {
     #[test]
     fn decide_tier_non_tabular_is_json() {
         // Opaque shape (HTTP JSON / shell stdout) → JSON fallback (OQ3).
-        let blob = serde_json::json!({ "stdout": "hello", "code": 0, "nested": { "a": [1, 2, 3] } });
+        let blob =
+            serde_json::json!({ "stdout": "hello", "code": 0, "nested": { "a": [1, 2, 3] } });
         let tier = decide_tier(&blob);
         assert_eq!(tier.kind, TierKind::Json);
         assert_eq!(tier.media, JSON_MEDIA);

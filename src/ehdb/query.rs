@@ -173,7 +173,9 @@ impl QueryParams {
     }
 
     fn bounded_limit(&self) -> usize {
-        self.limit.unwrap_or(DEFAULT_QUERY_LIMIT).clamp(1, MAX_QUERY_LIMIT)
+        self.limit
+            .unwrap_or(DEFAULT_QUERY_LIMIT)
+            .clamp(1, MAX_QUERY_LIMIT)
     }
 }
 
@@ -356,7 +358,9 @@ pub fn run_query(env: &EnvMap, tier: QueryTier, params: &QueryParams) -> QueryRe
 
 fn truthy(env: &EnvMap, key: &str) -> bool {
     matches!(
-        env.get(key).map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        env.get(key)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
         Some("1" | "true" | "yes" | "y" | "on")
     )
 }
@@ -411,7 +415,16 @@ fn query_eventlog(
     let backend = selected_backend(env);
 
     if let Some(execution) = params.execution.as_deref() {
-        return eventlog_read_execution(env, contract, backend, execution, params.after, limit, &tenant, &namespace);
+        return eventlog_read_execution(
+            env,
+            contract,
+            backend,
+            execution,
+            params.after,
+            limit,
+            &tenant,
+            &namespace,
+        );
     }
 
     match backend {
@@ -421,16 +434,27 @@ fn query_eventlog(
                 tenant,
                 namespace,
             );
-            match driver.scan_global(&EventLogScanRequest { after: params.after, limit }) {
+            match driver.scan_global(&EventLogScanRequest {
+                after: params.after,
+                limit,
+            }) {
                 Ok(out) => {
                     let outcome = if out.returned > 0 {
                         QueryOutcome::Served
                     } else {
                         QueryOutcome::Absent
                     };
-                    ("scan", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                    (
+                        "scan",
+                        outcome,
+                        serde_json::to_value(out).unwrap_or(Value::Null),
+                    )
                 }
-                Err(e) => ("scan", classify_read_error(&e), json!({ "error": e.to_string() })),
+                Err(e) => (
+                    "scan",
+                    classify_read_error(&e),
+                    json!({ "error": e.to_string() }),
+                ),
             }
         }
         EventLogStorageBackend::DurableSegment => {
@@ -441,9 +465,17 @@ fn query_eventlog(
                     } else {
                         QueryOutcome::Absent
                     };
-                    ("scan_merged", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                    (
+                        "scan_merged",
+                        outcome,
+                        serde_json::to_value(out).unwrap_or(Value::Null),
+                    )
                 }
-                Err(e) => ("scan_merged", QueryOutcome::Unavailable, json!({ "error": e })),
+                Err(e) => (
+                    "scan_merged",
+                    QueryOutcome::Unavailable,
+                    json!({ "error": e }),
+                ),
             }
         }
     }
@@ -479,9 +511,17 @@ fn eventlog_read_execution(
                     } else {
                         QueryOutcome::Absent
                     };
-                    ("read", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                    (
+                        "read",
+                        outcome,
+                        serde_json::to_value(out).unwrap_or(Value::Null),
+                    )
                 }
-                Err(e) => ("read", classify_read_error(&e), json!({ "error": e.to_string() })),
+                Err(e) => (
+                    "read",
+                    classify_read_error(&e),
+                    json!({ "error": e.to_string() }),
+                ),
             }
         }
         EventLogStorageBackend::DurableSegment => {
@@ -507,9 +547,17 @@ fn eventlog_read_execution(
                     } else {
                         QueryOutcome::Absent
                     };
-                    ("read", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                    (
+                        "read",
+                        outcome,
+                        serde_json::to_value(out).unwrap_or(Value::Null),
+                    )
                 }
-                Err(e) => ("read", classify_read_error(&e), json!({ "error": e.to_string() })),
+                Err(e) => (
+                    "read",
+                    classify_read_error(&e),
+                    json!({ "error": e.to_string() }),
+                ),
             }
         }
     }
@@ -602,16 +650,28 @@ fn query_kv(contract: &EhdbContract, params: &QueryParams) -> (&'static str, Que
     let driver = super::kv::driver_from(contract, &opts);
 
     if let Some(key) = params.key.clone() {
-        match driver.get(&KvGetRequest { bucket, key, now_ms: None }) {
+        match driver.get(&KvGetRequest {
+            bucket,
+            key,
+            now_ms: None,
+        }) {
             Ok(out) => {
                 let outcome = if out.found {
                     QueryOutcome::Served
                 } else {
                     QueryOutcome::Absent
                 };
-                ("get", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                (
+                    "get",
+                    outcome,
+                    serde_json::to_value(out).unwrap_or(Value::Null),
+                )
             }
-            Err(e) => ("get", classify_read_error(&e), json!({ "error": e.to_string() })),
+            Err(e) => (
+                "get",
+                classify_read_error(&e),
+                json!({ "error": e.to_string() }),
+            ),
         }
     } else {
         let req = KvScanRequest {
@@ -627,9 +687,17 @@ fn query_kv(contract: &EhdbContract, params: &QueryParams) -> (&'static str, Que
                 } else {
                     QueryOutcome::Absent
                 };
-                ("scan", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                (
+                    "scan",
+                    outcome,
+                    serde_json::to_value(out).unwrap_or(Value::Null),
+                )
             }
-            Err(e) => ("scan", classify_read_error(&e), json!({ "error": e.to_string() })),
+            Err(e) => (
+                "scan",
+                classify_read_error(&e),
+                json!({ "error": e.to_string() }),
+            ),
         }
     }
 }
@@ -656,19 +724,41 @@ fn query_object(
         .op
         .as_deref()
         .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| if params.key.is_some() { "get".to_string() } else { "list".to_string() });
+        .unwrap_or_else(|| {
+            if params.key.is_some() {
+                "get".to_string()
+            } else {
+                "list".to_string()
+            }
+        });
 
     match op.as_str() {
         "locate" => {
             let Some(key) = params.key.clone() else {
-                return ("locate", QueryOutcome::Rejected, json!({ "error": "object locate requires ?key=<key>" }));
+                return (
+                    "locate",
+                    QueryOutcome::Rejected,
+                    json!({ "error": "object locate requires ?key=<key>" }),
+                );
             };
             match driver.locate(&ObjectLocateRequest { key }) {
                 Ok(out) => {
-                    let outcome = if out.found { QueryOutcome::Served } else { QueryOutcome::Absent };
-                    ("locate", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                    let outcome = if out.found {
+                        QueryOutcome::Served
+                    } else {
+                        QueryOutcome::Absent
+                    };
+                    (
+                        "locate",
+                        outcome,
+                        serde_json::to_value(out).unwrap_or(Value::Null),
+                    )
                 }
-                Err(e) => ("locate", classify_read_error(&e), json!({ "error": e.to_string() })),
+                Err(e) => (
+                    "locate",
+                    classify_read_error(&e),
+                    json!({ "error": e.to_string() }),
+                ),
             }
         }
         "list" => {
@@ -678,23 +768,51 @@ fn query_object(
             };
             match driver.list(&req) {
                 Ok(out) => {
-                    let outcome = if out.returned > 0 { QueryOutcome::Served } else { QueryOutcome::Absent };
-                    ("list", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                    let outcome = if out.returned > 0 {
+                        QueryOutcome::Served
+                    } else {
+                        QueryOutcome::Absent
+                    };
+                    (
+                        "list",
+                        outcome,
+                        serde_json::to_value(out).unwrap_or(Value::Null),
+                    )
                 }
-                Err(e) => ("list", classify_read_error(&e), json!({ "error": e.to_string() })),
+                Err(e) => (
+                    "list",
+                    classify_read_error(&e),
+                    json!({ "error": e.to_string() }),
+                ),
             }
         }
         _ => {
             // "get" (default) — any other token folds here.
             let Some(key) = params.key.clone() else {
-                return ("get", QueryOutcome::Rejected, json!({ "error": "object get requires ?key=<key>" }));
+                return (
+                    "get",
+                    QueryOutcome::Rejected,
+                    json!({ "error": "object get requires ?key=<key>" }),
+                );
             };
             match driver.get(&ObjectGetRequest { key }) {
                 Ok(out) => {
-                    let outcome = if out.found { QueryOutcome::Served } else { QueryOutcome::Absent };
-                    ("get", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+                    let outcome = if out.found {
+                        QueryOutcome::Served
+                    } else {
+                        QueryOutcome::Absent
+                    };
+                    (
+                        "get",
+                        outcome,
+                        serde_json::to_value(out).unwrap_or(Value::Null),
+                    )
                 }
-                Err(e) => ("get", classify_read_error(&e), json!({ "error": e.to_string() })),
+                Err(e) => (
+                    "get",
+                    classify_read_error(&e),
+                    json!({ "error": e.to_string() }),
+                ),
             }
         }
     }
@@ -712,16 +830,21 @@ fn query_vector(
     contract: &EhdbContract,
     params: &QueryParams,
 ) -> (&'static str, QueryOutcome, Value) {
-    let (Some(collection), Some(model_id), Some(vector)) =
-        (params.collection.clone(), params.model_id.clone(), params.vector.clone())
-    else {
+    let (Some(collection), Some(model_id), Some(vector)) = (
+        params.collection.clone(),
+        params.model_id.clone(),
+        params.vector.clone(),
+    ) else {
         return (
             "query",
             QueryOutcome::Rejected,
             json!({ "error": "vector query requires ?collection=&model_id=&vector=<f,f,...>" }),
         );
     };
-    let top_k = params.top_k.unwrap_or(DEFAULT_QUERY_LIMIT).clamp(1, MAX_QUERY_LIMIT);
+    let top_k = params
+        .top_k
+        .unwrap_or(DEFAULT_QUERY_LIMIT)
+        .clamp(1, MAX_QUERY_LIMIT);
     let opts = super::vector::VectorOptions {
         tenant: params.tenant.clone(),
         namespace: params.namespace.clone(),
@@ -735,10 +858,22 @@ fn query_vector(
         top_k,
     }) {
         Ok(out) => {
-            let outcome = if out.returned > 0 { QueryOutcome::Served } else { QueryOutcome::Absent };
-            ("query", outcome, serde_json::to_value(out).unwrap_or(Value::Null))
+            let outcome = if out.returned > 0 {
+                QueryOutcome::Served
+            } else {
+                QueryOutcome::Absent
+            };
+            (
+                "query",
+                outcome,
+                serde_json::to_value(out).unwrap_or(Value::Null),
+            )
         }
-        Err(e) => ("query", classify_read_error(&e), json!({ "error": e.to_string() })),
+        Err(e) => (
+            "query",
+            classify_read_error(&e),
+            json!({ "error": e.to_string() }),
+        ),
     }
 }
 
@@ -747,7 +882,10 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> EnvMap {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn worker_env(log: &str) -> EnvMap {
@@ -800,9 +938,15 @@ mod tests {
 
     #[test]
     fn limit_is_bounded() {
-        let p = QueryParams { limit: Some(10_000), ..Default::default() };
+        let p = QueryParams {
+            limit: Some(10_000),
+            ..Default::default()
+        };
         assert_eq!(p.bounded_limit(), MAX_QUERY_LIMIT);
-        let p0 = QueryParams { limit: Some(0), ..Default::default() };
+        let p0 = QueryParams {
+            limit: Some(0),
+            ..Default::default()
+        };
         assert_eq!(p0.bounded_limit(), 1);
         let none = QueryParams::default();
         assert_eq!(none.bounded_limit(), DEFAULT_QUERY_LIMIT);
@@ -832,7 +976,10 @@ mod tests {
         // control_plane mode has no local_reference runtime → Disabled before the
         // guard even fires; a data-plane env with a control-plane role is the
         // GuardRefused path, exercised in the contract/guard unit tests.
-        assert!(matches!(r.outcome, QueryOutcome::Disabled | QueryOutcome::GuardRefused));
+        assert!(matches!(
+            r.outcome,
+            QueryOutcome::Disabled | QueryOutcome::GuardRefused
+        ));
     }
 
     #[test]
@@ -878,10 +1025,7 @@ mod tests {
         let seqs: Vec<u64> = merged.iter().map(|r| r.global_sequence).collect();
         assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
         // Tie on sequence → broken by execution_id.
-        let tie = merge_shard_records(
-            vec![vec![rec(1, "200")], vec![rec(1, "100")]],
-            100,
-        );
+        let tie = merge_shard_records(vec![vec![rec(1, "200")], vec![rec(1, "100")]], 100);
         assert_eq!(tie[0].execution_id, "100");
         assert_eq!(tie[1].execution_id, "200");
         // Truncation to limit.
