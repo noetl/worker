@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.109.0](https://github.com/noetl/worker/compare/v5.108.2...v5.109.0) (2026-08-10)
+
+### Features
+
+* **tools:** provider errors terminate the step behind a flag ([26e2d80](https://github.com/noetl/worker/commit/26e2d806549c8d27f5785b3093dd73db5e9bf251)), closes [noetl/ai-meta#246](https://github.com/noetl/ai-meta/issues/246) [noetl/ai-meta#251](https://github.com/noetl/ai-meta/issues/251) [#249](https://github.com/noetl/worker/issues/249) [noetl/ai-meta#246](https://github.com/noetl/ai-meta/issues/246)
+
 ## [5.108.2](https://github.com/noetl/worker/compare/v5.108.1...v5.108.2) (2026-08-10)
 
 ### Bug Fixes
