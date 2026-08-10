@@ -963,6 +963,60 @@ impl CommandExecutor {
                             summary = %summary,
                             "tool reported success but its result carries a provider error (noetl/ai-meta#246)",
                         );
+                        if provider_error_terminates() {
+                            // noetl/ai-meta#246 — the transport succeeded but the
+                            // provider did not do the thing.  Terminate the step.
+                            //
+                            // `command.failed` is what drives the DAG: orchestrate-core
+                            // state.rs:950 matches `command.failed | action_failed |
+                            // step_failed` to set StepState::Failed.  `call.error` alone
+                            // does NOT fail the node, and neither does a
+                            // `command.completed` carrying status=error — that handler
+                            // never reads event.status.  Both were checked.
+                            //
+                            // SINK: `result.is_success()` stays TRUE for a provider
+                            // error (the transport worked), so the ordinary path would
+                            // CONFIRM the sink while the step fails — telling both GC
+                            // gates that un-sunk context is reclaimable.  Release
+                            // instead, matching the hard-failure path below.
+                            if is_sink_step {
+                                crate::metrics::record_sink_signal(&tool_config.kind, "release");
+                                self.state_builder_index.lock().await.release_pending_sink(
+                                    command.execution_id,
+                                    "released_provider_error",
+                                );
+                            }
+                            self.emit_event_via(
+                                &dispatch_client,
+                                "call.error",
+                                &command.step,
+                                "FAILED",
+                                command.execution_id,
+                                command.attempts,
+                                serde_json::json!({
+                                    "command_id": command.command_id.clone(),
+                                    "call_index": ctx.call_index,
+                                    "error": summary,
+                                    "result": result_obj,
+                                }),
+                            )
+                            .await?;
+                            self.emit_event_via(
+                                &dispatch_client,
+                                "command.failed",
+                                &command.step,
+                                "FAILED",
+                                command.execution_id,
+                                command.attempts,
+                                serde_json::json!({
+                                    "command_id": command.command_id.clone(),
+                                    "error": summary,
+                                }),
+                            )
+                            .await?;
+                            record_metric(true);
+                            return Ok(());
+                        }
                     }
                     self.emit_event_via(
                         &dispatch_client,
@@ -3178,6 +3232,24 @@ fn command_completed_context(
         ctx["pending_callback"] = serde_json::Value::Bool(true);
     }
     ctx
+}
+
+/// Does a provider-level error terminate the step? (noetl/ai-meta#246)
+///
+/// Default OFF.  Enabling changes FAILURE SEMANTICS for every tool: a result that
+/// carries `isError` (the MCP convention — transport fine, provider said no) stops
+/// completing the step and fails the DAG node instead, so the playbook's error
+/// branch runs rather than the success arc.  That is the intent, but it is a
+/// behaviour change on live playbooks and must be a deliberate flip.
+fn provider_error_terminates() -> bool {
+    matches!(
+        std::env::var("NOETL_PROVIDER_ERROR_TERMINATES")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]
