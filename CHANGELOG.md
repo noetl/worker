@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.109.1](https://github.com/noetl/worker/compare/v5.109.0...v5.109.1) (2026-08-10)
+
+### Bug Fixes
+
+* **ehdb:** primary must not silently disarm tier verification ([3fc1b63](https://github.com/noetl/worker/commit/3fc1b635c4ff15d65bc0017a268f804ebc2e0b2e)), closes [noetl/ai-meta#247](https://github.com/noetl/ai-meta/issues/247) [noetl/ai-meta#247](https://github.com/noetl/ai-meta/issues/247)
+
 ## [5.109.0](https://github.com/noetl/worker/compare/v5.108.2...v5.109.0) (2026-08-10)
 
 ### Features
