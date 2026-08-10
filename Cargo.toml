@@ -396,3 +396,7 @@ tokio-test = "0.4"
 # uuid used in integration tests (dispatch_nats_mcp.rs) to generate unique
 # NATS KV bucket names so concurrent test runs don't collide.
 uuid = { version = "1", features = ["v4"] }
+
+[[example]]
+name = "poison_inject"
+path = "examples/poison_inject.rs"
