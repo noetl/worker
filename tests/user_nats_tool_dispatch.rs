@@ -22,8 +22,8 @@
 //! Without that variable the live half skips, so this stays CI-safe.
 
 use noetl_tools::registry::ToolConfig;
-use noetl_tools::tools::create_default_registry;
 use noetl_tools::result::ToolStatus;
+use noetl_tools::tools::create_default_registry;
 use noetl_tools::ExecutionContext;
 
 fn cfg(op: &str, url: &str, bucket: &str, extra: serde_json::Value) -> ToolConfig {
@@ -73,7 +73,9 @@ async fn nats_tool_round_trips_business_data_against_a_user_endpoint() {
     };
 
     // The user creates their own bucket in their own broker; the tool opens it.
-    let nc = async_nats::connect(&url).await.expect("connect to user broker");
+    let nc = async_nats::connect(&url)
+        .await
+        .expect("connect to user broker");
     let js = async_nats::jetstream::new(nc);
     let bucket = format!("worker_dispatch_{}", std::process::id());
     js.create_key_value(async_nats::jetstream::kv::Config {
@@ -99,17 +101,30 @@ async fn nats_tool_round_trips_business_data_against_a_user_endpoint() {
         )
         .await
         .expect("kv_put through the worker's registry");
-    assert_eq!(put.status, ToolStatus::Success, "kv_put should succeed: {put:?}");
+    assert_eq!(
+        put.status,
+        ToolStatus::Success,
+        "kv_put should succeed: {put:?}"
+    );
 
     let got = registry
         .execute(
             "nats",
-            &cfg("kv_get", &url, &bucket, serde_json::json!({"key": "order-42"})),
+            &cfg(
+                "kv_get",
+                &url,
+                &bucket,
+                serde_json::json!({"key": "order-42"}),
+            ),
             &ctx,
         )
         .await
         .expect("kv_get through the worker's registry");
-    assert_eq!(got.status, ToolStatus::Success, "kv_get should succeed: {got:?}");
+    assert_eq!(
+        got.status,
+        ToolStatus::Success,
+        "kv_get should succeed: {got:?}"
+    );
 
     // The value must come back intact — a tool that connects but round-trips
     // nothing is the failure mode a success flag alone would hide.
@@ -120,12 +135,22 @@ async fn nats_tool_round_trips_business_data_against_a_user_endpoint() {
     );
 
     let keys = registry
-        .execute("nats", &cfg("kv_keys", &url, &bucket, serde_json::json!({})), &ctx)
+        .execute(
+            "nats",
+            &cfg("kv_keys", &url, &bucket, serde_json::json!({})),
+            &ctx,
+        )
         .await
         .expect("kv_keys through the worker's registry");
-    assert_eq!(keys.status, ToolStatus::Success, "kv_keys should succeed: {keys:?}");
+    assert_eq!(
+        keys.status,
+        ToolStatus::Success,
+        "kv_keys should succeed: {keys:?}"
+    );
     assert!(
-        serde_json::to_string(&keys.data).unwrap_or_default().contains("order-42"),
+        serde_json::to_string(&keys.data)
+            .unwrap_or_default()
+            .contains("order-42"),
         "the bucket listing should contain the key we wrote"
     );
 

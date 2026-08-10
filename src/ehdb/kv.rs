@@ -956,8 +956,23 @@ pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
     if !truthy(env, EHDB_ENABLED_ENV) {
         return None;
     }
-    if KvMode::from_env(env) != KvMode::Shadow {
-        return None;
+    // `off` ⇒ no hook.  `shadow` AND `primary` both arm the live mirror.
+    //
+    // `primary` used to return `None` here, so selecting it SILENTLY DISARMED
+    // verification: the mirror stopped, and nothing served in its place because
+    // no runtime path calls `serve_primary_cycle` — its only caller is
+    // `bin/ehdb-selfcheck`, which by its own contract "never authors a NoETL
+    // event".  Measured in kind on one binary under identical load: `shadow`
+    // mirrored 30 events, `primary` mirrored 0.  A mode meant to promote the
+    // tier instead turned it off, with no signal (noetl/ai-meta#247).
+    //
+    // Until an authoritative serve path exists, `primary` behaves as "shadow,
+    // and say so".  Arming here is monotonic — it can only add mirroring, never
+    // remove it — so this cannot reduce verification for any configuration.
+    match KvMode::from_env(env) {
+        KvMode::Off => return None,
+        KvMode::Primary => super::warn_primary_not_wired("kv"),
+        KvMode::Shadow => {}
     }
     let contract = contract_from_env(env).ok()?;
     if !contract.role.is_data_plane() {
@@ -1298,9 +1313,27 @@ mod tests {
     }
 
     #[test]
-    fn runtime_hook_env_noop_when_tier_off_or_primary() {
-        assert!(runtime_hook_env(&worker_env("/tmp/kv-hook.jsonl", "off")).is_none());
-        assert!(runtime_hook_env(&worker_env("/tmp/kv-hook.jsonl", "primary")).is_none());
+    fn runtime_hook_env_off_disarms_but_primary_keeps_verifying() {
+        // `off` is the only mode that disarms the live mirror.
+        assert!(
+            runtime_hook_env(&worker_env("/tmp/kv-hook.jsonl", "off")).is_none(),
+            "`off` must be a strict no-op"
+        );
+
+        // `primary` MUST keep the mirror armed.  It previously returned `None`,
+        // which silently disarmed verification while serving nothing in its
+        // place — no runtime path calls `serve_primary_cycle` (noetl/ai-meta#247).
+        // Selecting a stronger mode must never reduce verification.
+        assert!(
+            runtime_hook_env(&worker_env("/tmp/kv-hook.jsonl", "primary")).is_some(),
+            "`primary` must keep mirroring — it must not silently disarm verification"
+        );
+
+        // Control: `shadow` is unchanged by this fix.
+        assert!(
+            runtime_hook_env(&worker_env("/tmp/kv-hook.jsonl", "shadow")).is_some(),
+            "`shadow` behaviour must be unchanged"
+        );
     }
 
     #[test]

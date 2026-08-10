@@ -166,6 +166,29 @@ pub fn record_rag(operation: &str, outcome: &str, ok: bool, degraded: bool, dura
 
 /// Record one event-log shadow op (EHDB Phase 6).  `disabled` outcomes are not
 /// recorded, preserving the byte-identical `/metrics` invariant.
+/// Record that a tier was configured `primary` while this build has no
+/// authoritative serve path for it (noetl/ai-meta#247).
+///
+/// Routed into the tier's own existing family with a distinct
+/// `operation="runtime_hook", outcome="primary_not_wired"` label pair rather
+/// than a new family, so it renders through the same path and needs no new
+/// registry surface.
+///
+/// Recorded once per tier per process, alongside the WARN — a log line alone is
+/// not observable from a dashboard, and the whole failure mode this guards
+/// against was "a counter quietly stopped moving and nobody saw it".
+pub fn record_primary_not_wired(tier: &str) {
+    let (op, outcome) = ("runtime_hook", "primary_not_wired");
+    match tier {
+        "eventlog" => record_eventlog(op, outcome, true, false, 0.0),
+        "projection" => record_projection(op, outcome, true, false, 0.0),
+        "kv" => record_kv(op, outcome, true, false, 0.0),
+        "object" => record_object(op, outcome, true, false, 0.0),
+        "vector" => record_vector(op, outcome, true, false, 0.0),
+        _ => {}
+    }
+}
+
 pub fn record_eventlog(
     operation: &str,
     outcome: &str,

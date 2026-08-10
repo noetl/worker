@@ -22,7 +22,13 @@ use noetl_worker::state_builder::{EvictionPolicy, SpineOrder, WalEventIndex};
 
 /// A realistic-ish `noetl_events` envelope: the chain fields + a result/context
 /// body sized like a planner turn (the events that dominate the ~73 KiB mean).
-fn envelope(execution_id: i64, event_id: i64, prev: Option<i64>, ty: &str, body: usize) -> serde_json::Value {
+fn envelope(
+    execution_id: i64,
+    event_id: i64,
+    prev: Option<i64>,
+    ty: &str,
+    body: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "event_id": event_id,
         "execution_id": execution_id,
@@ -54,7 +60,10 @@ fn load(index: &mut WalEventIndex, executions: i64, events_per: i64, body: usize
         for _ in 1..events_per {
             let prev = eid;
             eid += 1;
-            index.apply_at(&envelope(exec_id, eid, Some(prev), "command.completed", body), t);
+            index.apply_at(
+                &envelope(exec_id, eid, Some(prev), "command.completed", body),
+                t,
+            );
         }
     }
 }
@@ -81,7 +90,10 @@ fn unbounded_index_grows_linearly_bounded_index_holds_the_ceiling() {
     let ceiling = unbounded_bytes / 5;
     let mut bounded = WalEventIndex::with_order_policy(
         SpineOrder::Causal,
-        EvictionPolicy { max_bytes: Some(ceiling), ..Default::default() },
+        EvictionPolicy {
+            max_bytes: Some(ceiling),
+            ..Default::default()
+        },
     );
     load(&mut bounded, EXECUTIONS, EVENTS_PER, BODY, base);
     let bounded_before_sweep = bounded.total_bytes();
@@ -91,25 +103,52 @@ fn unbounded_index_grows_linearly_bounded_index_holds_the_ceiling() {
     // --- AFTER: slim projection shrinks per-event resident cost losslessly. ---
     let mut slim = WalEventIndex::with_order_policy(
         SpineOrder::Causal,
-        EvictionPolicy { slim: true, ..Default::default() },
+        EvictionPolicy {
+            slim: true,
+            ..Default::default()
+        },
     );
     load(&mut slim, EXECUTIONS, EVENTS_PER, BODY, base);
     let slim_bytes = slim.total_bytes();
 
     eprintln!("=== #166 WAL-index memory bound ({EXECUTIONS} execs × {EVENTS_PER} events × {BODY}B bodies) ===");
-    eprintln!("BEFORE  unbounded : {:>12} bytes ({} execs, {} events)", unbounded_bytes, unbounded_execs, unbounded.event_count());
-    eprintln!("        slim      : {:>12} bytes (lossless field projection, no eviction)", slim_bytes);
-    eprintln!("AFTER   ceiling   : {:>12} bytes  (set {ceiling}); pre-sweep {bounded_before_sweep}", bounded_bytes);
-    eprintln!("        evicted   : {} chains by byte_ceiling, {} resident", stats.byte_ceiling, bounded.execution_count());
+    eprintln!(
+        "BEFORE  unbounded : {:>12} bytes ({} execs, {} events)",
+        unbounded_bytes,
+        unbounded_execs,
+        unbounded.event_count()
+    );
+    eprintln!(
+        "        slim      : {:>12} bytes (lossless field projection, no eviction)",
+        slim_bytes
+    );
+    eprintln!(
+        "AFTER   ceiling   : {:>12} bytes  (set {ceiling}); pre-sweep {bounded_before_sweep}",
+        bounded_bytes
+    );
+    eprintln!(
+        "        evicted   : {} chains by byte_ceiling, {} resident",
+        stats.byte_ceiling,
+        bounded.execution_count()
+    );
 
     // The bounded index honors the ceiling regardless of how many executions
     // were applied — the bounded-memory guarantee.
-    assert!(bounded_bytes <= ceiling, "resident set must be held at/under the ceiling");
-    assert!(stats.byte_ceiling > 0, "the ceiling must have forced evictions");
+    assert!(
+        bounded_bytes <= ceiling,
+        "resident set must be held at/under the ceiling"
+    );
+    assert!(
+        stats.byte_ceiling > 0,
+        "the ceiling must have forced evictions"
+    );
     // Bounded resident set is a fraction of the unbounded one.
     assert!(bounded_bytes < unbounded_bytes / 4);
     // Slim is strictly smaller than the full envelope index (lossless win).
-    assert!(slim_bytes < unbounded_bytes, "slim projection reduces resident bytes");
+    assert!(
+        slim_bytes < unbounded_bytes,
+        "slim projection reduces resident bytes"
+    );
 }
 
 #[test]
@@ -122,7 +161,10 @@ fn ttl_sweep_clears_idle_working_set() {
     let base = Instant::now();
     let mut index = WalEventIndex::with_order_policy(
         SpineOrder::Causal,
-        EvictionPolicy { ttl: Some(ttl), ..Default::default() },
+        EvictionPolicy {
+            ttl: Some(ttl),
+            ..Default::default()
+        },
     );
     load(&mut index, EXECUTIONS, 10, 500, base);
     assert_eq!(index.execution_count(), EXECUTIONS as usize);
@@ -140,6 +182,14 @@ fn ttl_sweep_clears_idle_working_set() {
         index.execution_count(),
         index.total_bytes()
     );
-    assert_eq!(stats.ttl, (EXECUTIONS - 5) as usize, "all idle chains swept");
-    assert_eq!(index.execution_count(), 5, "only the active working set remains");
+    assert_eq!(
+        stats.ttl,
+        (EXECUTIONS - 5) as usize,
+        "all idle chains swept"
+    );
+    assert_eq!(
+        index.execution_count(),
+        5,
+        "only the active working set remains"
+    );
 }

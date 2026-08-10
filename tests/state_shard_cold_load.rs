@@ -40,7 +40,10 @@ use serde_json::{json, Value};
 /// output-equivalent to the drive, but not byte-identical; shard-read is designed
 /// to pair with the slim index, the prod default.)
 fn slim_index() -> SharedWalIndex {
-    let policy = EvictionPolicy { slim: true, ..Default::default() };
+    let policy = EvictionPolicy {
+        slim: true,
+        ..Default::default()
+    };
     SharedWalIndex::new(WalEventIndex::with_order_policy(SpineOrder::Causal, policy))
 }
 
@@ -145,7 +148,9 @@ fn encode_state_shard(events: &[Value]) -> Vec<u8> {
         "columns": ["event_id", "prev_event_id", "event_type", "node_name", "status", "result_ref", "extracted", "payload"],
         "rows": rows,
     });
-    noetl_tools::arrow_codec::try_encode_tabular_json(&tabular).unwrap().bytes
+    noetl_tools::arrow_codec::try_encode_tabular_json(&tabular)
+        .unwrap()
+        .bytes
 }
 
 /// Decode the `payload` column back into the per-event slim payloads (mirror of
@@ -155,8 +160,17 @@ fn decode_payload_column(bytes: &[u8]) -> Vec<Value> {
     let batches = noetl_tools::arrow_codec::decode_record_batches(bytes).unwrap();
     let mut out = Vec::new();
     for batch in &batches {
-        let idx = batch.schema().fields().iter().position(|f| f.name() == "payload").unwrap();
-        let arr = batch.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+        let idx = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "payload")
+            .unwrap();
+        let arr = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for r in 0..batch.num_rows() {
             out.push(serde_json::from_str::<Value>(arr.value(r)).unwrap());
         }
@@ -180,18 +194,34 @@ async fn cold_load_from_shard_is_byte_equivalent_to_wal_replay() {
             idx.apply(e);
         }
     }
-    let wal_input = build_offserver_input(&wal_index, EXEC, &playbook, None, Some(head), Some(head), false)
-        .await
-        .expect("WAL-replay path serves the drive");
+    let wal_input = build_offserver_input(
+        &wal_index,
+        EXEC,
+        &playbook,
+        None,
+        Some(head),
+        Some(head),
+        false,
+    )
+    .await
+    .expect("WAL-replay path serves the drive");
 
     // --- Phase 3 cold-load-from-shard -------------------------------------
     // Encode the shard (writer), decode the payload column (reader), apply into a
     // FRESH index, build the same drive input.
     let shard_bytes = encode_state_shard(&events);
     let decoded = decode_payload_column(&shard_bytes);
-    assert_eq!(decoded.len(), events.len(), "every event round-trips through the shard");
+    assert_eq!(
+        decoded.len(),
+        events.len(),
+        "every event round-trips through the shard"
+    );
     for (e, d) in events.iter().zip(&decoded) {
-        assert_eq!(&shard_chain_payload(e), d, "the shard payload column is the verbatim slim chain payload");
+        assert_eq!(
+            &shard_chain_payload(e),
+            d,
+            "the shard payload column is the verbatim slim chain payload"
+        );
     }
 
     let shard_index = slim_index();
@@ -201,9 +231,17 @@ async fn cold_load_from_shard_is_byte_equivalent_to_wal_replay() {
             idx.apply(p);
         }
     }
-    let shard_input = build_offserver_input(&shard_index, EXEC, &playbook, None, Some(head), Some(head), false)
-        .await
-        .expect("cold-load path serves the drive");
+    let shard_input = build_offserver_input(
+        &shard_index,
+        EXEC,
+        &playbook,
+        None,
+        Some(head),
+        Some(head),
+        false,
+    )
+    .await
+    .expect("cold-load path serves the drive");
 
     // --- Equivalence: byte-identical drive input --------------------------
     assert_eq!(

@@ -56,7 +56,14 @@ fn registry_has_mcp_tool_kind() {
 #[test]
 fn registry_still_has_pre_existing_tool_kinds() {
     let registry: ToolRegistry = create_default_registry();
-    for kind in &["shell", "http", "rhai", "result_fetch", "duckdb", "postgres"] {
+    for kind in &[
+        "shell",
+        "http",
+        "rhai",
+        "result_fetch",
+        "duckdb",
+        "postgres",
+    ] {
         assert!(
             registry.has(kind),
             "create_default_registry() must still register '{kind}'"
@@ -106,15 +113,9 @@ fn dispatch_duration_histogram_accepts_mcp_label() {
 #[test]
 fn dispatch_errors_counter_accepts_nats_label() {
     let m = noetl_worker::metrics::WorkerMetrics::global();
-    let before = m
-        .dispatch_errors_total
-        .with_label_values(&["nats"])
-        .get();
+    let before = m.dispatch_errors_total.with_label_values(&["nats"]).get();
     noetl_worker::metrics::record_dispatch("nats", 0.001, true);
-    let after = m
-        .dispatch_errors_total
-        .with_label_values(&["nats"])
-        .get();
+    let after = m.dispatch_errors_total.with_label_values(&["nats"]).get();
     assert_eq!(after, before + 1, "error counter must increment for nats");
 }
 
@@ -122,15 +123,9 @@ fn dispatch_errors_counter_accepts_nats_label() {
 #[test]
 fn dispatch_errors_counter_accepts_mcp_label() {
     let m = noetl_worker::metrics::WorkerMetrics::global();
-    let before = m
-        .dispatch_errors_total
-        .with_label_values(&["mcp"])
-        .get();
+    let before = m.dispatch_errors_total.with_label_values(&["mcp"]).get();
     noetl_worker::metrics::record_dispatch("mcp", 0.001, true);
-    let after = m
-        .dispatch_errors_total
-        .with_label_values(&["mcp"])
-        .get();
+    let after = m.dispatch_errors_total.with_label_values(&["mcp"]).get();
     assert_eq!(after, before + 1, "error counter must increment for mcp");
 }
 
@@ -152,10 +147,7 @@ async fn nats_dispatch_kv_roundtrip_via_registry() {
     let registry: ToolRegistry = create_default_registry();
     let mut ctx = ExecutionContext::default();
     // Provide the NATS URL as a keychain credential so the tool can resolve it.
-    ctx.set_secret(
-        "test_nats_cred",
-        format!(r#"{{"url":"{}"}}"#, nats_url),
-    );
+    ctx.set_secret("test_nats_cred", format!(r#"{{"url":"{}"}}"#, nats_url));
 
     // Use a unique bucket name to avoid cross-test collisions.
     let bucket = format!("noetl_wkr_test_{}", uuid::Uuid::new_v4().simple());
@@ -208,8 +200,7 @@ async fn nats_dispatch_kv_roundtrip_via_registry() {
     assert_eq!(data["value"], "hello-from-worker");
 
     // Confirm metric label surfaced.
-    let text =
-        String::from_utf8(noetl_worker::metrics::WorkerMetrics::global().encode()).unwrap();
+    let text = String::from_utf8(noetl_worker::metrics::WorkerMetrics::global().encode()).unwrap();
     assert!(
         text.contains("tool_kind=\"nats\""),
         "dispatch metric must surface nats label after live dispatch"
@@ -256,8 +247,7 @@ async fn mcp_dispatch_health_probe_via_registry() {
     assert_eq!(data["method"], "health");
 
     // Confirm metric label surfaced.
-    let text =
-        String::from_utf8(noetl_worker::metrics::WorkerMetrics::global().encode()).unwrap();
+    let text = String::from_utf8(noetl_worker::metrics::WorkerMetrics::global().encode()).unwrap();
     assert!(
         text.contains("tool_kind=\"mcp\""),
         "dispatch metric must surface mcp label after live dispatch"
