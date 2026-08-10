@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.111.0](https://github.com/noetl/worker/compare/v5.110.0...v5.111.0) (2026-08-10)
+
+### Features
+
+* **ehdb:** tier-service client + startup reachability probe ([415c46b](https://github.com/noetl/worker/commit/415c46bb4a4f7a5ff61840400fd0bbccf492557a)), closes [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.110.0](https://github.com/noetl/worker/compare/v5.109.1...v5.110.0) (2026-08-10)
 
 ### Features
