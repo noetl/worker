@@ -132,7 +132,9 @@ pub fn encode_response(req: &TierRequest) -> Vec<u8> {
 /// between requests, which is normal), and an error for a truncated frame or an
 /// over-long one — those are protocol violations and must not be silently
 /// treated as "no more work".
-async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>> {
+/// Shared with the client (`tier_client`) so both ends use ONE codec.  Two
+/// implementations of the same wire format is how a protocol drifts.
+pub(crate) async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -152,7 +154,8 @@ async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>> 
 }
 
 /// Write one length-framed message.
-async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+/// Shared with the client — see [`read_frame`].
+pub(crate) async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
     let len = u32::try_from(payload.len()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "response exceeds u32 length")
     })?;

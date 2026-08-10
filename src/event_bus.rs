@@ -290,6 +290,12 @@ pub async fn spawn_event_writer_host(
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed ingest listener up");
     }
 
+    // EHDB tier-service CLIENT probe (ai-meta#257 PR 2).  Checks reachability
+    // once at startup when NOETL_EHDB_TIER_SERVICE_ADDR is set, and does nothing
+    // at all when it is not.  Spawned rather than awaited so an unreachable
+    // endpoint delays no other face coming up.
+    tokio::spawn(crate::ehdb::tier_client::probe_at_startup());
+
     // EHDB tier service (ai-meta#257 PR 1) — the writer-fronted face for the
     // storage tiers.  Hosted here because this is the process that owns the
     // durable volumes and already fronts both buses.
