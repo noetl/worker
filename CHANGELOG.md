@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.113.0](https://github.com/noetl/worker/compare/v5.112.0...v5.113.0) (2026-08-11)
+
+### Features
+
+* **ehdb:** tier queries can resolve from the writer's store, not just pod-local ([f37afb2](https://github.com/noetl/worker/commit/f37afb2fd6ea763949d0342a6a0d9cf2f135cc12)), closes [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.112.0](https://github.com/noetl/worker/compare/v5.111.0...v5.112.0) (2026-08-11)
 
 ### Features
