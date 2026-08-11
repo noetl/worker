@@ -459,7 +459,15 @@ pub fn mirror_event(
             // incumbent and shadow is untouched.  That is byte-identical to the
             // pre-PR-6 behaviour for every configuration in use today, because
             // the address is set nowhere.
-            let durable_service_reachable = super::tier_client::TierClientConfig::from_env().is_some();
+            // ARM-D FIX: ask the MEASURED verdict, not whether an address is set.
+            // `config.is_some()` answered "is it configured"; a black-hole address
+            // then counted as a durable service and primary served — authoritative
+            // in name only.  Reachability is now derived from real tier-service
+            // operations (see `reachability`), and "never contacted" is not
+            // reachable.
+            let durable_service_reachable =
+                super::tier_client::TierClientConfig::from_env().is_some()
+                    && super::reachability::is_reachable();
             let decision = super::primary_serve::decide(
                 serving_primary,
                 durable_service_reachable,

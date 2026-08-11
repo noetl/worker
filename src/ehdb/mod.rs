@@ -103,6 +103,7 @@ pub mod primary_serve;
 pub mod projection;
 pub mod query;
 pub mod rag;
+pub mod reachability;
 pub mod readiness;
 pub mod systemstore;
 pub mod tier_client;
