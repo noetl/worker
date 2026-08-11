@@ -151,9 +151,23 @@ pub fn read_execution(cfg: Option<&TierStoreConfig>, execution_id: &str) -> Tier
         limit: MAX_SCAN_LIMIT,
     };
     match driver(cfg).read_execution(&request) {
-        Ok(out) => TierStoreOutcome::Ok(
-            serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()),
-        ),
+        Ok(out) => {
+            let mut v = serde_json::to_value(&out).unwrap_or(serde_json::Value::Null);
+            // ⚠ The driver reports `exists: true` for an execution it holds NO
+            // records for, so a caller using `exists` to decide hit-vs-miss gets
+            // the wrong answer (found by the PR-3 gate, which asserts on record
+            // payloads for exactly this reason).  Normalise it at the boundary we
+            // own rather than leaving a field that means the opposite of its name:
+            // `exists` now tracks whether any record came back.
+            if let Some(obj) = v.as_object_mut() {
+                let n = obj
+                    .get("record_count")
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(0);
+                obj.insert("exists".to_string(), serde_json::Value::Bool(n > 0));
+            }
+            TierStoreOutcome::Ok(serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()))
+        }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
     }
 }
@@ -233,6 +247,32 @@ mod tests {
             "a miss must NOT return another execution's data: {miss}"
         );
         assert_ne!(hit, miss, "hit and miss must be distinguishable");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[test]
+    fn exists_reflects_whether_records_came_back() {
+        // Regression guard for the field that meant the opposite of its name:
+        // the driver reports exists:true for an execution holding no records.
+        let cfg = tmp_cfg("exists");
+        append(Some(&cfg), "has-records", r#"{"n":1}"#);
+
+        let hit: serde_json::Value = match read_execution(Some(&cfg), "has-records") {
+            TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let miss: serde_json::Value = match read_execution(Some(&cfg), "no-such-execution") {
+            TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(hit["exists"], serde_json::Value::Bool(true));
+        assert_eq!(hit["record_count"], 1);
+        assert_eq!(
+            miss["exists"],
+            serde_json::Value::Bool(false),
+            "a miss must report exists:false — the driver says true, which is why we normalise"
+        );
+        assert_eq!(miss["record_count"], 0);
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
