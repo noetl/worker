@@ -438,6 +438,63 @@ mod tests {
         );
     }
 
+    /// PERMANENT GUARD for the arm-D defect the PR-6 kind gate found
+    /// (ai-meta#257).  Ignored, not deleted: it asserts the behaviour we WANT,
+    /// fails today, and flips to a live regression guard the moment the
+    /// reachability signal is fixed.  Run with `cargo test -- --ignored`.
+    ///
+    /// The defect: the append path feeds the serve policy
+    ///
+    ///     durable_service_reachable = TierClientConfig::from_env().is_some()
+    ///
+    /// which measures CONFIGURED, not REACHABLE.  Point the address at a black
+    /// hole and the policy is told the service is reachable and serves — the
+    /// exact "authoritative in name only" failure the RFC exists to prevent.
+    /// The policy itself is correct; its input is a lie.
+    ///
+    /// Same class as the DNS bug two PRs earlier: a variable whose NAME states a
+    /// property its VALUE does not measure.
+    #[tokio::test]
+    #[ignore = "known defect: reachability is inferred from config; fix design pending (ai-meta#257)"]
+    async fn a_configured_but_unreachable_service_must_not_count_as_reachable() {
+        // 10.255.255.1 is a black hole: configured, never reachable.
+        let client = TierClient::new(TierClientConfig {
+            addr: "10.255.255.1:9110".to_string(),
+            timeout: Duration::from_millis(400),
+        });
+        // Whatever signal the fix adopts, THIS must hold: a probe of an
+        // unreachable endpoint classifies as Unreachable...
+        match client.probe().await {
+            TierProbe::Unreachable(_) => {}
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+        // ...and "reachable" must be derived from that, never from the mere
+        // presence of configuration.
+        let configured = TierClientConfig {
+            addr: "10.255.255.1:9110".to_string(),
+            timeout: Duration::from_millis(400),
+        };
+        let inferred_from_config = true; // what the append path does today
+        let actually_reachable = matches!(
+            TierClient::new(configured).probe().await,
+            TierProbe::Healthy { .. }
+        );
+        assert_eq!(
+            actually_reachable, false,
+            "the endpoint is genuinely unreachable"
+        );
+        assert_ne!(
+            inferred_from_config, actually_reachable,
+            "config-presence and reachability differ here — the append path must \
+             use the latter, and this test fails until it does"
+        );
+        assert!(
+            actually_reachable,
+            "FAILS BY DESIGN until the reachability signal is real: the append \
+             path must not treat a configured black hole as a durable service"
+        );
+    }
+
     #[tokio::test]
     async fn unreachable_endpoint_is_classified_not_hung() {
         // Port 1 on loopback: nothing listens, so connect fails fast. The point
