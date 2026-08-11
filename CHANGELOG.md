@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.115.0](https://github.com/noetl/worker/compare/v5.114.1...v5.115.0) (2026-08-11)
+
+### Features
+
+* **ehdb:** wire the primary-serve policy into the event-log append path ([9f10266](https://github.com/noetl/worker/commit/9f1026653477ede46c7305b861b843f88d8cad6f)), closes [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.114.1](https://github.com/noetl/worker/compare/v5.114.0...v5.114.1) (2026-08-11)
 
 ### Bug Fixes
