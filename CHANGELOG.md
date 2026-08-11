@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.115.1](https://github.com/noetl/worker/compare/v5.115.0...v5.115.1) (2026-08-11)
+
+### Bug Fixes
+
+* **ehdb:** reachability is measured by the append, not inferred from config ([92646f8](https://github.com/noetl/worker/commit/92646f87881debcba1d18e3a7ce2edfdbded4dc8)), closes [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [worker#259](https://github.com/noetl/worker/issues/259) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.115.0](https://github.com/noetl/worker/compare/v5.114.1...v5.115.0) (2026-08-11)
 
 ### Features
