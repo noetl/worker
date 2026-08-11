@@ -486,6 +486,34 @@ impl ControlPlaneClient {
             anyhow::bail!("Failed to emit event: {}", body);
         }
 
+        // noetl/ai-meta#258 — read the AUTHORITATIVE identity back.
+        //
+        // `EventResponse` carries the `event_id` the server actually wrote to
+        // `noetl.event`, which may not be the one the producer sent: five live
+        // emit paths (`spool_runtime` ×2, `subscription` ×2, and the retry path
+        // below) send `event_id: None` and let the server assign a snowflake.
+        // The mirrored copy of those events therefore had no identity at all,
+        // and no cross-store comparison could ever match them.
+        //
+        // The body is read only when the EHDB hook is armed, so a build with
+        // EHDB off does not start parsing a response it previously discarded.
+        // A body that will not parse yields `None` — never an error: this is an
+        // auxiliary verification path and it must not be able to fail an event
+        // emit that the control plane has already accepted.
+        let authoritative_event_id = if self.ehdb_eventlog_hook.is_some() {
+            response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("event_id").and_then(|id| match id {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+                    _ => None,
+                }))
+        } else {
+            None
+        };
+
         // EHDB event-log live-append hook (noetl/ehdb#234 runtime integration).
         // This is the authoritative event-emit chokepoint every worker path
         // funnels through, so hooking here mirrors ALL live events (emitter,
@@ -497,11 +525,17 @@ impl ControlPlaneClient {
         // meters any failure so the authoritative event path is never affected.
         if let Some(env) = self.ehdb_eventlog_hook.as_ref() {
             if let Ok(payload) = serde_json::to_string(&event) {
-                let _ = crate::ehdb::eventlog::mirror_live_event(
+                let mirrored = crate::ehdb::eventlog::mirror_live_event(
                     env,
                     &event.execution_id.to_string(),
                     &payload,
+                    authoritative_event_id,
                 );
+                // The tier service must receive the SAME bytes the pod-local log
+                // received — the reconciled payload, not the original — or the
+                // two stores the server's comparator may read would disagree
+                // about the record's identity (noetl/ai-meta#258).
+                let payload = mirrored.payload;
                     // ai-meta#257 — GAP 2.  Option 2 says "the append IS the probe", but
                     // nothing on the append path ever called the client: the only writers
                     // of the verdict were the startup probe and the HTTP query handler.
