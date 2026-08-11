@@ -502,6 +502,25 @@ impl ControlPlaneClient {
                     &event.execution_id.to_string(),
                     &payload,
                 );
+                    // ai-meta#257 — GAP 2.  Option 2 says "the append IS the probe", but
+                    // nothing on the append path ever called the client: the only writers
+                    // of the verdict were the startup probe and the HTTP query handler.
+                    // A service that died AFTER startup would therefore never demote, and
+                    // the tier would keep claiming to serve from a dead store — arm D, one
+                    // restart later.
+                    //
+                    // Best-effort and isolated, exactly like the mirror above: the durable
+                    // append records a reachability verdict and its result is discarded.
+                    // The authoritative event path is never affected, and a failure
+                    // demotes rather than erroring the caller.  The cached negative keeps
+                    // an outage to one slow request instead of one per event.
+                    if let Some(client) = crate::ehdb::tier_client::TierClient::from_env() {
+                        if !crate::ehdb::reachability::is_cached_down() {
+                            let _ = client
+                                .append(&event.execution_id.to_string(), &payload)
+                                .await;
+                        }
+                    }
             }
         }
 
