@@ -180,8 +180,14 @@ impl TierClient {
     /// Append one record to the remote event-log tier.
     pub async fn append(&self, execution_id: &str, payload: &str) -> Result<String, String> {
         let req = serde_json::json!({"op":"append","execution_id":execution_id,"payload":payload});
-        let body = self.request(req.to_string().as_bytes()).await?;
-        Ok(String::from_utf8_lossy(&body).to_string())
+        // THE APPEND IS THE PROBE.  Reachability is measured by the operation
+        // that depends on it, so it cannot drift the way a cached poll does.
+        let out = self
+            .request(req.to_string().as_bytes())
+            .await
+            .map(|b| String::from_utf8_lossy(&b).to_string());
+        super::reachability::record(super::reachability::classify(&out));
+        out
     }
 
     /// Read every record the remote tier holds for one execution.
@@ -202,7 +208,9 @@ impl TierClient {
     /// *is* the result, and a caller deciding what to log should not also have
     /// to unwrap.
     pub async fn probe(&self) -> TierProbe {
-        match self.request(b"health").await {
+        let raw = self.request(b"health").await;
+        super::reachability::record(super::reachability::classify(&raw.clone().map(|b| String::from_utf8_lossy(&b).to_string())));
+        match raw {
             Err(e) => TierProbe::Unreachable(e),
             Ok(body) => {
                 let text = String::from_utf8_lossy(&body).to_string();
@@ -455,43 +463,39 @@ mod tests {
     /// Same class as the DNS bug two PRs earlier: a variable whose NAME states a
     /// property its VALUE does not measure.
     #[tokio::test]
-    #[ignore = "known defect: reachability is inferred from config; fix design pending (ai-meta#257)"]
     async fn a_configured_but_unreachable_service_must_not_count_as_reachable() {
+        use crate::ehdb::reachability;
+
         // 10.255.255.1 is a black hole: configured, never reachable.
         let client = TierClient::new(TierClientConfig {
             addr: "10.255.255.1:9110".to_string(),
             timeout: Duration::from_millis(400),
         });
-        // Whatever signal the fix adopts, THIS must hold: a probe of an
-        // unreachable endpoint classifies as Unreachable...
-        match client.probe().await {
-            TierProbe::Unreachable(_) => {}
-            other => panic!("expected Unreachable, got {other:?}"),
-        }
-        // ...and "reachable" must be derived from that, never from the mere
-        // presence of configuration.
-        let configured = TierClientConfig {
-            addr: "10.255.255.1:9110".to_string(),
-            timeout: Duration::from_millis(400),
-        };
-        let inferred_from_config = true; // what the append path does today
-        let actually_reachable = matches!(
-            TierClient::new(configured).probe().await,
-            TierProbe::Healthy { .. }
-        );
-        assert_eq!(
-            actually_reachable, false,
-            "the endpoint is genuinely unreachable"
-        );
-        assert_ne!(
-            inferred_from_config, actually_reachable,
-            "config-presence and reachability differ here — the append path must \
-             use the latter, and this test fails until it does"
+
+        // An append against it fails at the transport, which demotes.
+        let _ = client.append("armd", r#"{"x":1}"#).await;
+        assert!(
+            !reachability::is_reachable(),
+            "a configured black hole must NOT count as a durable service — the arm-D defect"
         );
         assert!(
-            actually_reachable,
-            "FAILS BY DESIGN until the reachability signal is real: the append \
-             path must not treat a configured black hole as a durable service"
+            reachability::is_cached_down(),
+            "the negative is cached so an outage costs one slow request, not one per append"
+        );
+
+        // POSITIVE CONTROL: a real listener promotes, proving the guard is not
+        // simply stuck at 'unreachable'.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tier(listener));
+        let good = TierClient::new(TierClientConfig {
+            addr: format!("127.0.0.1:{}", addr.port()),
+            timeout: Duration::from_millis(2_000),
+        });
+        assert_eq!(good.probe().await, TierProbe::Healthy { version: PROTOCOL_VERSION });
+        assert!(
+            reachability::is_reachable(),
+            "a reachable service must promote — self-healing, no operator action"
         );
     }
 
