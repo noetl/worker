@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.112.0](https://github.com/noetl/worker/compare/v5.111.0...v5.112.0) (2026-08-11)
+
+### Features
+
+* **ehdb:** tier-service durable store — append + read over the wire ([30b5f76](https://github.com/noetl/worker/commit/30b5f7623b91adf9675c9c304c45a96287791e72)), closes [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.111.0](https://github.com/noetl/worker/compare/v5.110.0...v5.111.0) (2026-08-10)
 
 ### Features
