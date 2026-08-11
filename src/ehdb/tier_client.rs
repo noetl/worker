@@ -38,10 +38,38 @@ pub const TIER_SERVICE_TIMEOUT_MS_ENV: &str = "NOETL_EHDB_TIER_SERVICE_TIMEOUT_M
 /// and it must never become a latency contributor on the caller's hot path.
 pub const DEFAULT_TIMEOUT_MS: u64 = 2_000;
 
+/// Split a `host:port` authority, accepting DNS names as well as IP literals.
+///
+/// Returns the normalised authority, or `None` when the shape is wrong. `[::1]:9110`
+/// style bracketed IPv6 is accepted by splitting on the LAST colon.
+pub fn split_authority(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let (host, port) = raw.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() {
+        return None;
+    }
+    let port: u16 = port.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some(format!("{host}:{port}"))
+}
+
 /// Resolved client configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierClientConfig {
-    pub addr: SocketAddr,
+    /// The raw `host:port` authority, NOT a resolved address.
+    ///
+    /// Kept unresolved on purpose.  The first version parsed this as a
+    /// `SocketAddr`, which accepts only literal IPs — so every Kubernetes DNS
+    /// name was rejected and the client fell back to local resolution. Its unit
+    /// tests all used `127.0.0.1`, so they passed while the client could not
+    /// address a real service; the kind gate is what caught it.
+    ///
+    /// Holding the name also gives **re-resolution on every connect** for free,
+    /// which matters because pod IPs move: a cached address would keep dialling
+    /// a pod that no longer exists after a writer restart.
+    pub addr: String,
     pub timeout: Duration,
 }
 
@@ -57,13 +85,17 @@ impl TierClientConfig {
         if raw.is_empty() {
             return None;
         }
-        let addr = match raw.parse::<SocketAddr>() {
-            Ok(a) => a,
-            Err(e) => {
+        // Validate the SHAPE (host:port with a numeric port), not resolvability.
+        // Resolution belongs at connect time — a name that does not resolve at
+        // startup may resolve later (the writer may simply not be up yet), and
+        // refusing the config for that would be wrong.
+        let addr = match split_authority(raw) {
+            Some(a) => a,
+            None => {
                 tracing::warn!(
                     var = TIER_SERVICE_ADDR_ENV,
-                    error = %e,
-                    "EHDB tier service address is unparseable; no tier client will be created"
+                    value = raw,
+                    "EHDB tier service address is not host:port; no tier client will be created"
                 );
                 return None;
             }
@@ -98,7 +130,7 @@ pub enum TierProbe {
 }
 
 /// A client for one tier service endpoint.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TierClient {
     cfg: TierClientConfig,
 }
@@ -113,8 +145,8 @@ impl TierClient {
         TierClientConfig::from_env().map(Self::new)
     }
 
-    pub fn addr(&self) -> SocketAddr {
-        self.cfg.addr
+    pub fn addr(&self) -> &str {
+        &self.cfg.addr
     }
 
     /// Send one request frame and read one reply frame.
@@ -125,7 +157,9 @@ impl TierClient {
     /// been bitten by before.
     pub async fn request(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let fut = async {
-            let mut s = TcpStream::connect(self.cfg.addr)
+            // Connect by NAME: tokio resolves it per call, so a moved pod is
+            // picked up on the next attempt rather than cached forever.
+            let mut s = TcpStream::connect(self.cfg.addr.as_str())
                 .await
                 .map_err(|e| format!("connect: {e}"))?;
             write_frame(&mut s, payload)
@@ -291,7 +325,7 @@ mod tests {
         tokio::spawn(serve_tier(listener));
 
         let client = TierClient::new(TierClientConfig {
-            addr,
+            addr: addr.to_string(),
             timeout: Duration::from_millis(2_000),
         });
         assert_eq!(
@@ -309,7 +343,7 @@ mod tests {
         tokio::spawn(serve_tier(listener));
 
         let client = TierClient::new(TierClientConfig {
-            addr,
+            addr: addr.to_string(),
             timeout: Duration::from_millis(2_000),
         });
         let body = client.request(b"append").await.expect("a reply, not an error");
@@ -336,7 +370,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_tier(listener));
-        let client = TierClient::new(TierClientConfig { addr, timeout: Duration::from_millis(3_000) });
+        let client = TierClient::new(TierClientConfig { addr: addr.to_string(), timeout: Duration::from_millis(3_000) });
 
         let appended = client
             .append("e2e-exec-1", r#"{"marker":"E2E-HIT"}"#)
@@ -359,12 +393,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_dns_hostname_is_accepted_not_rejected() {
+        // THE GAP THAT HID THE BUG.  Every earlier config test used
+        // `127.0.0.1:9110`, which parses as a SocketAddr — so the tests passed
+        // while the client rejected every Kubernetes DNS name and silently fell
+        // back to local resolution.  A gate against a real writer caught it.
+        for host in [
+            "noetl-cmdbus-writer-0.noetl-cmdbus-writer-headless.noetl.svc.cluster.local:9110",
+            "writer:9110",
+            "example.internal:1",
+            "127.0.0.1:9110",
+            "[::1]:9110",
+        ] {
+            assert!(
+                split_authority(host).is_some(),
+                "must accept host:port, including DNS names: {host}"
+            );
+        }
+        // Shape errors are still refused — accepting names must not mean
+        // accepting anything.
+        for bad in ["", "nocolon", "host:", ":9110", "host:abc", "host:0", "host:99999"] {
+            assert!(split_authority(bad).is_none(), "must reject: {bad:?}");
+        }
+    }
+
+    /// Connect to a real listener via a resolvable HOSTNAME rather than a literal
+    /// IP, exercising the resolution path the SocketAddr parse used to block.
+    #[tokio::test]
+    async fn client_connects_through_a_hostname() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_tier(listener));
+
+        // `localhost` is a genuine name lookup, not a literal-IP parse.
+        let client = TierClient::new(TierClientConfig {
+            addr: format!("localhost:{port}"),
+            timeout: Duration::from_millis(3_000),
+        });
+        assert_eq!(
+            client.probe().await,
+            TierProbe::Healthy { version: PROTOCOL_VERSION },
+            "a hostname must resolve and connect"
+        );
+    }
+
     #[tokio::test]
     async fn unreachable_endpoint_is_classified_not_hung() {
         // Port 1 on loopback: nothing listens, so connect fails fast. The point
         // is that the caller gets a classified answer rather than a hang.
         let client = TierClient::new(TierClientConfig {
-            addr: "127.0.0.1:1".parse().unwrap(),
+            addr: "127.0.0.1:1".to_string(),
             timeout: Duration::from_millis(500),
         });
         match client.probe().await {
