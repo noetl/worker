@@ -118,6 +118,60 @@ async fn ehdb_tier_query_handler(
         );
     };
     let params = QueryParams::from_pairs(raw.iter());
+
+    // ai-meta#257 PR 4 — resolve against the writer-fronted tier service when the
+    // operator asked for it.  Default (`local`) is byte-identical to the previous
+    // behaviour: this pod's own store.
+    //
+    // The server is NOT involved: it keeps its control-plane guard and still only
+    // relays to this route.  All that changes is which store this hop reads.
+    {
+        let env = crate::ehdb::process_env();
+        let (source, downgraded) = crate::ehdb::tier_query_source::effective_source(&env);
+        if downgraded {
+            // Asking for `service` and silently answering from a different store is
+            // the exact failure this effort exists to remove, so say so.
+            tracing::warn!(
+                "NOETL_EHDB_TIER_QUERY_SOURCE=service but no tier-service address is \
+                 configured; falling back to the pod-local store"
+            );
+        }
+        if source == crate::ehdb::tier_query_source::TierQuerySource::Service {
+            if let Some(client) = crate::ehdb::tier_client::TierClient::from_env() {
+                // `execution`, NOT `execution_id`: the latter is documented in
+                // QueryParams as a tracing correlation id, and reading by it would
+                // silently query the wrong key.
+                let reply = match params.execution.as_deref() {
+                    Some(eid) => client.read_execution(eid).await,
+                    None => client.scan(None, 100).await,
+                };
+                return match reply {
+                    Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                        Ok(v) => (StatusCode::OK, Json(v)),
+                        // A non-JSON reply is one of the service's typed refusals
+                        // (`unavailable` / `invalid` / `error`).  Surface it as-is
+                        // rather than as an empty 200, which would read as "no data".
+                        Err(_) => (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "action": "ehdb.tier.query",
+                                "source": "service",
+                                "error": body,
+                            })),
+                        ),
+                    },
+                    Err(e) => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "action": "ehdb.tier.query",
+                            "source": "service",
+                            "error": e,
+                        })),
+                    ),
+                };
+            }
+        }
+    }
     // The driver reads are synchronous, bounded, filesystem-backed opens; run
     // them on the blocking pool so a scan never stalls the metrics reactor.
     let env = crate::ehdb::process_env();
