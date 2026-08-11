@@ -166,19 +166,27 @@ pub fn record_rag(operation: &str, outcome: &str, ok: bool, degraded: bool, dura
 
 /// Record one event-log shadow op (EHDB Phase 6).  `disabled` outcomes are not
 /// recorded, preserving the byte-identical `/metrics` invariant.
-/// Record that a tier was configured `primary` while this build has no
-/// authoritative serve path for it (noetl/ai-meta#247).
+/// Record what selecting `primary` on a tier did, at flip time
+/// (noetl/ai-meta#247, corrected by #259).
+///
+/// `outcome` is one of `primary_not_wired` (the tier has no runtime serve path),
+/// `primary_no_tier_service` (it has one, but no durable store is configured to
+/// serve from) or `primary_armed` (serve path armed; per-op counters say what it
+/// then served).  See [`crate::ehdb::note_primary_selected`] for which condition
+/// means what.
 ///
 /// Routed into the tier's own existing family with a distinct
-/// `operation="runtime_hook", outcome="primary_not_wired"` label pair rather
-/// than a new family, so it renders through the same path and needs no new
-/// registry surface.
+/// `operation="runtime_hook"` label rather than a new family, so it renders
+/// through the same path and needs no new registry surface.
 ///
-/// Recorded once per tier per process, alongside the WARN — a log line alone is
-/// not observable from a dashboard, and the whole failure mode this guards
+/// Recorded once per tier per process, alongside the log line — a log line alone
+/// is not observable from a dashboard, and the whole failure mode this guards
 /// against was "a counter quietly stopped moving and nobody saw it".
-pub fn record_primary_not_wired(tier: &str) {
-    let (op, outcome) = ("runtime_hook", "primary_not_wired");
+///
+/// Not pinned to 0: these series are absent until someone selects `primary`,
+/// which is the point — absence means "no tier was flipped in this process".
+pub fn record_runtime_hook(tier: &str, outcome: &str) {
+    let op = "runtime_hook";
     match tier {
         "eventlog" => record_eventlog(op, outcome, true, false, 0.0),
         "projection" => record_projection(op, outcome, true, false, 0.0),
