@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.114.1](https://github.com/noetl/worker/compare/v5.114.0...v5.114.1) (2026-08-11)
+
+### Bug Fixes
+
+* **ehdb:** tier client must accept DNS names, not only IP literals ([8fed005](https://github.com/noetl/worker/commit/8fed0053a2914b16c46a219b4700d53e84376d19)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.114.0](https://github.com/noetl/worker/compare/v5.113.0...v5.114.0) (2026-08-11)
 
 ### Features
