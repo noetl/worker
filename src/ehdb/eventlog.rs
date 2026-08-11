@@ -212,7 +212,9 @@ fn txn_gen() -> &'static SnowflakeGen {
     GEN.get_or_init(|| SnowflakeGen::from_env_or_hint("ehdb-el"))
 }
 
-fn new_transaction_id() -> String {
+/// Shared with the tier store (ai-meta#257 PR 3) so remote appends carry the
+/// same transaction-id shape as local ones.
+pub(crate) fn new_transaction_id() -> String {
     format!("ehdbel-{}", txn_gen().next_id())
 }
 
