@@ -229,18 +229,55 @@ pub fn parse_health(text: &str) -> Option<u16> {
     rest.parse::<u16>().ok()
 }
 
-/// Probe once at startup when a client is configured, and record what was found.
+/// How many times the startup probe is attempted before giving up.
 ///
-/// Reachability is checked **once, at startup, off the hot path**. It is a
-/// deployment question ("did I point this at the right host?"), not a
-/// per-request one, and polling it would add load to a single-replica writer for
-/// no new information.
+/// Bounded, and small. This is a boot-race smoother, not a supervisor: if the
+/// service is still absent after the last attempt, the append path's own
+/// cached-negative retry takes over and will promote the moment a real append
+/// succeeds. Nothing here is load-bearing for recovery.
+const STARTUP_PROBE_ATTEMPTS: u32 = 5;
+
+/// Base backoff between startup probe attempts; doubles each time.
+/// 250ms + 500 + 1s + 2s ≈ 3.75s of total patience across the 5 attempts.
+const STARTUP_PROBE_BACKOFF_MS: u64 = 250;
+
+/// Probe at startup when a client is configured, and record what was found.
+///
+/// Reachability is checked **at startup, off the hot path**. It is a deployment
+/// question ("did I point this at the right host?"), not a per-request one, and
+/// polling it would add load to a single-replica writer for no new information.
+///
+/// # Why this retries
+///
+/// A single attempt makes worker boot a race against writer restart. The writer
+/// is a single-replica StatefulSet; a rolling restart of both leaves a window of
+/// a few seconds where the worker is up and the tier face is not. One failed
+/// probe would leave the worker unpromoted — not *permanently*, since the append
+/// path re-probes, but for as long as it takes the next event to arrive, which
+/// on an idle pool is unbounded. A handful of backed-off attempts closes that
+/// window for the cost of a few seconds of a background task.
+///
+/// Only a **transport failure** is retried. A service that answers — even to
+/// refuse, or with a version we do not speak — has been reached, and asking it
+/// again would tell us nothing new.
 pub async fn probe_at_startup() {
     let Some(client) = TierClient::from_env() else {
         return; // not configured — strict no-op
     };
     let addr = client.addr();
-    match client.probe().await {
+    let mut outcome = client.probe().await;
+    let mut attempt = 1;
+    while attempt < STARTUP_PROBE_ATTEMPTS && matches!(outcome, TierProbe::Unreachable(_)) {
+        let backoff = STARTUP_PROBE_BACKOFF_MS << (attempt - 1);
+        tracing::debug!(
+            %addr, attempt, backoff_ms = backoff,
+            "EHDB tier service not reachable yet; retrying the startup probe"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+        outcome = client.probe().await;
+        attempt += 1;
+    }
+    match outcome {
         TierProbe::Healthy { version } => {
             super::metrics::record_tier_client("probe", "healthy", true, false, 0.0);
             if version == PROTOCOL_VERSION {
@@ -262,7 +299,11 @@ pub async fn probe_at_startup() {
         }
         TierProbe::Unreachable(err) => {
             super::metrics::record_tier_client("probe", "unreachable", false, true, 0.0);
-            tracing::warn!(%addr, error = %err, "EHDB tier service is not reachable");
+            tracing::warn!(
+                %addr, error = %err, attempts = attempt,
+                "EHDB tier service is not reachable after the bounded startup probe; \
+                 the append path will re-probe and promote on the first success"
+            );
         }
     }
 }
