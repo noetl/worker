@@ -82,6 +82,17 @@ impl Worker {
         // Events run roughly an order of magnitude hotter than commands, so
         // sharing the command bus's engine would put that volume in front of
         // command dispatch latency and re-open noetl/ai-meta#205.
+        // ai-meta#257 — GAP 1.  The reachability probe used to be spawned ONLY
+        // inside spawn_event_writer_host, which runs only where
+        // NOETL_EVENT_BUS_HOST is set — the writer.  On worker pods nothing ever
+        // contacted the tier service, so EVER_SUCCEEDED never flipped,
+        // is_reachable() was permanently false, and `primary` could never
+        // promote.  The PR-6 gate's arm B caught it.
+        //
+        // Spawned wherever a tier CLIENT is configured, which is where the
+        // verdict is read.  A strict no-op when unconfigured.
+        tokio::spawn(crate::ehdb::tier_client::probe_at_startup());
+
         let eventbus = crate::event_bus::EventBusConfig::from_env();
         if eventbus.host {
             let (_coordinator, shutdown) =
