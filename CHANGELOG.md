@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.115.2](https://github.com/noetl/worker/compare/v5.115.1...v5.115.2) (2026-08-11)
+
+### Bug Fixes
+
+* **ehdb:** complete the primary serve-path wiring (traced audit, all gaps) ([2f5d4cf](https://github.com/noetl/worker/commit/2f5d4cff7ce6f99f18613f1718bcd8d6334b7f9e)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.115.1](https://github.com/noetl/worker/compare/v5.115.0...v5.115.1) (2026-08-11)
 
 ### Bug Fixes
