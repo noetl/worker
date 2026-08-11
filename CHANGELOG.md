@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.115.3](https://github.com/noetl/worker/compare/v5.115.2...v5.115.3) (2026-08-11)
+
+### Bug Fixes
+
+* **ehdb:** re-promotion is evidence-based, not timer-based ([c5161b2](https://github.com/noetl/worker/commit/c5161b2a5af8c23c750e57f00f45d7585ace9296)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.115.2](https://github.com/noetl/worker/compare/v5.115.1...v5.115.2) (2026-08-11)
 
 ### Bug Fixes
