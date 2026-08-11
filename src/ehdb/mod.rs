@@ -99,6 +99,7 @@ pub mod guard;
 pub mod kv;
 pub mod metrics;
 pub mod object;
+pub mod primary_serve;
 pub mod projection;
 pub mod query;
 pub mod rag;
