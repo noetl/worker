@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.114.0](https://github.com/noetl/worker/compare/v5.113.0...v5.114.0) (2026-08-11)
+
+### Features
+
+* **ehdb:** primary-serve policy — three conditions, and divergence demotes ([92ce0ce](https://github.com/noetl/worker/commit/92ce0ce5fb36667dc856b821863b36c324f7ad89)), closes [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [worker#251](https://github.com/noetl/worker/issues/251) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.113.0](https://github.com/noetl/worker/compare/v5.112.0...v5.113.0) (2026-08-11)
 
 ### Features
