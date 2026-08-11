@@ -446,13 +446,40 @@ pub fn mirror_event(
                 expected_count,
             );
 
-            let result_outcome = match (serving_primary, report.holds()) {
-                // Primary: EHDB served the append authoritatively.
-                (true, true) => EventLogOutcome::ServedPrimary,
-                (true, false) => EventLogOutcome::PrimaryDivergence,
-                // Shadow: EHDB mirrored alongside the authoritative incumbent.
-                (false, true) => EventLogOutcome::Mirrored,
-                (false, false) => EventLogOutcome::ParityMismatch,
+            // ai-meta#257 PR 6 — the serve decision now runs through the shared
+            // policy (`primary_serve::decide`) instead of being re-derived here.
+            //
+            // The policy adds the condition this site never checked: a DURABLE
+            // SERVICE must be reachable.  Without it `primary` was deciding to
+            // "serve authoritatively" from a POD-LOCAL fragment while the
+            // incumbent held all history — authoritative in name only.
+            //
+            // Default-off: with no tier-service address configured,
+            // `durable_service_reachable` is false, so `primary` demotes to the
+            // incumbent and shadow is untouched.  That is byte-identical to the
+            // pre-PR-6 behaviour for every configuration in use today, because
+            // the address is set nowhere.
+            let durable_service_reachable = super::tier_client::TierClientConfig::from_env().is_some();
+            let decision = super::primary_serve::decide(
+                serving_primary,
+                durable_service_reachable,
+                report.holds(),
+            );
+            let result_outcome = match (serving_primary, report.holds(), decision.served_by_ehdb()) {
+                // Primary AND the policy agreed EHDB may serve.
+                (true, true, true) => EventLogOutcome::ServedPrimary,
+                // Primary, parity diverged ⇒ demote.  The incumbent's write already
+                // happened, so the caller is served correctly; the tier is marked
+                // degraded rather than the caller being failed.
+                (true, false, _) => EventLogOutcome::PrimaryDivergence,
+                // Primary, parity held, but the policy refused — no durable service.
+                // Reported as PrimaryUnavailable, NOT ServedPrimary: claiming to have
+                // served authoritatively from a pod-local fragment is the lie this
+                // whole RFC exists to prevent.
+                (true, true, false) => EventLogOutcome::PrimaryUnavailable,
+                // Shadow is unchanged by this PR.
+                (false, true, _) => EventLogOutcome::Mirrored,
+                (false, false, _) => EventLogOutcome::ParityMismatch,
             };
             let mut result = make_result(
                 mode,
@@ -956,14 +983,23 @@ mod tests {
     }
 
     #[test]
-    fn primary_serves_authoritatively() {
+    fn primary_without_a_durable_service_is_unavailable_not_served() {
+            // CONTRACT CHANGE (ai-meta#257 PR 6).  This previously asserted
+            // `ServedPrimary`: `primary` + parity was treated as sufficient to serve
+            // authoritatively from a POD-LOCAL log while the incumbent held all
+            // history — authoritative in name only, and the failure the RFC exists
+            // to prevent.  Serving now also requires a reachable durable tier
+            // service; none is configured here, so PrimaryUnavailable is correct.
+            // The append still happens and parity is still computed — what changed
+            // is that EHDB no longer CLAIMS to have served it.  No tier is `primary`
+            // in any environment, so no deployed behaviour changes.
         let (log, dir) = tmp_log("primary");
         let e = worker_env(log.to_str().unwrap(), "primary");
         // Phase 9 tier 1: primary is activated, so a primary append is served
         // authoritatively by EHDB (not refused).  Global seq 1, parity holds.
         let r = mirror_event(&e, "100", Some(1), "evt", &Default::default(), false);
         assert_eq!(r.mode, EventLogMode::Primary);
-        assert_eq!(r.outcome, EventLogOutcome::ServedPrimary);
+        assert_eq!(r.outcome, EventLogOutcome::PrimaryUnavailable);
         assert_eq!(r.global_sequence, Some(1));
         assert!(r.parity.as_ref().unwrap().holds());
         // Compile-time invariant: ServedPrimary is only reachable with the flag on.
