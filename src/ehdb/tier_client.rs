@@ -143,6 +143,27 @@ impl TierClient {
         }
     }
 
+    /// Append one record to the remote event-log tier.
+    pub async fn append(&self, execution_id: &str, payload: &str) -> Result<String, String> {
+        let req = serde_json::json!({"op":"append","execution_id":execution_id,"payload":payload});
+        let body = self.request(req.to_string().as_bytes()).await?;
+        Ok(String::from_utf8_lossy(&body).to_string())
+    }
+
+    /// Read every record the remote tier holds for one execution.
+    pub async fn read_execution(&self, execution_id: &str) -> Result<String, String> {
+        let req = serde_json::json!({"op":"read_execution","execution_id":execution_id});
+        let body = self.request(req.to_string().as_bytes()).await?;
+        Ok(String::from_utf8_lossy(&body).to_string())
+    }
+
+    /// Bounded global scan of the remote tier.
+    pub async fn scan(&self, after: Option<u64>, limit: usize) -> Result<String, String> {
+        let req = serde_json::json!({"op":"scan","after":after,"limit":limit});
+        let body = self.request(req.to_string().as_bytes()).await?;
+        Ok(String::from_utf8_lossy(&body).to_string())
+    }
+
     /// Probe the endpoint's health. Never returns an error — the classification
     /// *is* the result, and a caller deciding what to log should not also have
     /// to unwrap.
@@ -293,6 +314,49 @@ mod tests {
         });
         let body = client.request(b"append").await.expect("a reply, not an error");
         assert_eq!(String::from_utf8(body).unwrap(), "unsupported append");
+    }
+
+    /// END-TO-END, the PR-3 property: a record appended THROUGH THE CLIENT, over
+    /// the real wire format, to a REAL listener backed by a REAL store, comes
+    /// back on a subsequent read.
+    ///
+    /// Includes the negative control in the same test, because "read returned
+    /// something" proves nothing on its own: a store that returned one blob for
+    /// every key would satisfy the positive half.
+    #[tokio::test]
+    async fn append_then_read_round_trips_through_the_wire() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("ehdb-tier-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var(
+            crate::ehdb::tier_store::TIER_SERVICE_DIR_ENV,
+            dir.to_str().unwrap(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tier(listener));
+        let client = TierClient::new(TierClientConfig { addr, timeout: Duration::from_millis(3_000) });
+
+        let appended = client
+            .append("e2e-exec-1", r#"{"marker":"E2E-HIT"}"#)
+            .await
+            .expect("append over the wire");
+        assert!(appended.contains("appended"), "append reply: {appended}");
+
+        let hit = client.read_execution("e2e-exec-1").await.expect("read over the wire");
+        assert!(hit.contains("E2E-HIT"), "the appended payload must come back: {hit}");
+
+        // NEGATIVE CONTROL — a different key must NOT return that payload.
+        let miss = client.read_execution("e2e-absent").await.expect("read over the wire");
+        assert!(
+            !miss.contains("E2E-HIT"),
+            "a miss must not return another execution's data: {miss}"
+        );
+        assert_ne!(hit, miss, "hit and miss must be distinguishable over the wire");
+
+        std::env::remove_var(crate::ehdb::tier_store::TIER_SERVICE_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

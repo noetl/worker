@@ -99,6 +99,12 @@ impl TierServiceConfig {
 pub enum TierRequest {
     /// Liveness + protocol handshake. Carries no tier data.
     Health,
+    /// Append one record to the event-log tier (ai-meta#257 PR 3).
+    Append { execution_id: String, payload: String },
+    /// Read every record for one execution.
+    ReadExecution { execution_id: String },
+    /// Bounded global scan.
+    Scan { after: Option<u64>, limit: usize },
     /// A frame this build does not implement. Carried as a value rather than an
     /// error so the server can answer `unsupported` — a client talking to an
     /// older writer must get a clear reply, not a dropped connection.
@@ -111,17 +117,61 @@ pub enum TierRequest {
 /// the ops that carry real data land in PR 2/3 and will define their own
 /// encoding then, and inventing a schema now would freeze a guess.
 pub fn decode_request(payload: &[u8]) -> TierRequest {
-    match std::str::from_utf8(payload).map(str::trim) {
-        Ok("health") => TierRequest::Health,
-        Ok(other) => TierRequest::Unsupported(other.to_string()),
-        Err(_) => TierRequest::Unsupported("<non-utf8>".to_string()),
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return TierRequest::Unsupported("<non-utf8>".to_string());
+    };
+    let text = text.trim();
+    // PR 1 spoke bare op names.  `health` stays bare so a PR-1 client keeps
+    // working against a PR-3 writer — a protocol that breaks its own previous
+    // version during a rolling upgrade is a self-inflicted outage.
+    if text == "health" {
+        return TierRequest::Health;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return TierRequest::Unsupported(text.chars().take(40).collect());
+    };
+    match v.get("op").and_then(|o| o.as_str()) {
+        Some("append") => TierRequest::Append {
+            execution_id: v.get("execution_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            payload: v.get("payload").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        },
+        Some("read_execution") => TierRequest::ReadExecution {
+            execution_id: v.get("execution_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        },
+        Some("scan") => TierRequest::Scan {
+            after: v.get("after").and_then(|x| x.as_u64()),
+            limit: v.get("limit").and_then(|x| x.as_u64()).unwrap_or(100) as usize,
+        },
+        Some(other) => TierRequest::Unsupported(other.to_string()),
+        None => TierRequest::Unsupported("<no op>".to_string()),
     }
 }
 
 /// Encode the reply for a request.
 pub fn encode_response(req: &TierRequest) -> Vec<u8> {
+    use super::tier_store::{self, TierStoreOutcome};
+    let cfg = tier_store::TierStoreConfig::from_env();
+    let render = |o: TierStoreOutcome| -> Vec<u8> {
+        match o {
+            TierStoreOutcome::Ok(body) => body.into_bytes(),
+            // Each failure keeps its own shape.  A caller must be able to tell
+            // "this writer has no store" from "your request was malformed" from
+            // "the store broke" — collapsing them into one error is how an
+            // operator spends an afternoon on the wrong hypothesis.
+            TierStoreOutcome::Unavailable => b"unavailable no tier store configured".to_vec(),
+            TierStoreOutcome::Invalid(e) => format!("invalid {e}").into_bytes(),
+            TierStoreOutcome::Error(e) => format!("error {e}").into_bytes(),
+        }
+    };
     match req {
         TierRequest::Health => format!("ok tier-service v{PROTOCOL_VERSION}").into_bytes(),
+        TierRequest::Append { execution_id, payload } => {
+            render(tier_store::append(cfg.as_ref(), execution_id, payload))
+        }
+        TierRequest::ReadExecution { execution_id } => {
+            render(tier_store::read_execution(cfg.as_ref(), execution_id))
+        }
+        TierRequest::Scan { after, limit } => render(tier_store::scan(cfg.as_ref(), *after, *limit)),
         TierRequest::Unsupported(op) => format!("unsupported {op}").into_bytes(),
     }
 }

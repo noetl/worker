@@ -106,6 +106,7 @@ pub mod readiness;
 pub mod systemstore;
 pub mod tier_client;
 pub mod tier_service;
+pub mod tier_store;
 pub mod vector;
 
 /// A snapshot of environment variables.  Functions take an explicit `&EnvMap`
