@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.117.0](https://github.com/noetl/worker/compare/v5.116.0...v5.117.0) (2026-08-12)
+
+### Features
+
+* **ehdb:** the tier service's server half is observable ([dcd0266](https://github.com/noetl/worker/commit/dcd02668dbc85944fa1733f6372a19bdf6713e3c)), closes [server#315](https://github.com/noetl/server/issues/315) [noetl/ai-meta#260](https://github.com/noetl/ai-meta/issues/260) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.116.0](https://github.com/noetl/worker/compare/v5.115.3...v5.116.0) (2026-08-12)
 
 ### Features
