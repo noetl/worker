@@ -1,6 +1,6 @@
 [package]
 name = "noetl-worker"
-version = "5.115.3"
+version = "5.116.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"

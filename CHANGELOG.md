@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.116.0](https://github.com/noetl/worker/compare/v5.115.3...v5.116.0) (2026-08-12)
+
+### Features
+
+* **ehdb:** give the mirror the server-assigned event_id ([29d7e68](https://github.com/noetl/worker/commit/29d7e6896aeac6802b732c8ad0b48f1d15b9b382)), closes [noetl/worker#264](https://github.com/noetl/worker/issues/264) [noetl/ai-meta#258](https://github.com/noetl/ai-meta/issues/258)
+
 ## [5.115.3](https://github.com/noetl/worker/compare/v5.115.2...v5.115.3) (2026-08-11)
 
 ### Bug Fixes
