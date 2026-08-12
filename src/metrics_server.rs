@@ -131,10 +131,15 @@ async fn ehdb_tier_query_handler(
     //
     // The server is NOT involved: it keeps its control-plane guard and still only
     // relays to this route.  All that changes is which store this hop reads.
-    {
-        let env = crate::ehdb::process_env();
-        let (source, downgraded) = crate::ehdb::tier_query_source::effective_source(&env);
-        if downgraded {
+    let env = crate::ehdb::process_env();
+    let resolution = crate::ehdb::tier_query_source::resolve(&env);
+    let source_label = resolution.label();
+    let source_addr = resolution.addr().map(str::to_string);
+    crate::ehdb::metrics::record_tier_query_source("read", source_label);
+
+    use crate::ehdb::tier_query_source::Resolution;
+    match &resolution {
+        Resolution::DowngradedToLocal => {
             // Asking for `service` and silently answering from a different store is
             // the exact failure this effort exists to remove, so say so.
             tracing::warn!(
@@ -142,45 +147,96 @@ async fn ehdb_tier_query_handler(
                  configured; falling back to the pod-local store"
             );
         }
-        if source == crate::ehdb::tier_query_source::TierQuerySource::Service {
-            if let Some(client) = crate::ehdb::tier_client::TierClient::from_env() {
-                // `execution`, NOT `execution_id`: the latter is documented in
-                // QueryParams as a tracing correlation id, and reading by it would
-                // silently query the wrong key.
-                let reply = match params.execution.as_deref() {
-                    Some(eid) => client.read_execution(eid).await,
-                    None => client.scan(None, 100).await,
-                };
-                return match reply {
-                    Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
-                        Ok(v) => (StatusCode::OK, Json(v)),
-                        // A non-JSON reply is one of the service's typed refusals
-                        // (`unavailable` / `invalid` / `error`).  Surface it as-is
-                        // rather than as an empty 200, which would read as "no data".
-                        Err(_) => (
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "action": "ehdb.tier.query",
-                                "source": "service",
-                                "error": body,
-                            })),
-                        ),
-                    },
-                    Err(e) => (
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "action": "ehdb.tier.query",
-                            "source": "service",
-                            "error": e,
-                        })),
-                    ),
-                };
-            }
+        Resolution::Misconfigured(reason) => {
+            // Fail loud.  Falling through to the local read here would answer
+            // from a store the operator did not ask for, in a body that looks
+            // exactly like a correct one — and with N replicas that body is a
+            // fragment of the tier, not the tier.
+            tracing::error!(%reason, "EHDB tier query: refusing to answer from a different store");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(stamp_source(
+                    serde_json::json!({
+                        "action": "ehdb.tier.query",
+                        "outcome": "unavailable",
+                        "error": reason,
+                    }),
+                    source_label,
+                    source_addr.as_deref(),
+                )),
+            );
         }
+        Resolution::Service(client) => {
+            // The remote store backs the event log only (`tier_store`), so any
+            // other tier would be answered with event-log records under a `kv` /
+            // `object` / `vector` label.  Refuse instead: a wrong-tier answer is
+            // worse than no answer, and it would be scored as data.
+            if !matches!(tier, QueryTier::Eventlog) {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(stamp_source(
+                        serde_json::json!({
+                            "action": "ehdb.tier.query",
+                            "outcome": "unsupported_tier",
+                            "error": format!(
+                                "the tier service serves the eventlog tier only; the {} \
+                                 tier must be read with NOETL_EHDB_TIER_QUERY_SOURCE=local",
+                                tier.as_str()
+                            ),
+                        }),
+                        source_label,
+                        source_addr.as_deref(),
+                    )),
+                );
+            }
+            // `execution`, NOT `execution_id`: the latter is documented in
+            // QueryParams as a tracing correlation id, and reading by it would
+            // silently query the wrong key.
+            let reply = match params.execution.as_deref() {
+                Some(eid) => client.read_execution(eid).await,
+                None => client.scan(None, 100).await,
+            };
+            return match reply {
+                Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(v) => (
+                        StatusCode::OK,
+                        Json(stamp_source(v, source_label, source_addr.as_deref())),
+                    ),
+                    // A non-JSON reply is one of the service's typed refusals
+                    // (`unavailable` / `invalid` / `error`).  Surface it as-is
+                    // rather than as an empty 200, which would read as "no data".
+                    Err(_) => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(stamp_source(
+                            serde_json::json!({
+                                "action": "ehdb.tier.query",
+                                "outcome": "unavailable",
+                                "error": body,
+                            }),
+                            source_label,
+                            source_addr.as_deref(),
+                        )),
+                    ),
+                },
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(stamp_source(
+                        serde_json::json!({
+                            "action": "ehdb.tier.query",
+                            "outcome": "unavailable",
+                            "error": e,
+                        }),
+                        source_label,
+                        source_addr.as_deref(),
+                    )),
+                ),
+            };
+        }
+        Resolution::Local => {}
     }
+
     // The driver reads are synchronous, bounded, filesystem-backed opens; run
     // them on the blocking pool so a scan never stalls the metrics reactor.
-    let env = crate::ehdb::process_env();
     let result = tokio::task::spawn_blocking(move || run_query(&env, tier, &params))
         .await
         .map(|r| (r.outcome.http_status(), r.body))
@@ -195,7 +251,47 @@ async fn ehdb_tier_query_handler(
             )
         });
     let status = StatusCode::from_u16(result.0).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(result.1))
+    (
+        status,
+        Json(stamp_source(result.1, source_label, source_addr.as_deref())),
+    )
+}
+
+/// Stamp which store answered onto a tier reply.
+///
+/// **This is what makes the flag observable from outside the process.** The
+/// local and the service bodies are the same shape, so without this field a
+/// reader cannot tell a working service path from a silent fall-back to local —
+/// and with more than one worker replica the local answer is a *fragment* that
+/// reads exactly like a complete one. Every gate for
+/// [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) PR 4 discriminates
+/// on this field.
+///
+/// A non-object body is wrapped rather than dropped: losing a reply to keep a
+/// label would be the wrong trade, and the wrapper keeps the original under
+/// `body` where it is still readable.
+fn stamp_source(
+    v: serde_json::Value,
+    source: &str,
+    addr: Option<&str>,
+) -> serde_json::Value {
+    let mut v = match v {
+        serde_json::Value::Object(_) => v,
+        other => serde_json::json!({ "body": other }),
+    };
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "tier_query_source".to_string(),
+            serde_json::Value::String(source.to_string()),
+        );
+        if let Some(a) = addr {
+            obj.insert(
+                "tier_service_addr".to_string(),
+                serde_json::Value::String(a.to_string()),
+            );
+        }
+    }
+    v
 }
 
 /// `POST /ehdb/tiers/{tier}` — append records the **server** authored.
@@ -311,27 +407,47 @@ async fn ehdb_tier_append_handler(
         );
     }
 
-    let (resolved, downgraded) = crate::ehdb::tier_query_source::effective_source(&env);
-    if downgraded {
-        tracing::warn!(
-            "NOETL_EHDB_TIER_QUERY_SOURCE=service but no tier-service address is \
-             configured; server-authored appends are landing in the pod-local store"
-        );
-    }
+    use crate::ehdb::tier_query_source::Resolution;
+    let resolution = crate::ehdb::tier_query_source::resolve(&env);
+    crate::ehdb::metrics::record_tier_query_source("append", resolution.label());
 
     let mut appended = 0usize;
     let mut failures: Vec<String> = Vec::new();
 
-    if resolved == crate::ehdb::tier_query_source::TierQuerySource::Service {
-        if let Some(client) = crate::ehdb::tier_client::TierClient::from_env() {
+    match &resolution {
+        Resolution::DowngradedToLocal => {
+            tracing::warn!(
+                "NOETL_EHDB_TIER_QUERY_SOURCE=service but no tier-service address is \
+                 configured; server-authored appends are landing in the pod-local store"
+            );
+        }
+        Resolution::Misconfigured(reason) => {
+            // Symmetric with the read.  Writing to the pod-local store while the
+            // operator believes the service holds the tier is how the two ends
+            // of this route come apart — and the comparator would then report
+            // every server-authored event missing, which is a true statement
+            // about the wrong store.
+            tracing::error!(%reason, "EHDB tier append: refusing to write to a different store");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "action": "ehdb.tier.append",
+                    "outcome": "unavailable",
+                    "tier_query_source": resolution.label(),
+                    "error": reason,
+                })),
+            );
+        }
+        Resolution::Service(client) => {
             for payload in &records {
                 match client.append(&execution_id, payload).await {
                     Ok(_) => appended += 1,
                     Err(e) => failures.push(e),
                 }
             }
-            return append_reply("service", appended, records.len(), failures);
+            return append_reply(resolution.label(), appended, records.len(), failures);
         }
+        Resolution::Local => {}
     }
 
     // Pod-local store. `mirror_event` is the same append the worker's own mirror
@@ -384,7 +500,7 @@ async fn ehdb_tier_append_handler(
         Err(e) => failures.push(format!("append task join error: {e}")),
     }
 
-    append_reply("local", appended, records.len(), failures)
+    append_reply(resolution.label(), appended, records.len(), failures)
 }
 
 /// One reply shape for both stores.
@@ -404,7 +520,7 @@ fn append_reply(
             Json(serde_json::json!({
                 "action": "ehdb.tier.append",
                 "outcome": "ok",
-                "source": source,
+                "tier_query_source": source,
                 "appended": appended,
             })),
         );
@@ -421,7 +537,7 @@ fn append_reply(
         Json(serde_json::json!({
             "action": "ehdb.tier.append",
             "outcome": "degraded",
-            "source": source,
+            "tier_query_source": source,
             "appended": appended,
             "requested": requested,
             "errors": failures,
@@ -473,6 +589,44 @@ async fn livez_handler() -> impl IntoResponse {
 mod tests {
     use super::*;
     use noetl_executor::worker::source::{ClaimOutcome, Command};
+
+    /// ai-meta#257 PR 4. The reply must name the store that answered, on BOTH
+    /// arms — a marker present only on the service arm is not a discriminator,
+    /// because its absence would then be ambiguous between "local answered" and
+    /// "this binary predates the marker".
+    #[test]
+    fn every_tier_reply_names_the_store_that_answered() {
+        let local = stamp_source(
+            serde_json::json!({"action": "ehdb.tier.query", "result": {"records": []}}),
+            "local",
+            None,
+        );
+        assert_eq!(local["tier_query_source"], "local");
+        assert!(
+            local.get("tier_service_addr").is_none(),
+            "local has no service address to name"
+        );
+        // The payload must survive being labelled.
+        assert!(local["result"]["records"].is_array());
+
+        let svc = stamp_source(
+            serde_json::json!({"record_count": 13, "records": []}),
+            "service",
+            Some("writer:9110"),
+        );
+        assert_eq!(svc["tier_query_source"], "service");
+        assert_eq!(svc["tier_service_addr"], "writer:9110");
+        assert_eq!(svc["record_count"], 13);
+    }
+
+    #[test]
+    fn a_non_object_reply_is_labelled_rather_than_dropped() {
+        // A reply that is not an object still has to carry the label, and it
+        // must not lose its body doing so.
+        let v = stamp_source(serde_json::json!([1, 2, 3]), "service", Some("w:9110"));
+        assert_eq!(v["tier_query_source"], "service");
+        assert_eq!(v["body"], serde_json::json!([1, 2, 3]));
+    }
 
     fn dummy_command(id: &str) -> Command {
         Command {
