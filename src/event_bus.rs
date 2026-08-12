@@ -300,18 +300,33 @@ pub async fn spawn_event_writer_host(
     // storage tiers.  Hosted here because this is the process that owns the
     // durable volumes and already fronts both buses.
     //
-    // Skeleton only: it answers `health` and serves no tier data yet.  Absent
-    // unless NOETL_EHDB_TIER_SERVICE_BIND is set, so a build with the flag unset
-    // opens no socket and is byte-identical to one without this face.
+    // Absent unless NOETL_EHDB_TIER_SERVICE_BIND is set, so a build with the flag
+    // unset opens no socket and is byte-identical to one without this face.
+    //
+    // Whether it can serve tier DATA depends on a second variable: PR 3 backed
+    // `append` / `read_execution` / `scan` with a real store at
+    // NOETL_EHDB_TIER_SERVICE_DIR, and without that directory every data op
+    // answers `unavailable`.  The log line says which, because the two states
+    // look identical from outside and the difference is the whole capability.
     if let Some(tier_cfg) = crate::ehdb::tier_service::TierServiceConfig::from_env() {
         let listener = TcpListener::bind(tier_cfg.bind).await?;
         let addr = tier_cfg.bind;
         tokio::spawn(crate::ehdb::tier_service::serve_tier(listener));
+        // The PR-1 text — "skeleton: health only, serves no tier data" — outlived
+        // the build it described.  PR 3 gave the service a store, so the line
+        // was telling an operator the opposite of what the process would do,
+        // in the one place they would look to check.  Report the store instead
+        // of asserting a capability.
+        let store = crate::ehdb::tier_store::TierStoreConfig::from_env();
         tracing::info!(
             %addr,
             shard = config.shard,
             protocol = crate::ehdb::tier_service::PROTOCOL_VERSION,
-            "EHDB tier service listener up (skeleton: health only, serves no tier data)"
+            store = %store
+                .as_ref()
+                .map(|c| c.dir.display().to_string())
+                .unwrap_or_else(|| "<none: data ops answer `unavailable`>".to_string()),
+            "EHDB tier service listener up"
         );
     }
 
