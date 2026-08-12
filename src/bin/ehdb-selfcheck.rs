@@ -67,6 +67,7 @@ fn main() -> ExitCode {
         Some("mirror-vector") => run_mirror_vector(&env, &flags),
         Some("vector-suite") => run_vector_suite(&env, &flags),
         Some("vector-primary-serve") => run_vector_primary_serve(&env, &flags),
+        Some("tier-concurrency") => run_tier_concurrency(&flags),
         Some("metrics") => {
             print!("{}", render_metrics());
             ExitCode::SUCCESS
@@ -2178,6 +2179,9 @@ fn usage() -> &'static str {
      consume         --stream <s> --consumer <c> [--limit <n>]\n  \
      ack             --stream <s> --consumer <c> --sequence <seq>\n  \
      suite           [--stream <s>] [--consumer <c>]\n  \
+     tier-concurrency [--addr host:port] [--clients N] [--appends M]\n  \
+                     (ai-meta#257 P0: concurrent appends into ONE tier store\n  \
+                      over the wire, then read the whole log back)\n  \
      publish-system  --path <lib> --revision <n> --digest <sha256:..> --entry <e> \
      --target <wasm32-unknown-unknown|wasm32-wasi-preview1> --object-path <p> \
      --byte-len <n> --capabilities <c1,c2,..>\n  \
@@ -2240,4 +2244,198 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         map.insert(key.to_string(), value.clone());
     }
     Ok(Flags(map))
+}
+
+/// `tier-concurrency` — the in-cluster half of the ai-meta#257 P0 gate.
+///
+/// Hammers ONE tier store with many CONCURRENT appends **over the wire**, from
+/// inside the cluster, against the writer's real `:9110` face — simulating the
+/// server-mirror single-store relay that the serve-ready config creates. Then
+/// it reads the whole log back and checks it is well formed.
+///
+/// This is the endpoint-level twin of `tests/tier_store_concurrent_append.rs`.
+/// The in-repo test proves the *code* is safe; this proves the **built image
+/// running in the cluster** is, which is the claim a serve flip actually needs.
+/// Neither substitutes for the other: the test cannot see the deployed binary,
+/// and this cannot run in CI.
+///
+/// Exit: 0 = the log is well formed; 1 = torn / lost / duplicated.
+///
+/// Flags: `--clients N` (default 16), `--appends M` (default 12),
+///        `--addr host:port` (default: `NOETL_EHDB_TIER_SERVICE_ADDR`).
+fn run_tier_concurrency(flags: &Flags) -> ExitCode {
+    use noetl_worker::ehdb::tier_client::{TierClient, TierClientConfig};
+
+    let clients: usize = flags.get("clients").and_then(|v| v.parse().ok()).unwrap_or(16);
+    let appends: usize = flags.get("appends").and_then(|v| v.parse().ok()).unwrap_or(12);
+    let total = clients * appends;
+    let addr = match flags
+        .get("addr")
+        .or_else(|| std::env::var("NOETL_EHDB_TIER_SERVICE_ADDR").ok())
+    {
+        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+        _ => {
+            eprintln!("tier-concurrency needs --addr or NOETL_EHDB_TIER_SERVICE_ADDR");
+            return ExitCode::from(2);
+        }
+    };
+
+    // A payload long enough that ONE record is many `write(2)` calls. The torn
+    // window is proportional to that count, so a short payload can pass a
+    // broken store by luck.
+    let filler = "0123456789abcdef".repeat(64);
+    // Unique per run: the store is durable and may already hold history, so a
+    // fixed prefix would make "did MY records land" unanswerable.
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("tier-concurrency: cannot build runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (failures, scan_body) = rt.block_on(async move {
+        let client = TierClient::new(TierClientConfig {
+            addr: addr.clone(),
+            timeout: std::time::Duration::from_secs(30),
+        });
+
+        let mut tasks = Vec::with_capacity(clients);
+        for c in 0..clients {
+            let client = client.clone();
+            let filler = filler.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut failed = Vec::new();
+                for n in 0..appends {
+                    let exec = format!("conc-{run}-{c}-{n}");
+                    let payload =
+                        format!(r#"{{"run":{run},"client":{c},"n":{n},"filler":"{filler}"}}"#);
+                    match client.append(&exec, &payload).await {
+                        Ok(b) if b.contains("\"appended\":true") => {}
+                        Ok(b) => failed.push(format!("{exec}: {b}")),
+                        Err(e) => failed.push(format!("{exec}: transport: {e}")),
+                    }
+                }
+                failed
+            }));
+        }
+        let mut failures: Vec<String> = Vec::new();
+        for t in tasks {
+            match t.await {
+                Ok(f) => failures.extend(f),
+                Err(e) => failures.push(format!("task panicked: {e}")),
+            }
+        }
+        // A failed fetch is a FAILURE, never a zero that reads as a pass.
+        let scan_body = client.scan(None, 1_000).await;
+        (failures, scan_body)
+    });
+
+    let scan_body = match scan_body {
+        Ok(b) => b,
+        Err(e) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "suite": "ehdb-tier-concurrency",
+                    "ok": false,
+                    "reason": "scan transport failed",
+                    "error": e,
+                })
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    if scan_body.starts_with("error") || scan_body.starts_with("unavailable") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-tier-concurrency",
+                "ok": false,
+                "reason": "the log did not read back",
+                "appends_failed": failures.len(),
+                "body": scan_body,
+            })
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Parsed with a parser, fail-loud — never substring-matched.
+    let v: serde_json::Value = match serde_json::from_str(&scan_body) {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "suite": "ehdb-tier-concurrency",
+                    "ok": false,
+                    "reason": "scan body is not JSON",
+                    "error": e.to_string(),
+                })
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let records = v["records"].as_array().cloned().unwrap_or_default();
+
+    // Only THIS run's records — the store is durable and carries history.
+    let mut mine: Vec<(u64, u64)> = Vec::new();
+    let mut unparseable = 0usize;
+    let mut seqs = std::collections::BTreeSet::new();
+    for r in &records {
+        let Some(p) = r["payload"].as_str() else { continue };
+        match serde_json::from_str::<serde_json::Value>(p) {
+            Ok(parsed) => {
+                if parsed["run"].as_u64() == Some(run as u64) {
+                    mine.push((
+                        parsed["client"].as_u64().unwrap_or(u64::MAX),
+                        parsed["n"].as_u64().unwrap_or(u64::MAX),
+                    ));
+                    if let Some(s) = r["global_sequence"].as_u64() {
+                        seqs.insert(s);
+                    }
+                }
+            }
+            // A payload that will not parse is a torn record that survived
+            // read-back — the worst case, because it reads as data.
+            Err(_) => unparseable += 1,
+        }
+    }
+    let distinct: std::collections::BTreeSet<(u64, u64)> = mine.iter().copied().collect();
+
+    // Positive control: assert the appends ACTUALLY happened and the log is
+    // non-empty, so "0 torn records" cannot be satisfied by an empty store.
+    let ok = failures.is_empty()
+        && unparseable == 0
+        && !records.is_empty()
+        && distinct.len() == total
+        && seqs.len() == total;
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-tier-concurrency",
+            "ok": ok,
+            "addr_env": "NOETL_EHDB_TIER_SERVICE_ADDR",
+            "clients": clients,
+            "appends_per_client": appends,
+            "expected": total,
+            "appends_failed": failures.len(),
+            "records_in_store": records.len(),
+            "mine_distinct": distinct.len(),
+            "distinct_sequences": seqs.len(),
+            "unparseable_payloads": unparseable,
+            "first_failures": failures.iter().take(3).collect::<Vec<_>>(),
+        })
+    );
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
