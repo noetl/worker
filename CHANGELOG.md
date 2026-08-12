@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.117.1](https://github.com/noetl/worker/compare/v5.117.0...v5.117.1) (2026-08-12)
+
+### Bug Fixes
+
+* **ehdb:** the flip-time signal must describe the tier it fires for ([a757f55](https://github.com/noetl/worker/commit/a757f5534821c83cbbce343e83bd07ab49b9f8c7)), closes [noetl/ai-meta#259](https://github.com/noetl/ai-meta/issues/259) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
+## [5.117.0](https://github.com/noetl/worker/compare/v5.116.0...v5.117.0) (2026-08-12)
+
+### Features
+
+* **ehdb:** the tier service's server half is observable ([dcd0266](https://github.com/noetl/worker/commit/dcd02668dbc85944fa1733f6372a19bdf6713e3c)), closes [server#315](https://github.com/noetl/server/issues/315) [noetl/ai-meta#260](https://github.com/noetl/ai-meta/issues/260) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
+## [5.116.0](https://github.com/noetl/worker/compare/v5.115.3...v5.116.0) (2026-08-12)
+
+### Features
+
+* **ehdb:** give the mirror the server-assigned event_id ([29d7e68](https://github.com/noetl/worker/commit/29d7e6896aeac6802b732c8ad0b48f1d15b9b382)), closes [noetl/worker#264](https://github.com/noetl/worker/issues/264) [noetl/ai-meta#258](https://github.com/noetl/ai-meta/issues/258)
+
 ## [5.115.3](https://github.com/noetl/worker/compare/v5.115.2...v5.115.3) (2026-08-11)
 
 ### Bug Fixes

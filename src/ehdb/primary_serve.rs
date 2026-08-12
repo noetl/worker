@@ -104,6 +104,31 @@ pub fn decide(
     ServeDecision::ServedByEhdb
 }
 
+/// The tiers whose `primary` mode is wired to a runtime serve decision — i.e.
+/// the tiers where a live worker path calls [`decide`] and can therefore answer
+/// authoritatively.
+///
+/// **Today that is the event-log tier and nothing else.**  `kv`, `object`,
+/// `projection` and `vector` have a `serve_primary_cycle`, but its only caller
+/// is `bin/ehdb-selfcheck` — a conformance drive that never authors a NoETL
+/// event — so selecting `primary` on those tiers cannot change what any caller
+/// receives.
+///
+/// This list exists because the *previous* way of knowing which tiers were
+/// wired was a sentence in a doc comment, and it went stale the moment PR 5
+/// wired the event log: the flip-time warning kept telling operators the tier
+/// was inert on a pod that was serving 48 ops as primary
+/// ([ai-meta#259](https://github.com/noetl/ai-meta/issues/259)).  The guard test
+/// below re-derives the list from the tier sources on every `cargo test`, so a
+/// tier that gains (or loses) a serve path and is not listed here fails the
+/// build rather than quietly mis-signalling during a cutover.
+pub const SERVE_WIRED_TIERS: &[&str] = &["eventlog"];
+
+/// Whether `tier` has a runtime serve path — see [`SERVE_WIRED_TIERS`].
+pub fn tier_serves_primary(tier: &str) -> bool {
+    SERVE_WIRED_TIERS.contains(&tier)
+}
+
 impl ServeDecision {
     pub fn served_by_ehdb(&self) -> bool {
         matches!(self, Self::ServedByEhdb)
@@ -125,6 +150,70 @@ impl ServeDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tier module, paired with its source text at compile time.
+    ///
+    /// `include_str!` resolves relative to this file, so these are the real
+    /// sibling modules — not a copy that can drift.
+    const TIER_SOURCES: &[(&str, &str)] = &[
+        ("eventlog", include_str!("eventlog.rs")),
+        ("kv", include_str!("kv.rs")),
+        ("object", include_str!("object.rs")),
+        ("projection", include_str!("projection.rs")),
+        ("vector", include_str!("vector.rs")),
+    ];
+
+    /// The guard for [ai-meta#259](https://github.com/noetl/ai-meta/issues/259):
+    /// [`SERVE_WIRED_TIERS`] must equal the set of tiers that actually call
+    /// [`decide`].
+    ///
+    /// The #259 defect was a *description* that stopped tracking the code — the
+    /// flip-time warning claimed no serve path existed on a build that served.
+    /// A doc comment cannot be wrong loudly; this can.  Matching on
+    /// `primary_serve::decide(` (with the paren) means a doc comment naming the
+    /// function does not count as a caller — comments passing for callers is one
+    /// of the ways the earlier reachability scans returned confident zeros.
+    #[test]
+    fn serve_wired_tiers_matches_the_tiers_that_call_decide() {
+        // Positive control: the match string must find SOMETHING, otherwise a
+        // renamed call form would make every tier read as unwired and the test
+        // would pass by finding nothing.
+        let wired_in_source: Vec<&str> = TIER_SOURCES
+            .iter()
+            .filter(|(_, src)| src.contains("primary_serve::decide("))
+            .map(|(tier, _)| *tier)
+            .collect();
+        assert!(
+            !wired_in_source.is_empty(),
+            "no tier module calls `primary_serve::decide(` — either the serve \
+             path was removed or this test's match string is stale; a zero here \
+             is not evidence"
+        );
+        let mut declared: Vec<&str> = SERVE_WIRED_TIERS.to_vec();
+        declared.sort_unstable();
+        let mut found = wired_in_source;
+        found.sort_unstable();
+        assert_eq!(
+            declared, found,
+            "SERVE_WIRED_TIERS disagrees with the tier sources.  A tier that \
+             gained a serve path must be added (else its flip-time signal tells \
+             operators it is inert while it serves); a tier that lost one must \
+             be removed."
+        );
+    }
+
+    #[test]
+    fn unwired_tiers_do_not_claim_a_serve_path() {
+        for tier in ["kv", "object", "projection", "vector"] {
+            assert!(
+                !tier_serves_primary(tier),
+                "{tier} is listed as serve-wired; if that is now true, update \
+                 the cutover order in the RFC and the operator runbook too"
+            );
+        }
+        assert!(tier_serves_primary("eventlog"));
+        assert!(!tier_serves_primary("nonexistent"));
+    }
 
     /// Exhaustive over all 8 input combinations. A policy this consequential
     /// should not have an untested corner, and there are only eight.
