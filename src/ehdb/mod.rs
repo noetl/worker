@@ -98,6 +98,7 @@ pub mod flight_sql_endpoint;
 pub mod guard;
 pub mod kv;
 pub mod metrics;
+pub mod mirror_source;
 pub mod object;
 pub mod primary_serve;
 pub mod projection;

@@ -429,6 +429,62 @@ pub fn pin_tier_service_series(store_bytes: u64, sequence: u64) {
     }
 }
 
+/// Every outcome the event-log **serve decision** can record on the
+/// service-resolved append path (`eventlog::serve_service_append`).
+///
+/// Enumerated, and it must stay exhaustive over that function's `match`: a pinned
+/// set that omits one value reintroduces the absent-series bug on that value
+/// alone, while the rest read 0 and look complete. `disabled` is deliberately
+/// absent — that outcome is never recorded (the byte-identical no-op).
+const EVENTLOG_SERVE_OUTCOMES: &[&str] = &[
+    "served_primary",
+    "primary_unavailable",
+    "primary_divergence",
+    "mirrored",
+    "parity_mismatch",
+    "rejected",
+    "unavailable",
+];
+
+/// Create the event-log serve-decision series at 0, once, at the bind site of the
+/// route that carries server-authored appends.
+///
+/// **Why this pin exists at all.** ai-meta#257's P0 was found by a gate asserting
+/// that `noetl_ehdb_eventlog_ops_total{outcome="served_primary"}` moved. The
+/// series was not 0 — it was **absent**, because `Registry`-style families render
+/// nothing until something increments them, and nothing did. Absent and
+/// "this build does not have the metric" are the same bytes. With the series
+/// pinned, a demoted tier reads `served_primary 0` and a build without the serve
+/// path reads nothing, which are different readings of different facts.
+///
+/// **Gated on config, and that is correct here** (unlike
+/// [server#315](https://github.com/noetl/server/pull/315), which pinned inside a
+/// feature branch and left the series absent on exactly the configuration whose
+/// value someone would read): with EHDB disabled or the tier `off`, the
+/// event-log family must not exist at all — that is the documented
+/// byte-identical-`/metrics` invariant. Both `shadow` and `primary` pin, so the
+/// FLIP does not change which series exist. Only their values move.
+/// Whether an outcome label is in the pinned serve set.
+///
+/// Exists so `eventlog`'s own test can assert the pin covers every outcome it
+/// records, rather than the two lists being kept in step by hand. The pin and the
+/// recorder are in different modules precisely because they are different
+/// concerns, which is also how they drift.
+#[cfg(test)]
+pub(crate) fn eventlog_serve_outcome_is_pinned(outcome: &str) -> bool {
+    EVENTLOG_SERVE_OUTCOMES.contains(&outcome)
+}
+
+pub fn pin_eventlog_serve_series() {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    for outcome in EVENTLOG_SERVE_OUTCOMES {
+        s.eventlog.pin(vec![
+            ("operation".to_string(), "mirror".to_string()),
+            ("outcome".to_string(), outcome.to_string()),
+        ]);
+    }
+}
+
 /// Record that the durable store grew.
 ///
 /// Separate from [`record_tier_service`] because it describes the **store**, not
@@ -600,6 +656,32 @@ pub fn record_query(
         ok,
         degraded,
         duration_seconds,
+    );
+}
+
+/// Record which store answered one tier operation (ai-meta#257 PR 4).
+///
+/// Routed into the existing `query` family — `tier="eventlog"`,
+/// `operation="tier_query_source.<read|append>"`, `outcome=<source label>` —
+/// rather than a new family, matching how `record_tier_client` reuses
+/// `dataplane`. One more family for a four-value label set is registry surface
+/// with no extra information in it.
+///
+/// The outcome set is closed: `local`, `downgraded_local`, `service`,
+/// `misconfigured`. It is deliberately NOT pinned at 0, because this family
+/// renders nothing at all until an EHDB op has run and pinning would break the
+/// byte-identical `/metrics` a disabled build produces. The load-bearing signal
+/// for the gate is the `tier_query_source` field in the reply body; this counter
+/// is for an operator watching a rollout, where a rising `downgraded_local` or
+/// `misconfigured` is the thing to alert on.
+pub fn record_tier_query_source(op: &str, source: &str) {
+    record_query(
+        "eventlog",
+        &format!("tier_query_source.{op}"),
+        source,
+        source == "local" || source == "service",
+        source == "downgraded_local" || source == "misconfigured",
+        0.0,
     );
 }
 

@@ -775,6 +775,376 @@ pub struct LiveMirror {
     pub id_verdict: AuthoritativeIdVerdict,
 }
 
+// ===========================================================================
+// The serve site for SERVICE-RESOLVED appends.
+//
+// ai-meta#257 P0.  `primary_serve::decide` had exactly two runtime call sites,
+// and the configuration that makes the event-log tier *correct* at more than one
+// replica routes around BOTH of them:
+//
+// | call site | routed around by |
+// | :-- | :-- |
+// | `mirror_live_event` (the worker's own emit hook) | `MIRROR_SOURCE=server` disarms the hook in `client/control_plane.rs` before the tier mode is consulted |
+// | `mirror_event` from the append handler's `Resolution::Local` branch | `TIER_QUERY_SOURCE=service` takes `Resolution::Service(client)`, which calls `client.append()` and never enters `mirror_event` |
+//
+// So on `MIRROR_SOURCE=server` + `TIER_QUERY_SOURCE=service` a flip to `primary`
+// changed nothing measurable: `served_primary` never recorded, the whole
+// `noetl_ehdb_eventlog_ops_total` family stayed absent, and no line was logged.
+// Measured in kind at three replicas — 13 events per execution flowed and landed
+// correctly the whole time, which is why nothing looked wrong.
+//
+// This is the third site, and it is the one the composed configuration reaches.
+// It is deliberately NOT a new policy: it calls the same
+// [`super::primary_serve::decide`] with the same three conditions and maps the
+// verdict onto the same outcome vocabulary `mirror_event` uses, so the two sites
+// cannot disagree about what `primary` means.  The mapping is written directly
+// below `mirror_event`'s for that reason — a reviewer can read them together.
+// ===========================================================================
+
+/// What the writer-fronted tier service acknowledged for one append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceAppendAck {
+    /// The sequence the remote store assigned this record.
+    pub global_sequence: u64,
+    /// Total records the remote store holds after this append.
+    ///
+    /// `None` only when the writer predates the field (a rollout skew — the pool
+    /// and the writer run the same image in a coherent deployment).  Absent means
+    /// the strong check cannot run, not that it failed; see [`Self::parity`].
+    pub log_record_count: Option<u64>,
+}
+
+impl ServiceAppendAck {
+    /// Parse the tier service's append reply.
+    ///
+    /// `None` for every reply that is not an acknowledged append — the service's
+    /// typed refusals (`invalid …` / `unavailable …` / `error …`) are plain text,
+    /// so they fail the JSON parse, and a JSON body without `appended: true` is
+    /// not an append either.  Both mean the record is not in the store, which the
+    /// caller must not mistake for a parity question.
+    pub fn parse(body: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        if !v.get("appended").and_then(|a| a.as_bool()).unwrap_or(false) {
+            return None;
+        }
+        Some(Self {
+            global_sequence: v.get("global_sequence").and_then(|s| s.as_u64())?,
+            log_record_count: v.get("log_record_count").and_then(|c| c.as_u64()),
+        })
+    }
+
+    /// Parity for this append, computed from the REMOTE store's own reply.
+    ///
+    /// Two checks, and which ones ran is reported rather than assumed:
+    ///
+    /// * **ordering** — the sequence must be strictly greater than the previous
+    ///   one *in this batch*.  Batch-local on purpose: the store has N appenders
+    ///   (one per replica) and process-global bookkeeping would race, reporting a
+    ///   divergence whenever two batches interleaved.  Within one batch the
+    ///   appends are sequential, and the store's sequence only ever grows, so
+    ///   strict monotonicity is a real invariant there.  `previous_sequence = 0`
+    ///   for a batch's first record makes that check vacuous, which is why it is
+    ///   never the only one.
+    /// * **gapless count** — `log_record_count == global_sequence`, the same
+    ///   invariant [`mirror_event`] checks on the local engine.  Skipped, with the
+    ///   skip named in the detail, when the writer did not send the count.
+    ///
+    /// **This is SELF-consistency, not cross-store parity, and the difference
+    /// matters.**  `mirror_event` is in the same position on the live path — it
+    /// passes `authoritative_sequence: None`, because the authoritative log has no
+    /// 1-based gapless sequence to compare against, so anything put there would be
+    /// measured on the wrong scale.  Parity against `noetl.event` is computed
+    /// **server-side** by the cross-store comparator, which is the only component
+    /// allowed to read `noetl.*` (`data-access-boundary.md`).  What this check
+    /// buys is that the tier does not serve from a store that has forgotten or
+    /// rewound — and a promoted tier that had would otherwise answer confidently.
+    fn parity(&self, previous_sequence: u64) -> Result<Option<&'static str>, String> {
+        if self.global_sequence <= previous_sequence {
+            return Err(format!(
+                "ordering divergence: tier-service sequence {} not > previous {previous_sequence}",
+                self.global_sequence
+            ));
+        }
+        match self.log_record_count {
+            Some(c) if c != self.global_sequence => Err(format!(
+                "count divergence: tier-service record count {c} != sequence {}",
+                self.global_sequence
+            )),
+            Some(_) => Ok(None),
+            None => Ok(Some(
+                "tier-service reply carries no log_record_count (writer predates the field); \
+                 parity verified by ordering alone",
+            )),
+        }
+    }
+}
+
+/// One service-resolved append's serve verdict.
+#[derive(Debug, Clone)]
+pub struct ServiceAppendServe {
+    /// The shared policy's verdict.  Carried alongside the outcome so a caller
+    /// can report the serve state without re-deriving it from a label.
+    pub decision: super::primary_serve::ServeDecision,
+    pub outcome: EventLogOutcome,
+    pub detail: Option<String>,
+    /// The sequence the store assigned, when the record landed.  The caller
+    /// threads this into the next record's `previous_sequence`.
+    pub sequence: Option<u64>,
+}
+
+/// Decide, record and log the serve outcome for ONE record appended through the
+/// writer-fronted tier service.
+///
+/// `reply` is exactly what [`super::tier_client::TierClient::append`] returned:
+/// `Ok(body)` for a reply from the service, `Err(e)` for a transport failure.
+///
+/// The three conditions are unchanged and are all measured, never assumed:
+///
+/// * **primary mode** — `NOETL_EHDB_EVENTLOG=primary` and the compile-time
+///   [`PRIMARY_SERVE_ACTIVATED`] switch.
+/// * **durable service reachable** — [`super::reachability::is_reachable`], which
+///   only a real successful operation sets and any transport failure clears.  The
+///   append that produced `reply` is itself that operation, so this is the
+///   post-append verdict rather than a cached poll.
+/// * **parity held** — the remote store's own reply, per
+///   [`ServiceAppendAck::parity`].
+///
+/// **Demotion never fails the caller and never serves partial data.**  The
+/// server's own write to `noetl.event` has already happened by the time it
+/// mirrors here, so a demote costs nothing but the tier's authority; the reply to
+/// the server is unchanged by this decision (the append handler still reports
+/// what landed).  A record that did NOT land is recorded on the degraded label
+/// and demotes — which is what makes a dead tier service visible instead of
+/// silently stopping the serve signal.
+pub fn serve_service_append(
+    env: &EnvMap,
+    reply: Result<&str, &str>,
+    previous_sequence: u64,
+    duration_seconds: f64,
+) -> ServiceAppendServe {
+    // ARM-D discipline: ask the MEASURED verdict, not whether an address is set.
+    // A black-hole address is configured and unreachable, and `primary` must not
+    // serve from it. The append that produced `reply` is the operation that set
+    // this, so it is a post-append fact rather than a cached poll.
+    let durable_service_reachable = super::tier_client::TierClientConfig::from_env().is_some()
+        && super::reachability::is_reachable();
+    serve_service_append_with(
+        env,
+        reply,
+        previous_sequence,
+        duration_seconds,
+        durable_service_reachable,
+    )
+}
+
+/// [`serve_service_append`] with the reachability verdict passed in.
+///
+/// Split out so the decision is testable without the process env and the
+/// process-global reachability latch: `cargo test` does **not** serialise tests,
+/// so a test that set `NOETL_EHDB_TIER_SERVICE_ADDR` or drove the latch would race
+/// every other test in the binary. The public wrapper above is the only place the
+/// two globals are read.
+pub(crate) fn serve_service_append_with(
+    env: &EnvMap,
+    reply: Result<&str, &str>,
+    previous_sequence: u64,
+    duration_seconds: f64,
+    durable_service_reachable: bool,
+) -> ServiceAppendServe {
+    let mode = EventLogMode::from_env(env);
+
+    // Off / EHDB disabled ⇒ strict no-op, and no metric.  The append handler is
+    // only reachable with the tier configured, but the gate stays here so this
+    // site can never be the reason the family exists on a disabled build.
+    if mode == EventLogMode::Off || !truthy(env, EHDB_ENABLED_ENV) {
+        return ServiceAppendServe {
+            decision: super::primary_serve::decide(false, false, false),
+            outcome: EventLogOutcome::Disabled,
+            detail: None,
+            sequence: None,
+        };
+    }
+
+    let is_primary = mode == EventLogMode::Primary && PRIMARY_SERVE_ACTIVATED;
+
+    // Did the record land, and if so did parity hold?
+    let (ack, parity_held, mut detail, landed_outcome) = match reply {
+        Err(e) => (
+            None,
+            false,
+            Some(format!("tier-service append failed: {e}")),
+            Some(EventLogOutcome::Unavailable),
+        ),
+        Ok(body) => match ServiceAppendAck::parse(body) {
+            // A reply the service produced that acknowledges no append: one of
+            // its typed refusals.  `invalid` is a caller mistake and NOT
+            // degraded — per `reachability`, a service that rejects one record is
+            // reachable and healthy, and demoting the whole tier for a poisoned
+            // payload would let one record disable authoritative serving.
+            // `unavailable` / `error` are the store, and are degraded.
+            None => {
+                let trimmed = body.trim();
+                let outcome = if trimmed.starts_with("invalid") {
+                    EventLogOutcome::Rejected
+                } else {
+                    EventLogOutcome::Unavailable
+                };
+                (
+                    None,
+                    false,
+                    Some(format!(
+                        "tier-service refused the append: {}",
+                        &trimmed[..trimmed.len().min(200)]
+                    )),
+                    Some(outcome),
+                )
+            }
+            Some(ack) => match ack.parity(previous_sequence) {
+                Ok(note) => (Some(ack), true, note.map(str::to_string), None),
+                Err(divergence) => (Some(ack), false, Some(divergence), None),
+            },
+        },
+    };
+
+    let decision = super::primary_serve::decide(is_primary, durable_service_reachable, parity_held);
+
+    // The SAME mapping `mirror_event` uses.  `landed_outcome` short-circuits it
+    // for the records that are not in the store at all: claiming a parity verdict
+    // about a record that was never written would be a statement about nothing.
+    let outcome = match landed_outcome {
+        Some(o) => o,
+        None => match (is_primary, parity_held, decision.served_by_ehdb()) {
+            (true, true, true) => EventLogOutcome::ServedPrimary,
+            (true, false, _) => EventLogOutcome::PrimaryDivergence,
+            // Primary, parity held, policy refused — no reachable durable
+            // service.  Never `ServedPrimary`: claiming to have served
+            // authoritatively is the lie this whole RFC exists to prevent.
+            (true, true, false) => EventLogOutcome::PrimaryUnavailable,
+            (false, true, _) => EventLogOutcome::Mirrored,
+            (false, false, _) => EventLogOutcome::ParityMismatch,
+        },
+    };
+
+    if detail.is_none() && outcome == EventLogOutcome::PrimaryUnavailable {
+        detail = Some(
+            "no reachable durable tier service — the event-log tier is primary but has \
+             nothing authoritative to serve from; the incumbent answers"
+                .to_string(),
+        );
+    }
+
+    metrics::record_eventlog(
+        "mirror",
+        outcome.as_str(),
+        outcome.ok(),
+        outcome.degraded(),
+        duration_seconds,
+    );
+    log_serve_transition(&decision, outcome, detail.as_deref());
+
+    ServiceAppendServe {
+        decision,
+        outcome,
+        detail,
+        sequence: ack.map(|a| a.global_sequence),
+    }
+}
+
+/// The last serve state this process logged, as a code.  `0` is "nothing yet".
+///
+/// A flip is a once-per-deployment event and an append is a 13-per-execution one,
+/// so the line has to be emitted on TRANSITION or it is noise that nobody reads —
+/// and a line nobody reads is the same as no line, which is the state this fix
+/// found.  Transitions in BOTH directions are logged: a demote that is silent
+/// because the promote was already logged would hide the outage.
+static LAST_SERVE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn serve_state_code(decision: &super::primary_serve::ServeDecision) -> u8 {
+    use super::primary_serve::{DemoteReason, ServeDecision};
+    match decision {
+        ServeDecision::ServedByEhdb => 1,
+        ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::NotPrimary,
+        } => 2,
+        ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::NoDurableService,
+        } => 3,
+        ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::ParityDiverged,
+        } => 4,
+    }
+}
+
+/// Log a serve-state change, once per transition.
+fn log_serve_transition(
+    decision: &super::primary_serve::ServeDecision,
+    outcome: EventLogOutcome,
+    detail: Option<&str>,
+) {
+    let code = serve_state_code(decision);
+    let prev = LAST_SERVE_STATE.swap(code, std::sync::atomic::Ordering::Relaxed);
+    if prev == code {
+        return;
+    }
+    let label = decision.outcome_label();
+    if decision.served_by_ehdb() {
+        tracing::info!(
+            serve_state = label,
+            outcome = outcome.as_str(),
+            "{}=primary IS SERVING: the event-log tier answered authoritatively through the \
+             writer-fronted tier service (mirror_source=server, tier_query_source=service)",
+            EVENTLOG_MODE_ENV
+        );
+    } else if decision.degraded() {
+        tracing::warn!(
+            serve_state = label,
+            outcome = outcome.as_str(),
+            detail = detail.unwrap_or("-"),
+            "{}=primary is NOT serving — the incumbent answers (demoted: {label})",
+            EVENTLOG_MODE_ENV
+        );
+    } else {
+        tracing::info!(
+            serve_state = label,
+            outcome = outcome.as_str(),
+            "event-log tier serve state: {label} (the incumbent is authoritative)"
+        );
+    }
+}
+
+/// The serve state this process last decided, as the label the metric carries.
+///
+/// `"unknown"` until the first service-resolved append — which is the honest
+/// answer, and different from every other value: a process that has not been
+/// asked to mirror anything has not decided anything.
+pub fn current_serve_state() -> &'static str {
+    use super::primary_serve::{DemoteReason, ServeDecision};
+    match LAST_SERVE_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ServeDecision::ServedByEhdb.outcome_label(),
+        2 => ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::NotPrimary,
+        }
+        .outcome_label(),
+        3 => ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::NoDurableService,
+        }
+        .outcome_label(),
+        4 => ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::ParityDiverged,
+        }
+        .outcome_label(),
+        _ => "unknown",
+    }
+}
+
+/// Reset the logged serve state.  Tests only — the transition logger is
+/// process-global, so a test that asserts a transition must start from a known
+/// state or it depends on which test ran first.
+#[cfg(test)]
+pub(crate) fn reset_serve_state_for_test() {
+    LAST_SERVE_STATE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How many events the built-in primary-serve cycle drives through the engine.
 pub const PRIMARY_SERVE_CYCLE_EVENTS: usize = 3;
 
@@ -1272,6 +1642,255 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         assert!(runtime_hook_env(&e).is_none());
+    }
+
+    // ======================================================================
+    // The service-resolved serve site (ai-meta#257 P0).
+    //
+    // These are the permanent guard for the defect: on the composed
+    // serve-ready configuration `primary` reached NO caller of
+    // `primary_serve::decide`, so the flip was inert AND silent while 13
+    // events per execution flowed correctly. Every test below asserts a
+    // property of the third call site — the one that configuration reaches.
+    // ======================================================================
+
+    /// The tier service's real acknowledgement shape, for one append.
+    fn ack_body(seq: u64, count: Option<u64>) -> String {
+        match count {
+            Some(c) => {
+                format!(r#"{{"appended":true,"global_sequence":{seq},"log_record_count":{c}}}"#)
+            }
+            None => format!(r#"{{"appended":true,"global_sequence":{seq}}}"#),
+        }
+    }
+
+    #[test]
+    fn service_append_serves_primary_when_all_three_conditions_hold() {
+        // THE P0, as an assertion. `primary` + a reachable durable service +
+        // parity holding must produce `served_primary` on the service-resolved
+        // path — the path `MIRROR_SOURCE=server` + `TIER_QUERY_SOURCE=service`
+        // takes, and the one that previously recorded nothing at all.
+        let e = worker_env("/tmp/svc-serve.jsonl", "primary");
+        let body = ack_body(7, Some(7));
+        let s = serve_service_append_with(&e, Ok(&body), 6, 0.001, true);
+        assert_eq!(
+            s.outcome,
+            EventLogOutcome::ServedPrimary,
+            "the composed configuration must reach the serve decision: {s:?}"
+        );
+        assert!(s.decision.served_by_ehdb());
+        assert!(!s.decision.degraded());
+        assert_eq!(s.sequence, Some(7));
+        assert_eq!(s.decision.outcome_label(), "served_primary");
+    }
+
+    #[test]
+    fn service_append_never_serves_without_a_reachable_durable_service() {
+        // The failure the whole RFC exists to prevent: a tier claiming to be
+        // authoritative with nothing authoritative behind it. Same inputs as
+        // above with reachability false.
+        let e = worker_env("/tmp/svc-unreach.jsonl", "primary");
+        let body = ack_body(7, Some(7));
+        let s = serve_service_append_with(&e, Ok(&body), 6, 0.001, false);
+        assert_eq!(s.outcome, EventLogOutcome::PrimaryUnavailable);
+        assert!(!s.decision.served_by_ehdb(), "must not serve: {s:?}");
+        assert!(s.decision.degraded(), "asking for primary and not getting it is degraded");
+        assert_eq!(s.decision.outcome_label(), "no_durable_service");
+        assert!(
+            s.detail.is_some_and(|d| d.contains("nothing authoritative")),
+            "the demote must say why"
+        );
+    }
+
+    #[test]
+    fn service_append_demotes_on_divergence_rather_than_serving_or_erroring() {
+        let e = worker_env("/tmp/svc-div.jsonl", "primary");
+        // Gapless invariant broken: the store holds 4 records but assigned 7.
+        let body = ack_body(7, Some(4));
+        let s = serve_service_append_with(&e, Ok(&body), 6, 0.001, true);
+        assert_eq!(s.outcome, EventLogOutcome::PrimaryDivergence);
+        assert!(!s.decision.served_by_ehdb());
+        assert!(s.decision.degraded());
+        assert_eq!(s.decision.outcome_label(), "parity_diverged");
+        assert!(s.detail.is_some_and(|d| d.contains("count divergence")));
+
+        // Ordering is checked too, and batch-locally: a sequence that did not
+        // advance within one batch is a divergence.
+        let flat = ack_body(6, Some(6));
+        let s2 = serve_service_append_with(&e, Ok(&flat), 6, 0.001, true);
+        assert_eq!(s2.outcome, EventLogOutcome::PrimaryDivergence);
+        assert!(s2.detail.is_some_and(|d| d.contains("ordering divergence")));
+    }
+
+    #[test]
+    fn service_append_in_shadow_mirrors_and_never_claims_to_serve() {
+        // The flip must be the ONLY difference. Same reachable service, same
+        // parity, `shadow` instead of `primary`.
+        let e = worker_env("/tmp/svc-shadow.jsonl", "shadow");
+        let body = ack_body(3, Some(3));
+        let s = serve_service_append_with(&e, Ok(&body), 2, 0.001, true);
+        assert_eq!(s.outcome, EventLogOutcome::Mirrored);
+        assert!(!s.decision.served_by_ehdb());
+        assert!(!s.decision.degraded(), "non-primary is not degraded");
+        assert_eq!(s.decision.outcome_label(), "not_primary");
+    }
+
+    #[test]
+    fn service_append_off_and_disabled_record_nothing() {
+        // Default-off, byte-identical: this site must never be the reason the
+        // event-log family exists.
+        let off = worker_env("/tmp/svc-off.jsonl", "off");
+        let body = ack_body(1, Some(1));
+        assert_eq!(
+            serve_service_append_with(&off, Ok(&body), 0, 0.0, true).outcome,
+            EventLogOutcome::Disabled
+        );
+
+        let mut disabled = worker_env("/tmp/svc-dis.jsonl", "primary");
+        disabled.insert("NOETL_EHDB_ENABLED".to_string(), "false".to_string());
+        assert_eq!(
+            serve_service_append_with(&disabled, Ok(&body), 0, 0.0, true).outcome,
+            EventLogOutcome::Disabled,
+            "the umbrella switch must dominate the tier mode"
+        );
+    }
+
+    #[test]
+    fn a_record_that_did_not_land_is_degraded_and_demotes_visibly() {
+        // Arm E: the tier service dies under `primary`. The serve signal must not
+        // simply STOP — that is indistinguishable from no traffic. A transport
+        // failure records on a degraded label and demotes.
+        let e = worker_env("/tmp/svc-dead.jsonl", "primary");
+        let s = serve_service_append_with(&e, Err("connect refused"), 0, 0.05, false);
+        assert_eq!(s.outcome, EventLogOutcome::Unavailable);
+        assert!(!s.decision.served_by_ehdb());
+        assert!(s.decision.degraded());
+        assert_eq!(s.sequence, None, "nothing landed, so there is no sequence");
+        assert!(s.detail.is_some_and(|d| d.contains("connect refused")));
+    }
+
+    #[test]
+    fn a_rejected_record_does_not_demote_the_whole_tier() {
+        // `reachability`'s distinction, enforced at this site: a service that
+        // refuses ONE record is reachable and healthy. Demoting for a poisoned
+        // payload would let one record disable authoritative serving platform-wide,
+        // so `invalid` is not degraded — while a store fault is.
+        let e = worker_env("/tmp/svc-rej.jsonl", "primary");
+        let rejected = serve_service_append_with(&e, Ok("invalid payload is empty"), 0, 0.0, true);
+        assert_eq!(rejected.outcome, EventLogOutcome::Rejected);
+        assert!(!rejected.outcome.degraded(), "a refused record is not a degraded tier");
+
+        for body in ["unavailable no tier store configured", "error disk full"] {
+            let s = serve_service_append_with(&e, Ok(body), 0, 0.0, true);
+            assert_eq!(
+                s.outcome,
+                EventLogOutcome::Unavailable,
+                "{body:?} is the store failing, which IS degraded"
+            );
+            assert!(s.outcome.degraded());
+        }
+    }
+
+    #[test]
+    fn an_ack_without_a_record_count_verifies_by_ordering_alone_and_says_so() {
+        // Rollout skew: the writer predates `log_record_count`. Parity degrades to
+        // the ordering check rather than being reported as a divergence — an
+        // unverifiable check must not be labelled a failed one, and the skip is
+        // named in the detail rather than being silent.
+        let e = worker_env("/tmp/svc-noc.jsonl", "primary");
+        let body = ack_body(9, None);
+        let s = serve_service_append_with(&e, Ok(&body), 8, 0.001, true);
+        assert_eq!(s.outcome, EventLogOutcome::ServedPrimary);
+        assert!(
+            s.detail.is_some_and(|d| d.contains("no log_record_count")),
+            "which checks ran must be reported, not assumed"
+        );
+    }
+
+    #[test]
+    fn the_serve_site_shares_one_policy_with_the_local_path() {
+        // The property that keeps the two sites from drifting: for every one of
+        // the eight input combinations, this site's serve verdict is exactly
+        // `primary_serve::decide`'s. If someone adds a fourth condition here, or
+        // relaxes one, this fails.
+        for is_primary in [false, true] {
+            for reachable in [false, true] {
+                for parity in [false, true] {
+                    let e = worker_env(
+                        "/tmp/svc-table.jsonl",
+                        if is_primary { "primary" } else { "shadow" },
+                    );
+                    // parity holds ⇒ count == sequence; diverges ⇒ it does not.
+                    let body = ack_body(5, Some(if parity { 5 } else { 2 }));
+                    let s = serve_service_append_with(&e, Ok(&body), 4, 0.0, reachable);
+                    let want = super::super::primary_serve::decide(is_primary, reachable, parity);
+                    assert_eq!(
+                        s.decision, want,
+                        "({is_primary},{reachable},{parity}) diverged from the shared policy"
+                    );
+                    assert_eq!(
+                        s.decision.served_by_ehdb(),
+                        is_primary && reachable && parity,
+                        "exactly one combination may serve"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_flip_is_never_silent_in_either_direction() {
+        // The second half of the P0: at flip time the pods emitted NO line about
+        // the tier being primary — not even a wrong one. The transition logger is
+        // process-global, so the assertion here is on the state it exposes, which
+        // is the same value the reply body and the log line carry.
+        reset_serve_state_for_test();
+        assert_eq!(
+            current_serve_state(),
+            "unknown",
+            "a process that has decided nothing must say so, not report `not_primary`"
+        );
+
+        let e = worker_env("/tmp/svc-signal.jsonl", "primary");
+        let body = ack_body(2, Some(2));
+        serve_service_append_with(&e, Ok(&body), 1, 0.0, true);
+        assert_eq!(current_serve_state(), "served_primary");
+
+        // Demote: the state must move back. A demote that stayed silent because
+        // the promote was already logged is how an outage hides.
+        serve_service_append_with(&e, Err("connect refused"), 2, 0.0, false);
+        assert_eq!(current_serve_state(), "no_durable_service");
+
+        // And re-promote on a real success, with no restart and no timer.
+        let body2 = ack_body(3, Some(3));
+        serve_service_append_with(&e, Ok(&body2), 2, 0.0, true);
+        assert_eq!(current_serve_state(), "served_primary");
+        reset_serve_state_for_test();
+    }
+
+    #[test]
+    fn the_pinned_serve_outcomes_cover_every_outcome_this_site_records() {
+        // The drift check from `representation-drift.md`: a pinned label set that
+        // omits one value reintroduces the absent-series bug on that value alone,
+        // while the rest read 0 and look complete. Enumerate what this site can
+        // record and require the pin to contain it.
+        let recorded = [
+            EventLogOutcome::ServedPrimary,
+            EventLogOutcome::PrimaryUnavailable,
+            EventLogOutcome::PrimaryDivergence,
+            EventLogOutcome::Mirrored,
+            EventLogOutcome::ParityMismatch,
+            EventLogOutcome::Rejected,
+            EventLogOutcome::Unavailable,
+        ];
+        for outcome in recorded {
+            assert!(
+                super::super::metrics::eventlog_serve_outcome_is_pinned(outcome.as_str()),
+                "{} is recorded by serve_service_append but not pinned — it would be ABSENT \
+                 until it first fires, which reads as 'this build has no serve path'",
+                outcome.as_str()
+            );
+        }
     }
 
     #[test]
