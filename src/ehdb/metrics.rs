@@ -364,6 +364,32 @@ pub fn record_query(
     );
 }
 
+/// Record which store answered one tier operation (ai-meta#257 PR 4).
+///
+/// Routed into the existing `query` family — `tier="eventlog"`,
+/// `operation="tier_query_source.<read|append>"`, `outcome=<source label>` —
+/// rather than a new family, matching how `record_tier_client` reuses
+/// `dataplane`. One more family for a four-value label set is registry surface
+/// with no extra information in it.
+///
+/// The outcome set is closed: `local`, `downgraded_local`, `service`,
+/// `misconfigured`. It is deliberately NOT pinned at 0, because this family
+/// renders nothing at all until an EHDB op has run and pinning would break the
+/// byte-identical `/metrics` a disabled build produces. The load-bearing signal
+/// for the gate is the `tier_query_source` field in the reply body; this counter
+/// is for an operator watching a rollout, where a rising `downgraded_local` or
+/// `misconfigured` is the thing to alert on.
+pub fn record_tier_query_source(op: &str, source: &str) {
+    record_query(
+        "eventlog",
+        &format!("tier_query_source.{op}"),
+        source,
+        source == "local" || source == "service",
+        source == "downgraded_local" || source == "misconfigured",
+        0.0,
+    );
+}
+
 /// Render all EHDB metric families as Prometheus text lines.  Returns an empty
 /// vec when no non-disabled EHDB op has run (the disabled/no-op case), so the
 /// worker `/metrics` output stays byte-identical.

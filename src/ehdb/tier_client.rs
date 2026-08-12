@@ -21,7 +21,6 @@
 //! as in PR 1, there is **no default address** — a client that dials a guessed
 //! host because a variable was forgotten is worse than one that does nothing.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
@@ -80,8 +79,28 @@ impl TierClientConfig {
     /// side: a typo must leave the client absent and say so, never dial a
     /// default and never panic a process that hosts the buses.
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var(TIER_SERVICE_ADDR_ENV).ok()?;
-        let raw = raw.trim();
+        Self::build(
+            std::env::var(TIER_SERVICE_ADDR_ENV).ok().as_deref(),
+            std::env::var(TIER_SERVICE_TIMEOUT_MS_ENV).ok().as_deref(),
+        )
+    }
+
+    /// Resolve from an explicit [`EnvMap`] rather than the live process env.
+    ///
+    /// Same parse, same refusals — [`Self::from_env`] is this function over a
+    /// snapshot. It exists because the request paths already hold an `EnvMap`
+    /// ([`crate::ehdb::process_env`]) and reading the address from a *second*
+    /// place would let "which source did I ask for" and "which address do I
+    /// dial" disagree, which is unobservable at the call site.
+    pub fn from_map(env: &super::EnvMap) -> Option<Self> {
+        Self::build(
+            env.get(TIER_SERVICE_ADDR_ENV).map(|s| s.as_str()),
+            env.get(TIER_SERVICE_TIMEOUT_MS_ENV).map(|s| s.as_str()),
+        )
+    }
+
+    fn build(raw: Option<&str>, raw_timeout: Option<&str>) -> Option<Self> {
+        let raw = raw?.trim();
         if raw.is_empty() {
             return None;
         }
@@ -103,8 +122,7 @@ impl TierClientConfig {
         // An unparseable timeout falls back to the default rather than
         // disabling the client: the address is the load-bearing setting, and a
         // bad timeout should not silently remove a configured capability.
-        let timeout_ms = std::env::var(TIER_SERVICE_TIMEOUT_MS_ENV)
-            .ok()
+        let timeout_ms = raw_timeout
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -143,6 +161,11 @@ impl TierClient {
     /// Build from the environment. `None` ⇒ not configured.
     pub fn from_env() -> Option<Self> {
         TierClientConfig::from_env().map(Self::new)
+    }
+
+    /// Build from an explicit [`EnvMap`]. See [`TierClientConfig::from_map`].
+    pub fn from_map(env: &super::EnvMap) -> Option<Self> {
+        TierClientConfig::from_map(env).map(Self::new)
     }
 
     pub fn addr(&self) -> &str {
