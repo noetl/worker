@@ -311,6 +311,28 @@ pub async fn spawn_event_writer_host(
     if let Some(tier_cfg) = crate::ehdb::tier_service::TierServiceConfig::from_env() {
         let listener = TcpListener::bind(tier_cfg.bind).await?;
         let addr = tier_cfg.bind;
+
+        // Create every tier-service metric series at 0 the moment the listener
+        // exists (noetl/ai-meta#260).  This is the ONLY call site, and it sits
+        // after the bind deliberately: the pin means "this process can serve a
+        // tier", so it must not fire for a process whose bind failed.
+        //
+        // Everything below the bind is unconditional — no store check, no tier
+        // mode, no `NOETL_EHDB_*`.  A pin placed inside a config branch is not a
+        // pin, and the configuration you most want to read the counters on is
+        // the broken one.  The store's size and sequence are sampled here rather
+        // than assumed 0, so a writer restarting in front of a populated store
+        // reports what it actually holds before serving a single request.
+        let store = crate::ehdb::tier_store::TierStoreConfig::from_env();
+        let (store_bytes, store_seq) = match store.as_ref() {
+            Some(c) => (
+                crate::ehdb::tier_store::store_bytes(c),
+                crate::ehdb::tier_store::startup_sequence(c),
+            ),
+            None => (0, 0),
+        };
+        crate::ehdb::metrics::pin_tier_service_series(store_bytes, store_seq);
+
         tokio::spawn(crate::ehdb::tier_service::serve_tier(listener));
         // The PR-1 text — "skeleton: health only, serves no tier data" — outlived
         // the build it described.  PR 3 gave the service a store, so the line
