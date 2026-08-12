@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.118.1](https://github.com/noetl/worker/compare/v5.118.0...v5.118.1) (2026-08-12)
+
+### Bug Fixes
+
+* **ehdb:** serialize tier-store appends — concurrent writers tore the log ([58e3af8](https://github.com/noetl/worker/commit/58e3af85c520251130f711f6bd39df486c82ffe7)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.118.0](https://github.com/noetl/worker/compare/v5.117.1...v5.118.0) (2026-08-12)
 
 ### Features
