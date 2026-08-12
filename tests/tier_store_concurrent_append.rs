@@ -118,6 +118,7 @@ async fn tier_store_append_is_safe_under_concurrent_writers() {
     phase_concurrent_appends_produce_a_readable_log().await;
     phase_reads_never_observe_a_half_written_record().await;
     phase_a_corrupt_store_is_refused_not_misread().await;
+    phase_the_preserved_prod_artifact_is_refused().await;
 }
 
 async fn phase_concurrent_appends_produce_a_readable_log() {
@@ -227,6 +228,49 @@ async fn phase_concurrent_appends_produce_a_readable_log() {
         ));
     }
     assert_eq!(seen.len(), TOTAL, "duplicate or mangled payloads round-tripped");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The **real** corrupt store from the prod soak, when it is available.
+///
+/// `EHDB_TORN_FIXTURE` points at a directory holding the preserved
+/// `eventlog.jsonl` (ai-meta#261 keeps one; it is deliberately not committed to
+/// a public repo). Absent ⇒ this phase reports that it did not run.
+///
+/// It is **opt-in rather than skip-if-missing-silently** on purpose: a test that
+/// quietly passes when its fixture is absent is worse than no test, because the
+/// green tick then means "the file was not there".  The synthetic splice in
+/// [`phase_a_corrupt_store_is_refused_not_misread`] is the portable assertion;
+/// this one confirms the synthetic shape matches the real bytes.
+async fn phase_the_preserved_prod_artifact_is_refused() {
+    let Ok(src) = std::env::var("EHDB_TORN_FIXTURE") else {
+        eprintln!("phase 4 SKIPPED: set EHDB_TORN_FIXTURE=<dir with eventlog.jsonl> to run it");
+        return;
+    };
+    let src = std::path::Path::new(&src).join("eventlog.jsonl");
+    let corrupt = std::fs::read(&src)
+        .unwrap_or_else(|e| panic!("EHDB_TORN_FIXTURE is set but unreadable ({e}): {}", src.display()));
+
+    // COPY it. The service writes into whatever directory it is pointed at, and
+    // a preserved incident artifact must not be mutated by the thing examining it.
+    let dir = tmp_dir("artifact");
+    std::fs::create_dir_all(&dir).expect("create store dir");
+    std::fs::write(dir.join("eventlog.jsonl"), &corrupt).expect("seed the corrupt log");
+
+    let client = start_service(&dir).await;
+    let body = client.scan(None, 1_000).await.expect("scan transport");
+
+    assert!(
+        body.starts_with("error"),
+        "the preserved corrupt store must be REFUSED, not served:\n{body}"
+    );
+    assert!(
+        body.contains("invalid type: map, expected u8"),
+        "the real artifact must reproduce the fingerprint this fix was written \
+         against:\n{body}"
+    );
+    eprintln!("phase 4: preserved artifact refused fail-loud -> {body}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
