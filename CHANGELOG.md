@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.118.0](https://github.com/noetl/worker/compare/v5.117.1...v5.118.0) (2026-08-12)
+
+### Features
+
+* **ehdb:** accept server-authored appends, and disarm when the server mirrors ([11e7145](https://github.com/noetl/worker/commit/11e7145931fcc1c9ae51e531f87e377e853a2f21)), closes [noetl/ai-meta#258](https://github.com/noetl/ai-meta/issues/258) [noetl/ai-meta#258](https://github.com/noetl/ai-meta/issues/258) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+* **ehdb:** the tier service's server half is observable ([a87dd14](https://github.com/noetl/worker/commit/a87dd142fd4cc4a263e8e8da103361226bc51ca0)), closes [server#315](https://github.com/noetl/server/issues/315) [noetl/ai-meta#260](https://github.com/noetl/ai-meta/issues/260) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+* **ehdb:** tier reads resolve through the writer, observably or not at all ([19862ca](https://github.com/noetl/worker/commit/19862ca62f7239b7f16b69a2deeb8a8588a17fef)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
+### Bug Fixes
+
+* **ehdb:** the serve decision runs on the configuration that makes the tier correct ([8d46b33](https://github.com/noetl/worker/commit/8d46b338f881cc07ea039feac30688a45aaacc40)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#259](https://github.com/noetl/ai-meta/issues/259)
+* **ehdb:** the tier service's startup line stops describing PR 1 ([7fd7e42](https://github.com/noetl/worker/commit/7fd7e42582d51ccfb8e200c1a1008f2b2f6d2465)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.117.1](https://github.com/noetl/worker/compare/v5.117.0...v5.117.1) (2026-08-12)
 
 ### Bug Fixes
