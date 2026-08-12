@@ -133,10 +133,20 @@ pub fn append(cfg: Option<&TierStoreConfig>, execution_id: &str, payload: &str) 
             // before a `primary` flip is "does this store hold anything", and
             // answering it by reading would change what is being measured.
             super::metrics::record_tier_service_append(out.global_sequence, store_bytes(cfg));
+            // `log_record_count` is what makes the append VERIFIABLE by the
+            // caller.  The remote appender cannot open this store, so without the
+            // count in the reply the only parity check available to it is
+            // ordering — and the serve decision on the service-resolved path
+            // (`eventlog::serve_service_append`) needs the same gapless
+            // invariant `mirror_event` checks locally: `log_record_count ==
+            // global_sequence`.  Additive: a caller that does not read it is
+            // unaffected, and one that does degrades to the ordering check alone
+            // when talking to a writer that predates the field.
             TierStoreOutcome::Ok(
                 serde_json::to_string(&serde_json::json!({
                     "appended": true,
                     "global_sequence": out.global_sequence,
+                    "log_record_count": out.log_record_count,
                 }))
                 .unwrap_or_else(|_| "{}".to_string()),
             )
