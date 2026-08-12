@@ -118,21 +118,36 @@ pub mod vector;
 pub type EnvMap = HashMap<String, String>;
 
 /// Snapshot the current process environment into an [`EnvMap`].
-/// Warn — once per tier per process — that a tier is configured `primary` while
-/// no authoritative serve path exists in this binary.
+/// Report — once per tier per process — what selecting `primary` on this tier
+/// actually did, at the moment an operator selects it.
 ///
-/// `primary` is accepted and treated as `shadow` (the tier keeps mirroring and
-/// parity-checking) rather than rejected, because refusing to start on a config
-/// a previous build accepted would turn a misconfiguration into an outage. But
-/// it must not be silent: before noetl/ai-meta#247 the same setting quietly
-/// disarmed the mirror and served nothing, and the only way to notice was to
-/// observe that a counter had stopped moving.
+/// Three distinct conditions, because they call for three different operator
+/// responses.  Getting this wrong is not cosmetic: the line fires exactly when
+/// someone is running a cutover, and a false "nothing happened" invites them to
+/// flip again or to walk away from a tier that is live
+/// ([ai-meta#259](https://github.com/noetl/ai-meta/issues/259)).
+///
+/// | condition | signal | what the operator should do |
+/// | :-- | :-- | :-- |
+/// | tier has no runtime serve path ([`primary_serve::SERVE_WIRED_TIERS`]) | WARN, `outcome="primary_not_wired"` | nothing was promoted; the tier stays a shadow. Flipping again will not help |
+/// | serve path exists, no tier-service address configured | WARN, `outcome="primary_no_tier_service"` | set `NOETL_EHDB_TIER_SERVICE_ADDR`; until then every op demotes to the incumbent |
+/// | serve path exists and a tier service is configured | INFO, `outcome="primary_armed"` | watch `served_primary` vs `parity_diverged` / `no_durable_service` |
+///
+/// `primary_armed` is deliberately *not* a claim that the tier is serving.
+/// Serving needs three conditions ([`primary_serve::decide`]) and two of them —
+/// measured reachability and per-op parity — are only knowable per operation.
+/// This says the flip was accepted and the serve path is armed; the per-op
+/// outcome counters say what it then did.
+///
+/// `primary` is accepted rather than rejected in every case, because refusing
+/// to start on a config a previous build accepted would turn a misconfiguration
+/// into an outage.
 ///
 /// Rate-limited to one line per tier because this sits on the per-event hot
 /// path — `logging.md` forbids per-event INFO/WARN volume.
-pub fn warn_primary_not_wired(tier: &str) {
-    use std::sync::Mutex;
+pub fn note_primary_selected(tier: &str) {
     use std::collections::HashSet;
+    use std::sync::Mutex;
     static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let mut g = match WARNED.lock() {
         Ok(g) => g,
@@ -142,15 +157,42 @@ pub fn warn_primary_not_wired(tier: &str) {
     if !set.insert(tier.to_string()) {
         return;
     }
-    crate::ehdb::metrics::record_primary_not_wired(tier);
-    tracing::warn!(
+    let upper = tier.to_uppercase();
+    if !primary_serve::tier_serves_primary(tier) {
+        crate::ehdb::metrics::record_runtime_hook(tier, "primary_not_wired");
+        tracing::warn!(
+            tier = tier,
+            "NOETL_EHDB_{upper} is set to `primary`, but the {tier} tier has no \
+             runtime serve path in this build — its `serve_primary_cycle` is \
+             reachable only from bin/ehdb-selfcheck, so no caller can receive an \
+             EHDB answer for it.  The tier keeps mirroring and parity-checking \
+             and the incumbent remains authoritative; flipping again will not \
+             change that.  The event-log tier is the only tier wired to serve \
+             today.  See noetl/ai-meta#257.",
+        );
+        return;
+    }
+    if tier_client::TierClientConfig::from_env().is_none() {
+        crate::ehdb::metrics::record_runtime_hook(tier, "primary_no_tier_service");
+        tracing::warn!(
+            tier = tier,
+            "NOETL_EHDB_{upper} is set to `primary` and the {tier} tier does have \
+             a serve path, but NOETL_EHDB_TIER_SERVICE_ADDR is unset — there is \
+             no durable store to serve FROM, so every operation demotes to the \
+             incumbent (outcome=\"no_durable_service\").  Set the tier-service \
+             address to complete the cutover.  See noetl/ai-meta#257.",
+        );
+        return;
+    }
+    crate::ehdb::metrics::record_runtime_hook(tier, "primary_armed");
+    tracing::info!(
         tier = tier,
-        "NOETL_EHDB_{} is set to `primary`, but this build has no authoritative \
-         serve path for it (serve_primary_cycle is only reachable from \
-         bin/ehdb-selfcheck).  Treating the tier as `shadow`: it keeps mirroring \
-         and parity-checking, and the incumbent remains authoritative.  See \
-         noetl/ai-meta#247.",
-        tier.to_uppercase()
+        "NOETL_EHDB_{upper} is set to `primary` and the {tier} serve path is \
+         armed.  Whether an individual operation is served by EHDB still depends \
+         on a REACHED tier service and on parity holding for that operation; \
+         divergence or unreachability demotes to the incumbent rather than \
+         failing the caller.  Watch outcome=\"served_primary\" against \
+         \"parity_diverged\" / \"no_durable_service\".  See noetl/ai-meta#257.",
     );
 }
 

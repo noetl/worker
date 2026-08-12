@@ -665,19 +665,20 @@ pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
     // `off` ⇒ no hook.  `shadow` AND `primary` both arm the live mirror.
     //
     // `primary` used to return `None` here, so selecting it SILENTLY DISARMED
-    // verification: the mirror stopped, and nothing served in its place because
-    // no runtime path calls `serve_primary_cycle` — its only caller is
-    // `bin/ehdb-selfcheck`, which by its own contract "never authors a NoETL
-    // event".  Measured in kind on one binary under identical load: `shadow`
-    // mirrored 30 events, `primary` mirrored 0.  A mode meant to promote the
-    // tier instead turned it off, with no signal (noetl/ai-meta#247).
+    // verification: the mirror stopped, and nothing served in its place.
+    // Measured in kind on one binary under identical load: `shadow` mirrored 30
+    // events, `primary` mirrored 0.  A mode meant to promote the tier instead
+    // turned it off, with no signal (noetl/ai-meta#247).
     //
-    // Until an authoritative serve path exists, `primary` behaves as "shadow,
-    // and say so".  Arming here is monotonic — it can only add mirroring, never
-    // remove it — so this cannot reduce verification for any configuration.
+    // Since ai-meta#257 PR 5/6 the event log DOES have a runtime serve path —
+    // the append site below runs `primary_serve::decide` — so `primary` here is
+    // "mirror, and additionally serve when the policy allows", not "shadow with
+    // a warning".  Arming the mirror is monotonic either way: it can only add
+    // verification, never remove it.  `primary` keeps parity-checking on every
+    // op precisely so that serving cannot silence verification.
     match EventLogMode::from_env(env) {
         EventLogMode::Off => return None,
-        EventLogMode::Primary => super::warn_primary_not_wired("eventlog"),
+        EventLogMode::Primary => super::note_primary_selected("eventlog"),
         EventLogMode::Shadow => {}
     }
     // A control-plane role carrying a data-plane env fails contract validation;

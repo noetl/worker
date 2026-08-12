@@ -1005,12 +1005,17 @@ pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
     // mirrored 30 events, `primary` mirrored 0.  A mode meant to promote the
     // tier instead turned it off, with no signal (noetl/ai-meta#247).
     //
-    // Until an authoritative serve path exists, `primary` behaves as "shadow,
-    // and say so".  Arming here is monotonic — it can only add mirroring, never
+    // This tier still has NO runtime serve path, so `primary` behaves as
+    // "shadow, and say so".  That is per-tier, not build-wide: the event-log
+    // tier IS wired to serve since ai-meta#257 PR 5/6, and the flip-time signal
+    // says which case a given tier is in (ai-meta#259, where one stale sentence
+    // told operators a serving tier was inert).  `primary_serve::SERVE_WIRED_TIERS`
+    // is the list, and a test re-derives it from these sources so it cannot
+    // drift again.  Arming here is monotonic — it can only add mirroring, never
     // remove it — so this cannot reduce verification for any configuration.
     match VectorMode::from_env(env) {
         VectorMode::Off => return None,
-        VectorMode::Primary => super::warn_primary_not_wired("vector"),
+        VectorMode::Primary => super::note_primary_selected("vector"),
         VectorMode::Shadow => {}
     }
     let contract = contract_from_env(env).ok()?;

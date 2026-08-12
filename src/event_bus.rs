@@ -300,7 +300,9 @@ pub async fn spawn_event_writer_host(
     // storage tiers.  Hosted here because this is the process that owns the
     // durable volumes and already fronts both buses.
     //
-    // Skeleton only: it answers `health` and serves no tier data yet.  Absent
+    // Serves `health`, `append`, `read_execution` and `scan` (ai-meta#257 PR 3
+    // wired the data ops; the "skeleton, health only" description this comment
+    // used to carry outlived the skeleton by three PRs — ai-meta#259).  Absent
     // unless NOETL_EHDB_TIER_SERVICE_BIND is set, so a build with the flag unset
     // opens no socket and is byte-identical to one without this face.
     if let Some(tier_cfg) = crate::ehdb::tier_service::TierServiceConfig::from_env() {
@@ -333,7 +335,7 @@ pub async fn spawn_event_writer_host(
             %addr,
             shard = config.shard,
             protocol = crate::ehdb::tier_service::PROTOCOL_VERSION,
-            "EHDB tier service listener up (skeleton: health only, serves no tier data)"
+            "EHDB tier service listener up (health, append, read_execution, scan)"
         );
     }
 
