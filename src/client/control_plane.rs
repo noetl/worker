@@ -316,7 +316,34 @@ impl ControlPlaneClient {
         // per-event path in `emit_event` does zero work unless the shadow tier
         // is explicitly armed for a data-plane role.
         let process_env = crate::ehdb::process_env();
-        let ehdb_eventlog_hook = Arc::new(crate::ehdb::eventlog::runtime_hook_env(&process_env));
+        // noetl/ai-meta#258 — who mirrors into the event-log tier.
+        //
+        // In `server` mode the server's write chokepoint mirrors the COMPLETE
+        // authoritative set, this worker's own events included (they reach
+        // `noetl.event` through `POST /api/events`, so the server writes them).
+        // The worker's hook must therefore disarm, and this is the only place it
+        // can: leaving it armed appends every worker-emitted event twice — once
+        // from here and once from the server — and the cross-store comparator
+        // reports a count divergence on every healthy execution.
+        //
+        // Disarming here also disarms the tier-service append below it, which is
+        // correct for the same reason and is why the two share this one gate.
+        let mirror_source = crate::ehdb::mirror_source::MirrorSource::from_env(&process_env);
+        let ehdb_eventlog_hook = Arc::new(
+            match mirror_source {
+                crate::ehdb::mirror_source::MirrorSource::Server => {
+                    tracing::info!(
+                        "{}=server — the worker's event-log mirror is disarmed; the server's \
+                         write chokepoint mirrors the full authoritative set (noetl/ai-meta#258)",
+                        crate::ehdb::mirror_source::MIRROR_SOURCE_ENV
+                    );
+                    None
+                }
+                crate::ehdb::mirror_source::MirrorSource::Worker => {
+                    crate::ehdb::eventlog::runtime_hook_env(&process_env)
+                }
+            },
+        );
         // Object-tier live-put hook (noetl/ehdb#234): `Some` only for a
         // data-plane role running `NOETL_EHDB_OBJECT=shadow` with EHDB enabled,
         // so `object_put` does zero work unless the shadow tier is armed.

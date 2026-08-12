@@ -51,7 +51,13 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
         // relays raw tier queries to (noetl/ai-meta#178).  Read-only, disabled by
         // default (no-op until `NOETL_EHDB_ENABLED`), reachable in-cluster via
         // the existing worker metrics/query service on :9090.
-        .route("/ehdb/tiers/{tier}", get(ehdb_tier_query_handler));
+        // GET reads the tier; POST appends to it (noetl/ai-meta#258).  Both on
+        // the SAME route deliberately — see `ehdb_tier_append_handler` for why
+        // the write must resolve its store exactly the way the read does.
+        .route(
+            "/ehdb/tiers/{tier}",
+            get(ehdb_tier_query_handler).post(ehdb_tier_append_handler),
+        );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -190,6 +196,237 @@ async fn ehdb_tier_query_handler(
         });
     let status = StatusCode::from_u16(result.0).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(result.1))
+}
+
+/// `POST /ehdb/tiers/{tier}` — append records the **server** authored.
+///
+/// The write half of the closure in noetl/ai-meta#258. The event-log tier could
+/// only ever hold the worker-emitted subset of the log, because the mirror hook
+/// sits on the worker's emit chokepoint and the server authors the rest itself.
+/// This is where the server's chokepoint puts the events it writes.
+///
+/// **It shares a route with the read on purpose, and that is a correctness
+/// property rather than a tidiness one.** The GET handler resolves which store
+/// answers — this pod's own log, or the writer-fronted tier service — from
+/// `NOETL_EHDB_TIER_QUERY_SOURCE`. A write that resolved its store any other way
+/// could land in a store the comparator does not read, and the comparator would
+/// then report every server-authored event missing: a total divergence that is
+/// an artefact of two different stores rather than a fact about either. Routing
+/// both through one handler makes "written where it will be read" true by
+/// construction instead of by matching two env vars.
+///
+/// The control-plane guard is untouched. The server still never opens tier
+/// storage; it makes the same HTTP hop it already makes to read.
+///
+/// Inert by default: without `NOETL_EHDB_EVENTLOG_MIRROR_SOURCE=server` this
+/// answers 501 and appends nothing, so a build carrying it behaves exactly as
+/// the build before it.
+async fn ehdb_tier_append_handler(
+    Path(tier): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Only the event log. The other four tiers hold derived data with no
+    // authoritative counterpart for a server to author, so accepting an append
+    // for them would invent records rather than mirror any.
+    if tier != "eventlog" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "action": "ehdb.tier.append",
+                "error": "append is supported for the eventlog tier only",
+                "tier": tier,
+            })),
+        );
+    }
+
+    let env = crate::ehdb::process_env();
+    let source = crate::ehdb::mirror_source::MirrorSource::from_env(&env);
+    if source != crate::ehdb::mirror_source::MirrorSource::Server {
+        // 501, not 403: the surface exists and the caller is entitled to it —
+        // this deployment simply has not been asked to mirror server-side. The
+        // server's mirror treats this as "unconfigured" and says so, the same
+        // vocabulary the comparator uses for a tier it cannot read.
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "action": "ehdb.tier.append",
+                "outcome": "unconfigured",
+                "error": format!(
+                    "{}={} — this worker is not configured to accept server-authored appends",
+                    crate::ehdb::mirror_source::MIRROR_SOURCE_ENV,
+                    source.as_str()
+                ),
+            })),
+        );
+    }
+
+    let execution_id = match body.get("execution_id").and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "action": "ehdb.tier.append",
+                    "error": "execution_id is required",
+                })),
+            )
+        }
+    };
+
+    // Records arrive as already-serialised event payloads, in the order the
+    // server intends them to sit in the tier. Preserving that order across this
+    // hop is the whole point of sending a batch rather than N requests: the
+    // comparator checks that the tier's records sit in the same relative order
+    // as the authoritative log, and N concurrent requests would not.
+    let records: Vec<String> = match body.get("records").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                other => Some(other.to_string()),
+            })
+            .collect(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "action": "ehdb.tier.append",
+                    "error": "records must be an array",
+                })),
+            )
+        }
+    };
+    if records.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "action": "ehdb.tier.append",
+                "outcome": "ok",
+                "appended": 0,
+            })),
+        );
+    }
+
+    let (resolved, downgraded) = crate::ehdb::tier_query_source::effective_source(&env);
+    if downgraded {
+        tracing::warn!(
+            "NOETL_EHDB_TIER_QUERY_SOURCE=service but no tier-service address is \
+             configured; server-authored appends are landing in the pod-local store"
+        );
+    }
+
+    let mut appended = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    if resolved == crate::ehdb::tier_query_source::TierQuerySource::Service {
+        if let Some(client) = crate::ehdb::tier_client::TierClient::from_env() {
+            for payload in &records {
+                match client.append(&execution_id, payload).await {
+                    Ok(_) => appended += 1,
+                    Err(e) => failures.push(e),
+                }
+            }
+            return append_reply("service", appended, records.len(), failures);
+        }
+    }
+
+    // Pod-local store. `mirror_event` is the same append the worker's own mirror
+    // uses, so a server-authored record and a worker-authored one are written by
+    // identical code into identical storage — there is no second write path that
+    // could diverge in format or in sequence assignment.
+    let exec = execution_id.clone();
+    let recs = records.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let env = crate::ehdb::process_env();
+        let mut ok = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        for payload in &recs {
+            let r = crate::ehdb::eventlog::mirror_event(
+                &env,
+                &exec,
+                None,
+                payload,
+                &crate::ehdb::eventlog::EventLogOptions::default(),
+                true,
+            );
+            // "Appended" means the record is in the store. `ParityMismatch` and
+            // `PrimaryDivergence` are appends that landed and then disagreed
+            // with something — the record exists, and the tier's own parity
+            // metric already carries the disagreement, so counting them as
+            // failures here would double-report one fault as two.
+            //
+            // `RoutedAway` is deliberately NOT in that set. It means "the owning
+            // replica mirrors it", which is true of a worker-originated append
+            // and false of this one: the server sent this record here and will
+            // not send it anywhere else, so treating it as success would drop an
+            // event silently.
+            match r.outcome {
+                crate::ehdb::eventlog::EventLogOutcome::Mirrored
+                | crate::ehdb::eventlog::EventLogOutcome::ServedPrimary
+                | crate::ehdb::eventlog::EventLogOutcome::ParityMismatch
+                | crate::ehdb::eventlog::EventLogOutcome::PrimaryDivergence => ok += 1,
+                other => errs.push(format!("{other:?}")),
+            }
+        }
+        (ok, errs)
+    })
+    .await;
+
+    match outcome {
+        Ok((ok, errs)) => {
+            appended = ok;
+            failures = errs;
+        }
+        Err(e) => failures.push(format!("append task join error: {e}")),
+    }
+
+    append_reply("local", appended, records.len(), failures)
+}
+
+/// One reply shape for both stores.
+///
+/// A partial append is reported as a partial append. Coercing "3 of 5 landed"
+/// into a 200 with no detail would let the comparator's later `count` verdict be
+/// the first anyone hears of it, at which point the cause is a store away.
+fn append_reply(
+    source: &str,
+    appended: usize,
+    requested: usize,
+    failures: Vec<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if failures.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "action": "ehdb.tier.append",
+                "outcome": "ok",
+                "source": source,
+                "appended": appended,
+            })),
+        );
+    }
+    tracing::warn!(
+        source,
+        appended,
+        requested,
+        failures = failures.len(),
+        "server-authored tier append did not land in full"
+    );
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "action": "ehdb.tier.append",
+            "outcome": "degraded",
+            "source": source,
+            "appended": appended,
+            "requested": requested,
+            "errors": failures,
+        })),
+    )
 }
 
 /// `GET /healthz` — liveness check.  Returns 200 OK whenever the
