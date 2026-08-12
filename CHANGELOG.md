@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.117.1](https://github.com/noetl/worker/compare/v5.117.0...v5.117.1) (2026-08-12)
+
+### Bug Fixes
+
+* **ehdb:** the flip-time signal must describe the tier it fires for ([a757f55](https://github.com/noetl/worker/commit/a757f5534821c83cbbce343e83bd07ab49b9f8c7)), closes [noetl/ai-meta#259](https://github.com/noetl/ai-meta/issues/259) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [5.117.0](https://github.com/noetl/worker/compare/v5.116.0...v5.117.0) (2026-08-12)
 
 ### Features
