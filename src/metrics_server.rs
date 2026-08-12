@@ -59,6 +59,25 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
             get(ehdb_tier_query_handler).post(ehdb_tier_append_handler),
         );
 
+    // ai-meta#257 P0 — pin the serve-decision series at the bind site of the
+    // route that carries server-authored appends, so `served_primary 0` is
+    // readable instead of the series being absent. A pod that comes up under
+    // `primary` while the tier service is down would otherwise render nothing at
+    // all, which is exactly what made the inert flip look like a missing metric.
+    // Gated so a disabled build's `/metrics` stays byte-identical; both `shadow`
+    // and `primary` pin, so the flip changes values and not which series exist.
+    {
+        use crate::ehdb::eventlog::EventLogMode;
+        let env = crate::ehdb::process_env();
+        // `enabled_from_env`, not a second copy of the truthiness rule — two
+        // readers of one flag are two chances to disagree about it.
+        if crate::ehdb::contract::enabled_from_env(&env)
+            && EventLogMode::from_env(&env) != EventLogMode::Off
+        {
+            crate::ehdb::metrics::pin_eventlog_serve_series();
+        }
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
 
@@ -136,6 +155,11 @@ async fn ehdb_tier_query_handler(
     let source_label = resolution.label();
     let source_addr = resolution.addr().map(str::to_string);
     crate::ehdb::metrics::record_tier_query_source("read", source_label);
+    // ai-meta#257 P0 — the event-log serve state, for the reply. Only for the
+    // event-log tier: it is that tier's state, and a bare `serve_state` on a `kv`
+    // body would describe the wrong thing to a reader who has no way to tell.
+    let serve_state = matches!(tier, QueryTier::Eventlog)
+        .then(crate::ehdb::eventlog::current_serve_state);
 
     use crate::ehdb::tier_query_source::Resolution;
     match &resolution {
@@ -163,6 +187,7 @@ async fn ehdb_tier_query_handler(
                     }),
                     source_label,
                     source_addr.as_deref(),
+                    serve_state,
                 )),
             );
         }
@@ -186,6 +211,7 @@ async fn ehdb_tier_query_handler(
                         }),
                         source_label,
                         source_addr.as_deref(),
+                        serve_state,
                     )),
                 );
             }
@@ -200,7 +226,7 @@ async fn ehdb_tier_query_handler(
                 Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
                     Ok(v) => (
                         StatusCode::OK,
-                        Json(stamp_source(v, source_label, source_addr.as_deref())),
+                        Json(stamp_source(v, source_label, source_addr.as_deref(), serve_state)),
                     ),
                     // A non-JSON reply is one of the service's typed refusals
                     // (`unavailable` / `invalid` / `error`).  Surface it as-is
@@ -215,6 +241,7 @@ async fn ehdb_tier_query_handler(
                             }),
                             source_label,
                             source_addr.as_deref(),
+                            serve_state,
                         )),
                     ),
                 },
@@ -228,6 +255,7 @@ async fn ehdb_tier_query_handler(
                         }),
                         source_label,
                         source_addr.as_deref(),
+                        serve_state,
                     )),
                 ),
             };
@@ -253,7 +281,7 @@ async fn ehdb_tier_query_handler(
     let status = StatusCode::from_u16(result.0).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
         status,
-        Json(stamp_source(result.1, source_label, source_addr.as_deref())),
+        Json(stamp_source(result.1, source_label, source_addr.as_deref(), serve_state)),
     )
 }
 
@@ -274,6 +302,7 @@ fn stamp_source(
     v: serde_json::Value,
     source: &str,
     addr: Option<&str>,
+    serve_state: Option<&str>,
 ) -> serde_json::Value {
     let mut v = match v {
         serde_json::Value::Object(_) => v,
@@ -284,6 +313,29 @@ fn stamp_source(
             "tier_query_source".to_string(),
             serde_json::Value::String(source.to_string()),
         );
+        // The serve state, on the READ, at the endpoint level (ai-meta#257 P0).
+        //
+        // The append decides it; the read is where a gate — or an operator — can
+        // see it per replica without scraping a metric. That matters more than it
+        // sounds: the P0 was found by a gate asserting a metric delta, and the
+        // family turned out to be ABSENT, which reads the same as a build that
+        // never had it. A field in the body cannot be absent for that reason.
+        //
+        // `unknown` until this pod has decided anything, which is a different
+        // statement from any of the four decisions and must not be confused with
+        // `not_primary`.
+        //
+        // `None` for every tier that is not the event log, and that is not
+        // fastidiousness: the serve state is the EVENT LOG's, and stamping it onto
+        // a `kv` or `object` reply would put a field on a body it does not
+        // describe. A reader has no way to tell which tier a bare `serve_state`
+        // belongs to, which is the whole class of defect this playbook is about.
+        if let Some(state) = serve_state {
+            obj.insert(
+                "serve_state".to_string(),
+                serde_json::Value::String(state.to_string()),
+            );
+        }
         if let Some(a) = addr {
             obj.insert(
                 "tier_service_addr".to_string(),
@@ -439,13 +491,50 @@ async fn ehdb_tier_append_handler(
             );
         }
         Resolution::Service(client) => {
+            // ai-meta#257 P0 — THE SERVE DECISION RUNS HERE.
+            //
+            // This branch is the event-log tier's append chokepoint on the only
+            // configuration that makes the tier correct at more than one replica
+            // (`MIRROR_SOURCE=server` + `TIER_QUERY_SOURCE=service`), and before
+            // this it was the one append path that never consulted
+            // `primary_serve::decide`: the worker's own mirror hook is disarmed by
+            // `MIRROR_SOURCE=server`, and `Resolution::Service` never enters
+            // `mirror_event`, which is where the other call site lives.  A flip to
+            // `primary` was therefore inert AND silent — measured in kind at three
+            // replicas with 13 events per execution flowing correctly throughout.
+            //
+            // `serve_service_append` is not a second policy: it calls the same
+            // `decide` with the same three conditions and the same outcome
+            // vocabulary.  It records on every record, landed or not, so a dead
+            // tier service shows as a demote rather than as a serve signal that
+            // quietly stopped.
+            let mut previous_sequence = 0u64;
+            let mut serve_state = crate::ehdb::eventlog::current_serve_state();
             for payload in &records {
-                match client.append(&execution_id, payload).await {
+                let started = std::time::Instant::now();
+                let out = client.append(&execution_id, payload).await;
+                let serve = crate::ehdb::eventlog::serve_service_append(
+                    &env,
+                    out.as_deref().map_err(String::as_str),
+                    previous_sequence,
+                    started.elapsed().as_secs_f64(),
+                );
+                if let Some(seq) = serve.sequence {
+                    previous_sequence = seq;
+                }
+                serve_state = serve.decision.outcome_label();
+                match out {
                     Ok(_) => appended += 1,
                     Err(e) => failures.push(e),
                 }
             }
-            return append_reply(resolution.label(), appended, records.len(), failures);
+            return append_reply(
+                resolution.label(),
+                appended,
+                records.len(),
+                failures,
+                serve_state,
+            );
         }
         Resolution::Local => {}
     }
@@ -500,7 +589,13 @@ async fn ehdb_tier_append_handler(
         Err(e) => failures.push(format!("append task join error: {e}")),
     }
 
-    append_reply(resolution.label(), appended, records.len(), failures)
+    append_reply(
+        resolution.label(),
+        appended,
+        records.len(),
+        failures,
+        crate::ehdb::eventlog::current_serve_state(),
+    )
 }
 
 /// One reply shape for both stores.
@@ -508,11 +603,19 @@ async fn ehdb_tier_append_handler(
 /// A partial append is reported as a partial append. Coercing "3 of 5 landed"
 /// into a 200 with no detail would let the comparator's later `count` verdict be
 /// the first anyone hears of it, at which point the cause is a store away.
+///
+/// `serve_state` is the serve decision's own label (`served_primary`,
+/// `no_durable_service`, `parity_diverged`, `not_primary`, or `unknown` before
+/// the first append). It is in the body because a serve decision that is only
+/// visible as a metric delta cannot be asserted at the endpoint level — and the
+/// P0 this closes was found by a gate reading a metric family that turned out to
+/// be absent, which reads identically to a build that does not have it.
 fn append_reply(
     source: &str,
     appended: usize,
     requested: usize,
     failures: Vec<String>,
+    serve_state: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if failures.is_empty() {
         return (
@@ -522,6 +625,7 @@ fn append_reply(
                 "outcome": "ok",
                 "tier_query_source": source,
                 "appended": appended,
+                "serve_state": serve_state,
             })),
         );
     }
@@ -529,6 +633,7 @@ fn append_reply(
         source,
         appended,
         requested,
+        serve_state,
         failures = failures.len(),
         "server-authored tier append did not land in full"
     );
@@ -540,6 +645,7 @@ fn append_reply(
             "tier_query_source": source,
             "appended": appended,
             "requested": requested,
+            "serve_state": serve_state,
             "errors": failures,
         })),
     )
@@ -600,6 +706,7 @@ mod tests {
             serde_json::json!({"action": "ehdb.tier.query", "result": {"records": []}}),
             "local",
             None,
+            None,
         );
         assert_eq!(local["tier_query_source"], "local");
         assert!(
@@ -613,8 +720,13 @@ mod tests {
             serde_json::json!({"record_count": 13, "records": []}),
             "service",
             Some("writer:9110"),
+            Some("served_primary"),
         );
         assert_eq!(svc["tier_query_source"], "service");
+        assert_eq!(
+            svc["serve_state"], "served_primary",
+            "the serve decision must be readable on the reply, not only as a metric"
+        );
         assert_eq!(svc["tier_service_addr"], "writer:9110");
         assert_eq!(svc["record_count"], 13);
     }
@@ -623,7 +735,7 @@ mod tests {
     fn a_non_object_reply_is_labelled_rather_than_dropped() {
         // A reply that is not an object still has to carry the label, and it
         // must not lose its body doing so.
-        let v = stamp_source(serde_json::json!([1, 2, 3]), "service", Some("w:9110"));
+        let v = stamp_source(serde_json::json!([1, 2, 3]), "service", Some("w:9110"), None);
         assert_eq!(v["tier_query_source"], "service");
         assert_eq!(v["body"], serde_json::json!([1, 2, 3]));
     }

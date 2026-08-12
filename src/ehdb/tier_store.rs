@@ -126,14 +126,64 @@ pub fn append(cfg: Option<&TierStoreConfig>, execution_id: &str, payload: &str) 
         payload: payload.to_string(),
     };
     match driver(cfg).append(&request) {
-        Ok(out) => TierStoreOutcome::Ok(
-            serde_json::to_string(&serde_json::json!({
-                "appended": true,
-                "global_sequence": out.global_sequence,
-            }))
-            .unwrap_or_else(|_| "{}".to_string()),
-        ),
+        Ok(out) => {
+            // The store's own state, recorded on the write path (ai-meta#260).
+            // Observing it here rather than on a read is what makes the tier
+            // checkable without generating traffic against it — the question
+            // before a `primary` flip is "does this store hold anything", and
+            // answering it by reading would change what is being measured.
+            super::metrics::record_tier_service_append(out.global_sequence, store_bytes(cfg));
+            // `log_record_count` is what makes the append VERIFIABLE by the
+            // caller.  The remote appender cannot open this store, so without the
+            // count in the reply the only parity check available to it is
+            // ordering — and the serve decision on the service-resolved path
+            // (`eventlog::serve_service_append`) needs the same gapless
+            // invariant `mirror_event` checks locally: `log_record_count ==
+            // global_sequence`.  Additive: a caller that does not read it is
+            // unaffected, and one that does degrades to the ordering check alone
+            // when talking to a writer that predates the field.
+            TierStoreOutcome::Ok(
+                serde_json::to_string(&serde_json::json!({
+                    "appended": true,
+                    "global_sequence": out.global_sequence,
+                    "log_record_count": out.log_record_count,
+                }))
+                .unwrap_or_else(|_| "{}".to_string()),
+            )
+        }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
+    }
+}
+
+/// Size of the backing event-log file, or 0 when it does not exist yet.
+///
+/// 0-on-error is safe here in a way it usually is not: this is only ever
+/// reported alongside `store_appends_total` and `store_sequence`, so a stat that
+/// fails shows as "0 bytes holding N records", which is visibly wrong rather
+/// than quietly plausible.
+pub(crate) fn store_bytes(cfg: &TierStoreConfig) -> u64 {
+    std::fs::metadata(cfg.eventlog_path())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Highest global sequence the store already holds, read once at startup.
+///
+/// Without this, a writer that restarts in front of a populated store reports
+/// `sequence 0` until the next append — which reads exactly like an empty store,
+/// on the component being promoted to authoritative.
+pub(crate) fn startup_sequence(cfg: &TierStoreConfig) -> u64 {
+    match driver(cfg).scan_global(&EventLogScanRequest {
+        after: None,
+        limit: MAX_SCAN_LIMIT,
+    }) {
+        Ok(out) => out
+            .records
+            .iter()
+            .map(|r| r.global_sequence)
+            .max()
+            .unwrap_or(0),
+        Err(_) => 0,
     }
 }
 
