@@ -218,6 +218,115 @@ pub(crate) fn new_transaction_id() -> String {
     format!("ehdbel-{}", txn_gen().next_id())
 }
 
+/// Flag arming the authoritative-id stamp (noetl/ai-meta#258). Default off.
+pub const AUTHORITATIVE_ID_STAMP_ENV: &str = "NOETL_EHDB_AUTHORITATIVE_ID_STAMP";
+
+/// What happened when the mirrored payload's identity was reconciled against
+/// the identity the server assigned.
+///
+/// Every value is a label on `noetl_ehdb_eventlog_ops_total{operation=
+/// "authoritative_id"}`, so the distribution is readable from a scrape. That
+/// matters most for `absent`: before this existed, a record with no `event_id`
+/// was mirrored and counted as a clean shadow op, and the fact that it could
+/// never be matched against the authoritative log was invisible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoritativeIdVerdict {
+    /// The caller supplied no authoritative id (selfcheck drive, unit test).
+    NotSupplied,
+    /// An authoritative id was supplied and the payload already carried the
+    /// same one — the producer stamped it and the server honoured it.
+    Agreed,
+    /// The payload carried no `event_id` and the authoritative one was written
+    /// in. This is the common case for five live emit paths (`spool_runtime`
+    /// ×2, `subscription` ×2, and the retry path in `control_plane`) which all
+    /// send `event_id: None` and let the server assign it.
+    Stamped,
+    /// The payload carried no `event_id`, an authoritative id was available, and
+    /// the stamp is **disarmed** — so the record goes to the tier
+    /// unidentifiable. Recorded so the flag-off state is visible rather than
+    /// looking like the flag-on one.
+    Unstamped,
+    /// The payload's `event_id` and the server's disagree. A genuine cross-store
+    /// identity divergence, detected at the append site.
+    Disagreed,
+    /// The payload is not a JSON object, so it has no identity to reconcile.
+    /// Only the synthetic selfcheck payloads look like this.
+    NotJson,
+}
+
+impl AuthoritativeIdVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotSupplied => "not_supplied",
+            Self::Agreed => "agreed",
+            Self::Stamped => "stamped",
+            Self::Unstamped => "unstamped",
+            Self::Disagreed => "disagreed",
+            Self::NotJson => "not_json",
+        }
+    }
+
+    /// A disagreement is the only verdict that indicates something wrong.
+    fn degraded(self) -> bool {
+        matches!(self, Self::Disagreed)
+    }
+}
+
+/// Reconcile the mirrored payload's `event_id` against the server-assigned one.
+///
+/// Returns the payload to mirror (rewritten only when a stamp was applied) plus
+/// the verdict.
+///
+/// The rewrite is deliberately narrow: it fills in an `event_id` the producer
+/// omitted and never overwrites one it supplied. A stamp that overwrote a
+/// producer's id would make the two stores agree by construction, which is the
+/// one thing a parity mechanism must not do — it would convert a real
+/// divergence into a silent correction.
+pub fn reconcile_authoritative_id(
+    payload: &str,
+    authoritative_event_id: Option<i64>,
+    stamp: bool,
+) -> (String, AuthoritativeIdVerdict) {
+    let Some(auth_id) = authoritative_event_id else {
+        return (payload.to_string(), AuthoritativeIdVerdict::NotSupplied);
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return (payload.to_string(), AuthoritativeIdVerdict::NotJson);
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return (payload.to_string(), AuthoritativeIdVerdict::NotJson);
+    };
+
+    match obj.get("event_id").and_then(|v| match v {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }) {
+        Some(producer_id) if producer_id == auth_id => {
+            (payload.to_string(), AuthoritativeIdVerdict::Agreed)
+        }
+        Some(producer_id) => {
+            tracing::warn!(
+                producer_event_id = producer_id,
+                authoritative_event_id = auth_id,
+                "EHDB mirror: the producer's event_id and the server-assigned event_id disagree"
+            );
+            (payload.to_string(), AuthoritativeIdVerdict::Disagreed)
+        }
+        None if stamp => {
+            obj.insert(
+                "event_id".to_string(),
+                serde_json::Value::Number(auth_id.into()),
+            );
+            (
+                serde_json::to_string(&value).unwrap_or_else(|_| payload.to_string()),
+                AuthoritativeIdVerdict::Stamped,
+            )
+        }
+        None => (payload.to_string(), AuthoritativeIdVerdict::Unstamped),
+    }
+}
+
 fn truthy(env: &EnvMap, key: &str) -> bool {
     matches!(
         env.get(key)
@@ -592,10 +701,16 @@ pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
 /// but on the real events the worker emits to the control plane, so a live drive
 /// advances the `noetl_ehdb_eventlog_*` metrics instead of only the selfcheck.
 ///
-/// `authoritative_sequence` is passed as `None`: the worker does not know the
-/// server-assigned global log sequence at emit time, so parity relies on the
-/// engine's own count + monotonic-order invariant (the safe default documented
-/// on [`mirror_event`]).
+/// `authoritative_sequence` is passed as `None`, and that stays correct: the
+/// authoritative log has no 1-based gapless global sequence to compare EHDB's
+/// against, so any value put there would be measured against the wrong scale.
+/// What the worker *can* now supply is the authoritative **identity** —
+/// `authoritative_event_id`, read back from the `POST /api/events` response and
+/// carried on [`EventLogOptions`] — which is what lets the server's cross-store
+/// comparator match a mirrored record to its `noetl.event` row at all
+/// (noetl/ai-meta#258). Count, ordering and payload parity against the
+/// authoritative log are compared **server-side**, because per
+/// `data-access-boundary.md` the worker may not read `noetl.*`.
 ///
 /// **Best-effort + isolated.**  Shadow is auxiliary: this NEVER affects the
 /// authoritative event path.  Any failure inside the mirror is contained — the
@@ -604,19 +719,59 @@ pub fn runtime_hook_env(env: &EnvMap) -> Option<EnvMap> {
 /// [`EventLogOutcome::Unavailable`] rather than unwinding into the caller's
 /// event-emit path.  The caller discards the return; the metric carries the
 /// signal.
-pub fn mirror_live_event(env: &EnvMap, execution_id: &str, payload: &str) -> EventLogOutcome {
+pub fn mirror_live_event(
+    env: &EnvMap,
+    execution_id: &str,
+    payload: &str,
+    authoritative_event_id: Option<i64>,
+) -> LiveMirror {
+    // Reconcile identity BEFORE the append, and return the reconciled payload so
+    // every store that receives this event receives the same bytes. That is not
+    // a tidiness point: the pod-local log and the writer-fronted tier service
+    // are both read by the server's comparator, and a record that is identified
+    // in one and anonymous in the other would diverge against itself.
+    let (payload, verdict) = reconcile_authoritative_id(
+        payload,
+        authoritative_event_id,
+        truthy(env, AUTHORITATIVE_ID_STAMP_ENV),
+    );
+    metrics::record_eventlog(
+        "authoritative_id",
+        verdict.as_str(),
+        !verdict.degraded(),
+        verdict.degraded(),
+        0.0,
+    );
+
     let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         mirror_event(
             env,
             execution_id,
             None,
-            payload,
+            &payload,
             &EventLogOptions::default(),
             true,
         )
         .outcome
     }));
-    guarded.unwrap_or(EventLogOutcome::Unavailable)
+    LiveMirror {
+        outcome: guarded.unwrap_or(EventLogOutcome::Unavailable),
+        payload,
+        id_verdict: verdict,
+    }
+}
+
+/// What [`mirror_live_event`] mirrored, and what it mirrored.
+///
+/// The payload is returned rather than discarded because the caller has a second
+/// store to feed — the writer-fronted tier service — and both must receive the
+/// identical record.
+#[derive(Debug, Clone)]
+pub struct LiveMirror {
+    pub outcome: EventLogOutcome,
+    /// The bytes actually appended, after any authoritative-id stamp.
+    pub payload: String,
+    pub id_verdict: AuthoritativeIdVerdict,
 }
 
 /// How many events the built-in primary-serve cycle drives through the engine.
@@ -1168,8 +1323,108 @@ mod tests {
         let (log, dir) = tmp_log("live-fire");
         let e = worker_env(log.to_str().unwrap(), "shadow");
         // A real (long) numeric execution id, mirrored via the runtime hook.
-        let outcome = mirror_live_event(&e, "478775660589088776", "{\"event_type\":\"call.done\"}");
+        let outcome = mirror_live_event(&e, "478775660589088776", "{\"event_type\":\"call.done\"}", None).outcome;
         assert_eq!(outcome, EventLogOutcome::Mirrored);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- noetl/ai-meta#258: authoritative-id reconciliation ------------------
+
+    #[test]
+    fn no_authoritative_id_is_reported_not_assumed() {
+        let (p, v) = reconcile_authoritative_id("{\"event_type\":\"x\"}", None, true);
+        assert_eq!(v, AuthoritativeIdVerdict::NotSupplied);
+        assert_eq!(p, "{\"event_type\":\"x\"}", "payload must be untouched");
+    }
+
+    #[test]
+    fn a_producer_stamped_id_is_never_overwritten() {
+        // The load-bearing property. A stamp that overwrote the producer's id
+        // would make the stores agree by construction — converting a real
+        // divergence into a silent correction, which is the one thing a parity
+        // mechanism must not do.
+        let (p, v) = reconcile_authoritative_id("{\"event_id\":11}", Some(22), true);
+        assert_eq!(v, AuthoritativeIdVerdict::Disagreed);
+        let parsed: serde_json::Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(parsed["event_id"], 11, "the producer's id must survive");
+    }
+
+    #[test]
+    fn agreement_is_distinguished_from_a_stamp() {
+        let (_, v) = reconcile_authoritative_id("{\"event_id\":7}", Some(7), true);
+        assert_eq!(v, AuthoritativeIdVerdict::Agreed);
+    }
+
+    #[test]
+    fn a_missing_id_is_stamped_only_when_armed() {
+        let payload = "{\"event_type\":\"step.enter\"}";
+
+        let (off, v_off) = reconcile_authoritative_id(payload, Some(42), false);
+        assert_eq!(v_off, AuthoritativeIdVerdict::Unstamped);
+        assert_eq!(off, payload, "flag-off must be byte-identical");
+
+        let (on, v_on) = reconcile_authoritative_id(payload, Some(42), true);
+        assert_eq!(v_on, AuthoritativeIdVerdict::Stamped);
+        let parsed: serde_json::Value = serde_json::from_str(&on).unwrap();
+        assert_eq!(parsed["event_id"], 42);
+        assert_eq!(
+            parsed["event_type"], "step.enter",
+            "stamping must not disturb the rest of the event"
+        );
+    }
+
+    #[test]
+    fn a_stringified_producer_id_is_compared_not_ignored() {
+        // The two producers spell event_id differently; reading only one
+        // spelling would report every event from the other as a disagreement.
+        let (_, v) = reconcile_authoritative_id("{\"event_id\":\"7\"}", Some(7), true);
+        assert_eq!(v, AuthoritativeIdVerdict::Agreed);
+    }
+
+    #[test]
+    fn a_non_json_payload_cannot_be_reconciled_and_says_so() {
+        let (p, v) = reconcile_authoritative_id("not json", Some(1), true);
+        assert_eq!(v, AuthoritativeIdVerdict::NotJson);
+        assert_eq!(p, "not json");
+    }
+
+    #[test]
+    fn the_stamped_payload_is_what_gets_mirrored() {
+        // The returned payload is fed to the tier service as well as the local
+        // log, so it has to BE the appended bytes, not a copy of the input.
+        let (log, dir) = tmp_log("live-stamp");
+        let mut e = worker_env(log.to_str().unwrap(), "shadow");
+        e.insert(AUTHORITATIVE_ID_STAMP_ENV.to_string(), "true".to_string());
+        let m = mirror_live_event(&e, "100", "{\"event_type\":\"x\"}", Some(4242));
+        assert_eq!(m.outcome, EventLogOutcome::Mirrored);
+        assert_eq!(m.id_verdict, AuthoritativeIdVerdict::Stamped);
+        assert!(
+            m.payload.contains("4242"),
+            "returned payload must carry the stamp: {}",
+            m.payload
+        );
+        // Read it back through the driver rather than grepping the JSONL: the
+        // log stores the payload as a byte array, so a text search over the file
+        // would match the digits of an unrelated field and pass without the
+        // stamp ever having landed.
+        let driver = LocalReferenceEventLogDriver::new(
+            log.clone(),
+            DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+        );
+        let out = driver
+            .read_execution(&ehdb_reference::EventLogReadExecutionRequest {
+                execution_id: "100".to_string(),
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(out.record_count, 1);
+        let stored: serde_json::Value = serde_json::from_str(&out.records[0].payload).unwrap();
+        assert_eq!(
+            stored["event_id"], 4242,
+            "the stamped id must be what reached the store"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1177,7 +1432,7 @@ mod tests {
     fn mirror_live_event_is_noop_when_disabled() {
         // No EHDB env at all ⇒ Disabled (records no metric, real path untouched).
         let e: EnvMap = EnvMap::new();
-        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}");
+        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}", None).outcome;
         assert_eq!(outcome, EventLogOutcome::Disabled);
     }
 
@@ -1194,7 +1449,7 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         // Even if the hook were called directly, the guard refuses the write.
-        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}");
+        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}", None).outcome;
         assert_eq!(outcome, EventLogOutcome::GuardRefused);
     }
 
@@ -1208,7 +1463,7 @@ mod tests {
         std::fs::write(&file_as_dir, b"x").unwrap(); // now a regular file
         let bad_log = file_as_dir.join("nested").join("log.jsonl");
         let e = worker_env(bad_log.to_str().unwrap(), "shadow");
-        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}");
+        let outcome = mirror_live_event(&e, "100", "{\"seq\":1}", None).outcome;
         assert!(
             matches!(
                 outcome,
