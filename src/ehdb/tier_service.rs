@@ -147,32 +147,104 @@ pub fn decode_request(payload: &[u8]) -> TierRequest {
     }
 }
 
+/// How one handled request is classified for metrics: the bare operation name,
+/// the outcome, and the two health bits the `noetl_ehdb_*` families carry.
+///
+/// `degraded` means **this writer is not able to serve**, which is a different
+/// question from `ok`. A malformed request is `ok = false, degraded = false` —
+/// the caller got a correct refusal and the service is fine. No store and a
+/// store error are both `degraded`, because in each case a tier promoted to
+/// primary here would be unable to answer. That split is the whole point: an
+/// alert on `degraded` must not fire because someone sent a bad frame.
+pub(crate) struct Observed {
+    pub op: &'static str,
+    pub outcome: &'static str,
+    pub ok: bool,
+    pub degraded: bool,
+}
+
 /// Encode the reply for a request.
 pub fn encode_response(req: &TierRequest) -> Vec<u8> {
+    encode_response_observed(req).0
+}
+
+/// Encode the reply and classify it in one pass.
+///
+/// One function, not two, because the classification depends on the store's
+/// answer — a `read_execution` is a hit or a miss according to what came back,
+/// and re-deriving that from the encoded bytes afterwards would be a second
+/// implementation of the same decision, free to disagree with the first.
+pub(crate) fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Observed) {
     use super::tier_store::{self, TierStoreOutcome};
     let cfg = tier_store::TierStoreConfig::from_env();
-    let render = |o: TierStoreOutcome| -> Vec<u8> {
+
+    // Did a read actually return records? Parsed from the body the store just
+    // produced. A parse failure counts as a miss rather than panicking: this is
+    // a metric label, and a malformed body is already going to surface as a
+    // client-side error.
+    let has_records = |body: &str| -> bool {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("record_count").and_then(|c| c.as_u64()))
+            .is_some_and(|n| n > 0)
+    };
+
+    let render = |op: &'static str, o: TierStoreOutcome| -> (Vec<u8>, Observed) {
         match o {
-            TierStoreOutcome::Ok(body) => body.into_bytes(),
+            TierStoreOutcome::Ok(body) => {
+                // Reads distinguish hit from miss; a write is simply `ok`.
+                let outcome = if op == "append" {
+                    "ok"
+                } else if has_records(&body) {
+                    "hit"
+                } else {
+                    "miss"
+                };
+                (
+                    body.into_bytes(),
+                    Observed { op, outcome, ok: true, degraded: false },
+                )
+            }
             // Each failure keeps its own shape.  A caller must be able to tell
             // "this writer has no store" from "your request was malformed" from
             // "the store broke" — collapsing them into one error is how an
             // operator spends an afternoon on the wrong hypothesis.
-            TierStoreOutcome::Unavailable => b"unavailable no tier store configured".to_vec(),
-            TierStoreOutcome::Invalid(e) => format!("invalid {e}").into_bytes(),
-            TierStoreOutcome::Error(e) => format!("error {e}").into_bytes(),
+            TierStoreOutcome::Unavailable => (
+                b"unavailable no tier store configured".to_vec(),
+                Observed { op, outcome: "unavailable", ok: false, degraded: true },
+            ),
+            TierStoreOutcome::Invalid(e) => (
+                format!("invalid {e}").into_bytes(),
+                Observed { op, outcome: "invalid", ok: false, degraded: false },
+            ),
+            TierStoreOutcome::Error(e) => (
+                format!("error {e}").into_bytes(),
+                Observed { op, outcome: "error", ok: false, degraded: true },
+            ),
         }
     };
+
     match req {
-        TierRequest::Health => format!("ok tier-service v{PROTOCOL_VERSION}").into_bytes(),
+        TierRequest::Health => (
+            format!("ok tier-service v{PROTOCOL_VERSION}").into_bytes(),
+            Observed { op: "health", outcome: "ok", ok: true, degraded: false },
+        ),
         TierRequest::Append { execution_id, payload } => {
-            render(tier_store::append(cfg.as_ref(), execution_id, payload))
+            render("append", tier_store::append(cfg.as_ref(), execution_id, payload))
         }
         TierRequest::ReadExecution { execution_id } => {
-            render(tier_store::read_execution(cfg.as_ref(), execution_id))
+            render("read_execution", tier_store::read_execution(cfg.as_ref(), execution_id))
         }
-        TierRequest::Scan { after, limit } => render(tier_store::scan(cfg.as_ref(), *after, *limit)),
-        TierRequest::Unsupported(op) => format!("unsupported {op}").into_bytes(),
+        TierRequest::Scan { after, limit } => {
+            render("scan", tier_store::scan(cfg.as_ref(), *after, *limit))
+        }
+        // `op` is NOT the label — the unknown op name is caller-controlled and
+        // would make `operation` unbounded-cardinality. The name stays in the
+        // reply, where the caller can read it.
+        TierRequest::Unsupported(op) => (
+            format!("unsupported {op}").into_bytes(),
+            Observed { op: "unsupported", outcome: "unsupported", ok: false, degraded: false },
+        ),
     }
 }
 
@@ -214,15 +286,47 @@ pub(crate) async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::
     stream.flush().await
 }
 
+/// Record one connection-lifecycle event (ai-meta#260).
+///
+/// Connection events carry no latency — the duration of "a peer hung up" is not
+/// a quantity — so they pass 0.0 and are excluded from the pinned latency
+/// series.
+fn record_conn(outcome: &str, ok: bool, degraded: bool) {
+    super::metrics::record_tier_service("conn", outcome, ok, degraded, 0.0);
+}
+
 /// Serve one connection until the peer hangs up or violates the protocol.
 async fn serve_conn(mut stream: TcpStream) {
+    record_conn("accepted", true, false);
     loop {
         match read_frame(&mut stream).await {
-            Ok(None) => return,
+            Ok(None) => {
+                record_conn("closed", true, false);
+                return;
+            }
             Ok(Some(payload)) => {
+                // The measured window is decode → store → encode: everything
+                // this service is responsible for. It deliberately excludes the
+                // frame read (which is dominated by how long the client took to
+                // send) and the write (which is dominated by the client's
+                // receive window). Including either would make the tier store
+                // look slow whenever a caller was.
+                let started = std::time::Instant::now();
                 let req = decode_request(&payload);
-                let resp = encode_response(&req);
+                let (resp, obs) = encode_response_observed(&req);
+                let elapsed = started.elapsed().as_secs_f64();
+                super::metrics::record_tier_service(
+                    obs.op,
+                    obs.outcome,
+                    obs.ok,
+                    obs.degraded,
+                    elapsed,
+                );
                 if let Err(e) = write_frame(&mut stream, &resp).await {
+                    // Degraded: the request was served and the answer was lost.
+                    // From the caller's side this is indistinguishable from the
+                    // service being down, so it must not read as healthy here.
+                    record_conn("write_error", false, true);
                     tracing::debug!(error = %e, "EHDB tier service: write failed; closing connection");
                     return;
                 }
@@ -231,6 +335,7 @@ async fn serve_conn(mut stream: TcpStream) {
                 // WARN, not silence: a malformed frame means a client is talking
                 // a protocol this writer does not speak, which is exactly the
                 // thing an operator needs to see during a rollout.
+                record_conn("protocol_error", false, false);
                 tracing::warn!(error = %e, "EHDB tier service: protocol error; closing connection");
                 return;
             }
@@ -246,6 +351,7 @@ pub async fn serve_tier(listener: TcpListener) {
                 tokio::spawn(serve_conn(stream));
             }
             Err(e) => {
+                record_conn("accept_error", false, true);
                 tracing::warn!(error = %e, "EHDB tier service: accept failed");
                 // Yield rather than spin if the listener is in a bad state.
                 tokio::task::yield_now().await;
@@ -321,8 +427,15 @@ mod tests {
         }
     }
 
+    // Every test that serves a frame now writes the process-global metric
+    // accumulator (ai-meta#260), so each takes the shared metrics test lock.
+    // Without it, serving one health frame here can land between another
+    // module's `reset()` and its "renders nothing" assertion.
+    use super::super::metrics;
+
     #[tokio::test]
     async fn listener_answers_health_over_the_wire() {
+        let _guard = metrics::test_guard();
         // Behaviour, not a call site: bind an ephemeral port, speak the actual
         // frame format, and assert on the bytes that come back.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -338,6 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_length_prefix_is_refused_before_allocating() {
+        let _guard = metrics::test_guard();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_tier(listener));
@@ -350,5 +464,120 @@ mod tests {
         let mut buf = [0u8; 1];
         let n = c.read(&mut buf).await.unwrap_or(0);
         assert_eq!(n, 0, "server must close the connection on an over-long frame");
+    }
+
+    /// Serving a real frame over a real socket must move the counter AND the
+    /// histogram (ai-meta#260).
+    ///
+    /// Driven end-to-end through the accept loop rather than by calling
+    /// `record_tier_service` directly: the defect #260 describes is not "the
+    /// recorder is wrong", it is "the serve path never calls one". A test that
+    /// invoked the recorder itself would pass against the un-instrumented
+    /// module this replaces.
+    #[tokio::test]
+    async fn serving_a_frame_moves_the_counter_and_the_histogram() {
+        let _guard = metrics::test_guard();
+        metrics::reset();
+        metrics::pin_tier_service_series(0, 0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tier(listener));
+
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        write_frame(&mut c, b"health").await.unwrap();
+        let _ = read_frame(&mut c).await.unwrap().expect("a reply frame");
+
+        let text = metrics::render_lines().join("\n");
+        assert!(
+            text.contains(
+                "noetl_ehdb_dataplane_ops_total{operation=\"tier_service.health\",outcome=\"ok\"} 1"
+            ),
+            "health must be counted:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "noetl_ehdb_tier_service_duration_seconds_count{operation=\"health\"} 1"
+            ),
+            "health must be timed:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "noetl_ehdb_dataplane_ops_total{operation=\"tier_service.conn\",outcome=\"accepted\"} 1"
+            ),
+            "the connection must be counted:\n{text}"
+        );
+        // The negative half: an operation nobody performed stays pinned at 0.
+        assert!(
+            text.contains(
+                "noetl_ehdb_dataplane_ops_total{operation=\"tier_service.append\",outcome=\"ok\"} 0"
+            ),
+            "an unserved op must read 0, not be absent:\n{text}"
+        );
+        metrics::reset();
+    }
+
+    /// A protocol violation is counted as one, and NOT as a served request.
+    /// Folding it into the request counters would make a client speaking the
+    /// wrong protocol look like healthy traffic.
+    #[tokio::test]
+    async fn a_protocol_error_is_counted_separately_from_a_request() {
+        let _guard = metrics::test_guard();
+        metrics::reset();
+        metrics::pin_tier_service_series(0, 0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tier(listener));
+
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes()).await.unwrap();
+        c.flush().await.unwrap();
+        let mut buf = [0u8; 1];
+        let _ = c.read(&mut buf).await.unwrap_or(0);
+
+        let text = metrics::render_lines().join("\n");
+        assert!(
+            text.contains(
+                "noetl_ehdb_dataplane_ops_total{operation=\"tier_service.conn\",outcome=\"protocol_error\"} 1"
+            ),
+            "the protocol error must be counted:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "noetl_ehdb_tier_service_duration_seconds_count{operation=\"health\"} 0"
+            ),
+            "a rejected frame is not a served request:\n{text}"
+        );
+        metrics::reset();
+    }
+
+    /// The taxonomy that alerting depends on: a malformed request is `ok=false`
+    /// but NOT `degraded`, while an absent store IS degraded. An alert on
+    /// degraded must not fire because a caller sent a bad frame.
+    #[test]
+    fn a_bad_request_is_not_a_degraded_service() {
+        let bad = encode_response_observed(&TierRequest::Append {
+            execution_id: String::new(),
+            payload: "{}".to_string(),
+        })
+        .1;
+        // With no store configured the append cannot even reach validation, so
+        // assert on whichever of the two failure shapes this environment yields
+        // — both must agree on the invariant under test.
+        assert!(!bad.ok, "an empty execution_id must not read as success");
+        match bad.outcome {
+            "invalid" => assert!(!bad.degraded, "a caller error is not a service degradation"),
+            "unavailable" => assert!(bad.degraded, "no store means this writer cannot serve"),
+            other => panic!("unexpected outcome {other}"),
+        }
+
+        let unsupported =
+            encode_response_observed(&TierRequest::Unsupported("nonsense".to_string())).1;
+        assert_eq!(unsupported.op, "unsupported");
+        assert!(
+            !unsupported.degraded,
+            "an unknown op is a client/version issue, not a sick service"
+        );
     }
 }
