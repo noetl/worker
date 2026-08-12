@@ -164,8 +164,8 @@ pub(crate) struct Observed {
 }
 
 /// Encode the reply for a request.
-pub fn encode_response(req: &TierRequest) -> Vec<u8> {
-    encode_response_observed(req).0
+pub async fn encode_response(req: &TierRequest) -> Vec<u8> {
+    encode_response_observed(req).await.0
 }
 
 /// Encode the reply and classify it in one pass.
@@ -174,7 +174,7 @@ pub fn encode_response(req: &TierRequest) -> Vec<u8> {
 /// answer — a `read_execution` is a hit or a miss according to what came back,
 /// and re-deriving that from the encoded bytes afterwards would be a second
 /// implementation of the same decision, free to disagree with the first.
-pub(crate) fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Observed) {
+pub(crate) async fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Observed) {
     use super::tier_store::{self, TierStoreOutcome};
     let cfg = tier_store::TierStoreConfig::from_env();
 
@@ -230,13 +230,16 @@ pub(crate) fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Observed)
             Observed { op: "health", outcome: "ok", ok: true, degraded: false },
         ),
         TierRequest::Append { execution_id, payload } => {
-            render("append", tier_store::append(cfg.as_ref(), execution_id, payload))
+            render("append", tier_store::append(cfg.as_ref(), execution_id, payload).await)
         }
         TierRequest::ReadExecution { execution_id } => {
-            render("read_execution", tier_store::read_execution(cfg.as_ref(), execution_id))
+            render(
+                "read_execution",
+                tier_store::read_execution(cfg.as_ref(), execution_id).await,
+            )
         }
         TierRequest::Scan { after, limit } => {
-            render("scan", tier_store::scan(cfg.as_ref(), *after, *limit))
+            render("scan", tier_store::scan(cfg.as_ref(), *after, *limit).await)
         }
         // `op` is NOT the label — the unknown op name is caller-controlled and
         // would make `operation` unbounded-cardinality. The name stays in the
@@ -313,7 +316,7 @@ async fn serve_conn(mut stream: TcpStream) {
                 // look slow whenever a caller was.
                 let started = std::time::Instant::now();
                 let req = decode_request(&payload);
-                let (resp, obs) = encode_response_observed(&req);
+                let (resp, obs) = encode_response_observed(&req).await;
                 let elapsed = started.elapsed().as_secs_f64();
                 super::metrics::record_tier_service(
                     obs.op,
@@ -364,21 +367,21 @@ pub async fn serve_tier(listener: TcpListener) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn health_round_trips() {
+    #[tokio::test]
+    async fn health_round_trips() {
         let req = decode_request(b"health");
         assert_eq!(req, TierRequest::Health);
-        let resp = String::from_utf8(encode_response(&req)).unwrap();
+        let resp = String::from_utf8(encode_response(&req).await).unwrap();
         assert!(resp.starts_with("ok tier-service v"), "got {resp}");
     }
 
-    #[test]
-    fn unknown_op_is_answered_not_dropped() {
+    #[tokio::test]
+    async fn unknown_op_is_answered_not_dropped() {
         // A client on a newer protocol must get a reply it can act on, rather
         // than a closed socket it has to guess about.
         let req = decode_request(b"append");
         assert_eq!(req, TierRequest::Unsupported("append".to_string()));
-        assert_eq!(encode_response(&req), b"unsupported append".to_vec());
+        assert_eq!(encode_response(&req).await, b"unsupported append".to_vec());
     }
 
     #[test]
@@ -555,12 +558,13 @@ mod tests {
     /// The taxonomy that alerting depends on: a malformed request is `ok=false`
     /// but NOT `degraded`, while an absent store IS degraded. An alert on
     /// degraded must not fire because a caller sent a bad frame.
-    #[test]
-    fn a_bad_request_is_not_a_degraded_service() {
+    #[tokio::test]
+    async fn a_bad_request_is_not_a_degraded_service() {
         let bad = encode_response_observed(&TierRequest::Append {
             execution_id: String::new(),
             payload: "{}".to_string(),
         })
+        .await
         .1;
         // With no store configured the append cannot even reach validation, so
         // assert on whichever of the two failure shapes this environment yields
@@ -573,7 +577,9 @@ mod tests {
         }
 
         let unsupported =
-            encode_response_observed(&TierRequest::Unsupported("nonsense".to_string())).1;
+            encode_response_observed(&TierRequest::Unsupported("nonsense".to_string()))
+                .await
+                .1;
         assert_eq!(unsupported.op, "unsupported");
         assert!(
             !unsupported.degraded,
