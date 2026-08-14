@@ -323,15 +323,27 @@ pub async fn spawn_event_writer_host(
         // the broken one.  The store's size and sequence are sampled here rather
         // than assumed 0, so a writer restarting in front of a populated store
         // reports what it actually holds before serving a single request.
+        //
+        // Sampled for EVERY tier the writer stores (#265), not just the event
+        // log: a writer restarting in front of a populated projection store
+        // would otherwise report it as 0 bytes / sequence 0 until its next
+        // append, which reads exactly like an empty store on the tier someone is
+        // deciding whether to promote.
         let store = crate::ehdb::tier_store::TierStoreConfig::from_env();
-        let (store_bytes, store_seq) = match store.as_ref() {
-            Some(c) => (
-                crate::ehdb::tier_store::store_bytes(c),
-                crate::ehdb::tier_store::startup_sequence(c),
-            ),
-            None => (0, 0),
+        let samples: Vec<(crate::ehdb::store_tier::StoreTier, u64, u64)> = match store.as_ref() {
+            Some(c) => crate::ehdb::store_tier::StoreTier::ALL
+                .iter()
+                .map(|t| {
+                    (
+                        *t,
+                        crate::ehdb::tier_store::store_bytes(c, *t),
+                        crate::ehdb::tier_store::startup_sequence(c, *t),
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
         };
-        crate::ehdb::metrics::pin_tier_service_series(store_bytes, store_seq);
+        crate::ehdb::metrics::pin_tier_service_series(&samples);
 
         tokio::spawn(crate::ehdb::tier_service::serve_tier(listener));
         // The PR-1 text — "skeleton: health only, serves no tier data" — outlived

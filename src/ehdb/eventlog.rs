@@ -858,7 +858,12 @@ impl ServiceAppendAck {
     /// allowed to read `noetl.*` (`data-access-boundary.md`).  What this check
     /// buys is that the tier does not serve from a store that has forgotten or
     /// rewound — and a promoted tier that had would otherwise answer confidently.
-    fn parity(&self, previous_sequence: u64) -> Result<Option<&'static str>, String> {
+    /// `pub(crate)` since #265: the projection tier's serve path reuses this
+    /// rather than reimplementing it. One store engine renders one ack body, so
+    /// a second parser would be a second chance to disagree about what "the
+    /// record landed" means — on exactly the two tiers whose verdicts an
+    /// operator compares during a cutover.
+    pub(crate) fn parity(&self, previous_sequence: u64) -> Result<Option<&'static str>, String> {
         if self.global_sequence <= previous_sequence {
             return Err(format!(
                 "ordering divergence: tier-service sequence {} not > previous {previous_sequence}",

@@ -108,11 +108,20 @@ pub fn decide(
 /// the tiers where a live worker path calls [`decide`] and can therefore answer
 /// authoritatively.
 ///
-/// **Today that is the event-log tier and nothing else.**  `kv`, `object`,
-/// `projection` and `vector` have a `serve_primary_cycle`, but its only caller
-/// is `bin/ehdb-selfcheck` — a conformance drive that never authors a NoETL
-/// event — so selecting `primary` on those tiers cannot change what any caller
-/// receives.
+/// **Today that is the event-log tier and the projection tier.**  `kv`,
+/// `object` and `vector` have a `serve_primary_cycle`, but its only caller is
+/// `bin/ehdb-selfcheck` — a conformance drive that never authors a NoETL event —
+/// so selecting `primary` on those tiers cannot change what any caller receives.
+///
+/// The projection tier joined in
+/// [ai-meta#265](https://github.com/noetl/ai-meta/issues/265) A2, and what it
+/// means there is narrower than for the event log, so it is worth stating
+/// rather than leaving to be inferred from membership: the projection tier's
+/// **write** path consults [`decide`] and reports the verdict, and no reader
+/// resolves projections from EHDB yet — `orch_snapshot::load_latest` still
+/// answers from `noetl.projection_snapshot`. Read-serve is #265 phase B1.
+/// Membership here means "the flag is not inert", which is exactly the question
+/// #259 was about; it does not mean "the incumbent has been replaced".
 ///
 /// This list exists because the *previous* way of knowing which tiers were
 /// wired was a sentence in a doc comment, and it went stale the moment PR 5
@@ -122,7 +131,7 @@ pub fn decide(
 /// below re-derives the list from the tier sources on every `cargo test`, so a
 /// tier that gains (or loses) a serve path and is not listed here fails the
 /// build rather than quietly mis-signalling during a cutover.
-pub const SERVE_WIRED_TIERS: &[&str] = &["eventlog"];
+pub const SERVE_WIRED_TIERS: &[&str] = &["eventlog", "projection"];
 
 /// Whether `tier` has a runtime serve path — see [`SERVE_WIRED_TIERS`].
 pub fn tier_serves_primary(tier: &str) -> bool {
@@ -204,7 +213,7 @@ mod tests {
 
     #[test]
     fn unwired_tiers_do_not_claim_a_serve_path() {
-        for tier in ["kv", "object", "projection", "vector"] {
+        for tier in ["kv", "object", "vector"] {
             assert!(
                 !tier_serves_primary(tier),
                 "{tier} is listed as serve-wired; if that is now true, update \
@@ -212,6 +221,7 @@ mod tests {
             );
         }
         assert!(tier_serves_primary("eventlog"));
+        assert!(tier_serves_primary("projection"));
         assert!(!tier_serves_primary("nonexistent"));
     }
 
