@@ -2,10 +2,11 @@
 //!
 //! Behind `NOETL_COMMAND_BUS`.
 //!
-//! ⚠ The cutover is done: every prod workload sets `NOETL_COMMAND_BUS=ehdb`
-//! explicitly and NATS is deleted (noetl/ai-meta#194 T5). The **code default
-//! is still `nats`**, which now names a transport that does not exist — see
-//! noetl/ai-meta#243. Two responsibilities, both opt-in:
+//! The cutover is done: every prod workload sets `NOETL_COMMAND_BUS=ehdb`
+//! explicitly and NATS is deleted (noetl/ai-meta#194 T5). The flag is therefore
+//! **required with no default** — an unset or unrecognised value is a startup
+//! error, not a guess at a dead transport (noetl/ai-meta#243). Two
+//! responsibilities, both opt-in:
 //!
 //! - **Host** (the system-pool worker that owns a shard, `NOETL_COMMAND_BUS_HOST`):
 //!   opens the shard's durable command-log `FeedWriter` and spawns its three
@@ -57,20 +58,60 @@ use crate::dispatch::{claim_outcome, CommandNotification};
 use crate::graceful::WriterShutdown;
 
 /// Which transport carries commands (`NOETL_COMMAND_BUS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// There is deliberately **no `Default`** (noetl/ai-meta#243). A default here
+/// would have to name a transport, and since T5 deleted NATS the only transport
+/// that exists is EHDB — so defaulting means guessing, and the guess this type
+/// used to make was `Nats`.
+///
+/// That made "unset the flag to roll back" an **outage** rather than a
+/// rollback: every prod workload sets `NOETL_COMMAND_BUS=ehdb` explicitly, so
+/// the dead default was load-bearing only in the sense that nothing exercised
+/// it. Worse, the fall-through laundered *unset* and *typo* into the string
+/// `Nats`, so the error an operator finally saw named a value nothing had set
+/// — sending them to grep for a `nats` that was not there.
+///
+/// The `Nats` variant survives so a stale `NOETL_COMMAND_BUS=nats` still gets a
+/// specific, actionable error instead of a generic parse failure. It is not
+/// selectable. Mirrors the sibling [`crate::event_bus::EventSourceMode`] and
+/// the server's `CommandBusMode`, which took this same fix first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandBusMode {
-    #[default]
+    /// ⚠ Not selectable — NATS was deleted at T5 (noetl/ai-meta#212). Retained
+    /// only so an explicit `nats` names itself in the error.
     Nats,
     Ehdb,
     Shadow,
 }
 
 impl CommandBusMode {
-    pub fn from_env_value(value: &str) -> Self {
+    /// Resolve `NOETL_COMMAND_BUS`, failing loud. Required — there is no default.
+    pub fn from_env_strict() -> Result<Self> {
+        Self::parse_strict(&std::env::var("NOETL_COMMAND_BUS").unwrap_or_default())
+    }
+
+    /// The pure half of [`Self::from_env_strict`], split out so the behaviour is
+    /// testable without mutating process-global env from parallel tests (the
+    /// `EnvGuard` SAFETY note claiming `cargo test` serialises tests is false).
+    pub fn parse_strict(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "ehdb" => Self::Ehdb,
-            "shadow" => Self::Shadow,
-            _ => Self::Nats,
+            "ehdb" => Ok(Self::Ehdb),
+            "shadow" => Ok(Self::Shadow),
+            "nats" => anyhow::bail!(
+                "NOETL_COMMAND_BUS=nats selects a transport that no longer exists — NATS was \
+                 removed at T5 (noetl/ai-meta#212). Set NOETL_COMMAND_BUS=ehdb."
+            ),
+            "" => anyhow::bail!(
+                "NOETL_COMMAND_BUS is required and unset. There is no default: the only \
+                 transport is EHDB, and guessing would start a worker that hosts no writer \
+                 and claims no commands while registering, heartbeating, and reporting \
+                 ready. Set NOETL_COMMAND_BUS=ehdb (noetl/ai-meta#243)."
+            ),
+            other => anyhow::bail!(
+                "NOETL_COMMAND_BUS={other:?} is not a known transport. Valid values: ehdb, \
+                 shadow. (nats was removed at T5.) Refusing to fall back, because a typo \
+                 would silently select a dead transport (noetl/ai-meta#243)."
+            ),
         }
     }
     /// The worker consumes from the EHDB bus (only in pure `ehdb`; in `shadow`
@@ -111,9 +152,10 @@ pub struct CommandBusConfig {
 }
 
 impl CommandBusConfig {
-    pub fn from_env() -> Self {
-        let mode =
-            CommandBusMode::from_env_value(&std::env::var("NOETL_COMMAND_BUS").unwrap_or_default());
+    /// Build from env. `Err` when `NOETL_COMMAND_BUS` is unset or unrecognised —
+    /// see [`CommandBusMode::parse_strict`] (noetl/ai-meta#243).
+    pub fn from_env() -> Result<Self> {
+        let mode = CommandBusMode::from_env_strict()?;
         let env_bool = |k: &str| {
             matches!(
                 std::env::var(k)
@@ -131,7 +173,7 @@ impl CommandBusConfig {
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(d)
         };
-        Self {
+        Ok(Self {
             mode,
             host: env_bool("NOETL_COMMAND_BUS_HOST"),
             shard: env_u32("NOETL_COMMAND_BUS_SHARD", 0),
@@ -154,7 +196,7 @@ impl CommandBusConfig {
             cursor_fallback: CursorFallback::from_env_value(
                 &std::env::var("NOETL_COMMAND_BUS_CURSOR_FALLBACK").unwrap_or_default(),
             ),
-        }
+        })
     }
 }
 
@@ -659,24 +701,80 @@ impl CommandSource for WorkerCommandSource {
 mod tests {
     use super::*;
 
+    /// noetl/ai-meta#243 — the regression guard.
+    ///
+    /// The predecessor of this test asserted the bug: it was named
+    /// `mode_parsing_defaults_to_nats` and checked that `""`, `"garbage"`, and
+    /// `CommandBusMode::default()` all resolved to `Nats`. That is exactly the
+    /// behaviour that turned "unset the flag to roll back" into an outage, and
+    /// a green test spelling it out is why it survived T5.
+    ///
+    /// The load-bearing assertion is the negative one: **no input silently
+    /// yields `Nats`.** Note this is checked over the error path, because there
+    /// is no longer any way to *obtain* a `Nats` from parsing.
     #[test]
-    fn mode_parsing_defaults_to_nats() {
-        assert_eq!(CommandBusMode::from_env_value("ehdb"), CommandBusMode::Ehdb);
+    fn unset_or_invalid_never_silently_selects_nats() {
+        // Valid values still resolve, case- and whitespace-insensitively.
+        assert_eq!(CommandBusMode::parse_strict("ehdb").unwrap(), CommandBusMode::Ehdb);
         assert_eq!(
-            CommandBusMode::from_env_value(" SHADOW "),
+            CommandBusMode::parse_strict(" SHADOW ").unwrap(),
             CommandBusMode::Shadow
         );
-        assert_eq!(CommandBusMode::from_env_value("nats"), CommandBusMode::Nats);
-        assert_eq!(
-            CommandBusMode::from_env_value("garbage"),
-            CommandBusMode::Nats
+
+        // The regression itself: every input that used to fall through to the
+        // dead transport must now be an error.
+        for bad in ["", "   ", "garbage", "ehbd", "NATS", "nats"] {
+            let err = CommandBusMode::parse_strict(bad);
+            assert!(
+                err.is_err(),
+                "{bad:?} must not resolve — it used to become Nats silently"
+            );
+        }
+
+        // Each failure mode names itself, so the operator is not sent looking
+        // for a `nats` that nothing set.
+        let unset = CommandBusMode::parse_strict("").unwrap_err().to_string();
+        assert!(unset.contains("NOETL_COMMAND_BUS"), "must name the var: {unset}");
+        assert!(unset.contains("unset"), "must say what is wrong: {unset}");
+
+        let stale = CommandBusMode::parse_strict("nats").unwrap_err().to_string();
+        assert!(
+            stale.contains("no longer exists"),
+            "an explicit stale `nats` gets its own actionable error: {stale}"
         );
-        assert_eq!(CommandBusMode::default(), CommandBusMode::Nats);
+
+        let typo = CommandBusMode::parse_strict("ehbd").unwrap_err().to_string();
+        assert!(typo.contains("ehbd"), "must echo the offending value: {typo}");
+
         // ehdb consumes EHDB; shadow keeps consuming NATS (authoritative).
         assert!(CommandBusMode::Ehdb.consumes_ehdb() && !CommandBusMode::Shadow.consumes_ehdb());
         // both ehdb + shadow want the writer to exist; nats does not.
         assert!(CommandBusMode::Ehdb.hosts_relevant() && CommandBusMode::Shadow.hosts_relevant());
         assert!(!CommandBusMode::Nats.hosts_relevant());
+    }
+
+    /// The strict resolver must reach the config builder, so a misconfigured
+    /// worker fails on the startup path rather than deep inside `Worker::new`
+    /// with a mode it invented. Mirrors `EventSourceMode`'s equivalent test.
+    ///
+    /// Uses the real var, so it sets and clears within the test. `cargo test`
+    /// does NOT serialise tests; this is safe only because no other test in
+    /// this binary reads `NOETL_COMMAND_BUS`.
+    #[test]
+    fn from_env_strict_reads_the_real_var() {
+        std::env::remove_var("NOETL_COMMAND_BUS");
+        assert!(
+            CommandBusMode::from_env_strict().is_err(),
+            "an unset var must be an error, not a default"
+        );
+        assert!(
+            CommandBusConfig::from_env().is_err(),
+            "the error must reach the config builder, not be swallowed"
+        );
+        std::env::set_var("NOETL_COMMAND_BUS", "ehdb");
+        assert_eq!(CommandBusMode::from_env_strict().unwrap(), CommandBusMode::Ehdb);
+        assert_eq!(CommandBusConfig::from_env().unwrap().mode, CommandBusMode::Ehdb);
+        std::env::remove_var("NOETL_COMMAND_BUS");
     }
 
     #[test]

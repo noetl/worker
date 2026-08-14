@@ -64,12 +64,16 @@ impl Worker {
         // Create HTTP client
         let client = ControlPlaneClient::new(&config.server_url);
 
-        // noetl/ai-meta#194 L1 T4 — the command-bus transport (default `nats`,
-        // path below unchanged). When `ehdb`/`shadow` AND this worker hosts its
-        // shard (the system-pool writer), open the shard's command-log writer and
-        // spawn its ingest (server publishes) + claim (replicas compete) +
-        // `/metrics` (lag) faces.
-        let cmdbus = crate::command_bus::CommandBusConfig::from_env();
+        // noetl/ai-meta#194 L1 T4 — the command-bus transport. `NOETL_COMMAND_BUS`
+        // is REQUIRED with no default since noetl/ai-meta#243: resolving it can
+        // fail, and failing here is the point. The old silent fall-through to
+        // `nats` meant an unset flag produced a worker that hosted no writer and
+        // claimed no commands while looking entirely healthy.
+        //
+        // When `ehdb`/`shadow` AND this worker hosts its shard (the system-pool
+        // writer), open the shard's command-log writer and spawn its ingest
+        // (server publishes) + claim (replicas compete) + `/metrics` (lag) faces.
+        let cmdbus = crate::command_bus::CommandBusConfig::from_env()?;
         let mut writer_shutdowns = Vec::new();
         if cmdbus.host && cmdbus.mode.hosts_relevant() {
             let (_writer, shutdown) = crate::command_bus::spawn_writer_host(&cmdbus).await?;
