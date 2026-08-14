@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 
+use super::store_tier::StoreTier;
+
 use super::tier_service::{read_frame, write_frame, PROTOCOL_VERSION};
 
 /// Env var naming the tier service to talk to. Unset ⇒ no client.
@@ -200,11 +202,37 @@ impl TierClient {
         }
     }
 
-    /// Append one record to the remote event-log tier.
+    /// Append one record to the remote **event-log** tier.
+    ///
+    /// Kept as the bare name because it is what every existing caller means and
+    /// what the wire default resolves to. Tier-addressed callers use
+    /// [`TierClient::append_tier`].
     pub async fn append(&self, execution_id: &str, payload: &str) -> Result<String, String> {
-        let req = serde_json::json!({"op":"append","execution_id":execution_id,"payload":payload});
+        self.append_tier(StoreTier::Eventlog, execution_id, payload)
+            .await
+    }
+
+    /// Append one record to `tier` on the remote writer (#265).
+    pub async fn append_tier(
+        &self,
+        tier: StoreTier,
+        execution_id: &str,
+        payload: &str,
+    ) -> Result<String, String> {
+        let req = serde_json::json!({
+            "op": "append",
+            "tier": tier.as_str(),
+            "execution_id": execution_id,
+            "payload": payload,
+        });
         // THE APPEND IS THE PROBE.  Reachability is measured by the operation
         // that depends on it, so it cannot drift the way a cached poll does.
+        //
+        // Reachability stays PROCESS-WIDE rather than per-tier on purpose: it
+        // answers "is the writer's tier service answering me", which is a fact
+        // about one TCP endpoint, not about which file it wrote. Splitting it
+        // per tier would let a tier that happens to be idle read as unreachable
+        // and demote a healthy one.
         let out = self
             .request(req.to_string().as_bytes())
             .await
@@ -213,8 +241,8 @@ impl TierClient {
         out
     }
 
-    /// Append N records in ONE request — one store lock, one `fsync`
-    /// (noetl/ai-meta#155).
+    /// Append N records to the remote **event-log** tier in ONE request — one
+    /// store lock, one `fsync` (noetl/ai-meta#155).
     ///
     /// Semantically N [`Self::append`]s in order. Returns the raw reply; the
     /// caller reads `results[]` for the per-record outcome, so it can report
@@ -224,8 +252,20 @@ impl TierClient {
         execution_id: &str,
         payloads: &[String],
     ) -> Result<String, String> {
+        self.append_batch_tier(StoreTier::Eventlog, execution_id, payloads)
+            .await
+    }
+
+    /// Append N records to `tier` in ONE request (#155 batching, #265 tiers).
+    pub async fn append_batch_tier(
+        &self,
+        tier: StoreTier,
+        execution_id: &str,
+        payloads: &[String],
+    ) -> Result<String, String> {
         let req = serde_json::json!({
             "op": "append_batch",
+            "tier": tier.as_str(),
             "execution_id": execution_id,
             "payloads": payloads,
         });
@@ -238,16 +278,45 @@ impl TierClient {
         out
     }
 
-    /// Read every record the remote tier holds for one execution.
+    /// Read every record the remote **event-log** tier holds for one execution.
     pub async fn read_execution(&self, execution_id: &str) -> Result<String, String> {
-        let req = serde_json::json!({"op":"read_execution","execution_id":execution_id});
+        self.read_execution_tier(StoreTier::Eventlog, execution_id)
+            .await
+    }
+
+    /// Read every record `tier` holds for one execution (#265).
+    pub async fn read_execution_tier(
+        &self,
+        tier: StoreTier,
+        execution_id: &str,
+    ) -> Result<String, String> {
+        let req = serde_json::json!({
+            "op": "read_execution",
+            "tier": tier.as_str(),
+            "execution_id": execution_id,
+        });
         let body = self.request(req.to_string().as_bytes()).await?;
         Ok(String::from_utf8_lossy(&body).to_string())
     }
 
-    /// Bounded global scan of the remote tier.
+    /// Bounded global scan of the remote **event-log** tier.
     pub async fn scan(&self, after: Option<u64>, limit: usize) -> Result<String, String> {
-        let req = serde_json::json!({"op":"scan","after":after,"limit":limit});
+        self.scan_tier(StoreTier::Eventlog, after, limit).await
+    }
+
+    /// Bounded global scan of `tier` (#265).
+    pub async fn scan_tier(
+        &self,
+        tier: StoreTier,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<String, String> {
+        let req = serde_json::json!({
+            "op": "scan",
+            "tier": tier.as_str(),
+            "after": after,
+            "limit": limit,
+        });
         let body = self.request(req.to_string().as_bytes()).await?;
         Ok(String::from_utf8_lossy(&body).to_string())
     }
