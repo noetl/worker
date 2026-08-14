@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.118.2](https://github.com/noetl/worker/compare/v5.118.1...v5.118.2) (2026-08-14)
+
+### Bug Fixes
+
+* require NOETL_COMMAND_BUS instead of defaulting to the deleted NATS ([d5f7d56](https://github.com/noetl/worker/commit/d5f7d56880bfaecd9a83f801b5fb126f91cba27e)), closes [noetl/ai-meta#212](https://github.com/noetl/ai-meta/issues/212) [noetl/ai-meta#243](https://github.com/noetl/ai-meta/issues/243) [noetl/ai-meta#243](https://github.com/noetl/ai-meta/issues/243)
+
 ## [5.118.1](https://github.com/noetl/worker/compare/v5.118.0...v5.118.1) (2026-08-12)
 
 ### Bug Fixes
