@@ -44,6 +44,8 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use super::store_tier::StoreTier;
+
 /// Env var naming the bind address for the tier service. Unset ⇒ the face does
 /// not exist. There is no default: a service that silently binds a port because
 /// someone forgot to set a variable is the opposite of what this PR is for.
@@ -99,12 +101,29 @@ impl TierServiceConfig {
 pub enum TierRequest {
     /// Liveness + protocol handshake. Carries no tier data.
     Health,
-    /// Append one record to the event-log tier (ai-meta#257 PR 3).
-    Append { execution_id: String, payload: String },
-    /// Read every record for one execution.
-    ReadExecution { execution_id: String },
-    /// Bounded global scan.
-    Scan { after: Option<u64>, limit: usize },
+    /// Append one record to `tier` (ai-meta#257 PR 3; tier-addressed since #265).
+    Append {
+        tier: StoreTier,
+        execution_id: String,
+        payload: String,
+    },
+    /// Read every record `tier` holds for one execution.
+    ReadExecution {
+        tier: StoreTier,
+        execution_id: String,
+    },
+    /// Bounded global scan of one tier.
+    Scan {
+        tier: StoreTier,
+        after: Option<u64>,
+        limit: usize,
+    },
+    /// A frame naming a tier this writer has no store for. Distinct from
+    /// [`TierRequest::Unsupported`] because the two need different operator
+    /// responses: an unknown *op* is a version skew, an unknown *tier* is a
+    /// caller addressing a store that does not exist. Folding them together
+    /// would answer "your writer is old" to someone who typed `projction`.
+    UnknownTier(String),
     /// A frame this build does not implement. Carried as a value rather than an
     /// error so the server can answer `unsupported` — a client talking to an
     /// older writer must get a clear reply, not a dropped connection.
@@ -116,6 +135,12 @@ pub enum TierRequest {
 /// The payload is a bare ASCII op name in PR 1. It is deliberately not JSON:
 /// the ops that carry real data land in PR 2/3 and will define their own
 /// encoding then, and inventing a schema now would freeze a guess.
+///
+/// **Tier addressing (#265).** Data ops carry an optional `tier`. Absent means
+/// `eventlog`, so every frame a pre-#265 client sends decodes to exactly what
+/// it meant — the rolling-upgrade property, on the tier that is already primary
+/// in prod. Present-but-unrecognised is [`TierRequest::UnknownTier`], never a
+/// silent fall-back to the event log.
 pub fn decode_request(payload: &[u8]) -> TierRequest {
     let Ok(text) = std::str::from_utf8(payload) else {
         return TierRequest::Unsupported("<non-utf8>".to_string());
@@ -130,15 +155,26 @@ pub fn decode_request(payload: &[u8]) -> TierRequest {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return TierRequest::Unsupported(text.chars().take(40).collect());
     };
-    match v.get("op").and_then(|o| o.as_str()) {
+    let op = v.get("op").and_then(|o| o.as_str());
+    // Resolve the tier ONCE, before dispatching on the op: every data op takes
+    // the same field with the same meaning, and three copies of this would be
+    // three chances for one of them to default differently.
+    let tier = match StoreTier::parse_or_default(v.get("tier").and_then(|x| x.as_str())) {
+        Ok(t) => t,
+        Err(e) => return TierRequest::UnknownTier(e),
+    };
+    match op {
         Some("append") => TierRequest::Append {
+            tier,
             execution_id: v.get("execution_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             payload: v.get("payload").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         },
         Some("read_execution") => TierRequest::ReadExecution {
+            tier,
             execution_id: v.get("execution_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         },
         Some("scan") => TierRequest::Scan {
+            tier,
             after: v.get("after").and_then(|x| x.as_u64()),
             limit: v.get("limit").and_then(|x| x.as_u64()).unwrap_or(100) as usize,
         },
@@ -229,18 +265,26 @@ pub(crate) async fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Obs
             format!("ok tier-service v{PROTOCOL_VERSION}").into_bytes(),
             Observed { op: "health", outcome: "ok", ok: true, degraded: false },
         ),
-        TierRequest::Append { execution_id, payload } => {
-            render("append", tier_store::append(cfg.as_ref(), execution_id, payload).await)
-        }
-        TierRequest::ReadExecution { execution_id } => {
-            render(
-                "read_execution",
-                tier_store::read_execution(cfg.as_ref(), execution_id).await,
-            )
-        }
-        TierRequest::Scan { after, limit } => {
-            render("scan", tier_store::scan(cfg.as_ref(), *after, *limit).await)
-        }
+        TierRequest::Append { tier, execution_id, payload } => render(
+            "append",
+            tier_store::append(cfg.as_ref(), *tier, execution_id, payload).await,
+        ),
+        TierRequest::ReadExecution { tier, execution_id } => render(
+            "read_execution",
+            tier_store::read_execution(cfg.as_ref(), *tier, execution_id).await,
+        ),
+        TierRequest::Scan { tier, after, limit } => render(
+            "scan",
+            tier_store::scan(cfg.as_ref(), *tier, *after, *limit).await,
+        ),
+        // A caller mistake, so `ok:false, degraded:false` — the writer is fine
+        // and an alert on `degraded` must not fire because someone typed a tier
+        // name wrong. `invalid ` prefix so the client's existing refusal parser
+        // classifies it as a rejection rather than an outage.
+        TierRequest::UnknownTier(reason) => (
+            format!("invalid {reason}").into_bytes(),
+            Observed { op: "unknown_tier", outcome: "invalid", ok: false, degraded: false },
+        ),
         // `op` is NOT the label — the unknown op name is caller-controlled and
         // would make `operation` unbounded-cardinality. The name stays in the
         // reply, where the caller can read it.
@@ -481,7 +525,7 @@ mod tests {
     async fn serving_a_frame_moves_the_counter_and_the_histogram() {
         let _guard = metrics::test_guard();
         metrics::reset();
-        metrics::pin_tier_service_series(0, 0);
+        metrics::pin_tier_service_series(&[]);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -527,7 +571,7 @@ mod tests {
     async fn a_protocol_error_is_counted_separately_from_a_request() {
         let _guard = metrics::test_guard();
         metrics::reset();
-        metrics::pin_tier_service_series(0, 0);
+        metrics::pin_tier_service_series(&[]);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -561,6 +605,7 @@ mod tests {
     #[tokio::test]
     async fn a_bad_request_is_not_a_degraded_service() {
         let bad = encode_response_observed(&TierRequest::Append {
+            tier: StoreTier::Eventlog,
             execution_id: String::new(),
             payload: "{}".to_string(),
         })

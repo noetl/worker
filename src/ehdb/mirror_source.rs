@@ -35,6 +35,21 @@ use super::EnvMap;
 /// `NOETL_EHDB_EVENTLOG_MIRROR_SOURCE` — `worker` (default) or `server`.
 pub const MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_EVENTLOG_MIRROR_SOURCE";
 
+/// `NOETL_EHDB_PROJECTION_MIRROR_SOURCE` — the projection tier's twin
+/// ([ai-meta#265](https://github.com/noetl/ai-meta/issues/265)).
+///
+/// **A separate variable, not a shared one.** The two tiers cut over
+/// independently — the event log is already primary in prod and the projection
+/// tier is not — so one variable would make arming the projection mirror a
+/// change to the event log's configuration. That is the class of coupling that
+/// turns a tier-2 experiment into a tier-1 incident.
+///
+/// The projection tier has no `worker` mode that means anything: the worker
+/// cannot read `noetl.projection_snapshot` (`data-access-boundary.md`), so it
+/// has nothing to mirror. `worker` here means "the projection mirror is off",
+/// and that is the default.
+pub const PROJECTION_MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_PROJECTION_MIRROR_SOURCE";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirrorSource {
     /// Today's behaviour: the worker's emit chokepoint mirrors what it emits.
@@ -60,8 +75,37 @@ impl MirrorSource {
     /// halves would leave the tier silently empty while `NOETL_EHDB_EVENTLOG`
     /// still said `shadow`.
     pub fn from_env(env: &EnvMap) -> Self {
+        Self::from_env_key(env, MIRROR_SOURCE_ENV)
+    }
+
+    /// Resolve the mirror source for one tier's own variable.
+    ///
+    /// [`StoreTier::Eventlog`] reads [`MIRROR_SOURCE_ENV`],
+    /// [`StoreTier::Projection`] reads [`PROJECTION_MIRROR_SOURCE_ENV`]. The
+    /// match is exhaustive rather than a fallback, so a tier added without a
+    /// variable fails the build instead of silently inheriting the event log's.
+    pub fn for_tier(env: &EnvMap, tier: super::store_tier::StoreTier) -> Self {
+        use super::store_tier::StoreTier;
+        let key = match tier {
+            StoreTier::Eventlog => MIRROR_SOURCE_ENV,
+            StoreTier::Projection => PROJECTION_MIRROR_SOURCE_ENV,
+        };
+        Self::from_env_key(env, key)
+    }
+
+    /// The variable `tier`'s mirror source is read from — for error messages, so
+    /// an operator is told which variable to set rather than a generic one.
+    pub fn env_key_for(tier: super::store_tier::StoreTier) -> &'static str {
+        use super::store_tier::StoreTier;
+        match tier {
+            StoreTier::Eventlog => MIRROR_SOURCE_ENV,
+            StoreTier::Projection => PROJECTION_MIRROR_SOURCE_ENV,
+        }
+    }
+
+    fn from_env_key(env: &EnvMap, key: &str) -> Self {
         match env
-            .get(MIRROR_SOURCE_ENV)
+            .get(key)
             .map(|s| s.trim().to_ascii_lowercase())
             .as_deref()
         {
@@ -104,5 +148,39 @@ mod tests {
                 "{v:?} must resolve to Server"
             );
         }
+    }
+
+    #[test]
+    fn the_two_tiers_have_independent_variables() {
+        use super::super::store_tier::StoreTier;
+        // The property that keeps a tier-2 experiment from being a tier-1
+        // change: arming the projection mirror must not arm the event log's,
+        // and vice versa.
+        let proj_only = env(&[(PROJECTION_MIRROR_SOURCE_ENV, "server")]);
+        assert_eq!(
+            MirrorSource::for_tier(&proj_only, StoreTier::Projection),
+            MirrorSource::Server
+        );
+        assert_eq!(
+            MirrorSource::for_tier(&proj_only, StoreTier::Eventlog),
+            MirrorSource::Worker,
+            "arming the projection mirror must not arm the event log's"
+        );
+
+        let el_only = env(&[(MIRROR_SOURCE_ENV, "server")]);
+        assert_eq!(
+            MirrorSource::for_tier(&el_only, StoreTier::Eventlog),
+            MirrorSource::Server
+        );
+        assert_eq!(
+            MirrorSource::for_tier(&el_only, StoreTier::Projection),
+            MirrorSource::Worker,
+            "the event log's mirror source must not arm the projection tier — prod \
+             sets it TODAY, so inheriting it would arm tier 2 on the next rollout"
+        );
+        assert_ne!(
+            MirrorSource::env_key_for(StoreTier::Eventlog),
+            MirrorSource::env_key_for(StoreTier::Projection)
+        );
     }
 }

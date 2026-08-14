@@ -1037,6 +1037,287 @@ fn mirror_live_window_inner(env: &EnvMap, payloads: &[serde_json::Value]) -> Pro
     outcome
 }
 
+// ---------------------------------------------------------------------------
+// #265 A2 — the projection tier's SERVE decision.
+//
+// This is the block that makes `primary_serve::SERVE_WIRED_TIERS` include
+// `projection`. Before it, `NOETL_EHDB_PROJECTION=primary` selected a mode whose
+// only reader was `serve_primary_cycle`, and `serve_primary_cycle`'s only caller
+// is `bin/ehdb-selfcheck` — a conformance drive that never authors a NoETL
+// event. Setting the flag therefore could not change what any caller received,
+// which is exactly the state ai-meta#259 recorded for the four unwired tiers.
+//
+// The site is the same one the event log's serve decision sits on: the
+// SERVICE-RESOLVED APPEND. That placement is not an accident of symmetry, it is
+// the ai-meta#257 P0 finding — the decision has to run where the append actually
+// resolves, because `MIRROR_SOURCE=server` + `TIER_QUERY_SOURCE=service` reaches
+// no other call site, and that is precisely the configuration that makes the
+// tier correct.
+//
+// What this does NOT do, stated because the opposite claim is how #259 happened:
+// it does not make any reader read projections from EHDB. The incumbent
+// `noetl.projection_snapshot` upsert runs unchanged in every mode, and
+// `orch_snapshot::load_latest` still answers from Postgres. `primary` here means
+// "the write path claims authority and says so, verifiably" — the read-serve is
+// phase B1 of ai-meta#265.
+// ---------------------------------------------------------------------------
+
+/// One service-resolved projection append's serve verdict. Twin of
+/// [`super::eventlog::ServiceAppendServe`].
+#[derive(Debug, Clone)]
+pub struct ProjectionServiceAppendServe {
+    pub decision: super::primary_serve::ServeDecision,
+    pub outcome: ProjectionOutcome,
+    pub detail: Option<String>,
+    /// The sequence the store assigned, when the record landed. The caller
+    /// threads this into the next record's `previous_sequence`.
+    pub sequence: Option<u64>,
+}
+
+/// Decide, record and log the serve outcome for ONE projection record appended
+/// through the writer-fronted tier service.
+///
+/// The three conditions are the shared policy's, all measured:
+///
+/// * **primary mode** — `NOETL_EHDB_PROJECTION=primary` and the compile-time
+///   [`PRIMARY_SERVE_ACTIVATED`] switch.
+/// * **durable service reachable** — [`super::reachability::is_reachable`], set
+///   by real operations. The append that produced `reply` is one of them, so
+///   this is a post-append fact and not a cached poll.
+/// * **parity held** — the remote store's own reply.
+///
+/// The ack is parsed by [`super::eventlog::ServiceAppendAck`] **deliberately
+/// reused rather than reimplemented**: the tier service renders the same
+/// `{appended, global_sequence, log_record_count}` body for every tier, because
+/// one store engine produces it. A second parser here would be a second chance
+/// to disagree about what "the record landed" means, on the two tiers whose
+/// verdicts an operator compares during a cutover.
+///
+/// As on the event log, this is SELF-consistency: it proves the projection store
+/// has not forgotten or rewound. Parity against `noetl.projection_snapshot` is
+/// computed **server-side** by the cross-store comparator, because the worker
+/// must not read `noetl.*` at all (`data-access-boundary.md`).
+pub fn serve_service_append(
+    env: &EnvMap,
+    reply: Result<&str, &str>,
+    previous_sequence: u64,
+    duration_seconds: f64,
+) -> ProjectionServiceAppendServe {
+    let durable_service_reachable = super::tier_client::TierClientConfig::from_env().is_some()
+        && super::reachability::is_reachable();
+    serve_service_append_with(
+        env,
+        reply,
+        previous_sequence,
+        duration_seconds,
+        durable_service_reachable,
+    )
+}
+
+/// [`serve_service_append`] with the reachability verdict passed in.
+///
+/// Split out for the same reason the event log's is: `cargo test` does **not**
+/// serialise tests, so a test that drove the process env or the global
+/// reachability latch would race every other test in the binary.
+pub(crate) fn serve_service_append_with(
+    env: &EnvMap,
+    reply: Result<&str, &str>,
+    previous_sequence: u64,
+    duration_seconds: f64,
+    durable_service_reachable: bool,
+) -> ProjectionServiceAppendServe {
+    let mode = ProjectionMode::from_env(env);
+
+    // Off / EHDB disabled ⇒ strict no-op, and no metric. Keeps the
+    // byte-identical-`/metrics` invariant true for a build that carries this
+    // code and is not asked to use it.
+    if mode == ProjectionMode::Off || !truthy(env, EHDB_ENABLED_ENV) {
+        return ProjectionServiceAppendServe {
+            decision: super::primary_serve::decide(false, false, false),
+            outcome: ProjectionOutcome::Disabled,
+            detail: None,
+            sequence: None,
+        };
+    }
+
+    let is_primary = mode == ProjectionMode::Primary && PRIMARY_SERVE_ACTIVATED;
+
+    let (ack, parity_held, mut detail, landed_outcome) = match reply {
+        Err(e) => (
+            None,
+            false,
+            Some(format!("tier-service projection append failed: {e}")),
+            Some(ProjectionOutcome::Unavailable),
+        ),
+        Ok(body) => match super::eventlog::ServiceAppendAck::parse(body) {
+            // A reply that acknowledges no append: one of the service's typed
+            // refusals. `invalid` is a caller mistake and NOT degraded — a
+            // service that rejects one record is reachable and healthy, and
+            // demoting the whole tier for a poisoned payload would let one row
+            // disable authoritative serving.
+            None => {
+                let trimmed = body.trim();
+                let outcome = if trimmed.starts_with("invalid") {
+                    ProjectionOutcome::Rejected
+                } else {
+                    ProjectionOutcome::Unavailable
+                };
+                (
+                    None,
+                    false,
+                    Some(format!(
+                        "tier-service refused the projection append: {}",
+                        &trimmed[..trimmed.len().min(200)]
+                    )),
+                    Some(outcome),
+                )
+            }
+            Some(ack) => match ack.parity(previous_sequence) {
+                Ok(note) => (Some(ack), true, note.map(str::to_string), None),
+                Err(divergence) => (Some(ack), false, Some(divergence), None),
+            },
+        },
+    };
+
+    let decision = super::primary_serve::decide(is_primary, durable_service_reachable, parity_held);
+
+    let outcome = match landed_outcome {
+        Some(o) => o,
+        None => match (is_primary, parity_held, decision.served_by_ehdb()) {
+            (true, true, true) => ProjectionOutcome::ServedPrimary,
+            (true, false, _) => ProjectionOutcome::PrimaryDivergence,
+            // Primary, parity held, policy refused — no reachable durable
+            // service. Never `ServedPrimary`: claiming to have served
+            // authoritatively from a pod-local fragment is the lie #257 exists
+            // to prevent, and the projection tier inherits it unchanged.
+            (true, true, false) => ProjectionOutcome::PrimaryUnavailable,
+            (false, true, _) => ProjectionOutcome::Materialized,
+            (false, false, _) => ProjectionOutcome::ParityMismatch,
+        },
+    };
+
+    if detail.is_none() && outcome == ProjectionOutcome::PrimaryUnavailable {
+        detail = Some(
+            "no reachable durable tier service — the projection tier is primary but has \
+             nothing authoritative to serve from; the incumbent answers"
+                .to_string(),
+        );
+    }
+
+    metrics::record_projection(
+        "mirror",
+        outcome.as_str(),
+        outcome.ok(),
+        outcome.degraded(),
+        duration_seconds,
+    );
+    log_serve_transition(&decision, outcome, detail.as_deref());
+
+    ProjectionServiceAppendServe {
+        decision,
+        outcome,
+        detail,
+        sequence: ack.map(|a| a.global_sequence),
+    }
+}
+
+/// The last serve state this process logged, as a code. `0` is "nothing yet".
+///
+/// Separate atomic from the event log's: the two tiers flip independently, and
+/// sharing one would make a projection demote silence an event-log promote.
+static LAST_SERVE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn serve_state_code(decision: &super::primary_serve::ServeDecision) -> u8 {
+    use super::primary_serve::{DemoteReason, ServeDecision};
+    match decision {
+        ServeDecision::ServedByEhdb => 1,
+        ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::NotPrimary,
+        } => 2,
+        ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::NoDurableService,
+        } => 3,
+        ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::ParityDiverged,
+        } => 4,
+    }
+}
+
+/// Log a serve-state change, once per TRANSITION.
+///
+/// A flip is a once-per-deployment event and an append is a once-per-trigger
+/// one, so a per-append line is noise nobody reads — and a line nobody reads is
+/// the same as no line. Transitions in BOTH directions are logged: a demote that
+/// stayed silent because the promote was already logged would hide the outage.
+fn log_serve_transition(
+    decision: &super::primary_serve::ServeDecision,
+    outcome: ProjectionOutcome,
+    detail: Option<&str>,
+) {
+    let code = serve_state_code(decision);
+    let prev = LAST_SERVE_STATE.swap(code, std::sync::atomic::Ordering::Relaxed);
+    if prev == code {
+        return;
+    }
+    let label = decision.outcome_label();
+    if decision.served_by_ehdb() {
+        tracing::info!(
+            serve_state = label,
+            outcome = outcome.as_str(),
+            "{}=primary IS SERVING: the projection tier answered authoritatively through the \
+             writer-fronted tier service (mirror_source=server, tier_query_source=service). \
+             NOTE: this is the WRITE path claiming authority — reads still resolve from \
+             noetl.projection_snapshot until ai-meta#265 phase B1.",
+            PROJECTION_MODE_ENV
+        );
+    } else if decision.degraded() {
+        tracing::warn!(
+            serve_state = label,
+            outcome = outcome.as_str(),
+            detail = detail.unwrap_or("-"),
+            "{}=primary is NOT serving — the incumbent answers (demoted: {label})",
+            PROJECTION_MODE_ENV
+        );
+    } else {
+        tracing::info!(
+            serve_state = label,
+            outcome = outcome.as_str(),
+            "projection tier serve state: {label} (the incumbent is authoritative)"
+        );
+    }
+}
+
+/// The serve state this process last decided, as the label the metric carries.
+///
+/// `"unknown"` until the first service-resolved append — the honest answer, and
+/// different from every other value: a process that has not been asked to mirror
+/// anything has not decided anything.
+pub fn current_serve_state() -> &'static str {
+    use super::primary_serve::{DemoteReason, ServeDecision};
+    match LAST_SERVE_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ServeDecision::ServedByEhdb.outcome_label(),
+        2 => ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::NotPrimary,
+        }
+        .outcome_label(),
+        3 => ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::NoDurableService,
+        }
+        .outcome_label(),
+        4 => ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::ParityDiverged,
+        }
+        .outcome_label(),
+        _ => "unknown",
+    }
+}
+
+/// Reset the logged serve state. Tests only.
+#[cfg(test)]
+pub(crate) fn reset_serve_state() {
+    LAST_SERVE_STATE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1689,5 +1970,190 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // -----------------------------------------------------------------------
+    // #265 A2 — the projection tier's serve decision.
+    //
+    // These drive `serve_service_append_with` directly rather than the process
+    // env, because `cargo test` does NOT serialise tests: a test that set
+    // `NOETL_EHDB_TIER_SERVICE_ADDR` or drove the reachability latch would race
+    // every other test in this binary.
+    // -----------------------------------------------------------------------
+
+    fn serve_env(mode: &str) -> EnvMap {
+        worker_env("/tmp/proj-serve-unused.jsonl", mode)
+    }
+
+    /// The tier service's append ack, exactly as `tier_store::append_locked`
+    /// renders it. Built here rather than hand-written per test so a change to
+    /// the real body shape breaks one place.
+    fn ack_body(sequence: u64, count: Option<u64>) -> String {
+        let mut v = serde_json::json!({"appended": true, "global_sequence": sequence});
+        if let Some(c) = count {
+            v["log_record_count"] = serde_json::json!(c);
+        }
+        v.to_string()
+    }
+
+    #[test]
+    fn projection_primary_serves_when_all_three_conditions_hold() {
+        let s = serve_service_append_with(&serve_env("primary"), Ok(&ack_body(7, Some(7))), 6, 0.001, true);
+        assert_eq!(s.outcome, ProjectionOutcome::ServedPrimary);
+        assert!(s.decision.served_by_ehdb());
+        assert!(!s.decision.degraded());
+        assert_eq!(s.sequence, Some(7));
+        // POSITIVE control for the label the kind gate reads: the serve outcome
+        // has to be the string the pinned metric series carries, or the gate
+        // asserts on a series that never moves and passes vacuously.
+        assert_eq!(s.outcome.as_str(), "served_primary");
+    }
+
+    #[test]
+    fn projection_primary_without_a_reachable_service_does_not_claim_to_serve() {
+        // The failure #257 exists to prevent, inherited unchanged: claiming
+        // authority while answering from a pod-local fragment.
+        let s = serve_service_append_with(&serve_env("primary"), Ok(&ack_body(7, Some(7))), 6, 0.001, false);
+        assert_eq!(s.outcome, ProjectionOutcome::PrimaryUnavailable);
+        assert!(!s.decision.served_by_ehdb());
+        assert!(s.decision.degraded());
+        assert!(
+            s.detail.is_some_and(|d| d.contains("nothing authoritative to serve from")),
+            "a demote must say why"
+        );
+    }
+
+    #[test]
+    fn projection_divergence_demotes_rather_than_failing_the_caller() {
+        // count != sequence ⇒ the store lost or duplicated a record.
+        let s = serve_service_append_with(&serve_env("primary"), Ok(&ack_body(7, Some(3))), 6, 0.001, true);
+        assert_eq!(s.outcome, ProjectionOutcome::PrimaryDivergence);
+        assert!(!s.decision.served_by_ehdb(), "a diverged tier must not serve");
+        assert!(s.decision.degraded());
+        // The record DID land — the caller is not failed, the tier loses its
+        // authority. That is the whole safety property.
+        assert_eq!(s.sequence, Some(7));
+    }
+
+    #[test]
+    fn projection_shadow_materializes_and_never_serves() {
+        let s = serve_service_append_with(&serve_env("shadow"), Ok(&ack_body(7, Some(7))), 6, 0.001, true);
+        assert_eq!(s.outcome, ProjectionOutcome::Materialized);
+        assert!(!s.decision.served_by_ehdb());
+        assert!(!s.decision.degraded(), "shadow is the normal state, not a degradation");
+    }
+
+    #[test]
+    fn projection_off_and_disabled_are_strict_no_ops() {
+        let body = ack_body(1, Some(1));
+        assert_eq!(
+            serve_service_append_with(&serve_env("off"), Ok(&body), 0, 0.0, true).outcome,
+            ProjectionOutcome::Disabled
+        );
+        let mut disabled = serve_env("primary");
+        disabled.insert(EHDB_ENABLED_ENV.to_string(), "false".to_string());
+        assert_eq!(
+            serve_service_append_with(&disabled, Ok(&body), 0, 0.0, true).outcome,
+            ProjectionOutcome::Disabled,
+            "the umbrella switch must win over the tier flag"
+        );
+    }
+
+    #[test]
+    fn a_dead_tier_service_demotes_instead_of_going_quiet() {
+        // The direction to be wrong in: a transport failure must show up as a
+        // degraded outcome, not as the serve signal simply ceasing — an absent
+        // series and a demoted one are the same bytes to a dashboard.
+        let s = serve_service_append_with(&serve_env("primary"), Err("connect refused"), 0, 0.05, false);
+        assert_eq!(s.outcome, ProjectionOutcome::Unavailable);
+        assert!(s.outcome.degraded());
+        assert_eq!(s.sequence, None, "nothing landed, so no sequence may be claimed");
+    }
+
+    #[test]
+    fn a_refused_record_is_not_a_degraded_tier() {
+        // One poisoned payload must not be able to disable authoritative
+        // serving for the whole tier.
+        let s = serve_service_append_with(&serve_env("primary"), Ok("invalid payload is empty"), 0, 0.0, true);
+        assert_eq!(s.outcome, ProjectionOutcome::Rejected);
+        assert!(!s.outcome.degraded(), "a caller mistake is not a store failure");
+    }
+
+    #[test]
+    fn the_projection_serve_site_shares_one_policy_with_the_event_log() {
+        // The property that keeps the two tiers from drifting into two policies:
+        // for all eight input combinations this site's verdict is exactly
+        // `primary_serve::decide`'s — the same function the event log calls.
+        for is_primary in [false, true] {
+            for reachable in [false, true] {
+                for parity in [false, true] {
+                    let e = serve_env(if is_primary { "primary" } else { "shadow" });
+                    let body = ack_body(5, Some(if parity { 5 } else { 2 }));
+                    let s = serve_service_append_with(&e, Ok(&body), 4, 0.0, reachable);
+                    let want = super::super::primary_serve::decide(is_primary, reachable, parity);
+                    assert_eq!(
+                        s.decision, want,
+                        "({is_primary},{reachable},{parity}) diverged from the shared policy"
+                    );
+                    assert_eq!(
+                        s.decision.served_by_ehdb(),
+                        is_primary && reachable && parity,
+                        "exactly one combination may serve"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_serve_outcome_this_site_records_is_pinned() {
+        // The absent-series guard. A recorded outcome with no pinned series
+        // renders nothing until it first fires, and "nothing" is what a build
+        // without the metric also renders — so the one reading an operator most
+        // needs during a flip would be unreadable.
+        //
+        // Driven through the real function, so this cannot pass by listing
+        // outcomes the code no longer produces.
+        let body_ok = ack_body(5, Some(5));
+        let body_bad = ack_body(5, Some(2));
+        let produced = [
+            serve_service_append_with(&serve_env("primary"), Ok(&body_ok), 4, 0.0, true).outcome,
+            serve_service_append_with(&serve_env("primary"), Ok(&body_ok), 4, 0.0, false).outcome,
+            serve_service_append_with(&serve_env("primary"), Ok(&body_bad), 4, 0.0, true).outcome,
+            serve_service_append_with(&serve_env("shadow"), Ok(&body_ok), 4, 0.0, true).outcome,
+            serve_service_append_with(&serve_env("shadow"), Ok(&body_bad), 4, 0.0, true).outcome,
+            serve_service_append_with(&serve_env("primary"), Ok("invalid nope"), 0, 0.0, true).outcome,
+            serve_service_append_with(&serve_env("primary"), Err("gone"), 0, 0.0, false).outcome,
+        ];
+        // Positive control: the drive must actually reach the serving outcome,
+        // or "every outcome is pinned" is a statement about an empty set.
+        assert!(
+            produced.contains(&ProjectionOutcome::ServedPrimary),
+            "the drive never reached served_primary — this check would be vacuous"
+        );
+        for o in produced {
+            assert!(
+                metrics::projection_serve_outcome_is_pinned(o.as_str()),
+                "outcome {:?} is recorded but not pinned — it would be ABSENT from \
+                 /metrics until it first fires",
+                o.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_flip_is_never_silent_in_either_direction() {
+        // A demote after a promote must still log. The transition state is
+        // process-global, so the assertion is on the state it exposes.
+        reset_serve_state();
+        assert_eq!(current_serve_state(), "unknown", "no decision yet is its own answer");
+        let body = ack_body(5, Some(5));
+        serve_service_append_with(&serve_env("primary"), Ok(&body), 4, 0.0, true);
+        assert_eq!(current_serve_state(), "served_primary");
+        // ... and back. A demote that stayed silent because the promote was
+        // already logged would hide the outage.
+        serve_service_append_with(&serve_env("primary"), Ok(&body), 4, 0.0, false);
+        assert_eq!(current_serve_state(), "no_durable_service");
+        reset_serve_state();
     }
 }
