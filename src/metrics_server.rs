@@ -78,6 +78,11 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
         }
     }
 
+    // noetl/ai-meta#155 — pin the closed pickup-phase label set so both series
+    // read 0 on a worker that has not yet claimed, instead of being absent and
+    // indistinguishable from a binary that lacks the metric.
+    crate::metrics::pin_command_pickup_phases();
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
 

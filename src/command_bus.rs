@@ -597,6 +597,12 @@ impl CommandSource for EhdbCommandSource {
                     }
                 }
             }
+            // noetl/ai-meta#155: split ONE pickup into park vs outcome.  The
+            // gap from "server published" to "worker began work" is ~510ms p50
+            // and is 79% of a turn, while every bus primitive under it is
+            // microseconds-to-milliseconds.  Timing the two halves separately
+            // is the only way to tell a slow hand-over from a slow claim ack.
+            let park_started = std::time::Instant::now();
             let claimed = match self
                 .pull
                 .as_mut()
@@ -623,10 +629,21 @@ impl CommandSource for EhdbCommandSource {
                     continue;
                 }
             };
+            let park_secs = park_started.elapsed().as_secs_f64();
+            crate::metrics::record_command_pickup_phase("park", park_secs);
             let notification: CommandNotification =
                 serde_json::from_str(&claimed.record.payload)
                     .map_err(|e| anyhow!("EHDB command notification decode: {e}"))?;
+            let outcome_started = std::time::Instant::now();
             let outcome = claim_outcome(&self.client, &self.worker_id, &notification).await?;
+            let outcome_secs = outcome_started.elapsed().as_secs_f64();
+            crate::metrics::record_command_pickup_phase("outcome", outcome_secs);
+            tracing::debug!(
+                park_ms = park_secs * 1000.0,
+                outcome_ms = outcome_secs * 1000.0,
+                sort_key = claimed.sort_key,
+                "command pickup phases"
+            );
             return Ok(Some(Pulled {
                 outcome,
                 ack: EhdbAckHandle {

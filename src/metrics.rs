@@ -76,6 +76,23 @@ pub struct WorkerMetrics {
     pub event_emit_retries_total: IntCounterVec,
     /// Emissions abandoned after exhausting retries (noetl/ai-meta#238).
     pub event_emit_failed_total: IntCounterVec,
+    /// Splits ONE command pickup into its two serial parts (noetl/ai-meta#155).
+    ///
+    /// Measurement showed ~79% of a playbook turn is the gap between "server
+    /// published the command to the bus" and "worker began the work" (~510ms
+    /// p50, twice per hop), while the bus primitives underneath it are 3 orders
+    /// of magnitude faster (fsync 0.39ms, claim path 16-33us, append ~4ms).
+    /// Nothing recorded WHERE inside that gap the time went, so the phase label
+    /// splits it at the only seam that exists in `EhdbCommandSource::next`:
+    ///
+    /// - `park`    — time blocked in `claim_next` (record not yet assigned).
+    /// - `outcome` — time in the `claim_outcome` HTTP round-trip to the server.
+    ///
+    /// A `park`-dominated split means the coordinator/feed is not handing the
+    /// record over promptly; an `outcome`-dominated split means the control
+    /// plane's claim endpoint is.  The two fixes are entirely different, which
+    /// is why this is measured rather than assumed.
+    pub command_pickup_phase_seconds: HistogramVec,
     /// Claim-coordinator reconnects on the EHDB command path, by reason.
     ///
     /// The EHDB claim loop is how every command reaches this worker post-T5.
@@ -607,6 +624,21 @@ impl WorkerMetrics {
         registry
             .register(Box::new(dispatch_duration_seconds.clone()))
             .expect("register dispatch_duration_seconds");
+
+        let command_pickup_phase_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_worker_command_pickup_phase_seconds",
+                "Latency of one phase of a command pickup (park in claim_next vs claim_outcome RTT).",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["phase"],
+        )
+        .expect("command_pickup_phase_seconds metric");
+        registry
+            .register(Box::new(command_pickup_phase_seconds.clone()))
+            .expect("register command_pickup_phase_seconds");
 
         let dispatch_errors_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -1673,6 +1705,7 @@ impl WorkerMetrics {
             event_emit_retries_total,
             event_emit_failed_total,
             ehdb_claim_reconnect_total,
+            command_pickup_phase_seconds,
             build_info,
             concurrent_dispatches,
             result_store_put_duration_seconds,
@@ -2406,6 +2439,26 @@ pub fn record_ehdb_claim_reconnect(feed: &str, reason: &str) {
         .ehdb_claim_reconnect_total
         .with_label_values(&[feed, reason])
         .inc();
+}
+
+/// Record one phase of a command pickup (noetl/ai-meta#155).
+///
+/// `phase` is `park` or `outcome`.  Both are pinned at startup by
+/// [`pin_command_pickup_phases`] so an absent series means "this binary predates
+/// the metric", not "zero" — `Registry::gather` prunes empty families.
+pub fn record_command_pickup_phase(phase: &str, seconds: f64) {
+    WorkerMetrics::global()
+        .command_pickup_phase_seconds
+        .with_label_values(&[phase])
+        .observe(seconds);
+}
+
+/// Pin the closed `phase` label set so both series exist from process start.
+pub fn pin_command_pickup_phases() {
+    let m = WorkerMetrics::global();
+    for phase in ["park", "outcome"] {
+        let _ = m.command_pickup_phase_seconds.with_label_values(&[phase]);
+    }
 }
 
 /// Every `outcome` the off-server DRIVE build records, taken from the call
