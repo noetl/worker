@@ -213,6 +213,31 @@ impl TierClient {
         out
     }
 
+    /// Append N records in ONE request — one store lock, one `fsync`
+    /// (noetl/ai-meta#155).
+    ///
+    /// Semantically N [`Self::append`]s in order. Returns the raw reply; the
+    /// caller reads `results[]` for the per-record outcome, so it can report
+    /// exactly what it reported when it looped.
+    pub async fn append_batch(
+        &self,
+        execution_id: &str,
+        payloads: &[String],
+    ) -> Result<String, String> {
+        let req = serde_json::json!({
+            "op": "append_batch",
+            "execution_id": execution_id,
+            "payloads": payloads,
+        });
+        // Same reachability contract as `append`: the batch IS the probe.
+        let out = self
+            .request(req.to_string().as_bytes())
+            .await
+            .map(|b| String::from_utf8_lossy(&b).to_string());
+        super::reachability::record(super::reachability::classify(&out));
+        out
+    }
+
     /// Read every record the remote tier holds for one execution.
     pub async fn read_execution(&self, execution_id: &str) -> Result<String, String> {
         let req = serde_json::json!({"op":"read_execution","execution_id":execution_id});
@@ -232,7 +257,9 @@ impl TierClient {
     /// to unwrap.
     pub async fn probe(&self) -> TierProbe {
         let raw = self.request(b"health").await;
-        super::reachability::record(super::reachability::classify(&raw.clone().map(|b| String::from_utf8_lossy(&b).to_string())));
+        super::reachability::record(super::reachability::classify(
+            &raw.clone().map(|b| String::from_utf8_lossy(&b).to_string()),
+        ));
         match raw {
             Err(e) => TierProbe::Unreachable(e),
             Ok(body) => {
@@ -418,7 +445,10 @@ mod tests {
             addr: addr.to_string(),
             timeout: Duration::from_millis(2_000),
         });
-        let body = client.request(b"append").await.expect("a reply, not an error");
+        let body = client
+            .request(b"append")
+            .await
+            .expect("a reply, not an error");
         assert_eq!(String::from_utf8(body).unwrap(), "unsupported append");
     }
 
@@ -442,7 +472,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_tier(listener));
-        let client = TierClient::new(TierClientConfig { addr: addr.to_string(), timeout: Duration::from_millis(3_000) });
+        let client = TierClient::new(TierClientConfig {
+            addr: addr.to_string(),
+            timeout: Duration::from_millis(3_000),
+        });
 
         let appended = client
             .append("e2e-exec-1", r#"{"marker":"E2E-HIT"}"#)
@@ -450,16 +483,28 @@ mod tests {
             .expect("append over the wire");
         assert!(appended.contains("appended"), "append reply: {appended}");
 
-        let hit = client.read_execution("e2e-exec-1").await.expect("read over the wire");
-        assert!(hit.contains("E2E-HIT"), "the appended payload must come back: {hit}");
+        let hit = client
+            .read_execution("e2e-exec-1")
+            .await
+            .expect("read over the wire");
+        assert!(
+            hit.contains("E2E-HIT"),
+            "the appended payload must come back: {hit}"
+        );
 
         // NEGATIVE CONTROL — a different key must NOT return that payload.
-        let miss = client.read_execution("e2e-absent").await.expect("read over the wire");
+        let miss = client
+            .read_execution("e2e-absent")
+            .await
+            .expect("read over the wire");
         assert!(
             !miss.contains("E2E-HIT"),
             "a miss must not return another execution's data: {miss}"
         );
-        assert_ne!(hit, miss, "hit and miss must be distinguishable over the wire");
+        assert_ne!(
+            hit, miss,
+            "hit and miss must be distinguishable over the wire"
+        );
 
         std::env::remove_var(crate::ehdb::tier_store::TIER_SERVICE_DIR_ENV);
         let _ = std::fs::remove_dir_all(&dir);
@@ -485,7 +530,15 @@ mod tests {
         }
         // Shape errors are still refused — accepting names must not mean
         // accepting anything.
-        for bad in ["", "nocolon", "host:", ":9110", "host:abc", "host:0", "host:99999"] {
+        for bad in [
+            "",
+            "nocolon",
+            "host:",
+            ":9110",
+            "host:abc",
+            "host:0",
+            "host:99999",
+        ] {
             assert!(split_authority(bad).is_none(), "must reject: {bad:?}");
         }
     }
@@ -505,7 +558,9 @@ mod tests {
         });
         assert_eq!(
             client.probe().await,
-            TierProbe::Healthy { version: PROTOCOL_VERSION },
+            TierProbe::Healthy {
+                version: PROTOCOL_VERSION
+            },
             "a hostname must resolve and connect"
         );
     }
@@ -556,7 +611,12 @@ mod tests {
             addr: format!("127.0.0.1:{}", addr.port()),
             timeout: Duration::from_millis(2_000),
         });
-        assert_eq!(good.probe().await, TierProbe::Healthy { version: PROTOCOL_VERSION });
+        assert_eq!(
+            good.probe().await,
+            TierProbe::Healthy {
+                version: PROTOCOL_VERSION
+            }
+        );
         assert!(
             reachability::is_reachable(),
             "a reachable service must promote — self-healing, no operator action"
