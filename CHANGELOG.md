@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.119.1](https://github.com/noetl/worker/compare/v5.119.0...v5.119.1) (2026-08-18)
+
+### Performance Improvements
+
+* **ehdb:** adopt the event-log runtime cache ([#155](https://github.com/noetl/worker/issues/155)) ([940f9cd](https://github.com/noetl/worker/commit/940f9cd25926679a1a6cb3f803cacff3fc575064)), closes [noetl/ehdb#316](https://github.com/noetl/ehdb/issues/316)
+
 ## [5.119.0](https://github.com/noetl/worker/compare/v5.118.2...v5.119.0) (2026-08-18)
 
 ### Features
