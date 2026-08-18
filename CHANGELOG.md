@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.119.0](https://github.com/noetl/worker/compare/v5.118.2...v5.119.0) (2026-08-18)
+
+### Features
+
+* **metrics:** split command pickup into park vs claim_outcome ([#155](https://github.com/noetl/worker/issues/155)) ([41ef419](https://github.com/noetl/worker/commit/41ef4194044b58becd0c8efeba9710338bcfd8af)), closes [#205](https://github.com/noetl/worker/issues/205)
+
 ## [5.118.2](https://github.com/noetl/worker/compare/v5.118.1...v5.118.2) (2026-08-14)
 
 ### Bug Fixes
