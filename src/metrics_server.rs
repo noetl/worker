@@ -75,6 +75,15 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
             && EventLogMode::from_env(&env) != EventLogMode::Off
         {
             crate::ehdb::metrics::pin_eventlog_serve_series();
+            // noetl/ai-meta#155 — same site, same reasoning, for the tier-append
+            // store path. This is the bind site of the route that RECEIVES the
+            // appends, so pinning here means the counters exist on every worker
+            // that can serve one — including the ones that forward to a writer
+            // elsewhere and therefore never set `tier_service_up`.
+            //
+            // Those are the workers whose ratio anyone reads, and the first
+            // version of this metric was invisible on exactly them.
+            crate::ehdb::metrics::pin_tier_append_series();
         }
     }
 

@@ -155,6 +155,17 @@ struct EhdbMetricsState {
     /// comparable and their sum is the append total.
     tier_append_records_batched: u64,
     tier_append_records_single: u64,
+    /// Whether the tier-append **handler** exists in this process — i.e.
+    /// whether [`pin_tier_append_series`] has run.
+    ///
+    /// A separate flag from `tier_service_up`, which means "this process HOSTS
+    /// a tier-service store". The handler runs on any worker exposing the tier
+    /// surface, including ones that forward every append to a writer
+    /// elsewhere — and those are the workers whose numbers get read. Gating the
+    /// counters on `tier_service_up` made them invisible on exactly that
+    /// configuration, which is how the first version of this metric shipped
+    /// unusable.
+    tier_append_up: bool,
 }
 
 fn state() -> &'static Mutex<EhdbMetricsState> {
@@ -521,8 +532,28 @@ pub fn record_tier_service_append(sequence: u64, store_bytes: u64) {
 /// Called once per request rather than per record: the request is where the
 /// batch/single decision is made, and per-record calls would take the lock N
 /// times to record a number the caller already knows.
+/// Declare that this process serves tier appends, so both path series exist at
+/// 0 from the first scrape.
+///
+/// Same idiom as [`pin_tier_service_series`], and for the same reason: a
+/// `batch` line that is absent until the flag is on is indistinguishable from a
+/// binary too old to have the path at all, which is exactly the question an
+/// operator asks when checking whether ehdb#317 is doing anything.
+///
+/// Not unconditional. `render_lines()` on a process with no EHDB surface must
+/// stay **empty** — `without_a_listener_the_tier_service_renders_nothing` holds
+/// that invariant, and it is what keeps `/metrics` byte-identical on a worker
+/// that has EHDB switched off.
+pub fn pin_tier_append_series() {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    s.tier_append_up = true;
+}
+
 pub fn record_tier_append_path(batched: bool, records: usize) {
     let mut s = state().lock().expect("ehdb metrics lock");
+    // Recording implies the handler exists, so the series can never carry a
+    // value while being suppressed by an unset pin.
+    s.tier_append_up = true;
     if batched {
         s.tier_append_records_batched += records as u64;
     } else {
@@ -834,19 +865,21 @@ pub fn render_lines() -> Vec<String> {
     // Both paths always render, including the zero: a `batch` line absent until
     // the flag is on is indistinguishable from a binary too old to have the
     // path, which is precisely the question being asked.
-    lines.push(
-        "# HELP noetl_ehdb_tier_append_records_total Records appended by the tier-append handler, by store path (noetl/ai-meta#155)"
-            .to_string(),
-    );
-    lines.push("# TYPE noetl_ehdb_tier_append_records_total counter".to_string());
-    lines.push(format!(
-        "noetl_ehdb_tier_append_records_total{{path=\"batch\"}} {}",
-        s.tier_append_records_batched
-    ));
-    lines.push(format!(
-        "noetl_ehdb_tier_append_records_total{{path=\"single\"}} {}",
-        s.tier_append_records_single
-    ));
+    if s.tier_append_up {
+        lines.push(
+            "# HELP noetl_ehdb_tier_append_records_total Records appended by the tier-append handler, by store path (noetl/ai-meta#155)"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_ehdb_tier_append_records_total counter".to_string());
+        lines.push(format!(
+            "noetl_ehdb_tier_append_records_total{{path=\"batch\"}} {}",
+            s.tier_append_records_batched
+        ));
+        lines.push(format!(
+            "noetl_ehdb_tier_append_records_total{{path=\"single\"}} {}",
+            s.tier_append_records_single
+        ));
+    }
 
     // Tier-service latency + store state (ai-meta#260). Rendered only when the
     // listener exists in this process — see `pin_tier_service_series` for why
@@ -1062,6 +1095,7 @@ mod tests {
         reset();
         // Deliberately do NOT touch the tier-service state, so `tier_service_up`
         // stays false — the configuration this metric was invisible on.
+        pin_tier_append_series();
         record_tier_append_path(true, 7);
         record_tier_append_path(false, 3);
         let text = render_lines().join("\n");
@@ -1092,6 +1126,7 @@ mod tests {
     fn tier_append_paths_are_pinned_at_zero() {
         let _g = test_guard();
         reset();
+        pin_tier_append_series();
         let text = render_lines().join("\n");
         assert!(text.contains("noetl_ehdb_tier_append_records_total{path=\"batch\"} 0"), "{text}");
         assert!(text.contains("noetl_ehdb_tier_append_records_total{path=\"single\"} 0"), "{text}");
