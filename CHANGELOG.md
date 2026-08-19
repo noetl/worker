@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.120.0](https://github.com/noetl/worker/compare/v5.119.2...v5.120.0) (2026-08-19)
+
+### Features
+
+* **metrics:** count which store path each tier append took ([#155](https://github.com/noetl/worker/issues/155)) ([f23dde0](https://github.com/noetl/worker/commit/f23dde0e67cf2daf6e9971a7b27439a6e93df422)), closes [ehdb#317](https://github.com/noetl/ehdb/issues/317) [worker#281](https://github.com/noetl/worker/issues/281) [ai-meta#242](https://github.com/noetl/ai-meta/issues/242) [#266](https://github.com/noetl/worker/issues/266) [#263](https://github.com/noetl/worker/issues/263)
+
+### Bug Fixes
+
+* **metrics:** pin the tier-append paths at the handler's bind site ([#155](https://github.com/noetl/worker/issues/155)) ([a7f3bb0](https://github.com/noetl/worker/commit/a7f3bb086cfae31df6e39cc86ec677c23ccb2f4c))
+* **metrics:** render the tier-append paths outside the tier-service gate ([#155](https://github.com/noetl/worker/issues/155)) ([649465e](https://github.com/noetl/worker/commit/649465eee369054bf2596c35998d301f056eab46))
+
 ## [5.119.2](https://github.com/noetl/worker/compare/v5.119.1...v5.119.2) (2026-08-19)
 
 ### Performance Improvements
