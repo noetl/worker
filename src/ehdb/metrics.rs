@@ -139,6 +139,22 @@ struct EhdbMetricsState {
     /// Size of the backing store file in bytes, sampled at pin time and after
     /// each successful append.
     tier_service_store_bytes: u64,
+    /// Records the tier-append handler pushed through the **batched** store
+    /// append (one open, N writes, one fsync), and through the per-record loop.
+    ///
+    /// Two counters because the interesting question is a *ratio*, and because
+    /// without them the batch path is unfalsifiable in production. worker#281
+    /// shipped `append_batch` behind a flag whose entire justification is "the
+    /// async mirror (noetl/ai-meta#155) will produce multi-record batches" —
+    /// and nothing on `/metrics` could say whether it ever did. Measured inert
+    /// once already under the synchronous mirror; a claim that can only be
+    /// checked by reading the code is the shape this repo keeps shipping
+    /// (ai-meta#242, #266).
+    ///
+    /// Counted in **records**, not requests, so the two are directly
+    /// comparable and their sum is the append total.
+    tier_append_records_batched: u64,
+    tier_append_records_single: u64,
 }
 
 fn state() -> &'static Mutex<EhdbMetricsState> {
@@ -500,6 +516,20 @@ pub fn record_tier_service_append(sequence: u64, store_bytes: u64) {
     s.tier_service_store_bytes = store_bytes;
 }
 
+/// Record how many records one tier-append request took through each path.
+///
+/// Called once per request rather than per record: the request is where the
+/// batch/single decision is made, and per-record calls would take the lock N
+/// times to record a number the caller already knows.
+pub fn record_tier_append_path(batched: bool, records: usize) {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    if batched {
+        s.tier_append_records_batched += records as u64;
+    } else {
+        s.tier_append_records_single += records as u64;
+    }
+}
+
 pub fn record_eventlog(
     operation: &str,
     outcome: &str,
@@ -835,6 +865,25 @@ pub fn render_lines() -> Vec<String> {
         lines.push(format!(
             "noetl_ehdb_tier_service_store_appends_total {}",
             s.tier_service_appends
+        ));
+        // Pinned: BOTH paths render unconditionally, including the zero.
+        // `Registry::gather`-style pruning is not the issue here (this renderer
+        // is hand-rolled), but the same reasoning applies — a `batch` line that
+        // is absent until the flag is on is indistinguishable from a binary too
+        // old to have the path at all, which is exactly the question an
+        // operator asks when checking whether ehdb#317 is doing anything.
+        lines.push(
+            "# HELP noetl_ehdb_tier_append_records_total Records appended by the tier-append handler, by store path (noetl/ai-meta#155)"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_ehdb_tier_append_records_total counter".to_string());
+        lines.push(format!(
+            "noetl_ehdb_tier_append_records_total{{path=\"batch\"}} {}",
+            s.tier_append_records_batched
+        ));
+        lines.push(format!(
+            "noetl_ehdb_tier_append_records_total{{path=\"single\"}} {}",
+            s.tier_append_records_single
         ));
         lines.push(
             "# HELP noetl_ehdb_tier_service_store_sequence Highest global sequence the tier-service store holds"

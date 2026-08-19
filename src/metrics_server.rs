@@ -539,6 +539,7 @@ async fn ehdb_tier_append_handler(
             // Skipping it here would recreate ai-meta#257's inert-serve-decision
             // bug on a new path.
             if batch_appends_enabled() && records.len() > 1 {
+                crate::ehdb::metrics::record_tier_append_path(true, records.len());
                 let started = std::time::Instant::now();
                 let raw = client.append_batch(&execution_id, &records).await;
                 let elapsed = started.elapsed().as_secs_f64() / records.len() as f64;
@@ -570,6 +571,7 @@ async fn ehdb_tier_append_handler(
                 );
             }
 
+            crate::ehdb::metrics::record_tier_append_path(false, records.len());
             let mut previous_sequence = 0u64;
             let mut serve_state = crate::ehdb::eventlog::current_serve_state();
             for payload in &records {
@@ -948,6 +950,42 @@ mod tests {
 
 #[cfg(test)]
 mod tier_append_batch_tests {
+
+    /// Both store paths must be instrumented, and instrumented once each.
+    ///
+    /// `append_batch` (ehdb#317 + worker#281) shipped behind a flag whose whole
+    /// justification is "the async mirror will produce multi-record batches"
+    /// (noetl/ai-meta#155) — and for one release nothing on `/metrics` could say
+    /// whether it ever ran. Counting the call sites rather than naming them: a
+    /// third append path added later is the failure this catches, and a test
+    /// that lists the two it knows about cannot.
+    #[test]
+    fn every_tier_append_path_is_counted() {
+        // Scan the CODE half only. A guard that reads the whole file counts its
+        // own search literals and reports a number that is off by exactly the
+        // number of patterns it uses — which is how this test failed the first
+        // time it ran, and the same way the noetl/ai-meta#263 INSERT counter
+        // once counted its own doc comment.
+        let whole = include_str!("metrics_server.rs");
+        let src = &whole[..whole
+            .find("mod tier_append_batch_tests {")
+            .expect("the test module must still be the tail of this file")];
+        let batch_calls = src.matches("client.append_batch(&execution_id").count();
+        let single_calls = src.matches("client.append(&execution_id").count();
+        let recorded = src.matches("record_tier_append_path(").count();
+        assert_eq!(
+            batch_calls + single_calls,
+            recorded,
+            "the tier-append handler has {batch_calls} batch + {single_calls} single store \
+             call(s) but {recorded} record_tier_append_path call(s). An uncounted path makes \
+             the batch substrate unfalsifiable from /metrics, which is the state \
+             noetl/ai-meta#155 found it in."
+        );
+        assert!(
+            batch_calls >= 1 && single_calls >= 1,
+            "both paths must still exist; if one was removed, delete this guard and say so"
+        );
+    }
     use super::{batch_appends_enabled, batch_results};
 
     /// A batch reply must split into exactly one result per record, in order.
