@@ -184,6 +184,105 @@ pub async fn append(
     append_locked(cfg, execution_id, payload)
 }
 
+/// Append N records under ONE store-write lock and ONE `fsync`
+/// (noetl/ai-meta#155).
+///
+/// The single-record path pays an `fsync` per record — measured at ~118 ms per
+/// record at production payload size, on an empty store, so it is a fixed cost
+/// and it dominates mirroring. This is the same work with the per-record cost
+/// paid once.
+///
+/// Durability and ordering are unchanged: the engine writes the records in the
+/// order given and returns only after the `fsync` that covers them, so every
+/// returned sequence is on disk exactly as it was before.
+///
+/// Returns one outcome per record, in request order, so a caller can report
+/// per-record results exactly as it did when it looped.
+pub async fn append_batch(
+    cfg: Option<&TierStoreConfig>,
+    execution_id: &str,
+    payloads: &[String],
+) -> Vec<TierStoreOutcome> {
+    let Some(cfg) = cfg else {
+        return payloads
+            .iter()
+            .map(|_| TierStoreOutcome::Unavailable)
+            .collect();
+    };
+    if payloads.is_empty() {
+        return Vec::new();
+    }
+    // Validation outside the critical section, same as the single path. An
+    // invalid batch is refused whole: a partial append would leave the caller
+    // unable to say which records landed.
+    if execution_id.trim().is_empty() {
+        return payloads
+            .iter()
+            .map(|_| TierStoreOutcome::Invalid("execution_id is empty".to_string()))
+            .collect();
+    }
+    if let Some(index) = payloads.iter().position(|p| p.is_empty()) {
+        return payloads
+            .iter()
+            .map(|_| TierStoreOutcome::Invalid(format!("payload {index} of the batch is empty")))
+            .collect();
+    }
+
+    let lock = store_lock(cfg);
+    let _exclusive = lock.write().await;
+    append_batch_locked(cfg, execution_id, payloads)
+}
+
+fn append_batch_locked(
+    cfg: &TierStoreConfig,
+    execution_id: &str,
+    payloads: &[String],
+) -> Vec<TierStoreOutcome> {
+    if let Err(e) = ensure_dir(cfg) {
+        return payloads
+            .iter()
+            .map(|_| TierStoreOutcome::Error(e.clone()))
+            .collect();
+    }
+    let requests: Vec<EventLogAppendRequest> = payloads
+        .iter()
+        .map(|payload| EventLogAppendRequest {
+            execution_id: execution_id.to_string(),
+            transaction_id: super::eventlog::new_transaction_id(),
+            payload: payload.clone(),
+        })
+        .collect();
+
+    match driver(cfg).append_batch(&requests) {
+        Ok(outs) => {
+            // Record store state once for the batch — the same signal the
+            // single path records per append (ai-meta#260), and the last
+            // record's sequence is the store's sequence after the batch.
+            if let Some(last) = outs.last() {
+                super::metrics::record_tier_service_append(last.global_sequence, store_bytes(cfg));
+            }
+            outs.into_iter()
+                .map(|out| {
+                    TierStoreOutcome::Ok(
+                        serde_json::to_string(&serde_json::json!({
+                            "appended": true,
+                            "global_sequence": out.global_sequence,
+                            "log_record_count": out.log_record_count,
+                        }))
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    )
+                })
+                .collect()
+        }
+        // The batch is refused whole, so every record reports the same error
+        // rather than the caller guessing a split point.
+        Err(e) => payloads
+            .iter()
+            .map(|_| TierStoreOutcome::Error(e.to_string()))
+            .collect(),
+    }
+}
+
 /// The append itself. Callers reach it only through [`append`], which holds the
 /// store's write lock for the whole replay → sequence → write → flush window.
 fn append_locked(cfg: &TierStoreConfig, execution_id: &str, payload: &str) -> TierStoreOutcome {
@@ -264,10 +363,7 @@ pub(crate) fn startup_sequence(cfg: &TierStoreConfig) -> u64 {
 }
 
 /// Read every record for one execution.
-pub async fn read_execution(
-    cfg: Option<&TierStoreConfig>,
-    execution_id: &str,
-) -> TierStoreOutcome {
+pub async fn read_execution(cfg: Option<&TierStoreConfig>, execution_id: &str) -> TierStoreOutcome {
     let Some(cfg) = cfg else {
         return TierStoreOutcome::Unavailable;
     };
@@ -324,9 +420,9 @@ pub async fn scan(
 fn scan_locked(cfg: &TierStoreConfig, after: Option<u64>, limit: usize) -> TierStoreOutcome {
     let limit = limit.clamp(1, MAX_SCAN_LIMIT);
     match driver(cfg).scan_global(&EventLogScanRequest { after, limit }) {
-        Ok(out) => TierStoreOutcome::Ok(
-            serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()),
-        ),
+        Ok(out) => {
+            TierStoreOutcome::Ok(serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()))
+        }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
     }
 }
@@ -346,8 +442,14 @@ mod tests {
     async fn no_store_configured_is_unavailable_not_empty() {
         // The distinction that matters: a caller must be able to tell "no store
         // here" from "the store is empty".
-        assert_eq!(append(None, "e1", "{}").await, TierStoreOutcome::Unavailable);
-        assert_eq!(read_execution(None, "e1").await, TierStoreOutcome::Unavailable);
+        assert_eq!(
+            append(None, "e1", "{}").await,
+            TierStoreOutcome::Unavailable
+        );
+        assert_eq!(
+            read_execution(None, "e1").await,
+            TierStoreOutcome::Unavailable
+        );
         assert_eq!(scan(None, None, 10).await, TierStoreOutcome::Unavailable);
     }
 
@@ -449,7 +551,10 @@ mod tests {
         match scan(Some(&cfg), None, usize::MAX).await {
             TierStoreOutcome::Ok(b) => {
                 let v: serde_json::Value = serde_json::from_str(&b).expect("scan returns JSON");
-                assert_eq!(v["record_count"], 5, "clamped scan still serves every record: {b}");
+                assert_eq!(
+                    v["record_count"], 5,
+                    "clamped scan still serves every record: {b}"
+                );
                 assert!(v["records"].as_array().is_some_and(|r| r.len() == 5));
             }
             other => panic!("clamped scan must serve: {other:?}"),

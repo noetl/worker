@@ -100,7 +100,18 @@ pub enum TierRequest {
     /// Liveness + protocol handshake. Carries no tier data.
     Health,
     /// Append one record to the event-log tier (ai-meta#257 PR 3).
-    Append { execution_id: String, payload: String },
+    Append {
+        execution_id: String,
+        payload: String,
+    },
+    /// Append N records under one store lock and ONE `fsync`
+    /// (noetl/ai-meta#155).  Semantically N `Append`s in order; the reply
+    /// carries one result per record so a caller reports exactly what it did
+    /// when it looped.
+    AppendBatch {
+        execution_id: String,
+        payloads: Vec<String>,
+    },
     /// Read every record for one execution.
     ReadExecution { execution_id: String },
     /// Bounded global scan.
@@ -132,11 +143,39 @@ pub fn decode_request(payload: &[u8]) -> TierRequest {
     };
     match v.get("op").and_then(|o| o.as_str()) {
         Some("append") => TierRequest::Append {
-            execution_id: v.get("execution_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            payload: v.get("payload").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            execution_id: v
+                .get("execution_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            payload: v
+                .get("payload")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        },
+        Some("append_batch") => TierRequest::AppendBatch {
+            execution_id: v
+                .get("execution_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            payloads: v
+                .get("payloads")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|p| p.as_str().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
         Some("read_execution") => TierRequest::ReadExecution {
-            execution_id: v.get("execution_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            execution_id: v
+                .get("execution_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
         },
         Some("scan") => TierRequest::Scan {
             after: v.get("after").and_then(|x| x.as_u64()),
@@ -202,7 +241,12 @@ pub(crate) async fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Obs
                 };
                 (
                     body.into_bytes(),
-                    Observed { op, outcome, ok: true, degraded: false },
+                    Observed {
+                        op,
+                        outcome,
+                        ok: true,
+                        degraded: false,
+                    },
                 )
             }
             // Each failure keeps its own shape.  A caller must be able to tell
@@ -211,15 +255,30 @@ pub(crate) async fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Obs
             // operator spends an afternoon on the wrong hypothesis.
             TierStoreOutcome::Unavailable => (
                 b"unavailable no tier store configured".to_vec(),
-                Observed { op, outcome: "unavailable", ok: false, degraded: true },
+                Observed {
+                    op,
+                    outcome: "unavailable",
+                    ok: false,
+                    degraded: true,
+                },
             ),
             TierStoreOutcome::Invalid(e) => (
                 format!("invalid {e}").into_bytes(),
-                Observed { op, outcome: "invalid", ok: false, degraded: false },
+                Observed {
+                    op,
+                    outcome: "invalid",
+                    ok: false,
+                    degraded: false,
+                },
             ),
             TierStoreOutcome::Error(e) => (
                 format!("error {e}").into_bytes(),
-                Observed { op, outcome: "error", ok: false, degraded: true },
+                Observed {
+                    op,
+                    outcome: "error",
+                    ok: false,
+                    degraded: true,
+                },
             ),
         }
     };
@@ -227,17 +286,64 @@ pub(crate) async fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Obs
     match req {
         TierRequest::Health => (
             format!("ok tier-service v{PROTOCOL_VERSION}").into_bytes(),
-            Observed { op: "health", outcome: "ok", ok: true, degraded: false },
+            Observed {
+                op: "health",
+                outcome: "ok",
+                ok: true,
+                degraded: false,
+            },
         ),
-        TierRequest::Append { execution_id, payload } => {
-            render("append", tier_store::append(cfg.as_ref(), execution_id, payload).await)
-        }
-        TierRequest::ReadExecution { execution_id } => {
-            render(
-                "read_execution",
-                tier_store::read_execution(cfg.as_ref(), execution_id).await,
+        TierRequest::Append {
+            execution_id,
+            payload,
+        } => render(
+            "append",
+            tier_store::append(cfg.as_ref(), execution_id, payload).await,
+        ),
+        TierRequest::AppendBatch {
+            execution_id,
+            payloads,
+        } => {
+            let outs = tier_store::append_batch(cfg.as_ref(), execution_id, payloads).await;
+            // One reply carrying one result per record, in order. The batch is
+            // refused whole on error, so `ok` is a property of the batch — a
+            // caller must not have to guess a split point.
+            let results: Vec<serde_json::Value> = outs
+                .iter()
+                .map(|o| match o {
+                    tier_store::TierStoreOutcome::Ok(body) => serde_json::json!({
+                        "ok": true,
+                        "body": serde_json::from_str::<serde_json::Value>(body)
+                            .unwrap_or(serde_json::Value::Null),
+                    }),
+                    other => serde_json::json!({ "ok": false, "error": format!("{other:?}") }),
+                })
+                .collect();
+            let all_ok = outs
+                .iter()
+                .all(|o| matches!(o, tier_store::TierStoreOutcome::Ok(_)));
+            let body = serde_json::json!({
+                "action": "ehdb.tier.append_batch",
+                "outcome": if all_ok { "ok" } else { "error" },
+                "appended": results.iter().filter(|r| r["ok"] == true).count(),
+                "requested": payloads.len(),
+                "results": results,
+            })
+            .to_string();
+            (
+                body.into_bytes(),
+                Observed {
+                    op: "append_batch",
+                    outcome: if all_ok { "ok" } else { "error" },
+                    ok: all_ok,
+                    degraded: false,
+                },
             )
         }
+        TierRequest::ReadExecution { execution_id } => render(
+            "read_execution",
+            tier_store::read_execution(cfg.as_ref(), execution_id).await,
+        ),
         TierRequest::Scan { after, limit } => {
             render("scan", tier_store::scan(cfg.as_ref(), *after, *limit).await)
         }
@@ -246,7 +352,12 @@ pub(crate) async fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Obs
         // reply, where the caller can read it.
         TierRequest::Unsupported(op) => (
             format!("unsupported {op}").into_bytes(),
-            Observed { op: "unsupported", outcome: "unsupported", ok: false, degraded: false },
+            Observed {
+                op: "unsupported",
+                outcome: "unsupported",
+                ok: false,
+                degraded: false,
+            },
         ),
     }
 }
@@ -282,7 +393,10 @@ pub(crate) async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option
 /// Shared with the client — see [`read_frame`].
 pub(crate) async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
     let len = u32::try_from(payload.len()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "response exceeds u32 length")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "response exceeds u32 length",
+        )
     })?;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(payload).await?;
@@ -461,12 +575,17 @@ mod tests {
 
         let mut c = TcpStream::connect(addr).await.unwrap();
         // Claim a frame far larger than the cap and send nothing after it.
-        c.write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes()).await.unwrap();
+        c.write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes())
+            .await
+            .unwrap();
         c.flush().await.unwrap();
         // The server must close rather than wait on (or allocate for) the body.
         let mut buf = [0u8; 1];
         let n = c.read(&mut buf).await.unwrap_or(0);
-        assert_eq!(n, 0, "server must close the connection on an over-long frame");
+        assert_eq!(
+            n, 0,
+            "server must close the connection on an over-long frame"
+        );
     }
 
     /// Serving a real frame over a real socket must move the counter AND the
@@ -499,9 +618,7 @@ mod tests {
             "health must be counted:\n{text}"
         );
         assert!(
-            text.contains(
-                "noetl_ehdb_tier_service_duration_seconds_count{operation=\"health\"} 1"
-            ),
+            text.contains("noetl_ehdb_tier_service_duration_seconds_count{operation=\"health\"} 1"),
             "health must be timed:\n{text}"
         );
         assert!(
@@ -534,7 +651,9 @@ mod tests {
         tokio::spawn(serve_tier(listener));
 
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes()).await.unwrap();
+        c.write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes())
+            .await
+            .unwrap();
         c.flush().await.unwrap();
         let mut buf = [0u8; 1];
         let _ = c.read(&mut buf).await.unwrap_or(0);
@@ -547,9 +666,7 @@ mod tests {
             "the protocol error must be counted:\n{text}"
         );
         assert!(
-            text.contains(
-                "noetl_ehdb_tier_service_duration_seconds_count{operation=\"health\"} 0"
-            ),
+            text.contains("noetl_ehdb_tier_service_duration_seconds_count{operation=\"health\"} 0"),
             "a rejected frame is not a served request:\n{text}"
         );
         metrics::reset();

@@ -163,8 +163,8 @@ async fn ehdb_tier_query_handler(
     // ai-meta#257 P0 — the event-log serve state, for the reply. Only for the
     // event-log tier: it is that tier's state, and a bare `serve_state` on a `kv`
     // body would describe the wrong thing to a reader who has no way to tell.
-    let serve_state = matches!(tier, QueryTier::Eventlog)
-        .then(crate::ehdb::eventlog::current_serve_state);
+    let serve_state =
+        matches!(tier, QueryTier::Eventlog).then(crate::ehdb::eventlog::current_serve_state);
 
     use crate::ehdb::tier_query_source::Resolution;
     match &resolution {
@@ -231,7 +231,12 @@ async fn ehdb_tier_query_handler(
                 Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
                     Ok(v) => (
                         StatusCode::OK,
-                        Json(stamp_source(v, source_label, source_addr.as_deref(), serve_state)),
+                        Json(stamp_source(
+                            v,
+                            source_label,
+                            source_addr.as_deref(),
+                            serve_state,
+                        )),
                     ),
                     // A non-JSON reply is one of the service's typed refusals
                     // (`unavailable` / `invalid` / `error`).  Surface it as-is
@@ -286,7 +291,12 @@ async fn ehdb_tier_query_handler(
     let status = StatusCode::from_u16(result.0).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
         status,
-        Json(stamp_source(result.1, source_label, source_addr.as_deref(), serve_state)),
+        Json(stamp_source(
+            result.1,
+            source_label,
+            source_addr.as_deref(),
+            serve_state,
+        )),
     )
 }
 
@@ -513,6 +523,53 @@ async fn ehdb_tier_append_handler(
             // vocabulary.  It records on every record, landed or not, so a dead
             // tier service shows as a demote rather than as a serve signal that
             // quietly stopped.
+            // noetl/ai-meta#155 Option 2 — one request, one store lock, one
+            // `fsync` for the whole batch instead of one per record. Measured:
+            // the per-record `fsync` is ~118ms at production payload size even
+            // on an empty store, and the tier appends one record per mirrored
+            // event.
+            //
+            // Off unless `NOETL_EHDB_TIER_APPEND_BATCH` is truthy — the loop
+            // below stays the default, so this is per-deployment and instantly
+            // revertible.
+            //
+            // The serve decision is NOT skipped: `serve_service_append` still
+            // runs per record against the batch's per-record results, because a
+            // batch that landed is still N records the serve policy must see.
+            // Skipping it here would recreate ai-meta#257's inert-serve-decision
+            // bug on a new path.
+            if batch_appends_enabled() && records.len() > 1 {
+                let started = std::time::Instant::now();
+                let raw = client.append_batch(&execution_id, &records).await;
+                let elapsed = started.elapsed().as_secs_f64() / records.len() as f64;
+                let mut previous_sequence = 0u64;
+                let mut serve_state = crate::ehdb::eventlog::current_serve_state();
+                let per_record = batch_results(&raw, records.len());
+                for out in &per_record {
+                    let serve = crate::ehdb::eventlog::serve_service_append(
+                        &env,
+                        out.as_deref().map_err(String::as_str),
+                        previous_sequence,
+                        elapsed,
+                    );
+                    if let Some(seq) = serve.sequence {
+                        previous_sequence = seq;
+                    }
+                    serve_state = serve.decision.outcome_label();
+                    match out {
+                        Ok(_) => appended += 1,
+                        Err(e) => failures.push(e.clone()),
+                    }
+                }
+                return append_reply(
+                    resolution.label(),
+                    appended,
+                    records.len(),
+                    failures,
+                    serve_state,
+                );
+            }
+
             let mut previous_sequence = 0u64;
             let mut serve_state = crate::ehdb::eventlog::current_serve_state();
             for payload in &records {
@@ -615,6 +672,71 @@ async fn ehdb_tier_append_handler(
 /// visible as a metric delta cannot be asserted at the endpoint level — and the
 /// P0 this closes was found by a gate reading a metric family that turned out to
 /// be absent, which reads identically to a build that does not have it.
+/// `NOETL_EHDB_TIER_APPEND_BATCH` — send a multi-record tier append as one
+/// batch (noetl/ai-meta#155 Option 2).
+///
+/// Default **false**: the per-record loop stays the shipped behaviour, so
+/// enabling and reverting are both per-deployment and immediate.
+fn batch_appends_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_EHDB_TIER_APPEND_BATCH")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Split a batch reply into one result per record, in request order.
+///
+/// A transport failure, an unparseable reply, or a reply whose `results` array
+/// does not have one entry per requested record all collapse to "every record
+/// failed, with the reason". That is the safe direction: a batch reported as
+/// partially landed when the count does not line up would let the serve
+/// decision and the caller's `appended` tally disagree with the store.
+fn batch_results(raw: &Result<String, String>, expected: usize) -> Vec<Result<String, String>> {
+    let body = match raw {
+        Ok(b) => b,
+        Err(e) => return (0..expected).map(|_| Err(e.clone())).collect(),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("tier append_batch reply is not JSON: {e}");
+            return (0..expected).map(|_| Err(msg.clone())).collect();
+        }
+    };
+    let results = parsed.get("results").and_then(|r| r.as_array());
+    match results {
+        Some(list) if list.len() == expected => list
+            .iter()
+            .map(|r| {
+                if r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+                    Ok(r.get("body").map(|b| b.to_string()).unwrap_or_default())
+                } else {
+                    Err(r
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("tier append_batch: record refused")
+                        .to_string())
+                }
+            })
+            .collect(),
+        Some(list) => {
+            let msg = format!(
+                "tier append_batch returned {} results for {expected} records",
+                list.len()
+            );
+            (0..expected).map(|_| Err(msg.clone())).collect()
+        }
+        None => {
+            let msg = "tier append_batch reply carried no results array".to_string();
+            (0..expected).map(|_| Err(msg.clone())).collect()
+        }
+    }
+}
+
 fn append_reply(
     source: &str,
     appended: usize,
@@ -740,7 +862,12 @@ mod tests {
     fn a_non_object_reply_is_labelled_rather_than_dropped() {
         // A reply that is not an object still has to carry the label, and it
         // must not lose its body doing so.
-        let v = stamp_source(serde_json::json!([1, 2, 3]), "service", Some("w:9110"), None);
+        let v = stamp_source(
+            serde_json::json!([1, 2, 3]),
+            "service",
+            Some("w:9110"),
+            None,
+        );
         assert_eq!(v["tier_query_source"], "service");
         assert_eq!(v["body"], serde_json::json!([1, 2, 3]));
     }
@@ -816,5 +943,83 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         assert_eq!(resp.text().await.unwrap(), "ok");
         server_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tier_append_batch_tests {
+    use super::{batch_appends_enabled, batch_results};
+
+    /// A batch reply must split into exactly one result per record, in order.
+    #[test]
+    fn well_formed_reply_splits_per_record() {
+        let raw = Ok(serde_json::json!({
+            "action": "ehdb.tier.append_batch",
+            "outcome": "ok",
+            "results": [
+                {"ok": true,  "body": {"global_sequence": 7}},
+                {"ok": false, "error": "refused"},
+            ],
+        })
+        .to_string());
+        let out = batch_results(&raw, 2);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_ok(), "first record landed");
+        assert_eq!(out[1].as_ref().unwrap_err(), "refused");
+    }
+
+    /// Every failure shape must collapse to "all records failed".
+    ///
+    /// This is the safe direction and it is the point of the test: a batch
+    /// reported as partially landed when the reply does not line up would let
+    /// the caller's `appended` tally and the serve decision disagree with what
+    /// the store actually holds — the ai-meta#263 shape, where a tier reported
+    /// completeness it did not have.
+    #[test]
+    fn every_malformed_reply_fails_all_records() {
+        let expected = 3;
+
+        let transport_err: Result<String, String> = Err("connect refused".to_string());
+        let out = batch_results(&transport_err, expected);
+        assert_eq!(out.len(), expected);
+        assert!(
+            out.iter().all(|r| r.is_err()),
+            "transport failure fails all"
+        );
+
+        let not_json = Ok("<html>502</html>".to_string());
+        assert!(
+            batch_results(&not_json, expected)
+                .iter()
+                .all(|r| r.is_err()),
+            "unparseable reply fails all"
+        );
+
+        let no_array = Ok(serde_json::json!({"outcome": "ok"}).to_string());
+        assert!(
+            batch_results(&no_array, expected)
+                .iter()
+                .all(|r| r.is_err()),
+            "missing results array fails all"
+        );
+
+        // The one that matters most: a reply that looks fine but is SHORT.
+        let short = Ok(serde_json::json!({
+            "results": [{"ok": true, "body": {}}, {"ok": true, "body": {}}]
+        })
+        .to_string());
+        let out = batch_results(&short, expected);
+        assert_eq!(out.len(), expected, "count must match what was requested");
+        assert!(
+            out.iter().all(|r| r.is_err()),
+            "a short results array must not be read as a partial success"
+        );
+    }
+
+    /// Default off — the per-record loop stays the shipped behaviour.
+    #[test]
+    fn batch_is_opt_in() {
+        std::env::remove_var("NOETL_EHDB_TIER_APPEND_BATCH");
+        assert!(!batch_appends_enabled(), "must default to the loop");
     }
 }
