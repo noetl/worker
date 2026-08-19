@@ -819,6 +819,35 @@ pub fn render_lines() -> Vec<String> {
         "EHDB vector shadow operations by operation and outcome",
     );
 
+    // Tier-append store path (noetl/ai-meta#155). OUTSIDE the
+    // `tier_service_up` gate on purpose: that flag means "this process HOSTS a
+    // tier-service store", while these count what the tier-append **handler**
+    // did — and the handler runs on any worker exposing the tier surface,
+    // including ones that forward to a writer elsewhere. Rendering them inside
+    // the gate made them invisible on exactly the workers that serve the
+    // mirror, which is where the number is read.
+    //
+    // Found by checking a kind worker's /metrics and seeing nothing, after the
+    // doc comment on the fields already claimed they rendered unconditionally.
+    // The comment was right and the code was not.
+    //
+    // Both paths always render, including the zero: a `batch` line absent until
+    // the flag is on is indistinguishable from a binary too old to have the
+    // path, which is precisely the question being asked.
+    lines.push(
+        "# HELP noetl_ehdb_tier_append_records_total Records appended by the tier-append handler, by store path (noetl/ai-meta#155)"
+            .to_string(),
+    );
+    lines.push("# TYPE noetl_ehdb_tier_append_records_total counter".to_string());
+    lines.push(format!(
+        "noetl_ehdb_tier_append_records_total{{path=\"batch\"}} {}",
+        s.tier_append_records_batched
+    ));
+    lines.push(format!(
+        "noetl_ehdb_tier_append_records_total{{path=\"single\"}} {}",
+        s.tier_append_records_single
+    ));
+
     // Tier-service latency + store state (ai-meta#260). Rendered only when the
     // listener exists in this process — see `pin_tier_service_series` for why
     // that is the right condition and why it is not a feature flag.
@@ -865,25 +894,6 @@ pub fn render_lines() -> Vec<String> {
         lines.push(format!(
             "noetl_ehdb_tier_service_store_appends_total {}",
             s.tier_service_appends
-        ));
-        // Pinned: BOTH paths render unconditionally, including the zero.
-        // `Registry::gather`-style pruning is not the issue here (this renderer
-        // is hand-rolled), but the same reasoning applies — a `batch` line that
-        // is absent until the flag is on is indistinguishable from a binary too
-        // old to have the path at all, which is exactly the question an
-        // operator asks when checking whether ehdb#317 is doing anything.
-        lines.push(
-            "# HELP noetl_ehdb_tier_append_records_total Records appended by the tier-append handler, by store path (noetl/ai-meta#155)"
-                .to_string(),
-        );
-        lines.push("# TYPE noetl_ehdb_tier_append_records_total counter".to_string());
-        lines.push(format!(
-            "noetl_ehdb_tier_append_records_total{{path=\"batch\"}} {}",
-            s.tier_append_records_batched
-        ));
-        lines.push(format!(
-            "noetl_ehdb_tier_append_records_total{{path=\"single\"}} {}",
-            s.tier_append_records_single
         ));
         lines.push(
             "# HELP noetl_ehdb_tier_service_store_sequence Highest global sequence the tier-service store holds"
@@ -1030,6 +1040,62 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both tier-append paths must render on a worker that hosts **no** tier
+    /// service — because that is the worker whose number anyone reads.
+    ///
+    /// This test exists because the first version of the metric failed exactly
+    /// here. It was placed inside the `if s.tier_service_up` block, which means
+    /// "this process hosts a tier-service store" — while the counters describe
+    /// what the tier-append *handler* did, and that handler runs on workers
+    /// that forward to a writer elsewhere. The fields' own doc comment already
+    /// claimed the series rendered unconditionally; the comment was right and
+    /// the code was not, and nothing said so until a kind worker's `/metrics`
+    /// came back without them.
+    ///
+    /// The `single` assertion is the one with teeth: on a healthy prod worker
+    /// with the batch flag off, `single` is the only line that moves, and a
+    /// gate would have hidden it there too.
+    #[test]
+    fn tier_append_paths_render_without_a_tier_service() {
+        let _g = test_guard();
+        reset();
+        // Deliberately do NOT touch the tier-service state, so `tier_service_up`
+        // stays false — the configuration this metric was invisible on.
+        record_tier_append_path(true, 7);
+        record_tier_append_path(false, 3);
+        let text = render_lines().join("\n");
+        assert!(
+            text.contains("noetl_ehdb_tier_append_records_total{path=\"batch\"} 7"),
+            "batch path must render with no tier service in this process:\n{text}"
+        );
+        assert!(
+            text.contains("noetl_ehdb_tier_append_records_total{path=\"single\"} 3"),
+            "single path must render with no tier service in this process:\n{text}"
+        );
+        // Positive control for the gate itself: the store gauges MUST still be
+        // absent here, or this test would pass against a build that simply
+        // rendered everything and proved nothing about the placement.
+        assert!(
+            !text.contains("noetl_ehdb_tier_service_store_appends_total"),
+            "the tier-service store gauges must stay gated; if they render here \
+             this test no longer distinguishes anything:\n{text}"
+        );
+    }
+
+    /// Both series exist at zero before anything appends.
+    ///
+    /// Absent and zero are different answers: absent means "this binary may not
+    /// have the path at all", which is the question an operator asks when
+    /// checking whether ehdb#317 is doing anything.
+    #[test]
+    fn tier_append_paths_are_pinned_at_zero() {
+        let _g = test_guard();
+        reset();
+        let text = render_lines().join("\n");
+        assert!(text.contains("noetl_ehdb_tier_append_records_total{path=\"batch\"} 0"), "{text}");
+        assert!(text.contains("noetl_ehdb_tier_append_records_total{path=\"single\"} 0"), "{text}");
+    }
 
     /// The tests below drive the same process-global accumulator: they
     /// `reset()` it, record into it, then assert on `render_lines()`.  Cargo
