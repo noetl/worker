@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.119.2](https://github.com/noetl/worker/compare/v5.119.1...v5.119.2) (2026-08-19)
+
+### Performance Improvements
+
+* **tier:** batch tier appends behind a flag — one fsync per batch ([#155](https://github.com/noetl/worker/issues/155)) ([072a1fc](https://github.com/noetl/worker/commit/072a1fc9226482f4ab9da6bed19d28910493aede)), closes [noetl/ehdb#317](https://github.com/noetl/ehdb/issues/317) [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [ai-meta#263](https://github.com/noetl/ai-meta/issues/263)
+
 ## [5.119.1](https://github.com/noetl/worker/compare/v5.119.0...v5.119.1) (2026-08-18)
 
 ### Performance Improvements
