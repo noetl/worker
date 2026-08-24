@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.121.0](https://github.com/noetl/worker/compare/v5.120.0...v5.121.0) (2026-08-24)
+
+### Features
+
+* **ehdb:** the projection tier gets a store, a serve decision and its own mirror flag ([8375830](https://github.com/noetl/worker/commit/8375830a8bfcff44bb509c425327f123b2f0ccda)), closes [ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [#257](https://github.com/noetl/worker/issues/257) [#258](https://github.com/noetl/worker/issues/258) [#257](https://github.com/noetl/worker/issues/257) [pre-#265](https://github.com/noetl/pre-/issues/265) [#257](https://github.com/noetl/worker/issues/257) [#259](https://github.com/noetl/worker/issues/259) [server#315](https://github.com/noetl/server/issues/315) [#259](https://github.com/noetl/worker/issues/259) [ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [#257](https://github.com/noetl/worker/issues/257) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+
 ## [5.120.0](https://github.com/noetl/worker/compare/v5.119.2...v5.120.0) (2026-08-19)
 
 ### Features
