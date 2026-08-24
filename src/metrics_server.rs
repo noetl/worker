@@ -84,6 +84,7 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
             // Those are the workers whose ratio anyone reads, and the first
             // version of this metric was invisible on exactly them.
             crate::ehdb::metrics::pin_tier_append_series();
+            crate::ehdb::metrics::pin_projection_serve_series();
         }
     }
 
@@ -146,13 +147,24 @@ async fn ehdb_tier_query_handler(
     Path(tier): Path<String>,
     Query(raw): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // #265 — the projection tier is served by the writer-fronted tier service,
+    // not by a pod-local shadow driver, so it is handled before `QueryTier` and
+    // deliberately NOT added to that enum. `QueryTier` is the shadow-driver read
+    // surface; adding a variant there would promise a local read path that does
+    // not exist, and a promise a route cannot keep is how a caller ends up
+    // scoring an error body as data.
+    if crate::ehdb::store_tier::StoreTier::parse(&tier)
+        == Some(crate::ehdb::store_tier::StoreTier::Projection)
+    {
+        return ehdb_projection_tier_query(&raw).await;
+    }
     let Some(tier) = QueryTier::parse(&tier) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "action": "ehdb.tier.query",
                 "error": "unknown tier",
-                "known_tiers": ["eventlog", "kv", "object", "vector"],
+                "known_tiers": ["eventlog", "projection", "kv", "object", "vector"],
             })),
         );
     };
@@ -370,6 +382,120 @@ fn stamp_source(
     v
 }
 
+/// The serve state of `tier`, as the label its own metric carries (#265).
+///
+/// Dispatched rather than shared: each tier keeps its own transition atomic, so
+/// a demote on one cannot be reported as the other's state.
+fn current_serve_state_for(tier: crate::ehdb::store_tier::StoreTier) -> &'static str {
+    match tier {
+        crate::ehdb::store_tier::StoreTier::Eventlog => {
+            crate::ehdb::eventlog::current_serve_state()
+        }
+        crate::ehdb::store_tier::StoreTier::Projection => {
+            crate::ehdb::projection::current_serve_state()
+        }
+    }
+}
+
+/// `GET /ehdb/tiers/projection` — read the projection tier through the
+/// writer-fronted tier service (#265).
+///
+/// Service-resolved **only**, for the same reason the append is: a pod-local
+/// projection store would be one replica's fragment, and answering a comparator
+/// from a fragment produces a confident divergence report about the wrong store.
+/// `local` is refused with a reason rather than silently answered.
+async fn ehdb_projection_tier_query(
+    raw: &HashMap<String, String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::ehdb::store_tier::StoreTier;
+    use crate::ehdb::tier_query_source::Resolution;
+
+    let params = QueryParams::from_pairs(raw.iter());
+    let env = crate::ehdb::process_env();
+    let resolution = crate::ehdb::tier_query_source::resolve(&env);
+    let source_label = resolution.label();
+    let source_addr = resolution.addr().map(str::to_string);
+    crate::ehdb::metrics::record_tier_query_source("read", source_label);
+    let serve_state = Some(crate::ehdb::projection::current_serve_state());
+
+    let refuse = |reason: String| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(stamp_source(
+                serde_json::json!({
+                    "action": "ehdb.tier.query",
+                    "tier": "projection",
+                    "outcome": "unavailable",
+                    "error": reason,
+                }),
+                source_label,
+                source_addr.as_deref(),
+                serve_state,
+            )),
+        )
+    };
+
+    let client = match &resolution {
+        Resolution::Service(c) => c,
+        Resolution::Misconfigured(reason) => {
+            tracing::error!(%reason, "EHDB projection tier query: refusing to answer");
+            return refuse(reason.clone());
+        }
+        Resolution::Local | Resolution::DowngradedToLocal => {
+            return refuse(
+                "the projection tier is served only by the writer-fronted tier service; \
+                 set NOETL_EHDB_TIER_QUERY_SOURCE=service and NOETL_EHDB_TIER_SERVICE_ADDR"
+                    .to_string(),
+            );
+        }
+    };
+
+    // `execution`, NOT `execution_id` — the latter is a tracing correlation id
+    // in QueryParams, and reading by it would silently query the wrong key.
+    let reply = match params.execution.as_deref() {
+        Some(eid) => client.read_execution_tier(StoreTier::Projection, eid).await,
+        None => client.scan_tier(StoreTier::Projection, None, 100).await,
+    };
+    match reply {
+        Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => (
+                StatusCode::OK,
+                Json(stamp_source(v, source_label, source_addr.as_deref(), serve_state)),
+            ),
+            // A non-JSON reply is one of the service's typed refusals. Surface it
+            // as-is rather than as an empty 200, which would read as "no data".
+            Err(_) => (
+                StatusCode::BAD_GATEWAY,
+                Json(stamp_source(
+                    serde_json::json!({
+                        "action": "ehdb.tier.query",
+                        "tier": "projection",
+                        "outcome": "unavailable",
+                        "error": body,
+                    }),
+                    source_label,
+                    source_addr.as_deref(),
+                    serve_state,
+                )),
+            ),
+        },
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(stamp_source(
+                serde_json::json!({
+                    "action": "ehdb.tier.query",
+                    "tier": "projection",
+                    "outcome": "unavailable",
+                    "error": e,
+                }),
+                source_label,
+                source_addr.as_deref(),
+                serve_state,
+            )),
+        ),
+    }
+}
+
 /// `POST /ehdb/tiers/{tier}` — append records the **server** authored.
 ///
 /// The write half of the closure in noetl/ai-meta#258. The event-log tier could
@@ -397,22 +523,26 @@ async fn ehdb_tier_append_handler(
     Path(tier): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Only the event log. The other four tiers hold derived data with no
-    // authoritative counterpart for a server to author, so accepting an append
-    // for them would invent records rather than mirror any.
-    if tier != "eventlog" {
+    // The tiers with a durable store behind the tier service (#265): the event
+    // log, mirroring `noetl.event`, and the projection tier, mirroring
+    // `noetl.projection_snapshot`. `kv` / `object` / `vector` hold derived data
+    // with no authoritative counterpart for a server to author, so accepting an
+    // append for them would invent records rather than mirror any.
+    let Some(store_tier) = crate::ehdb::store_tier::StoreTier::parse(&tier) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "action": "ehdb.tier.append",
-                "error": "append is supported for the eventlog tier only",
+                "error": "append is supported for the eventlog and projection tiers only",
                 "tier": tier,
             })),
         );
-    }
+    };
 
     let env = crate::ehdb::process_env();
-    let source = crate::ehdb::mirror_source::MirrorSource::from_env(&env);
+    // Per-tier, so arming the projection mirror is not a change to the event
+    // log's configuration — prod sets the event log's TODAY.
+    let source = crate::ehdb::mirror_source::MirrorSource::for_tier(&env, store_tier);
     if source != crate::ehdb::mirror_source::MirrorSource::Server {
         // 501, not 403: the surface exists and the caller is entitled to it —
         // this deployment simply has not been asked to mirror server-side. The
@@ -423,10 +553,12 @@ async fn ehdb_tier_append_handler(
             Json(serde_json::json!({
                 "action": "ehdb.tier.append",
                 "outcome": "unconfigured",
+                "tier": store_tier.as_str(),
                 "error": format!(
-                    "{}={} — this worker is not configured to accept server-authored appends",
-                    crate::ehdb::mirror_source::MIRROR_SOURCE_ENV,
-                    source.as_str()
+                    "{}={} — this worker is not configured to accept server-authored {} appends",
+                    crate::ehdb::mirror_source::MirrorSource::env_key_for(store_tier),
+                    source.as_str(),
+                    store_tier.as_str()
                 ),
             })),
         );
@@ -532,6 +664,13 @@ async fn ehdb_tier_append_handler(
             // vocabulary.  It records on every record, landed or not, so a dead
             // tier service shows as a demote rather than as a serve signal that
             // quietly stopped.
+            //
+            // #265 — the same shape for the projection tier. The dispatch is on
+            // the tier rather than a shared function because the two tiers keep
+            // their OWN mode flag, their OWN outcome vocabulary and their OWN
+            // transition log: a shared serve state would let a projection demote
+            // silence an event-log promote, on the tier that is primary in prod.
+            //
             // noetl/ai-meta#155 Option 2 — one request, one store lock, one
             // `fsync` for the whole batch instead of one per record. Measured:
             // the per-record `fsync` is ~118ms at production payload size even
@@ -542,30 +681,47 @@ async fn ehdb_tier_append_handler(
             // below stays the default, so this is per-deployment and instantly
             // revertible.
             //
-            // The serve decision is NOT skipped: `serve_service_append` still
-            // runs per record against the batch's per-record results, because a
-            // batch that landed is still N records the serve policy must see.
-            // Skipping it here would recreate ai-meta#257's inert-serve-decision
-            // bug on a new path.
+            // The serve decision is NOT skipped: the same per-tier decision runs
+            // per record against the batch's per-record results, because a batch
+            // that landed is still N records the serve policy must see. Skipping
+            // it here would recreate ai-meta#257's inert-serve-decision bug on a
+            // new path — and #265 would inherit it for the projection tier.
             if batch_appends_enabled() && records.len() > 1 {
                 crate::ehdb::metrics::record_tier_append_path(true, records.len());
                 let started = std::time::Instant::now();
-                let raw = client.append_batch(&execution_id, &records).await;
+                let raw = client
+                    .append_batch_tier(store_tier, &execution_id, &records)
+                    .await;
                 let elapsed = started.elapsed().as_secs_f64() / records.len() as f64;
                 let mut previous_sequence = 0u64;
-                let mut serve_state = crate::ehdb::eventlog::current_serve_state();
+                let mut serve_state = current_serve_state_for(store_tier);
                 let per_record = batch_results(&raw, records.len());
                 for out in &per_record {
-                    let serve = crate::ehdb::eventlog::serve_service_append(
-                        &env,
-                        out.as_deref().map_err(String::as_str),
-                        previous_sequence,
-                        elapsed,
-                    );
-                    if let Some(seq) = serve.sequence {
-                        previous_sequence = seq;
+                    let reply = out.as_deref().map_err(String::as_str);
+                    let (seq, label) = match store_tier {
+                        crate::ehdb::store_tier::StoreTier::Eventlog => {
+                            let serve = crate::ehdb::eventlog::serve_service_append(
+                                &env,
+                                reply,
+                                previous_sequence,
+                                elapsed,
+                            );
+                            (serve.sequence, serve.decision.outcome_label())
+                        }
+                        crate::ehdb::store_tier::StoreTier::Projection => {
+                            let serve = crate::ehdb::projection::serve_service_append(
+                                &env,
+                                reply,
+                                previous_sequence,
+                                elapsed,
+                            );
+                            (serve.sequence, serve.decision.outcome_label())
+                        }
+                    };
+                    if let Some(s) = seq {
+                        previous_sequence = s;
                     }
-                    serve_state = serve.decision.outcome_label();
+                    serve_state = label;
                     match out {
                         Ok(_) => appended += 1,
                         Err(e) => failures.push(e.clone()),
@@ -582,20 +738,36 @@ async fn ehdb_tier_append_handler(
 
             crate::ehdb::metrics::record_tier_append_path(false, records.len());
             let mut previous_sequence = 0u64;
-            let mut serve_state = crate::ehdb::eventlog::current_serve_state();
+            let mut serve_state = current_serve_state_for(store_tier);
             for payload in &records {
                 let started = std::time::Instant::now();
-                let out = client.append(&execution_id, payload).await;
-                let serve = crate::ehdb::eventlog::serve_service_append(
-                    &env,
-                    out.as_deref().map_err(String::as_str),
-                    previous_sequence,
-                    started.elapsed().as_secs_f64(),
-                );
-                if let Some(seq) = serve.sequence {
-                    previous_sequence = seq;
+                let out = client.append_tier(store_tier, &execution_id, payload).await;
+                let elapsed = started.elapsed().as_secs_f64();
+                let reply = out.as_deref().map_err(String::as_str);
+                let (seq, label) = match store_tier {
+                    crate::ehdb::store_tier::StoreTier::Eventlog => {
+                        let serve = crate::ehdb::eventlog::serve_service_append(
+                            &env,
+                            reply,
+                            previous_sequence,
+                            elapsed,
+                        );
+                        (serve.sequence, serve.decision.outcome_label())
+                    }
+                    crate::ehdb::store_tier::StoreTier::Projection => {
+                        let serve = crate::ehdb::projection::serve_service_append(
+                            &env,
+                            reply,
+                            previous_sequence,
+                            elapsed,
+                        );
+                        (serve.sequence, serve.decision.outcome_label())
+                    }
+                };
+                if let Some(s) = seq {
+                    previous_sequence = s;
                 }
-                serve_state = serve.decision.outcome_label();
+                serve_state = label;
                 match out {
                     Ok(_) => appended += 1,
                     Err(e) => failures.push(e),
@@ -610,6 +782,38 @@ async fn ehdb_tier_append_handler(
             );
         }
         Resolution::Local => {}
+    }
+
+    // #265 — the projection tier has NO pod-local write path, and that is a
+    // decision rather than an omission.
+    //
+    // The event log has one because it predates the tier service: a pod-local
+    // mirror already existed and had to keep working. The projection tier has no
+    // such history, so giving it one would be building the exact defect #257
+    // §1.3 exists to describe — N disjoint pod-local fragments, each of which a
+    // `primary` flip would promote while the incumbent holds everything. The
+    // comparator would then read one replica's fragment and report the other
+    // replicas' snapshots missing: a true statement about the wrong store.
+    //
+    // Refused with 503 and a reason, never written somewhere else.
+    if store_tier == crate::ehdb::store_tier::StoreTier::Projection {
+        tracing::error!(
+            tier_query_source = resolution.label(),
+            "EHDB projection tier append: refusing a pod-local write — the projection tier is \
+             served only by the writer-fronted tier service (set \
+             NOETL_EHDB_TIER_QUERY_SOURCE=service and NOETL_EHDB_TIER_SERVICE_ADDR)"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "action": "ehdb.tier.append",
+                "outcome": "unavailable",
+                "tier": store_tier.as_str(),
+                "tier_query_source": resolution.label(),
+                "error": "the projection tier has no pod-local store; it requires \
+                          NOETL_EHDB_TIER_QUERY_SOURCE=service",
+            })),
+        );
     }
 
     // Pod-local store. `mirror_event` is the same append the worker's own mirror
@@ -979,16 +1183,59 @@ mod tier_append_batch_tests {
         let src = &whole[..whole
             .find("mod tier_append_batch_tests {")
             .expect("the test module must still be the tail of this file")];
-        let batch_calls = src.matches("client.append_batch(&execution_id").count();
-        let single_calls = src.matches("client.append(&execution_id").count();
-        let recorded = src.matches("record_tier_append_path(").count();
+        // Counted by PREFIX, not by full name. The first version of this guard
+        // matched `client.append_batch(&execution_id` and `client.append(&execution_id`
+        // literally, and noetl/ai-meta#265 then renamed both call sites to their
+        // tier-addressed forms — which a name-listing guard reports as "zero
+        // store calls, zero recorded", i.e. as agreement. A prefix count cannot
+        // be satisfied by renaming, and it still catches the case the guard is
+        // for: a third append path added later with no counter.
+        // Two normalisations before counting, each for a zero this guard already
+        // produced:
+        //
+        // 1. Strip `//` comments. A comment naming a call site counts as one
+        //    (noetl/ai-meta#263 counted its own doc comment) — and worse, the
+        //    count could be SATISFIED by deleting a comment while adding a real
+        //    uncounted path.
+        // 2. Strip whitespace. rustfmt is free to break
+        //    `client\n    .append_batch_tier(...)` across lines, and a literal
+        //    count then reads 0 — the same silent zero, arrived at through
+        //    formatting instead of renaming.
+        let code: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let store_calls = flat.matches("client.append").count();
+        let batch_calls = flat.matches("client.append_batch_tier(").count();
+        let single_calls = flat.matches("client.append_tier(").count();
+        let recorded = flat.matches("record_tier_append_path(").count();
+        // Positive control for the strippers: if either ate real code, the
+        // handler's own route literal would vanish too and every count above
+        // would be a meaningless zero that still compared equal.
+        assert!(
+            flat.contains("\"/ehdb/tiers/{tier}\""),
+            "the comment/whitespace strippers ate real code; every count below is \
+             meaningless and would still compare equal"
+        );
         assert_eq!(
-            batch_calls + single_calls,
+            store_calls,
             recorded,
-            "the tier-append handler has {batch_calls} batch + {single_calls} single store \
-             call(s) but {recorded} record_tier_append_path call(s). An uncounted path makes \
+            "the tier-append handler makes {store_calls} store call(s) but has \
+             {recorded} record_tier_append_path call(s). An uncounted path makes \
              the batch substrate unfalsifiable from /metrics, which is the state \
              noetl/ai-meta#155 found it in."
+        );
+        assert_eq!(
+            batch_calls + single_calls,
+            store_calls,
+            "{store_calls} store call(s) but only {batch_calls} batch + {single_calls} \
+             single recognised — a path this guard does not know about was added; \
+             name it here rather than letting the prefix count absorb it"
         );
         assert!(
             batch_calls >= 1 && single_calls >= 1,

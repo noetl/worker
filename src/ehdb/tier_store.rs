@@ -8,14 +8,26 @@
 //! the writer owns, so a remote caller's append is durable and a remote read
 //! returns it.
 //!
-//! # Scope, deliberately narrow
+//! # Scope
 //!
-//! **Event-log tier only**, and only `append` / `read_execution` / `scan`. KV,
-//! object, projection and vector reuse this shape in a later PR. The RFC puts
-//! `ack` here too; it is held back because `ack` drives segment GC — deleting
-//! data on a remote caller's say-so deserves its own PR and its own gate, and
-//! bundling it here would put "returns the right bytes" and "removes bytes" in
-//! one review.
+//! `append` / `read_execution` / `scan`, over the tiers in
+//! [`StoreTier`][super::store_tier::StoreTier] — **event-log and projection**
+//! ([ai-meta#265](https://github.com/noetl/ai-meta/issues/265) A1). KV, object
+//! and vector still have no store here; they gain one in the same change set
+//! that gives them a `StoreTier` variant, not before.
+//!
+//! Each tier is a **separate store file** under the same directory, with its
+//! own lock. That is the whole of the genericisation and it is deliberately
+//! that small: one engine, one serialised-append critical section, N files. A
+//! shared file with a tier discriminator inside each record would put the
+//! projection tier's write volume — roughly one append per orchestrator trigger
+//! — behind the event log's lock, on the process that is already serving the
+//! event-log tier primary in production.
+//!
+//! The RFC puts `ack` here too; it is held back because `ack` drives segment GC
+//! — deleting data on a remote caller's say-so deserves its own PR and its own
+//! gate, and bundling it here would put "returns the right bytes" and "removes
+//! bytes" in one review.
 //!
 //! # Store location
 //!
@@ -39,6 +51,8 @@ use ehdb_reference::{
     DEFAULT_LOCAL_REFERENCE_TENANT,
 };
 use tokio::sync::RwLock;
+
+use super::store_tier::StoreTier;
 
 /// Directory the tier service stores into. Unset ⇒ no store.
 pub const TIER_SERVICE_DIR_ENV: &str = "NOETL_EHDB_TIER_SERVICE_DIR";
@@ -71,9 +85,17 @@ impl TierStoreConfig {
         })
     }
 
-    /// Path of the event-log JSONL this store appends to.
+    /// Path of the JSONL this store appends `tier`'s records to.
+    ///
+    /// The filename comes from [`StoreTier::file_name`], never from the caller,
+    /// so a wire value cannot traverse out of the writer's directory.
+    pub fn path_for(&self, tier: StoreTier) -> PathBuf {
+        self.dir.join(tier.file_name())
+    }
+
+    /// Back-compat alias for the event-log store path.
     pub fn eventlog_path(&self) -> PathBuf {
-        self.dir.join("eventlog.jsonl")
+        self.path_for(StoreTier::Eventlog)
     }
 }
 
@@ -134,21 +156,33 @@ pub enum TierStoreOutcome {
 ///
 /// Keyed by store path so two distinct stores never block each other — which is
 /// also what keeps the tests below independent.
-fn store_lock(cfg: &TierStoreConfig) -> Arc<RwLock<()>> {
+///
+/// Since #265 the key is the **per-tier** path, so the projection tier's appends
+/// and the event log's do not serialise against each other. They are different
+/// files; sharing a lock would be pure contention with no invariant behind it.
+fn store_lock(cfg: &TierStoreConfig, tier: StoreTier) -> Arc<RwLock<()>> {
     static LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<RwLock<()>>>>> = OnceLock::new();
     let registry = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     // Poison-tolerant: the registry guards a map, not an invariant, and a
     // panic while holding it must not take down the writer.
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard
-        .entry(cfg.eventlog_path())
+        .entry(cfg.path_for(tier))
         .or_insert_with(|| Arc::new(RwLock::new(())))
         .clone()
 }
 
-fn driver(cfg: &TierStoreConfig) -> LocalReferenceEventLogDriver {
+/// One engine for every tier.
+///
+/// `LocalReferenceEventLogDriver` is an append-only sequenced record store; the
+/// "event log" in its name is where it was first used, not a constraint on what
+/// it can hold. Reusing it for the projection tier means the concurrency fix
+/// that #257's soak paid for — the serialised replay → sequence → write window
+/// — protects the new tier from its first append rather than being reproduced
+/// for it.
+fn driver(cfg: &TierStoreConfig, tier: StoreTier) -> LocalReferenceEventLogDriver {
     LocalReferenceEventLogDriver::new(
-        cfg.eventlog_path(),
+        cfg.path_for(tier),
         DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
         DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
     )
@@ -165,6 +199,7 @@ fn ensure_dir(cfg: &TierStoreConfig) -> Result<(), String> {
 /// indistinguishable from a read miss later.
 pub async fn append(
     cfg: Option<&TierStoreConfig>,
+    tier: StoreTier,
     execution_id: &str,
     payload: &str,
 ) -> TierStoreOutcome {
@@ -179,9 +214,9 @@ pub async fn append(
     if payload.is_empty() {
         return TierStoreOutcome::Invalid("payload is empty".to_string());
     }
-    let lock = store_lock(cfg);
+    let lock = store_lock(cfg, tier);
     let _exclusive = lock.write().await;
-    append_locked(cfg, execution_id, payload)
+    append_locked(cfg, tier, execution_id, payload)
 }
 
 /// Append N records under ONE store-write lock and ONE `fsync`
@@ -200,6 +235,7 @@ pub async fn append(
 /// per-record results exactly as it did when it looped.
 pub async fn append_batch(
     cfg: Option<&TierStoreConfig>,
+    tier: StoreTier,
     execution_id: &str,
     payloads: &[String],
 ) -> Vec<TierStoreOutcome> {
@@ -228,13 +264,14 @@ pub async fn append_batch(
             .collect();
     }
 
-    let lock = store_lock(cfg);
+    let lock = store_lock(cfg, tier);
     let _exclusive = lock.write().await;
-    append_batch_locked(cfg, execution_id, payloads)
+    append_batch_locked(cfg, tier, execution_id, payloads)
 }
 
 fn append_batch_locked(
     cfg: &TierStoreConfig,
+    tier: StoreTier,
     execution_id: &str,
     payloads: &[String],
 ) -> Vec<TierStoreOutcome> {
@@ -253,13 +290,17 @@ fn append_batch_locked(
         })
         .collect();
 
-    match driver(cfg).append_batch(&requests) {
+    match driver(cfg, tier).append_batch(&requests) {
         Ok(outs) => {
             // Record store state once for the batch — the same signal the
             // single path records per append (ai-meta#260), and the last
             // record's sequence is the store's sequence after the batch.
             if let Some(last) = outs.last() {
-                super::metrics::record_tier_service_append(last.global_sequence, store_bytes(cfg));
+                super::metrics::record_tier_service_append(
+                    tier,
+                    last.global_sequence,
+                    store_bytes(cfg, tier),
+                );
             }
             outs.into_iter()
                 .map(|out| {
@@ -285,7 +326,12 @@ fn append_batch_locked(
 
 /// The append itself. Callers reach it only through [`append`], which holds the
 /// store's write lock for the whole replay → sequence → write → flush window.
-fn append_locked(cfg: &TierStoreConfig, execution_id: &str, payload: &str) -> TierStoreOutcome {
+fn append_locked(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    execution_id: &str,
+    payload: &str,
+) -> TierStoreOutcome {
     if execution_id.trim().is_empty() {
         return TierStoreOutcome::Invalid("execution_id is empty".to_string());
     }
@@ -300,14 +346,18 @@ fn append_locked(cfg: &TierStoreConfig, execution_id: &str, payload: &str) -> Ti
         transaction_id: super::eventlog::new_transaction_id(),
         payload: payload.to_string(),
     };
-    match driver(cfg).append(&request) {
+    match driver(cfg, tier).append(&request) {
         Ok(out) => {
             // The store's own state, recorded on the write path (ai-meta#260).
             // Observing it here rather than on a read is what makes the tier
             // checkable without generating traffic against it — the question
             // before a `primary` flip is "does this store hold anything", and
             // answering it by reading would change what is being measured.
-            super::metrics::record_tier_service_append(out.global_sequence, store_bytes(cfg));
+            super::metrics::record_tier_service_append(
+                tier,
+                out.global_sequence,
+                store_bytes(cfg, tier),
+            );
             // `log_record_count` is what makes the append VERIFIABLE by the
             // caller.  The remote appender cannot open this store, so without the
             // count in the reply the only parity check available to it is
@@ -336,8 +386,8 @@ fn append_locked(cfg: &TierStoreConfig, execution_id: &str, payload: &str) -> Ti
 /// reported alongside `store_appends_total` and `store_sequence`, so a stat that
 /// fails shows as "0 bytes holding N records", which is visibly wrong rather
 /// than quietly plausible.
-pub(crate) fn store_bytes(cfg: &TierStoreConfig) -> u64 {
-    std::fs::metadata(cfg.eventlog_path())
+pub(crate) fn store_bytes(cfg: &TierStoreConfig, tier: StoreTier) -> u64 {
+    std::fs::metadata(cfg.path_for(tier))
         .map(|m| m.len())
         .unwrap_or(0)
 }
@@ -347,8 +397,8 @@ pub(crate) fn store_bytes(cfg: &TierStoreConfig) -> u64 {
 /// Without this, a writer that restarts in front of a populated store reports
 /// `sequence 0` until the next append — which reads exactly like an empty store,
 /// on the component being promoted to authoritative.
-pub(crate) fn startup_sequence(cfg: &TierStoreConfig) -> u64 {
-    match driver(cfg).scan_global(&EventLogScanRequest {
+pub(crate) fn startup_sequence(cfg: &TierStoreConfig, tier: StoreTier) -> u64 {
+    match driver(cfg, tier).scan_global(&EventLogScanRequest {
         after: None,
         limit: MAX_SCAN_LIMIT,
     }) {
@@ -363,25 +413,33 @@ pub(crate) fn startup_sequence(cfg: &TierStoreConfig) -> u64 {
 }
 
 /// Read every record for one execution.
-pub async fn read_execution(cfg: Option<&TierStoreConfig>, execution_id: &str) -> TierStoreOutcome {
+pub async fn read_execution(
+    cfg: Option<&TierStoreConfig>,
+    tier: StoreTier,
+    execution_id: &str,
+) -> TierStoreOutcome {
     let Some(cfg) = cfg else {
         return TierStoreOutcome::Unavailable;
     };
     if execution_id.trim().is_empty() {
         return TierStoreOutcome::Invalid("execution_id is empty".to_string());
     }
-    let lock = store_lock(cfg);
+    let lock = store_lock(cfg, tier);
     let _shared = lock.read().await;
-    read_execution_locked(cfg, execution_id)
+    read_execution_locked(cfg, tier, execution_id)
 }
 
-fn read_execution_locked(cfg: &TierStoreConfig, execution_id: &str) -> TierStoreOutcome {
+fn read_execution_locked(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    execution_id: &str,
+) -> TierStoreOutcome {
     let request = EventLogReadExecutionRequest {
         execution_id: execution_id.to_string(),
         after: None,
         limit: MAX_SCAN_LIMIT,
     };
-    match driver(cfg).read_execution(&request) {
+    match driver(cfg, tier).read_execution(&request) {
         Ok(out) => {
             let mut v = serde_json::to_value(&out).unwrap_or(serde_json::Value::Null);
             // ⚠ The driver reports `exists: true` for an execution it holds NO
@@ -406,23 +464,29 @@ fn read_execution_locked(cfg: &TierStoreConfig, execution_id: &str) -> TierStore
 /// Bounded global scan. `limit` is clamped to [`MAX_SCAN_LIMIT`].
 pub async fn scan(
     cfg: Option<&TierStoreConfig>,
+    tier: StoreTier,
     after: Option<u64>,
     limit: usize,
 ) -> TierStoreOutcome {
     let Some(cfg) = cfg else {
         return TierStoreOutcome::Unavailable;
     };
-    let lock = store_lock(cfg);
+    let lock = store_lock(cfg, tier);
     let _shared = lock.read().await;
-    scan_locked(cfg, after, limit)
+    scan_locked(cfg, tier, after, limit)
 }
 
-fn scan_locked(cfg: &TierStoreConfig, after: Option<u64>, limit: usize) -> TierStoreOutcome {
+fn scan_locked(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    after: Option<u64>,
+    limit: usize,
+) -> TierStoreOutcome {
     let limit = limit.clamp(1, MAX_SCAN_LIMIT);
-    match driver(cfg).scan_global(&EventLogScanRequest { after, limit }) {
-        Ok(out) => {
-            TierStoreOutcome::Ok(serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()))
-        }
+    match driver(cfg, tier).scan_global(&EventLogScanRequest { after, limit }) {
+        Ok(out) => TierStoreOutcome::Ok(
+            serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()),
+        ),
         Err(e) => TierStoreOutcome::Error(e.to_string()),
     }
 }
@@ -430,6 +494,12 @@ fn scan_locked(cfg: &TierStoreConfig, after: Option<u64>, limit: usize) -> TierS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every pre-#265 test addresses the event log, which is also the tier the
+    /// wire default resolves to — so these keep asserting exactly what they
+    /// asserted before the tier argument existed.
+    const EL: StoreTier = StoreTier::Eventlog;
+    const PROJ: StoreTier = StoreTier::Projection;
 
     fn tmp_cfg(name: &str) -> TierStoreConfig {
         let mut d = std::env::temp_dir();
@@ -442,26 +512,20 @@ mod tests {
     async fn no_store_configured_is_unavailable_not_empty() {
         // The distinction that matters: a caller must be able to tell "no store
         // here" from "the store is empty".
-        assert_eq!(
-            append(None, "e1", "{}").await,
-            TierStoreOutcome::Unavailable
-        );
-        assert_eq!(
-            read_execution(None, "e1").await,
-            TierStoreOutcome::Unavailable
-        );
-        assert_eq!(scan(None, None, 10).await, TierStoreOutcome::Unavailable);
+        assert_eq!(append(None, EL, "e1", "{}").await, TierStoreOutcome::Unavailable);
+        assert_eq!(read_execution(None, EL, "e1").await, TierStoreOutcome::Unavailable);
+        assert_eq!(scan(None, EL, None, 10).await, TierStoreOutcome::Unavailable);
     }
 
     #[tokio::test]
     async fn append_then_read_returns_the_same_payload() {
         let cfg = tmp_cfg("roundtrip");
         let payload = r#"{"event_type":"probe","n":1}"#;
-        match append(Some(&cfg), "exec-1", payload).await {
+        match append(Some(&cfg), EL, "exec-1", payload).await {
             TierStoreOutcome::Ok(_) => {}
             other => panic!("append failed: {other:?}"),
         }
-        let body = match read_execution(Some(&cfg), "exec-1").await {
+        let body = match read_execution(Some(&cfg), EL, "exec-1").await {
             TierStoreOutcome::Ok(b) => b,
             other => panic!("read failed: {other:?}"),
         };
@@ -478,13 +542,13 @@ mod tests {
         // nothing — a store that returned the same blob for every key would pass
         // the round-trip test above.
         let cfg = tmp_cfg("absent");
-        append(Some(&cfg), "present-1", r#"{"marker":"HIT"}"#).await;
+        append(Some(&cfg), EL, "present-1", r#"{"marker":"HIT"}"#).await;
 
-        let hit = match read_execution(Some(&cfg), "present-1").await {
+        let hit = match read_execution(Some(&cfg), EL, "present-1").await {
             TierStoreOutcome::Ok(b) => b,
             other => panic!("expected a hit: {other:?}"),
         };
-        let miss = match read_execution(Some(&cfg), "definitely-not-there").await {
+        let miss = match read_execution(Some(&cfg), EL, "definitely-not-there").await {
             TierStoreOutcome::Ok(b) => b,
             other => panic!("a miss must still be Ok with an empty result: {other:?}"),
         };
@@ -502,13 +566,13 @@ mod tests {
         // Regression guard for the field that meant the opposite of its name:
         // the driver reports exists:true for an execution holding no records.
         let cfg = tmp_cfg("exists");
-        append(Some(&cfg), "has-records", r#"{"n":1}"#).await;
+        append(Some(&cfg), EL, "has-records", r#"{"n":1}"#).await;
 
-        let hit: serde_json::Value = match read_execution(Some(&cfg), "has-records").await {
+        let hit: serde_json::Value = match read_execution(Some(&cfg), EL, "has-records").await {
             TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
             other => panic!("{other:?}"),
         };
-        let miss: serde_json::Value = match read_execution(Some(&cfg), "no-such-execution").await {
+        let miss: serde_json::Value = match read_execution(Some(&cfg), EL, "no-such-execution").await {
             TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
             other => panic!("{other:?}"),
         };
@@ -526,11 +590,11 @@ mod tests {
     #[tokio::test]
     async fn empty_payload_and_empty_id_are_refused() {
         let cfg = tmp_cfg("invalid");
-        match append(Some(&cfg), "e", "").await {
+        match append(Some(&cfg), EL, "e", "").await {
             TierStoreOutcome::Invalid(_) => {}
             other => panic!("empty payload must be Invalid, got {other:?}"),
         }
-        match append(Some(&cfg), "  ", "{}").await {
+        match append(Some(&cfg), EL, "  ", "{}").await {
             TierStoreOutcome::Invalid(_) => {}
             other => panic!("empty execution_id must be Invalid, got {other:?}"),
         }
@@ -541,14 +605,14 @@ mod tests {
     async fn scan_limit_is_clamped_not_trusted() {
         let cfg = tmp_cfg("clamp");
         for i in 0..5 {
-            append(Some(&cfg), &format!("e{i}"), &format!(r#"{{"i":{i}}}"#)).await;
+            append(Some(&cfg), EL, &format!("e{i}"), &format!(r#"{{"i":{i}}}"#)).await;
         }
         // A caller asking for far more than the cap is clamped, and still served.
         // Parsed, not substring-matched: the record payload is JSON-ESCAPED
         // inside the response ("payload":"{\\"i\\":0}"), so a naive
         // `contains("\"i\":0")` fails against correct data — which is exactly
         // how a good store gets blamed for a bad assertion.
-        match scan(Some(&cfg), None, usize::MAX).await {
+        match scan(Some(&cfg), EL, None, usize::MAX).await {
             TierStoreOutcome::Ok(b) => {
                 let v: serde_json::Value = serde_json::from_str(&b).expect("scan returns JSON");
                 assert_eq!(
@@ -560,10 +624,133 @@ mod tests {
             other => panic!("clamped scan must serve: {other:?}"),
         }
         // A zero/absurd low limit is raised to 1 rather than returning nothing.
-        match scan(Some(&cfg), None, 0).await {
+        match scan(Some(&cfg), EL, None, 0).await {
             TierStoreOutcome::Ok(_) => {}
             other => panic!("limit 0 must clamp to 1, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // #265 A1 — per-tier isolation.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tiers_do_not_read_each_others_records() {
+        // The property the whole genericisation rests on. If these shared a
+        // store, a projection append would land in the log that is serving
+        // primary in prod, and the event-log comparator would report it as a
+        // record with no authoritative counterpart — divergence caused by the
+        // mirror rather than found by it.
+        let cfg = tmp_cfg("isolation");
+        append(Some(&cfg), EL, "exec-9", r#"{"marker":"EVENTLOG-ONLY"}"#).await;
+        append(Some(&cfg), PROJ, "exec-9", r#"{"marker":"PROJECTION-ONLY"}"#).await;
+
+        let el = match read_execution(Some(&cfg), EL, "exec-9").await {
+            TierStoreOutcome::Ok(b) => b,
+            other => panic!("{other:?}"),
+        };
+        let proj = match read_execution(Some(&cfg), PROJ, "exec-9").await {
+            TierStoreOutcome::Ok(b) => b,
+            other => panic!("{other:?}"),
+        };
+        // POSITIVE control first: each tier must actually hold its own record,
+        // or "did not see the other one" is satisfied by an empty store.
+        assert!(el.contains("EVENTLOG-ONLY"), "event-log tier lost its record: {el}");
+        assert!(proj.contains("PROJECTION-ONLY"), "projection tier lost its record: {proj}");
+        assert!(
+            !el.contains("PROJECTION-ONLY"),
+            "the event-log tier can see projection records: {el}"
+        );
+        assert!(
+            !proj.contains("EVENTLOG-ONLY"),
+            "the projection tier can see event-log records: {proj}"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn each_tier_sequences_independently_from_one() {
+        // A shared sequence would make the projection tier's global_sequence
+        // jump with event-log traffic, and the append-side parity check is
+        // exactly `log_record_count == global_sequence`. Sharing would fail it
+        // on a healthy store.
+        let cfg = tmp_cfg("sequence");
+        for i in 0..3 {
+            append(Some(&cfg), EL, &format!("e{i}"), r#"{"t":"el"}"#).await;
+        }
+        let body = match append(Some(&cfg), PROJ, "p0", r#"{"t":"proj"}"#).await {
+            TierStoreOutcome::Ok(b) => b,
+            other => panic!("{other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["global_sequence"], 1,
+            "the projection tier's first append must be sequence 1, not 4: {body}"
+        );
+        assert_eq!(v["log_record_count"], 1, "{body}");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_to_one_tier_stay_readable() {
+        // Reproduces the shape of the #257 P0 (torn appends under concurrent
+        // writers) on the NEW tier, so the projection store inherits the fix
+        // rather than being assumed to. Before the serialising lock this test
+        // fails on read-back, not on append.
+        let cfg = tmp_cfg("concurrent-proj");
+        let n = 24;
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..n {
+            let c = cfg.clone();
+            set.spawn(async move {
+                append(Some(&c), PROJ, &format!("exec-{i}"), &format!(r#"{{"i":{i}}}"#)).await
+            });
+        }
+        let mut ok = 0;
+        while let Some(r) = set.join_next().await {
+            if matches!(r.expect("task panicked"), TierStoreOutcome::Ok(_)) {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, n, "every concurrent append must succeed");
+        // The real assertion is the READ: one torn line makes the replay fail
+        // on every subsequent operation, so a store that tore is unreadable.
+        match scan(Some(&cfg), PROJ, None, MAX_SCAN_LIMIT).await {
+            TierStoreOutcome::Ok(b) => {
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+                assert_eq!(v["record_count"], n, "records lost or torn: {b}");
+            }
+            other => panic!("store unreadable after concurrent appends: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn store_bytes_and_startup_sequence_are_per_tier() {
+        // These two feed the gauges an operator reads before a flip ("does this
+        // store hold anything"). Reporting the event log's size under the
+        // projection tier would answer that question about the wrong store.
+        let cfg = tmp_cfg("gauges");
+        for i in 0..4 {
+            append(Some(&cfg), EL, &format!("e{i}"), r#"{"t":"el"}"#).await;
+        }
+        assert_eq!(
+            startup_sequence(&cfg, PROJ),
+            0,
+            "an untouched projection store must report 0, not the event log's tip"
+        );
+        assert_eq!(store_bytes(&cfg, PROJ), 0);
+        assert_eq!(startup_sequence(&cfg, EL), 4);
+        assert!(store_bytes(&cfg, EL) > 0);
+
+        append(Some(&cfg), PROJ, "p0", r#"{"t":"proj"}"#).await;
+        assert_eq!(startup_sequence(&cfg, PROJ), 1);
+        assert_eq!(
+            startup_sequence(&cfg, EL),
+            4,
+            "a projection append must not move the event log's tip"
+        );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 }

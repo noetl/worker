@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use super::format_labels;
+use super::store_tier::StoreTier;
 
 #[derive(Default)]
 struct FamilyState {
@@ -129,16 +130,25 @@ struct EhdbMetricsState {
     /// render `0` on every worker that has no tier service at all and make the
     /// family look present-but-empty everywhere.
     tier_service_up: bool,
-    /// Appends this process has served. A counter, so a restart is visible as a
-    /// reset rather than as a plateau.
-    tier_service_appends: u64,
-    /// Highest `global_sequence` the store has reported — "how many records does
-    /// the thing I am about to promote actually hold". Sampled at pin time from
-    /// the store file too, so it is meaningful before the first append.
-    tier_service_sequence: u64,
-    /// Size of the backing store file in bytes, sampled at pin time and after
+    /// Appends this process has served, **per tier**. A counter, so a restart is
+    /// visible as a reset rather than as a plateau.
+    ///
+    /// Per-tier since [ai-meta#265](https://github.com/noetl/ai-meta/issues/265):
+    /// the writer now holds one store per tier, and a single unlabelled number
+    /// would describe whichever one happened to be appended to. On the process
+    /// being promoted to authoritative, "how many records does the thing I am
+    /// about to promote hold" has to be answerable about a *named* store.
+    ///
+    /// Every tier in [`StoreTier::ALL`] is seeded at pin time, so a tier holding
+    /// nothing reads `0` rather than being absent — the pruned-family trap that
+    /// made the prod gateway serve an empty `/metrics`.
+    tier_service_appends: BTreeMap<&'static str, u64>,
+    /// Highest `global_sequence` each store has reported. Sampled at pin time
+    /// from the store file too, so it is meaningful before the first append.
+    tier_service_sequence: BTreeMap<&'static str, u64>,
+    /// Size of each backing store file in bytes, sampled at pin time and after
     /// each successful append.
-    tier_service_store_bytes: u64,
+    tier_service_store_bytes: BTreeMap<&'static str, u64>,
     /// Records the tier-append handler pushed through the **batched** store
     /// append (one open, N writes, one fsync), and through the per-record loop.
     ///
@@ -406,6 +416,10 @@ const TIER_SERVICE_SERIES: &[(&str, &str)] = &[
     ("scan", "error"),
     // A frame this build does not implement — answered, never dropped.
     ("unsupported", "unsupported"),
+    // A frame naming a tier this writer has no store for (#265). A caller
+    // mistake, not an outage — kept separate from `unsupported` so "your writer
+    // is old" and "you typed the tier wrong" are different readings.
+    ("unknown_tier", "invalid"),
     // Connection lifecycle, not a request. Distinguishes a peer that hung up
     // cleanly from one that spoke a protocol this writer does not understand
     // from a listener that is failing to accept at all.
@@ -440,11 +454,21 @@ const TIER_SERVICE_OPS: &[&str] = &["health", "append", "read_execution", "scan"
 /// `store_bytes` / `sequence` are the store's state at startup, so a writer that
 /// restarts in front of an existing store reports its real size before serving
 /// anything.
-pub fn pin_tier_service_series(store_bytes: u64, sequence: u64) {
+pub fn pin_tier_service_series(samples: &[(StoreTier, u64, u64)]) {
     let mut s = state().lock().expect("ehdb metrics lock");
     s.tier_service_up = true;
-    s.tier_service_store_bytes = store_bytes;
-    s.tier_service_sequence = sequence;
+    // Seed EVERY tier at 0 first, then apply the samples. Seeding from the
+    // samples alone would leave a tier the caller forgot to sample absent, and
+    // absent is indistinguishable from "this build has no such tier".
+    for tier in StoreTier::ALL {
+        s.tier_service_appends.entry(tier.as_str()).or_insert(0);
+        s.tier_service_sequence.entry(tier.as_str()).or_insert(0);
+        s.tier_service_store_bytes.entry(tier.as_str()).or_insert(0);
+    }
+    for (tier, store_bytes, sequence) in samples {
+        s.tier_service_store_bytes.insert(tier.as_str(), *store_bytes);
+        s.tier_service_sequence.insert(tier.as_str(), *sequence);
+    }
     for (op, outcome) in TIER_SERVICE_SERIES {
         s.dataplane.pin(vec![
             ("operation".to_string(), format!("tier_service.{op}")),
@@ -502,6 +526,49 @@ pub(crate) fn eventlog_serve_outcome_is_pinned(outcome: &str) -> bool {
     EVENTLOG_SERVE_OUTCOMES.contains(&outcome)
 }
 
+/// The projection tier's serve-decision outcomes
+/// ([ai-meta#265](https://github.com/noetl/ai-meta/issues/265) A2).
+///
+/// Exhaustive over `projection::serve_service_append_with`'s match, for the same
+/// reason [`EVENTLOG_SERVE_OUTCOMES`] is: a pinned set that omits one value
+/// reintroduces the absent-series bug on that value alone, while the rest read 0
+/// and look complete. `disabled` is deliberately absent — never recorded.
+const PROJECTION_SERVE_OUTCOMES: &[&str] = &[
+    "served_primary",
+    "primary_unavailable",
+    "primary_divergence",
+    "materialized",
+    "parity_mismatch",
+    "rejected",
+    "unavailable",
+];
+
+/// Whether an outcome label is in the pinned projection serve set. See
+/// [`eventlog_serve_outcome_is_pinned`].
+#[cfg(test)]
+pub(crate) fn projection_serve_outcome_is_pinned(outcome: &str) -> bool {
+    PROJECTION_SERVE_OUTCOMES.contains(&outcome)
+}
+
+/// Create the projection serve-decision series at 0, at the same bind site as
+/// the event log's.
+///
+/// Pinned unconditionally alongside the event log's, NOT inside a
+/// projection-tier config branch — that is the
+/// [server#315](https://github.com/noetl/server/pull/315) mistake, which pinned
+/// inside a feature branch and left the series absent on exactly the
+/// configuration whose value someone would read. An operator asking "is the
+/// projection tier serving" must get `0`, not nothing.
+pub fn pin_projection_serve_series() {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    for outcome in PROJECTION_SERVE_OUTCOMES {
+        s.projection.pin(vec![
+            ("operation".to_string(), "mirror".to_string()),
+            ("outcome".to_string(), outcome.to_string()),
+        ]);
+    }
+}
+
 pub fn pin_eventlog_serve_series() {
     let mut s = state().lock().expect("ehdb metrics lock");
     for outcome in EVENTLOG_SERVE_OUTCOMES {
@@ -518,13 +585,14 @@ pub fn pin_eventlog_serve_series() {
 /// the request: #260 asks for the store to be observable independently of
 /// whether anyone is reading it, so that a tier about to be promoted can be
 /// checked for "does it actually hold anything" without generating traffic.
-pub fn record_tier_service_append(sequence: u64, store_bytes: u64) {
+pub fn record_tier_service_append(tier: StoreTier, sequence: u64, store_bytes: u64) {
     let mut s = state().lock().expect("ehdb metrics lock");
-    s.tier_service_appends += 1;
+    *s.tier_service_appends.entry(tier.as_str()).or_insert(0) += 1;
     // `max`, not assignment: the sequence must never appear to go backwards on a
     // reordered or concurrent append.
-    s.tier_service_sequence = s.tier_service_sequence.max(sequence);
-    s.tier_service_store_bytes = store_bytes;
+    let cur = s.tier_service_sequence.entry(tier.as_str()).or_insert(0);
+    *cur = (*cur).max(sequence);
+    s.tier_service_store_bytes.insert(tier.as_str(), store_bytes);
 }
 
 /// Record how many records one tier-append request took through each path.
@@ -924,28 +992,31 @@ pub fn render_lines() -> Vec<String> {
                 .to_string(),
         );
         lines.push("# TYPE noetl_ehdb_tier_service_store_appends_total counter".to_string());
-        lines.push(format!(
-            "noetl_ehdb_tier_service_store_appends_total {}",
-            s.tier_service_appends
-        ));
+        for (tier, v) in &s.tier_service_appends {
+            lines.push(format!(
+                "noetl_ehdb_tier_service_store_appends_total{{tier=\"{tier}\"}} {v}"
+            ));
+        }
         lines.push(
             "# HELP noetl_ehdb_tier_service_store_sequence Highest global sequence the tier-service store holds"
                 .to_string(),
         );
         lines.push("# TYPE noetl_ehdb_tier_service_store_sequence gauge".to_string());
-        lines.push(format!(
-            "noetl_ehdb_tier_service_store_sequence {}",
-            s.tier_service_sequence
-        ));
+        for (tier, v) in &s.tier_service_sequence {
+            lines.push(format!(
+                "noetl_ehdb_tier_service_store_sequence{{tier=\"{tier}\"}} {v}"
+            ));
+        }
         lines.push(
             "# HELP noetl_ehdb_tier_service_store_bytes Size on disk of the tier-service durable store"
                 .to_string(),
         );
         lines.push("# TYPE noetl_ehdb_tier_service_store_bytes gauge".to_string());
-        lines.push(format!(
-            "noetl_ehdb_tier_service_store_bytes {}",
-            s.tier_service_store_bytes
-        ));
+        for (tier, v) in &s.tier_service_store_bytes {
+            lines.push(format!(
+                "noetl_ehdb_tier_service_store_bytes{{tier=\"{tier}\"}} {v}"
+            ));
+        }
     }
 
     // The read-only tier-query family uses the `noetl_worker_ehdb_query_*` name
@@ -1190,7 +1261,7 @@ mod tests {
     fn pin_creates_every_series_at_zero() {
         let _guard = serialised();
         reset();
-        pin_tier_service_series(0, 0);
+        pin_tier_service_series(&[]);
         let text = render_lines().join("\n");
 
         for (op, outcome) in TIER_SERVICE_SERIES {
@@ -1204,9 +1275,19 @@ mod tests {
                 format!("noetl_ehdb_tier_service_duration_seconds_count{{operation=\"{op}\"}} 0");
             assert!(text.contains(&want), "missing pinned histogram: {want}");
         }
-        assert!(text.contains("noetl_ehdb_tier_service_store_appends_total 0"));
-        assert!(text.contains("noetl_ehdb_tier_service_store_bytes 0"));
-        assert!(text.contains("noetl_ehdb_tier_service_store_sequence 0"));
+        // EVERY tier is seeded at 0 by the pin, so "this store holds nothing"
+        // and "this build has no such tier" are different readings (#265).
+        for tier in StoreTier::ALL {
+            let t = tier.as_str();
+            for family in [
+                "noetl_ehdb_tier_service_store_appends_total",
+                "noetl_ehdb_tier_service_store_bytes",
+                "noetl_ehdb_tier_service_store_sequence",
+            ] {
+                let needle = format!("{family}{{tier=\"{t}\"}} 0");
+                assert!(text.contains(&needle), "missing {needle} in\n{text}");
+            }
+        }
         reset();
     }
 
@@ -1232,7 +1313,7 @@ mod tests {
     fn pin_does_not_write_the_last_op_gauges() {
         let _guard = serialised();
         reset();
-        pin_tier_service_series(0, 0);
+        pin_tier_service_series(&[]);
         let text = render_lines().join("\n");
         assert!(text.contains("noetl_ehdb_dataplane_last_ok 0"), "{text}");
         assert!(
@@ -1248,7 +1329,7 @@ mod tests {
     fn recording_moves_only_the_named_series() {
         let _guard = serialised();
         reset();
-        pin_tier_service_series(0, 0);
+        pin_tier_service_series(&[]);
         record_tier_service("append", "ok", true, false, 0.003);
         record_tier_service("read_execution", "hit", true, false, 0.001);
         record_tier_service("read_execution", "miss", true, false, 0.001);
@@ -1291,7 +1372,7 @@ mod tests {
     fn histogram_buckets_are_cumulative_and_total_at_inf() {
         let _guard = serialised();
         reset();
-        pin_tier_service_series(0, 0);
+        pin_tier_service_series(&[]);
         // One observation in a low bucket, one mid, one above the top bound.
         record_tier_service("scan", "hit", true, false, 0.0001);
         record_tier_service("scan", "hit", true, false, 0.03);
@@ -1325,15 +1406,25 @@ mod tests {
     fn store_state_tracks_appends_and_never_goes_backwards() {
         let _guard = serialised();
         reset();
-        pin_tier_service_series(0, 0);
-        record_tier_service_append(7, 512);
-        record_tier_service_append(9, 900);
+        pin_tier_service_series(&[]);
+        record_tier_service_append(StoreTier::Eventlog, 7, 512);
+        record_tier_service_append(StoreTier::Eventlog, 9, 900);
         // An out-of-order sequence must not rewind the gauge.
-        record_tier_service_append(4, 950);
+        record_tier_service_append(StoreTier::Eventlog, 4, 950);
+        // A second tier's appends must land on their OWN series (#265) — if the
+        // gauges were still process-wide, this would rewrite the event log's.
+        record_tier_service_append(StoreTier::Projection, 2, 64);
         let text = render_lines().join("\n");
-        assert!(text.contains("noetl_ehdb_tier_service_store_appends_total 3"), "{text}");
-        assert!(text.contains("noetl_ehdb_tier_service_store_sequence 9"), "{text}");
-        assert!(text.contains("noetl_ehdb_tier_service_store_bytes 950"), "{text}");
+        for (needle, why) in [
+            (r#"noetl_ehdb_tier_service_store_appends_total{tier="eventlog"} 3"#, "event-log appends"),
+            (r#"noetl_ehdb_tier_service_store_sequence{tier="eventlog"} 9"#, "event-log tip, not rewound"),
+            (r#"noetl_ehdb_tier_service_store_bytes{tier="eventlog"} 950"#, "event-log size"),
+            (r#"noetl_ehdb_tier_service_store_appends_total{tier="projection"} 1"#, "projection appends"),
+            (r#"noetl_ehdb_tier_service_store_sequence{tier="projection"} 2"#, "projection tip"),
+            (r#"noetl_ehdb_tier_service_store_bytes{tier="projection"} 64"#, "projection size"),
+        ] {
+            assert!(text.contains(needle), "{why}: missing {needle} in\n{text}");
+        }
         reset();
     }
 }
