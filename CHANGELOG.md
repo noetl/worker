@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.122.1](https://github.com/noetl/worker/compare/v5.122.0...v5.122.1) (2026-08-26)
+
+### Bug Fixes
+
+* **deps:** re-pin ehdb to the bounded change-feed (noetl/ai-meta[#298](https://github.com/noetl/worker/issues/298)) ([e918954](https://github.com/noetl/worker/commit/e9189547569c59c66ea096a298520a569d84fe8c)), closes [ehdb#318](https://github.com/noetl/ehdb/issues/318) [#119](https://github.com/noetl/worker/issues/119)
+
 ## [5.122.0](https://github.com/noetl/worker/compare/v5.121.0...v5.122.0) (2026-08-26)
 
 ### Features
