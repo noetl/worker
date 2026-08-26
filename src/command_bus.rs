@@ -588,9 +588,13 @@ impl CommandSource for EhdbCommandSource {
             if self.pull.is_none() {
                 match ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await
                 {
+                    // NOT progress: a frozen peer's kernel still completes the
+                    // handshake, so redialling a stuck writer "connects" every
+                    // time.  Only a claim proves the bus works (noetl/ai-meta#297).
                     Ok(c) => self.pull = Some(c),
                     Err(e) => {
                         crate::metrics::record_ehdb_claim_reconnect("commands", "connect_failed");
+                        crate::metrics::record_claim_loop_failure();
                         tracing::warn!(claim_addr = %self.claim_addr, error = %e, "EHDB claim connect failed; retrying");
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         continue;
@@ -618,6 +622,7 @@ impl CommandSource for EhdbCommandSource {
                     // left this read parked forever, so dispatch stopped with
                     // nothing logged anywhere.
                     crate::metrics::record_ehdb_claim_reconnect("commands", "claim_next_failed");
+                    crate::metrics::record_claim_loop_failure();
                     tracing::warn!(
                         claim_addr = %self.claim_addr,
                         member = self.member,
@@ -629,6 +634,10 @@ impl CommandSource for EhdbCommandSource {
                     continue;
                 }
             };
+            // A claim landed: the loop is demonstrably alive.  Stamped here and
+            // not only on connect, so a loop that connects and then never claims
+            // still goes stale (noetl/ai-meta#297).
+            crate::metrics::record_claim_loop_progress();
             let park_secs = park_started.elapsed().as_secs_f64();
             crate::metrics::record_command_pickup_phase("park", park_secs);
             let notification: CommandNotification =

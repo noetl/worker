@@ -538,6 +538,20 @@ pub struct WorkerMetrics {
     /// workers that don't run the builder (mode `Off`, e.g. the request pool)
     /// always report alive.
     pub state_builder_healthy: IntGauge,
+    /// Claim-loop liveness (noetl/ai-meta#297): `1` while the command-bus claim
+    /// loop is connected and claiming, `0` once it has made no progress for
+    /// longer than `NOETL_CLAIM_LOOP_UNHEALTHY_SECS`.
+    ///
+    /// This exists because "idle" and "wedged" previously produced **identical**
+    /// telemetry: a pool whose claim loop parked forever stayed `Running`, `1/1`,
+    /// probes green, `restarts=0`, and logged nothing at all.  The only way to
+    /// tell was to diff `noetl.command` PENDING over time.  Defaults to `1` so a
+    /// worker that runs no claim loop always reports alive.
+    pub claim_loop_connected: IntGauge,
+    /// Unix seconds of the claim loop's last successful claim or connect
+    /// (noetl/ai-meta#297).  A boolean alone cannot separate "just reconnected"
+    /// from "silent for a day"; that ambiguity is what made #297 invisible.
+    pub claim_loop_last_progress: IntGauge,
     /// Count of state-builder consumer/connection rebuilds (noetl/ai-meta#161),
     /// partitioned by `reason`: `connect_error` — initial connect / create_consumer
     /// failed and is being retried with backoff; `drain_dead` — a live consumer
@@ -1592,6 +1606,27 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_healthy.clone()))
             .expect("register state_builder_healthy");
 
+        let claim_loop_connected = IntGauge::new(
+            "noetl_worker_claim_loop_connected",
+            "Command-bus claim-loop liveness — 1 connected/claiming, 0 wedged past NOETL_CLAIM_LOOP_UNHEALTHY_SECS; the /livez probe reads this (noetl/ai-meta#297).",
+        )
+        .expect("claim_loop_connected metric");
+        // Default healthy, same reasoning as state_builder_healthy: a worker that
+        // runs no claim loop must report alive so the probe is safe fleet-wide.
+        claim_loop_connected.set(1);
+        registry
+            .register(Box::new(claim_loop_connected.clone()))
+            .expect("register claim_loop_connected");
+
+        let claim_loop_last_progress = IntGauge::new(
+            "noetl_worker_claim_loop_last_progress_seconds",
+            "Unix seconds of the claim loop's last successful claim or connect (noetl/ai-meta#297).",
+        )
+        .expect("claim_loop_last_progress metric");
+        registry
+            .register(Box::new(claim_loop_last_progress.clone()))
+            .expect("register claim_loop_last_progress");
+
         let state_builder_consumer_recreate_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_state_builder_consumer_recreate_total",
@@ -1778,6 +1813,8 @@ impl WorkerMetrics {
             plugin_warm_total,
             worker_ready,
             state_builder_healthy,
+            claim_loop_connected,
+            claim_loop_last_progress,
             state_builder_consumer_recreate_total,
             command_loop_reconnect_total,
             state_materializer_drained_total,
@@ -2568,6 +2605,145 @@ pub fn set_state_builder_healthy(healthy: bool) {
     WorkerMetrics::global()
         .state_builder_healthy
         .set(if healthy { 1 } else { 0 });
+}
+
+/// Set the claim-loop liveness gauge (noetl/ai-meta#297).
+pub fn set_claim_loop_connected(connected: bool) {
+    WorkerMetrics::global()
+        .claim_loop_connected
+        .set(if connected { 1 } else { 0 });
+}
+
+/// Read the claim-loop liveness gauge — the `/livez` handler's second source.
+pub fn claim_loop_connected() -> bool {
+    WorkerMetrics::global().claim_loop_connected.get() == 1
+}
+
+/// Consecutive claim failures with no successful claim between them.  Reset by
+/// [`record_claim_loop_progress`], incremented by [`record_claim_loop_failure`].
+static CLAIM_LOOP_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// How many consecutive failures mean "wedged" rather than "a blip".
+/// `NOETL_CLAIM_LOOP_FAILURE_STREAK`, default 3.
+fn claim_loop_failure_streak() -> u32 {
+    std::env::var("NOETL_CLAIM_LOOP_FAILURE_STREAK")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3)
+}
+
+/// Stamp a **successful claim** and mark the loop connected (noetl/ai-meta#297).
+///
+/// Only a claim counts.  A successful *connect* deliberately does not, and that
+/// distinction is load-bearing: a frozen peer's kernel still completes the TCP
+/// handshake, so a loop redialling a stuck writer connects every time.  Stamping
+/// on connect made a wedged pool report `connected=1` forever — the exact
+/// idle-vs-wedged ambiguity this gauge exists to remove, reintroduced one level
+/// up.  Caught by the kind fault arm, not by a test.
+pub fn record_claim_loop_progress() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    WorkerMetrics::global().claim_loop_last_progress.set(now);
+    CLAIM_LOOP_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+    set_claim_loop_connected(true);
+}
+
+/// Record a claim failure.  Past `NOETL_CLAIM_LOOP_FAILURE_STREAK` consecutive
+/// failures the loop is wedged, not blipping, and the gauge says so.
+///
+/// A healthy idle bus produces **zero** failures — it parks — so this cannot
+/// mistake idleness for a stall, which is the trap a naive "no claims recently"
+/// rule falls into.
+pub fn record_claim_loop_failure() {
+    let n = CLAIM_LOOP_CONSECUTIVE_FAILURES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    CLAIM_LOOP_LAST_FAILURE.store(unix_now(), std::sync::atomic::Ordering::Relaxed);
+    if n >= claim_loop_failure_streak() {
+        set_claim_loop_connected(false);
+    }
+}
+
+/// Unix seconds of the most recent claim failure.
+static CLAIM_LOOP_LAST_FAILURE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Seconds since the last claim failure, or `None` if there has never been one.
+pub fn claim_loop_secs_since_failure() -> Option<u64> {
+    let last = CLAIM_LOOP_LAST_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return None;
+    }
+    Some((unix_now() - last).max(0) as u64)
+}
+
+/// Is the claim loop **wedged** — failing repeatedly and *still* failing?
+///
+/// The discriminator is ongoing failure, not absent claims, and the difference
+/// is not academic. The kind fault arm showed why: the system pool legitimately
+/// has nothing to claim most of the time, so "no claim recently" is its normal
+/// healthy state. A rule keyed on claim recency reported a *recovered* pool as
+/// wedged and would have had Kubernetes restart-loop a perfectly healthy worker.
+///
+/// Keyed on failures instead:
+/// - stuck peer — failures keep arriving every ceiling period → wedged;
+/// - recovered but idle — failures stop, the window lapses → healthy;
+/// - healthy and idle — no failures ever → healthy.
+pub fn claim_loop_wedged(window_secs: u64) -> bool {
+    wedged_from(
+        claim_loop_consecutive_failures(),
+        claim_loop_failure_streak(),
+        claim_loop_secs_since_failure(),
+        window_secs,
+    )
+}
+
+/// The wedged decision as a pure function, so every arm is testable without
+/// waiting real seconds. `secs_since_failure` is `None` when no failure has ever
+/// been recorded.
+pub fn wedged_from(
+    failures: u32,
+    streak: u32,
+    secs_since_failure: Option<u64>,
+    window_secs: u64,
+) -> bool {
+    if failures < streak {
+        return false;
+    }
+    match secs_since_failure {
+        Some(since) => since <= window_secs,
+        None => false,
+    }
+}
+
+/// Current consecutive-failure count — for tests and diagnostics.
+pub fn claim_loop_consecutive_failures() -> u32 {
+    CLAIM_LOOP_CONSECUTIVE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Seconds since the claim loop last made progress, or `None` if it never has
+/// (still at the 0 default — a worker that runs no claim loop).
+pub fn claim_loop_stale_secs() -> Option<u64> {
+    let last = WorkerMetrics::global().claim_loop_last_progress.get();
+    if last == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((now - last).max(0) as u64)
 }
 
 /// Read the state-builder health gauge — the `/livez` handler's source of truth.
