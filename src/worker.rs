@@ -263,7 +263,13 @@ impl Worker {
         // immediately surfaced; the server runs in the background
         // for the worker's lifetime.  Per
         // `agents/rules/observability.md` Principle 2.
-        let metrics_handle = crate::metrics_server::spawn(&self.config.metrics_bind).await?;
+        // ai-meta#265 Phase 2: hand the WAL chain index to the metrics server so
+        // `/ehdb/state-spine` can serve the same spine the drive builds.
+        let metrics_handle = crate::metrics_server::spawn_with_index(
+            &self.config.metrics_bind,
+            Some(self.state_builder_index.clone()),
+        )
+        .await?;
 
         // The NATS consumer-lag poller is gone with NATS (noetl/ai-meta#212).
         // It had already become a no-op on the EHDB bus — `nats_subscriber()`
