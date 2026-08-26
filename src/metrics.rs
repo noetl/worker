@@ -538,6 +538,20 @@ pub struct WorkerMetrics {
     /// workers that don't run the builder (mode `Off`, e.g. the request pool)
     /// always report alive.
     pub state_builder_healthy: IntGauge,
+    /// Claim-loop liveness (noetl/ai-meta#297): `1` while the command-bus claim
+    /// loop is connected and claiming, `0` once it has made no progress for
+    /// longer than `NOETL_CLAIM_LOOP_UNHEALTHY_SECS`.
+    ///
+    /// This exists because "idle" and "wedged" previously produced **identical**
+    /// telemetry: a pool whose claim loop parked forever stayed `Running`, `1/1`,
+    /// probes green, `restarts=0`, and logged nothing at all.  The only way to
+    /// tell was to diff `noetl.command` PENDING over time.  Defaults to `1` so a
+    /// worker that runs no claim loop always reports alive.
+    pub claim_loop_connected: IntGauge,
+    /// Unix seconds of the claim loop's last successful claim or connect
+    /// (noetl/ai-meta#297).  A boolean alone cannot separate "just reconnected"
+    /// from "silent for a day"; that ambiguity is what made #297 invisible.
+    pub claim_loop_last_progress: IntGauge,
     /// Count of state-builder consumer/connection rebuilds (noetl/ai-meta#161),
     /// partitioned by `reason`: `connect_error` — initial connect / create_consumer
     /// failed and is being retried with backoff; `drain_dead` — a live consumer
@@ -1592,6 +1606,27 @@ impl WorkerMetrics {
             .register(Box::new(state_builder_healthy.clone()))
             .expect("register state_builder_healthy");
 
+        let claim_loop_connected = IntGauge::new(
+            "noetl_worker_claim_loop_connected",
+            "Command-bus claim-loop liveness — 1 connected/claiming, 0 wedged past NOETL_CLAIM_LOOP_UNHEALTHY_SECS; the /livez probe reads this (noetl/ai-meta#297).",
+        )
+        .expect("claim_loop_connected metric");
+        // Default healthy, same reasoning as state_builder_healthy: a worker that
+        // runs no claim loop must report alive so the probe is safe fleet-wide.
+        claim_loop_connected.set(1);
+        registry
+            .register(Box::new(claim_loop_connected.clone()))
+            .expect("register claim_loop_connected");
+
+        let claim_loop_last_progress = IntGauge::new(
+            "noetl_worker_claim_loop_last_progress_seconds",
+            "Unix seconds of the claim loop's last successful claim or connect (noetl/ai-meta#297).",
+        )
+        .expect("claim_loop_last_progress metric");
+        registry
+            .register(Box::new(claim_loop_last_progress.clone()))
+            .expect("register claim_loop_last_progress");
+
         let state_builder_consumer_recreate_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_state_builder_consumer_recreate_total",
@@ -1778,6 +1813,8 @@ impl WorkerMetrics {
             plugin_warm_total,
             worker_ready,
             state_builder_healthy,
+            claim_loop_connected,
+            claim_loop_last_progress,
             state_builder_consumer_recreate_total,
             command_loop_reconnect_total,
             state_materializer_drained_total,
@@ -2568,6 +2605,44 @@ pub fn set_state_builder_healthy(healthy: bool) {
     WorkerMetrics::global()
         .state_builder_healthy
         .set(if healthy { 1 } else { 0 });
+}
+
+/// Set the claim-loop liveness gauge (noetl/ai-meta#297).
+pub fn set_claim_loop_connected(connected: bool) {
+    WorkerMetrics::global()
+        .claim_loop_connected
+        .set(if connected { 1 } else { 0 });
+}
+
+/// Read the claim-loop liveness gauge — the `/livez` handler's second source.
+pub fn claim_loop_connected() -> bool {
+    WorkerMetrics::global().claim_loop_connected.get() == 1
+}
+
+/// Stamp the claim loop's last successful progress and mark it connected
+/// (noetl/ai-meta#297).  Paired deliberately: a boolean with no timestamp cannot
+/// distinguish "just reconnected" from "silent for a day".
+pub fn record_claim_loop_progress() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    WorkerMetrics::global().claim_loop_last_progress.set(now);
+    set_claim_loop_connected(true);
+}
+
+/// Seconds since the claim loop last made progress, or `None` if it never has
+/// (still at the 0 default — a worker that runs no claim loop).
+pub fn claim_loop_stale_secs() -> Option<u64> {
+    let last = WorkerMetrics::global().claim_loop_last_progress.get();
+    if last == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((now - last).max(0) as u64)
 }
 
 /// Read the state-builder health gauge — the `/livez` handler's source of truth.

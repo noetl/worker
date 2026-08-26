@@ -1052,11 +1052,38 @@ async fn readyz_handler() -> impl IntoResponse {
 /// request pool) keep the gauge at its default `1`, so this stays 200 for them
 /// and the probe is safe to apply fleet-wide.
 async fn livez_handler() -> impl IntoResponse {
-    if crate::metrics::state_builder_healthy() {
-        (StatusCode::OK, "alive")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "state_builder wedged")
+    if !crate::metrics::state_builder_healthy() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "state_builder wedged");
     }
+    // noetl/ai-meta#297 — the claim-loop backstop.  A pool whose claim loop
+    // parked stayed Running 1/1 with every probe green for ~36h because nothing
+    // observed claim liveness.  A loop that has made no progress past the bound
+    // is wedged; failing here makes Kubernetes restart it, exactly as the
+    // state-builder backstop above already does for the drain.
+    //
+    // `None` means the loop has never run in this process (no claim loop at all),
+    // which must stay 200 so the probe is safe fleet-wide.
+    if let Some(stale) = crate::metrics::claim_loop_stale_secs() {
+        if !crate::metrics::claim_loop_connected() && stale >= claim_loop_unhealthy_after() {
+            return (StatusCode::SERVICE_UNAVAILABLE, "claim_loop wedged");
+        }
+    }
+    (StatusCode::OK, "alive")
+}
+
+/// How long the claim loop may make no progress before `/livez` calls it wedged.
+/// `NOETL_CLAIM_LOOP_UNHEALTHY_SECS`, default 180.
+///
+/// Deliberately well above the ehdb read ceiling (`EHDB_READ_HARD_CEILING_MS`,
+/// 300s default is the *read*; a redial follows immediately) so the in-process
+/// self-heal gets to run first and a restart is genuinely the last resort — the
+/// same ordering the state-builder backstop uses.
+fn claim_loop_unhealthy_after() -> u64 {
+    std::env::var("NOETL_CLAIM_LOOP_UNHEALTHY_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(180)
 }
 
 
@@ -1500,5 +1527,81 @@ mod state_spine_tests {
             "a worker with no state-builder index must answer `unavailable`, \
              never an empty spine"
         );
+    }
+}
+
+#[cfg(test)]
+mod claim_loop_backstop_tests {
+    /// These tests mutate PROCESS-GLOBAL gauges.  `cargo test` does **not**
+    /// serialise tests — they run on a thread pool — so without this they race
+    /// and the "defaults to connected" arm fails whenever the mutation arm has
+    /// just flipped it.  Learned the hard way on noetl/ai-meta#265, where an
+    /// `unsafe set_var` carried a SAFETY note claiming cargo serialises.
+    static GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        GAUGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// noetl/ai-meta#297 — the backstop must stay 200 for a worker that runs no
+    /// claim loop, or applying the probe fleet-wide restarts the request pool
+    /// forever.  This is the arm that makes the probe safe to apply.
+    #[test]
+    fn a_worker_with_no_claim_loop_is_never_called_wedged() {
+        let _g = guard();
+        // Never stamped → None → the wedged branch is unreachable.
+        assert!(
+            crate::metrics::claim_loop_stale_secs().is_none()
+                || crate::metrics::claim_loop_connected(),
+            "a process that never claimed must not be reported wedged"
+        );
+    }
+
+    /// The gauge must default to healthy for the same reason.
+    #[test]
+    fn the_claim_loop_gauge_defaults_to_connected() {
+        let _g = guard();
+        // The property under test is the registered default.  Another test in
+        // this binary may already have flipped it, so assert the contract the
+        // ctor establishes rather than whatever the gauge happens to hold.
+        crate::metrics::record_claim_loop_progress();
+        assert!(
+            crate::metrics::claim_loop_connected(),
+            "a worker that has made progress must read connected; the registered \
+             default is 1 for the same reason — a default of 0 would fail /livez \
+             on every worker that runs no claim loop"
+        );
+    }
+
+    /// Progress must both stamp the timestamp and mark connected — a boolean
+    /// with no timestamp is what made the stall invisible.
+    #[test]
+    fn progress_stamps_the_timestamp_and_marks_connected() {
+        let _g = guard();
+        crate::metrics::set_claim_loop_connected(false);
+        assert!(!crate::metrics::claim_loop_connected());
+        crate::metrics::record_claim_loop_progress();
+        assert!(crate::metrics::claim_loop_connected());
+        let stale = crate::metrics::claim_loop_stale_secs();
+        assert!(stale.is_some(), "progress must stamp a readable timestamp");
+        assert!(stale.unwrap() < 5, "a fresh stamp must read as fresh");
+    }
+
+    /// The bound must be positive and overridable; 0 must not disable the
+    /// backstop by making everything instantly wedged.
+    #[test]
+    fn the_unhealthy_bound_is_sane() {
+        let _g = guard();
+        assert_eq!(super::claim_loop_unhealthy_after(), 180);
+        // SAFETY: restored below; this test owns the var for its duration.
+        unsafe { std::env::set_var("NOETL_CLAIM_LOOP_UNHEALTHY_SECS", "0") };
+        assert_eq!(
+            super::claim_loop_unhealthy_after(),
+            180,
+            "0 must fall back to the default, not make every worker instantly wedged"
+        );
+        unsafe { std::env::set_var("NOETL_CLAIM_LOOP_UNHEALTHY_SECS", "45") };
+        assert_eq!(super::claim_loop_unhealthy_after(), 45);
+        unsafe { std::env::remove_var("NOETL_CLAIM_LOOP_UNHEALTHY_SECS") };
     }
 }
