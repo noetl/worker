@@ -40,8 +40,23 @@ use crate::metrics::{WorkerMetrics, METRICS_CONTENT_TYPE};
 /// down the server.  Errors during bind are returned synchronously
 /// before the server starts accepting connections.
 pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
+    spawn_with_index(bind, None).await
+}
+
+/// As [`spawn`], but with the off-server WAL chain index attached so the
+/// state-spine route can serve it (ai-meta#265 Phase 2).
+///
+/// `None` keeps every existing caller byte-identical: the route is registered
+/// either way, and without an index it answers `unavailable` — which is a
+/// different answer from "this execution has no events", and the server's fold
+/// treats the two differently.
+pub async fn spawn_with_index(
+    bind: &str,
+    index: Option<crate::state_builder::SharedWalIndex>,
+) -> Result<JoinHandle<()>> {
     let addr: SocketAddr = bind.parse()?;
 
+    let spine_state = SpineState { index };
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz_handler))
@@ -57,7 +72,18 @@ pub async fn spawn(bind: &str) -> Result<JoinHandle<()>> {
         .route(
             "/ehdb/tiers/{tier}",
             get(ehdb_tier_query_handler).post(ehdb_tier_append_handler),
-        );
+        )
+        // ai-meta#265 Phase 2 — the WAL spine, served for one execution.
+        //
+        // The worker holds the log and does NOT fold: `WorkflowState` lives in
+        // the server's `orchestrate-core`, and the drive folds inside the wasm
+        // plug-in. So the split is deliberate — the worker serves the ordered
+        // verbatim slim payloads, the server folds and digests them. The
+        // alternative (teach the worker to fold) would mean a second
+        // implementation of what an execution's state IS, which is the one
+        // thing an event-sourced read model must not have.
+        .route("/ehdb/state-spine", get(state_spine_handler))
+        .with_state(spine_state);
 
     // ai-meta#257 P0 — pin the serve-decision series at the bind site of the
     // route that carries server-authored appends, so `served_primary 0` is
@@ -1033,6 +1059,101 @@ async fn livez_handler() -> impl IntoResponse {
     }
 }
 
+
+/// Router state carrying the off-server WAL chain index (ai-meta#265 Phase 2).
+#[derive(Clone)]
+struct SpineState {
+    index: Option<crate::state_builder::SharedWalIndex>,
+}
+
+/// `GET /ehdb/state-spine?execution=<id>[&head=<expected_head>]`
+///
+/// Serve the ordered event spine for one execution, exactly as the off-server
+/// drive builds it — same `build_spine` / `build_spine_to`, same completeness
+/// contract, same payloads.
+///
+/// # Fail-closed by construction
+///
+/// `AdvanceOutcome::Incomplete` means the chain does not reach the requested
+/// head: the WAL drain has not caught up, or a link is missing. The drive's own
+/// answer to that is a benign no-op the reconciler re-drives, and this route
+/// gives the same answer — **`complete: false` and NO events**. It never serves
+/// a partial spine, because a fold over a gapped spine is a different
+/// execution's history, and a caller cannot tell the difference from the events
+/// alone.
+///
+/// Read-only: it advances the cached chain (the same work a drive would do) and
+/// touches the LRU stamp, but writes nothing durable.
+async fn state_spine_handler(
+    axum::extract::State(st): axum::extract::State<SpineState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let execution_id = match params.get("execution").and_then(|v| v.parse::<i64>().ok()) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "action": "ehdb.state.spine",
+                    "outcome": "invalid",
+                    "error": "execution is required and must be an integer",
+                })),
+            )
+        }
+    };
+    let Some(index) = st.index.as_ref() else {
+        // Not "no events" — this process has no index at all. The distinction is
+        // the whole reason the route reports an outcome rather than an empty
+        // list: a fold that read `unavailable` as `empty` would build a state
+        // from nothing and call it correct.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "action": "ehdb.state.spine",
+                "outcome": "unavailable",
+                "error": "this worker runs no off-server state-builder index",
+            })),
+        );
+    };
+    let head = params.get("head").and_then(|v| v.parse::<i64>().ok());
+
+    let (outcome, spine) = {
+        let mut idx = index.lock().await;
+        let out = match head {
+            Some(target) => idx.build_spine_to(execution_id, target),
+            None => idx.build_spine(execution_id),
+        };
+        idx.touch(execution_id);
+        out
+    };
+
+    let label = match outcome {
+        crate::state_builder::AdvanceOutcome::CacheHit => "cache_hit",
+        crate::state_builder::AdvanceOutcome::Incremental(_) => "incremental",
+        crate::state_builder::AdvanceOutcome::ColdRebuild(_) => "cold_rebuild",
+        crate::state_builder::AdvanceOutcome::Incomplete => "incomplete",
+    };
+    let complete = !matches!(
+        outcome,
+        crate::state_builder::AdvanceOutcome::Incomplete
+    );
+    let events = if complete { spine.unwrap_or_default() } else { Vec::new() };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "action": "ehdb.state.spine",
+            "outcome": if complete { "ok" } else { "incomplete" },
+            "build": label,
+            "execution_id": execution_id.to_string(),
+            "requested_head": head,
+            "complete": complete,
+            "count": events.len(),
+            "events": events,
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,5 +1436,69 @@ mod tier_append_batch_tests {
     fn batch_is_opt_in() {
         std::env::remove_var("NOETL_EHDB_TIER_APPEND_BATCH");
         assert!(!batch_appends_enabled(), "must default to the loop");
+    }
+}
+
+#[cfg(test)]
+mod state_spine_tests {
+    /// An `Incomplete` build must serve NO events.
+    ///
+    /// This is the fail-closed property the server's fold depends on: a spine
+    /// that does not reach the requested head is a gapped history, and folding
+    /// it produces a state for an execution that never existed. The drive's own
+    /// answer is a benign no-op the reconciler re-drives; this route must give
+    /// the same one rather than a shorter list the caller cannot distinguish
+    /// from a genuinely shorter execution.
+    ///
+    /// Asserted on the ROUTE'S OWN CODE rather than by standing up an index,
+    /// because the property is a branch in the handler and the branch is what
+    /// can regress. Comment-stripped so prose cannot satisfy it, with a
+    /// positive control that the stripper left the real code.
+    #[test]
+    fn an_incomplete_spine_serves_no_events() {
+        let whole = include_str!("metrics_server.rs");
+        let code: String = whole
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("async fn state_spine_handler"),
+            "the comment stripper ate the handler; this guard proves nothing"
+        );
+        assert!(
+            code.contains("let events = if complete { spine.unwrap_or_default() } else { Vec::new() };"),
+            "the spine route must serve an EMPTY event list when the build is \
+             Incomplete. Serving the partial spine would let the server fold a \
+             gapped history and digest it as if it were the execution's state."
+        );
+    }
+
+    /// The route must distinguish "no index in this process" from "no events".
+    ///
+    /// Two zeros that mean opposite things: `unavailable` is a worker that
+    /// cannot answer, `ok` with an empty list is an execution the index knows
+    /// nothing about. A fold that collapsed them would build a state from
+    /// nothing on a misconfigured worker and report it as correct.
+    #[test]
+    fn no_index_is_unavailable_not_empty() {
+        let whole = include_str!("metrics_server.rs");
+        let code: String = whole
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("StatusCode::SERVICE_UNAVAILABLE")
+                && code.contains("\"unavailable\""),
+            "a worker with no state-builder index must answer `unavailable`, \
+             never an empty spine"
+        );
     }
 }
