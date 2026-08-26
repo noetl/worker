@@ -588,15 +588,13 @@ impl CommandSource for EhdbCommandSource {
             if self.pull.is_none() {
                 match ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await
                 {
-                    Ok(c) => {
-                        // A connect IS progress: it distinguishes "reconnecting"
-                        // from "parked forever" (noetl/ai-meta#297).
-                        crate::metrics::record_claim_loop_progress();
-                        self.pull = Some(c)
-                    }
+                    // NOT progress: a frozen peer's kernel still completes the
+                    // handshake, so redialling a stuck writer "connects" every
+                    // time.  Only a claim proves the bus works (noetl/ai-meta#297).
+                    Ok(c) => self.pull = Some(c),
                     Err(e) => {
                         crate::metrics::record_ehdb_claim_reconnect("commands", "connect_failed");
-                        crate::metrics::set_claim_loop_connected(false);
+                        crate::metrics::record_claim_loop_failure();
                         tracing::warn!(claim_addr = %self.claim_addr, error = %e, "EHDB claim connect failed; retrying");
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         continue;
@@ -624,7 +622,7 @@ impl CommandSource for EhdbCommandSource {
                     // left this read parked forever, so dispatch stopped with
                     // nothing logged anywhere.
                     crate::metrics::record_ehdb_claim_reconnect("commands", "claim_next_failed");
-                    crate::metrics::set_claim_loop_connected(false);
+                    crate::metrics::record_claim_loop_failure();
                     tracing::warn!(
                         claim_addr = %self.claim_addr,
                         member = self.member,

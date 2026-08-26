@@ -1063,10 +1063,8 @@ async fn livez_handler() -> impl IntoResponse {
     //
     // `None` means the loop has never run in this process (no claim loop at all),
     // which must stay 200 so the probe is safe fleet-wide.
-    if let Some(stale) = crate::metrics::claim_loop_stale_secs() {
-        if !crate::metrics::claim_loop_connected() && stale >= claim_loop_unhealthy_after() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "claim_loop wedged");
-        }
+    if crate::metrics::claim_loop_wedged(claim_loop_unhealthy_after()) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "claim_loop wedged");
     }
     (StatusCode::OK, "alive")
 }
@@ -1549,11 +1547,17 @@ mod claim_loop_backstop_tests {
     #[test]
     fn a_worker_with_no_claim_loop_is_never_called_wedged() {
         let _g = guard();
-        // Never stamped → None → the wedged branch is unreachable.
+        // Asserted through the pure decision, not the process-global gauges:
+        // this binary runs 690+ other tests and a sibling arm legitimately
+        // leaves the gauges flipped. The property is about the CONTRACT — a
+        // process that never claims records no failures — not about whatever
+        // the shared gauge happens to hold when this test is scheduled.
+        //
+        // Getting this arm wrong restarts the request pool forever, which is why
+        // it is asserted rather than assumed.
         assert!(
-            crate::metrics::claim_loop_stale_secs().is_none()
-                || crate::metrics::claim_loop_connected(),
-            "a process that never claimed must not be reported wedged"
+            !crate::metrics::wedged_from(0, 3, None, super::claim_loop_unhealthy_after()),
+            "a worker that runs no claim loop must never read wedged"
         );
     }
 
@@ -1585,6 +1589,81 @@ mod claim_loop_backstop_tests {
         let stale = crate::metrics::claim_loop_stale_secs();
         assert!(stale.is_some(), "progress must stamp a readable timestamp");
         assert!(stale.unwrap() < 5, "a fresh stamp must read as fresh");
+    }
+
+    /// The defect the kind fault arm found: a frozen peer still completes the TCP
+    /// handshake, so a loop redialling a stuck writer "connects" every time. When
+    /// a connect counted as progress the gauge read healthy through an 8-failure
+    /// streak. Only a claim may clear it.
+    #[test]
+    fn a_reconnect_to_a_stuck_peer_is_not_progress() {
+        let _g = guard();
+        crate::metrics::record_claim_loop_progress(); // clean slate
+        assert!(crate::metrics::claim_loop_connected());
+        for _ in 0..8 {
+            crate::metrics::record_claim_loop_failure();
+        }
+        assert!(
+            !crate::metrics::claim_loop_connected(),
+            "a failure streak must flip the gauge; connects must not clear it"
+        );
+        assert!(crate::metrics::claim_loop_consecutive_failures() >= 8);
+        // Only a claim recovers it.
+        crate::metrics::record_claim_loop_progress();
+        assert!(crate::metrics::claim_loop_connected());
+        assert_eq!(crate::metrics::claim_loop_consecutive_failures(), 0);
+    }
+
+    /// A healthy idle bus produces zero failures, so idleness can never be
+    /// mistaken for a stall — the trap a naive "no claims recently" rule falls
+    /// into, and the reason the discriminator is a failure streak.
+    #[test]
+    fn an_idle_bus_is_never_called_wedged() {
+        let _g = guard();
+        crate::metrics::record_claim_loop_progress();
+        assert!(
+            !crate::metrics::claim_loop_wedged(super::claim_loop_unhealthy_after()),
+            "an idle bus parks — it must never read wedged"
+        );
+    }
+
+    /// The SECOND defect the kind arm found, and the more dangerous one: after a
+    /// stall clears, the system pool is legitimately idle — it has nothing to
+    /// claim. A rule keyed on claim recency left the gauge at 0 and /livez at 503
+    /// indefinitely, which would restart-loop a healthy pool forever. Recovery
+    /// must be provable WITHOUT a claim.
+    #[test]
+    fn a_recovered_but_idle_pool_stops_reading_wedged() {
+        let _g = guard();
+        crate::metrics::record_claim_loop_progress();
+        for _ in 0..5 {
+            crate::metrics::record_claim_loop_failure();
+        }
+        assert!(
+            crate::metrics::claim_loop_wedged(3600),
+            "while failures are recent it is wedged"
+        );
+        // Failures stop. No claim arrives — the pool is simply idle. Once the
+        // last failure is older than the window it must read healthy, and that
+        // has to hold WITHOUT a claim ever arriving.
+        let streak = 5;
+        assert!(
+            crate::metrics::wedged_from(streak, 3, Some(10), 180),
+            "control: a failure 10s ago inside a 180s window is wedged"
+        );
+        assert!(
+            !crate::metrics::wedged_from(streak, 3, Some(600), 180),
+            "once failures stop past the window, an idle pool must not stay wedged \
+             — otherwise /livez restart-loops a healthy worker forever"
+        );
+        assert!(
+            !crate::metrics::wedged_from(0, 3, Some(1), 180),
+            "a single blip below the streak is never wedged"
+        );
+        assert!(
+            !crate::metrics::wedged_from(99, 3, None, 180),
+            "no failure ever recorded cannot be wedged"
+        );
     }
 
     /// The bound must be positive and overridable; 0 must not disable the

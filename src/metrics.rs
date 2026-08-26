@@ -2619,16 +2619,117 @@ pub fn claim_loop_connected() -> bool {
     WorkerMetrics::global().claim_loop_connected.get() == 1
 }
 
-/// Stamp the claim loop's last successful progress and mark it connected
-/// (noetl/ai-meta#297).  Paired deliberately: a boolean with no timestamp cannot
-/// distinguish "just reconnected" from "silent for a day".
+/// Consecutive claim failures with no successful claim between them.  Reset by
+/// [`record_claim_loop_progress`], incremented by [`record_claim_loop_failure`].
+static CLAIM_LOOP_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// How many consecutive failures mean "wedged" rather than "a blip".
+/// `NOETL_CLAIM_LOOP_FAILURE_STREAK`, default 3.
+fn claim_loop_failure_streak() -> u32 {
+    std::env::var("NOETL_CLAIM_LOOP_FAILURE_STREAK")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3)
+}
+
+/// Stamp a **successful claim** and mark the loop connected (noetl/ai-meta#297).
+///
+/// Only a claim counts.  A successful *connect* deliberately does not, and that
+/// distinction is load-bearing: a frozen peer's kernel still completes the TCP
+/// handshake, so a loop redialling a stuck writer connects every time.  Stamping
+/// on connect made a wedged pool report `connected=1` forever — the exact
+/// idle-vs-wedged ambiguity this gauge exists to remove, reintroduced one level
+/// up.  Caught by the kind fault arm, not by a test.
 pub fn record_claim_loop_progress() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     WorkerMetrics::global().claim_loop_last_progress.set(now);
+    CLAIM_LOOP_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
     set_claim_loop_connected(true);
+}
+
+/// Record a claim failure.  Past `NOETL_CLAIM_LOOP_FAILURE_STREAK` consecutive
+/// failures the loop is wedged, not blipping, and the gauge says so.
+///
+/// A healthy idle bus produces **zero** failures — it parks — so this cannot
+/// mistake idleness for a stall, which is the trap a naive "no claims recently"
+/// rule falls into.
+pub fn record_claim_loop_failure() {
+    let n = CLAIM_LOOP_CONSECUTIVE_FAILURES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    CLAIM_LOOP_LAST_FAILURE.store(unix_now(), std::sync::atomic::Ordering::Relaxed);
+    if n >= claim_loop_failure_streak() {
+        set_claim_loop_connected(false);
+    }
+}
+
+/// Unix seconds of the most recent claim failure.
+static CLAIM_LOOP_LAST_FAILURE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Seconds since the last claim failure, or `None` if there has never been one.
+pub fn claim_loop_secs_since_failure() -> Option<u64> {
+    let last = CLAIM_LOOP_LAST_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return None;
+    }
+    Some((unix_now() - last).max(0) as u64)
+}
+
+/// Is the claim loop **wedged** — failing repeatedly and *still* failing?
+///
+/// The discriminator is ongoing failure, not absent claims, and the difference
+/// is not academic. The kind fault arm showed why: the system pool legitimately
+/// has nothing to claim most of the time, so "no claim recently" is its normal
+/// healthy state. A rule keyed on claim recency reported a *recovered* pool as
+/// wedged and would have had Kubernetes restart-loop a perfectly healthy worker.
+///
+/// Keyed on failures instead:
+/// - stuck peer — failures keep arriving every ceiling period → wedged;
+/// - recovered but idle — failures stop, the window lapses → healthy;
+/// - healthy and idle — no failures ever → healthy.
+pub fn claim_loop_wedged(window_secs: u64) -> bool {
+    wedged_from(
+        claim_loop_consecutive_failures(),
+        claim_loop_failure_streak(),
+        claim_loop_secs_since_failure(),
+        window_secs,
+    )
+}
+
+/// The wedged decision as a pure function, so every arm is testable without
+/// waiting real seconds. `secs_since_failure` is `None` when no failure has ever
+/// been recorded.
+pub fn wedged_from(
+    failures: u32,
+    streak: u32,
+    secs_since_failure: Option<u64>,
+    window_secs: u64,
+) -> bool {
+    if failures < streak {
+        return false;
+    }
+    match secs_since_failure {
+        Some(since) => since <= window_secs,
+        None => false,
+    }
+}
+
+/// Current consecutive-failure count — for tests and diagnostics.
+pub fn claim_loop_consecutive_failures() -> u32 {
+    CLAIM_LOOP_CONSECUTIVE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Seconds since the claim loop last made progress, or `None` if it never has
