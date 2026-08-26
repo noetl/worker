@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.122.2](https://github.com/noetl/worker/compare/v5.122.1...v5.122.2) (2026-08-26)
+
+### Bug Fixes
+
+* **claim:** a stuck peer is wedged, an idle one is not — and the arm proved I had it backwards twice ([49057ee](https://github.com/noetl/worker/commit/49057ee66f550ac05e8b309846e82f2d3e5a95d8)), closes [noetl/ai-meta#297](https://github.com/noetl/ai-meta/issues/297)
+* **claim:** bound the claim park, publish claim liveness, and back it with /livez ([4a2bcad](https://github.com/noetl/worker/commit/4a2bcad2d04078b446b090da0b9fb33d4d478118)), closes [noetl/ai-meta#297](https://github.com/noetl/ai-meta/issues/297) [ehdb#319](https://github.com/noetl/ehdb/issues/319) [#297](https://github.com/noetl/worker/issues/297) [noetl/ai-meta#297](https://github.com/noetl/ai-meta/issues/297)
+
 ## [5.122.1](https://github.com/noetl/worker/compare/v5.122.0...v5.122.1) (2026-08-26)
 
 ### Bug Fixes
