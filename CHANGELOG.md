@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.122.0](https://github.com/noetl/worker/compare/v5.121.0...v5.122.0) (2026-08-26)
+
+### Features
+
+* **ehdb:** serve the WAL spine, so the server can re-fold it ([409b36f](https://github.com/noetl/worker/commit/409b36f36c735faa08337cd0748df362fd100326)), closes [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+
 ## [5.121.0](https://github.com/noetl/worker/compare/v5.120.0...v5.121.0) (2026-08-24)
 
 ### Features
