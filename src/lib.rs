@@ -22,6 +22,7 @@ pub mod executor;
 pub mod graceful;
 pub mod materializer;
 pub mod metrics;
+pub mod secrets;
 pub mod metrics_server;
 /// WASM plug-in host for the system worker pool (noetl/ai-meta#105). Gated
 /// behind the `wasm-plugin` feature while it is an unwired skeleton.
