@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.123.0](https://github.com/noetl/worker/compare/v5.122.2...v5.123.0) (2026-08-27)
+
+### Features
+
+* **secrets:** hydrate NOETL_INTERNAL_API_TOKEN from _FILE — INERT by default ([fd0abf4](https://github.com/noetl/worker/commit/fd0abf4704d6ccfcf9e8ec996651dee686a7b9a1)), closes [noetl/ai-meta#267](https://github.com/noetl/ai-meta/issues/267) [server#362](https://github.com/noetl/server/issues/362) [noetl/ai-meta#267](https://github.com/noetl/ai-meta/issues/267)
+
 ## [5.122.2](https://github.com/noetl/worker/compare/v5.122.1...v5.122.2) (2026-08-26)
 
 ### Bug Fixes
