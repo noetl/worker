@@ -22,6 +22,21 @@ async fn main() -> Result<()> {
     // Load environment variables
     dotenvy::dotenv().ok();
 
+    // noetl/ai-meta#267 Tier 2 — hydrate NOETL_INTERNAL_API_TOKEN from
+    // NOETL_INTERNAL_API_TOKEN_FILE, BEFORE any thread spawns and before
+    // client/tls.rs or materializer.rs read it.  Inert unless the *_FILE
+    // variable is set.  Placement is pinned by
+    // secrets::file_env::tests::hydrate_is_called_at_the_top_of_main.
+    let secret_sources = noetl_worker::secrets::file_env::hydrate();
+    for (var, source) in &secret_sources {
+        noetl_worker::metrics::record_secret_source(var, source.as_str());
+        tracing::info!(
+            target: "noetl_worker::secrets",
+            var, source = source.as_str(),
+            "bootstrap secret source resolved"
+        );
+    }
+
     // Load configuration
     let config = WorkerConfig::from_env()?;
 

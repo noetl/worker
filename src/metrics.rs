@@ -106,6 +106,16 @@ pub struct WorkerMetrics {
     /// with nothing logged anywhere, for ~2.4 days.  That fix added the log
     /// line; this adds the signal (`agents/rules/observability.md` Principle 2).
     pub ehdb_claim_reconnect_total: IntCounterVec,
+    /// Where the worker's bootstrap secret came from at startup
+    /// (noetl/ai-meta#267 Tier 2), labelled by `var` and `source`
+    /// (`file` / `env` / `file_unusable`).  Records the PROVENANCE, never the
+    /// value.
+    ///
+    /// All three sources are pinned at startup, so an absent series means "this
+    /// binary predates the metric" rather than "it never happened" —
+    /// `Registry::gather` prunes empty families, and without pinning those two
+    /// are indistinguishable.
+    pub secret_source_total: IntCounterVec,
     /// Always 1; the `version` label identifies the running binary.
     ///
     /// `Registry::gather` prunes empty metric families, so a labelled metric is
@@ -704,6 +714,23 @@ impl WorkerMetrics {
         registry
             .register(Box::new(event_emit_failed_total.clone()))
             .expect("register event_emit_failed_total");
+
+        let secret_source_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_secret_source_total",
+                "Where a bootstrap secret was read from at startup: file (CSI mount) or env (secretKeyRef). Provenance only, never the value (noetl/ai-meta#267).",
+            ),
+            &["var", "source"],
+        )
+        .expect("secret_source_total metric");
+        registry
+            .register(Box::new(secret_source_total.clone()))
+            .expect("register secret_source_total");
+        for var in crate::secrets::file_env::HYDRATED {
+            for source in ["file", "env", "file_unusable"] {
+                secret_source_total.with_label_values(&[var, source]).reset();
+            }
+        }
 
         let ehdb_claim_reconnect_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -1740,6 +1767,7 @@ impl WorkerMetrics {
             event_emit_retries_total,
             event_emit_failed_total,
             ehdb_claim_reconnect_total,
+            secret_source_total,
             command_pickup_phase_seconds,
             build_info,
             concurrent_dispatches,
@@ -2471,6 +2499,15 @@ pub const EHDB_CLAIM_RECONNECT_REASONS: [&str; 2] = ["connect_failed", "claim_ne
 pub const EHDB_CLAIM_FEEDS: [&str; 2] = ["commands", "events"];
 
 /// Record one EHDB claim-coordinator reconnect.
+/// Record where one bootstrap secret came from (noetl/ai-meta#267).
+/// `source` is `file`, `env` or `file_unusable`.
+pub fn record_secret_source(var: &str, source: &str) {
+    WorkerMetrics::global()
+        .secret_source_total
+        .with_label_values(&[var, source])
+        .inc();
+}
+
 pub fn record_ehdb_claim_reconnect(feed: &str, reason: &str) {
     WorkerMetrics::global()
         .ehdb_claim_reconnect_total
