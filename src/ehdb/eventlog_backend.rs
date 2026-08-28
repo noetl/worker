@@ -443,6 +443,58 @@ mod tests {
         assert_eq!(o.shard_count(), 2);
     }
 
+    /// The claim in this module's doc comments — "identical selection to
+    /// `AffinityConfig::from_env`" — asserted **against that rule**, over a
+    /// matrix, rather than against hardcoded numbers (noetl/ai-meta#266).
+    ///
+    /// The test above is named `ownership_matches_worker_affinity_env` but never
+    /// referenced the affinity code at all: it checked two hand-written pairs. So
+    /// the correspondence three doc comments depend on was prose with nothing
+    /// forcing it true, and either side could have moved while both kept claiming
+    /// to match. This is the assertion that makes the claim load-bearing.
+    #[test]
+    fn ownership_selection_is_the_same_rule_the_affinity_config_uses() {
+        for (index, count) in [
+            (0u32, 0u32),  // count 0 is normalised to 1 by both
+            (0, 1),
+            (0, 2),
+            (1, 2),
+            (2, 2),        // out of range -> single owner
+            (3, 2),        // further out of range
+            (0, 4),
+            (3, 4),
+            (4, 4),        // boundary: index == count is out of range
+            (7, 8),
+        ] {
+            let (want_index, want_count) =
+                crate::sharding::effective_shard_selection(index, count);
+            let got = ownership_from_env(&env(&[
+                ("NOETL_SHARD_INDEX", &index.to_string()),
+                ("NOETL_SHARD_COUNT", &count.to_string()),
+            ]));
+            assert_eq!(
+                (got.shard_index(), got.shard_count()),
+                (want_index, want_count),
+                "durable ownership diverged from the affinity selection rule at \
+                 index={index} count={count}"
+            );
+        }
+
+        // Positive control: the matrix must contain a case where the rule
+        // actually rewrites the input, otherwise the loop above could pass with a
+        // selection function that returned its arguments unchanged.
+        assert_eq!(
+            crate::sharding::effective_shard_selection(2, 2),
+            (0, 1),
+            "an out-of-range index must degrade — without this the matrix proves nothing"
+        );
+        assert_ne!(
+            crate::sharding::effective_shard_selection(3, 4),
+            (0, 1),
+            "and an in-range index must NOT degrade"
+        );
+    }
+
     #[test]
     fn out_of_range_index_degrades_to_single_owner() {
         let o = ownership_from_env(&env(&[

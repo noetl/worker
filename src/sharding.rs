@@ -119,7 +119,24 @@ impl AffinityDecision {}
 
 /// Execution-affinity routing configuration for one stateful worker
 /// replica. Resolved once from env at source construction
-/// ([`AffinityConfig::from_env`]). Every knob defaults to today's
+/// ([`AffinityConfig::from_env`]).
+///
+/// # ⚠ Runtime-inert, and deliberately retained (noetl/ai-meta#266)
+///
+/// `from_env`, `decide` and `max_redirects` have **no callers** outside this
+/// module: T5 deleted the steering block that used them, so
+/// `NOETL_STATE_AFFINITY_ROUTE` is set to `true` on prod and steers nothing.
+///
+/// This type is NOT deleted, because it is not merely dead — it is the written
+/// **specification** of how a replica's shard ownership is selected, and
+/// `ehdb::eventlog_backend::ownership_from_env` is a live reader that claims to
+/// match it exactly. Deleting it would remove the reference the live code is
+/// defined against and leave three doc comments pointing at nothing.
+///
+/// What #266 changed instead: the shared rule now lives in
+/// [`effective_shard_selection`], and the durable stack's ownership is tested
+/// **against it** rather than against hardcoded numbers. The spec is enforced,
+/// so the two can no longer drift apart in silence. Every knob defaults to today's
 /// behaviour, so a worker carrying this code is behaviour-neutral until an
 /// operator both sets `NOETL_SHARD_COUNT > 1` and turns
 /// `NOETL_STATE_AFFINITY_ROUTE` on.
@@ -155,6 +172,29 @@ impl Default for AffinityConfig {
     }
 }
 
+/// The shard-selection rule, as a pure function of the two env values.
+///
+/// Extracted so it can be **compared against**, not just described. Three doc
+/// comments in `ehdb/eventlog_backend.rs` claim its `ownership_from_env` performs
+/// "identical selection" to [`AffinityConfig::from_env`] — and until
+/// noetl/ai-meta#266 nothing checked that. The test named
+/// `ownership_matches_worker_affinity_env` asserted hardcoded values and never
+/// referenced this type at all, so the correspondence was prose with nothing
+/// forcing it true: change one side and the other stays silently claiming to
+/// match.
+///
+/// Returns the `(shard_index, shard_count)` this replica effectively owns.
+/// An index outside the pool degrades to single-owner `(0, 1)` — correctness
+/// never depends on the partition, and a single writer is always safe.
+pub fn effective_shard_selection(shard_index: u32, shard_count: u32) -> (u32, u32) {
+    let count = shard_count.max(1);
+    if count > 1 && shard_index >= count {
+        (0, 1)
+    } else {
+        (shard_index, count)
+    }
+}
+
 impl AffinityConfig {
     /// Resolve the config from env. Invalid combinations degrade to the
     /// safe (disabled) default with a WARN rather than panicking a worker
@@ -170,6 +210,18 @@ impl AffinityConfig {
             "NOETL_STATE_AFFINITY_NAK_DELAY_MS",
             DEFAULT_NAK_DELAY_MS,
         ));
+
+        // The selection itself is `effective_shard_selection`, shared with the
+        // durable event-log stack so the two provably agree (noetl/ai-meta#266).
+        debug_assert_eq!(
+            effective_shard_selection(shard_index, shard_count),
+            if shard_count > 1 && shard_index >= shard_count {
+                (0, 1)
+            } else {
+                (shard_index, shard_count)
+            },
+            "the shared rule must reproduce this function's own selection"
+        );
 
         // A replica configured for a shard that does not exist in the pool
         // is a config bug. The server panics; a worker must not (a crashed
