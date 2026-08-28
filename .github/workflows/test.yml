@@ -1,0 +1,56 @@
+# noetl/ai-meta#232 — actually run the tests.
+#
+# Before this workflow, NO GitHub Actions workflow in this repo (or in
+# noetl/server, noetl/tools, noetl/cli) ran `cargo test`.  `release.yml` builds
+# and publishes; `semantic-release.yml` versions and tags.  Neither runs a test.
+#
+# That is worse than having no tests, because the repo has ~860 of them and they
+# read as a safety net.  Several are deliberate guards whose entire value is
+# failing when someone changes the thing they guard — for example
+# `file_env::tests`, which pins the `<VAR>_FILE` precedence the prod secret
+# migration depends on (noetl/ai-meta#267), and the metrics-server tests that pin
+# the claim-loop liveness decision (noetl/ai-meta#297).
+# A guard that no runner executes cannot fail, and a guard that cannot fail is
+# indistinguishable from one that was never written.
+#
+# Deliberately NOT here:
+#   * `cargo fmt --check` — these crates are formatted with rustfmt 1.9.0 and a
+#     different version reformats large parts of the tree; a CI fmt gate would
+#     fail on unrelated files.
+#   * `-D warnings` on clippy — `main` currently carries 5 pre-existing warnings.
+#     Clippy runs and is visible, but does not gate, so this workflow does not
+#     start life red for reasons nobody in this PR caused.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # --all-targets, not the default. `cargo build`/`cargo test` alone skip
+      # integration tests and `cfg(test)`-only code, so a binary can be broken
+      # while the lib compiles clean — that has happened in this repo before.
+      - name: build (all targets)
+        run: cargo build --all-targets --locked
+
+      - name: test
+        run: cargo test --all-targets --locked
+
+      - name: clippy (visible, non-gating)
+        run: cargo clippy --all-targets --locked || true
