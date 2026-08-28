@@ -153,15 +153,32 @@ async fn sigterm_seals_the_active_part_with_no_acked_record_lost() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The quantified counterfactual: the *same* writes, with no seal, are gone.
+/// The counterfactual, inverted: the *same* writes with **no seal** now survive.
 ///
-/// This is what a SIGKILL / OOM still costs today — the hard-kill half of
-/// noetl/ai-meta#209, which needs L0-level replay of the local active part on
-/// open and is out of scope here. Pinning it as a test rather than a comment
-/// means the day someone closes that half, this test fails and tells them the
-/// exposure is gone.
+/// This test used to assert the opposite — that a SIGKILL lost the whole unsealed
+/// tail, the residual hard-kill half of noetl/ai-meta#209 — and it said in its own
+/// failure message that the day someone closed that half, it should be updated.
+/// That day had already come and gone unnoticed: `ehdb-l0` gained active-part
+/// replay on open (`Engine::recover_active_parts` → `Part::recover_active`), #209
+/// is closed, and 300 of 300 records now come back.
+///
+/// **Nobody found out, because no CI job ran this test** (noetl/ai-meta#232). A
+/// tripwire nothing executes cannot trip; the exposure had been closed for some
+/// time while the test still described it as open.
+///
+/// Two things are worth asserting rather than one, because "the data came back"
+/// has a boring wrong explanation:
+///
+/// 1. the tail survives a drop with **no** `shutdown.run()`, and
+/// 2. it survives for the right reason — recovery on open, not a `Drop`-time
+///    flush. A `Drop` impl that sealed would make this pass while a real SIGKILL
+///    (where no destructor runs) still lost everything. There is no such `Drop`
+///    in `ehdb-l0`; this test would keep passing if one were added, so the
+///    assertion below is paired with `ehdb_l0::part::tests::
+///    unsealed_active_part_survives_a_crash`, which exercises the reopen path
+///    directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_the_seal_the_unsealed_tail_is_lost_the_hard_kill_exposure() {
+async fn the_unsealed_tail_survives_a_hard_kill_now_that_l0_replays_it() {
     let dir = unique_dir("nokill");
     const RECORDS: u64 = 300;
 
@@ -182,15 +199,17 @@ async fn without_the_seal_the_unsealed_tail_is_lost_the_hard_kill_exposure() {
 
     let visible = records_visible_after_reopen(&dir).await;
     assert_eq!(
-        visible, 0,
-        "expected the whole unsealed tail to be lost on a hard kill (that is the \
-         residual exposure #209 documents); saw {visible} of {RECORDS} survive. \
-         If the L0 active-part replay landed, this exposure is closed — update \
-         the issue and delete this test."
+        visible, RECORDS,
+        "the unsealed tail must survive a hard kill: L0 replays the active part on \
+         open (noetl/ai-meta#209 closed), so the reopened engine should see all \
+         {RECORDS} acked records — it saw {visible}. A regression here is SILENT \
+         DATA LOSS on any SIGKILL or OOM, which is why it is asserted rather than \
+         assumed."
     );
-    // The loss is bounded by `seal_max_records` — that bound is the number the
-    // soak's hard-kill measurement is checked against.
-    const _: () = assert!(RECORDS <= 1024);
+    // Below `seal_max_records` on purpose: above it the engine would have
+    // auto-sealed along the way and the recovery path would not be what is
+    // being exercised.
+    const _: () = assert!(RECORDS < 1024);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
