@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.123.1](https://github.com/noetl/worker/compare/v5.123.0...v5.123.1) (2026-08-28)
+
+### Bug Fixes
+
+* **sharding:** enforce the affinity spec the durable stack claims to match ([4fad9ef](https://github.com/noetl/worker/commit/4fad9ef6a3fc83bfa90ea4466735125efa34b595)), closes [noetl/ai-meta#266](https://github.com/noetl/ai-meta/issues/266) [noetl/ai-meta#266](https://github.com/noetl/ai-meta/issues/266)
+
 ## [5.123.0](https://github.com/noetl/worker/compare/v5.122.2...v5.123.0) (2026-08-27)
 
 ### Features
