@@ -179,10 +179,17 @@ async fn ehdb_tier_query_handler(
     // surface; adding a variant there would promise a local read path that does
     // not exist, and a promise a route cannot keep is how a caller ends up
     // scoring an error body as data.
-    if crate::ehdb::store_tier::StoreTier::parse(&tier)
-        == Some(crate::ehdb::store_tier::StoreTier::Projection)
-    {
-        return ehdb_projection_tier_query(&raw).await;
+    // Both of these are served by the writer-fronted tier service rather than a
+    // pod-local shadow driver, so they are handled before `QueryTier` and
+    // deliberately NOT added to that enum — `QueryTier` is the shadow-driver read
+    // surface, and a variant there would promise a local read path that does not
+    // exist.
+    match crate::ehdb::store_tier::StoreTier::parse(&tier) {
+        Some(t @ crate::ehdb::store_tier::StoreTier::Projection)
+        | Some(t @ crate::ehdb::store_tier::StoreTier::Catalog) => {
+            return ehdb_service_tier_query(t, &raw).await;
+        }
+        _ => {}
     }
     let Some(tier) = QueryTier::parse(&tier) else {
         return (
@@ -190,7 +197,7 @@ async fn ehdb_tier_query_handler(
             Json(serde_json::json!({
                 "action": "ehdb.tier.query",
                 "error": "unknown tier",
-                "known_tiers": ["eventlog", "projection", "kv", "object", "vector"],
+                "known_tiers": ["eventlog", "projection", "catalog", "kv", "object", "vector"],
             })),
         );
     };
@@ -429,17 +436,20 @@ fn current_serve_state_for(tier: crate::ehdb::store_tier::StoreTier) -> &'static
     }
 }
 
-/// `GET /ehdb/tiers/projection` — read the projection tier through the
-/// writer-fronted tier service (#265).
+/// `GET /ehdb/tiers/{projection|catalog}` — read a **service-resolved** tier.
 ///
 /// Service-resolved **only**, for the same reason the append is: a pod-local
-/// projection store would be one replica's fragment, and answering a comparator
-/// from a fragment produces a confident divergence report about the wrong store.
+/// store would be one replica's fragment, and answering a comparator from a
+/// fragment produces a confident divergence report about the wrong store.
 /// `local` is refused with a reason rather than silently answered.
-async fn ehdb_projection_tier_query(
+///
+/// Parameterised over the tier rather than duplicated per tier: two copies of
+/// this would be two refusal postures and two places for the `execution` vs
+/// `execution_id` trap below to be got wrong.
+async fn ehdb_service_tier_query(
+    tier: crate::ehdb::store_tier::StoreTier,
     raw: &HashMap<String, String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use crate::ehdb::store_tier::StoreTier;
     use crate::ehdb::tier_query_source::Resolution;
 
     let params = QueryParams::from_pairs(raw.iter());
@@ -448,7 +458,7 @@ async fn ehdb_projection_tier_query(
     let source_label = resolution.label();
     let source_addr = resolution.addr().map(str::to_string);
     crate::ehdb::metrics::record_tier_query_source("read", source_label);
-    let serve_state = Some(crate::ehdb::projection::current_serve_state());
+    let serve_state = Some(current_serve_state_for(tier));
 
     let refuse = |reason: String| {
         (
@@ -456,7 +466,7 @@ async fn ehdb_projection_tier_query(
             Json(stamp_source(
                 serde_json::json!({
                     "action": "ehdb.tier.query",
-                    "tier": "projection",
+                    "tier": tier.as_str(),
                     "outcome": "unavailable",
                     "error": reason,
                 }),
@@ -470,14 +480,16 @@ async fn ehdb_projection_tier_query(
     let client = match &resolution {
         Resolution::Service(c) => c,
         Resolution::Misconfigured(reason) => {
-            tracing::error!(%reason, "EHDB projection tier query: refusing to answer");
+            tracing::error!(%reason, tier = tier.as_str(), "EHDB tier query: refusing to answer");
             return refuse(reason.clone());
         }
         Resolution::Local | Resolution::DowngradedToLocal => {
             return refuse(
-                "the projection tier is served only by the writer-fronted tier service; \
-                 set NOETL_EHDB_TIER_QUERY_SOURCE=service and NOETL_EHDB_TIER_SERVICE_ADDR"
-                    .to_string(),
+                format!(
+                    "the {} tier is served only by the writer-fronted tier service; \
+                     set NOETL_EHDB_TIER_QUERY_SOURCE=service and NOETL_EHDB_TIER_SERVICE_ADDR",
+                    tier.as_str()
+                ),
             );
         }
     };
@@ -485,8 +497,8 @@ async fn ehdb_projection_tier_query(
     // `execution`, NOT `execution_id` — the latter is a tracing correlation id
     // in QueryParams, and reading by it would silently query the wrong key.
     let reply = match params.execution.as_deref() {
-        Some(eid) => client.read_execution_tier(StoreTier::Projection, eid).await,
-        None => client.scan_tier(StoreTier::Projection, None, 100).await,
+        Some(eid) => client.read_execution_tier(tier, eid).await,
+        None => client.scan_tier(tier, None, 100).await,
     };
     match reply {
         Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
@@ -501,7 +513,7 @@ async fn ehdb_projection_tier_query(
                 Json(stamp_source(
                     serde_json::json!({
                         "action": "ehdb.tier.query",
-                        "tier": "projection",
+                        "tier": tier.as_str(),
                         "outcome": "unavailable",
                         "error": body,
                     }),
@@ -516,7 +528,7 @@ async fn ehdb_projection_tier_query(
             Json(stamp_source(
                 serde_json::json!({
                     "action": "ehdb.tier.query",
-                    "tier": "projection",
+                    "tier": tier.as_str(),
                     "outcome": "unavailable",
                     "error": e,
                 }),
@@ -555,17 +567,29 @@ async fn ehdb_tier_append_handler(
     Path(tier): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // The tiers with a durable store behind the tier service (#265): the event
-    // log, mirroring `noetl.event`, and the projection tier, mirroring
-    // `noetl.projection_snapshot`. `kv` / `object` / `vector` hold derived data
-    // with no authoritative counterpart for a server to author, so accepting an
-    // append for them would invent records rather than mirror any.
+    // The tiers with a durable store behind the tier service (#265, #311): the
+    // event log mirroring `noetl.event`, the projection tier mirroring
+    // `noetl.projection_snapshot`, and the catalog log. `kv` / `object` /
+    // `vector` hold derived data with no authoritative counterpart for a server
+    // to author, so accepting an append for them would invent records rather
+    // than mirror any.
     let Some(store_tier) = crate::ehdb::store_tier::StoreTier::parse(&tier) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
+                // Derived from the enum rather than spelled out: the previous
+                // wording said "eventlog and projection only" and would have
+                // gone stale the moment a tier was added — telling an operator
+                // their valid tier is unsupported.
+                "error": format!(
+                    "append is supported for these tiers only: {}",
+                    crate::ehdb::store_tier::StoreTier::ALL
+                        .iter()
+                        .map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
                 "action": "ehdb.tier.append",
-                "error": "append is supported for the eventlog and projection tiers only",
                 "tier": tier,
             })),
         );
