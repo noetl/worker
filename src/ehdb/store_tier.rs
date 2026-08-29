@@ -37,12 +37,32 @@
 //! the list says what is true, and a test re-derives it rather than a doc
 //! comment asserting it.
 
-/// The append outcome label for the catalog tier.
+/// Append outcome labels for the catalog tier.
 ///
-/// A constant rather than an inline literal so it cannot drift between the batch
+/// Constants rather than inline literals so they cannot drift between the batch
 /// and single append paths, which is how one of two copies ends up spelling a
 /// metric label differently.
 pub const CATALOG_APPEND_LABEL: &str = "appended";
+
+/// The catalog tier's append **failure** label.
+///
+/// ⚠ This exists because its absence was a fail-open. The first version of the
+/// catalog append arm returned [`CATALOG_APPEND_LABEL`] without inspecting the
+/// reply at all, so an append the tier service REFUSED was reported as
+/// `appended`. Caught in kind: three registrations reported `recorded` against a
+/// writer that did not yet know the tier, and the bytes went nowhere — a silent
+/// loss during exactly the rolling-upgrade window where the server is ahead of
+/// the writer.
+pub const CATALOG_APPEND_FAILED_LABEL: &str = "append_failed";
+
+/// Classify a catalog append reply. Split out so the rule is asserted by a test
+/// rather than living twice inside two match arms.
+pub fn catalog_append_label(reply: Result<&str, &str>) -> &'static str {
+    match reply {
+        Ok(_) => CATALOG_APPEND_LABEL,
+        Err(_) => CATALOG_APPEND_FAILED_LABEL,
+    }
+}
 
 /// The serve-state label for the catalog tier.
 ///
@@ -213,6 +233,23 @@ mod tests {
                 "{n:?} is not a bare filename"
             );
         }
+    }
+
+    /// An append the tier service REFUSED must not be labelled `appended`.
+    ///
+    /// The regression this pins was real and silent: the first version of the
+    /// catalog arm ignored the reply, so three registrations reported success
+    /// against a writer that did not know the tier and the records were lost.
+    #[test]
+    fn a_refused_catalog_append_is_not_reported_as_appended() {
+        assert_eq!(catalog_append_label(Ok("ok")), CATALOG_APPEND_LABEL);
+        assert_eq!(
+            catalog_append_label(Err("unknown tier")),
+            CATALOG_APPEND_FAILED_LABEL,
+            "a refused append reported as `appended` loses records silently during \
+             a rolling upgrade"
+        );
+        assert_ne!(CATALOG_APPEND_LABEL, CATALOG_APPEND_FAILED_LABEL);
     }
 
     /// The catalog log parses, round-trips, and keeps its own store file.

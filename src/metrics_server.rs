@@ -779,7 +779,7 @@ async fn ehdb_tier_append_handler(
                         // a serve decision here would be a verdict about a read
                         // path that does not exist.
                         crate::ehdb::store_tier::StoreTier::Catalog => {
-                            (None, crate::ehdb::store_tier::CATALOG_APPEND_LABEL)
+                            (None, crate::ehdb::store_tier::catalog_append_label(reply))
                         }
                     };
                     if let Some(s) = seq {
@@ -830,7 +830,7 @@ async fn ehdb_tier_append_handler(
                     // See the batch path above: catalog appends are recorded,
                     // not scored.
                     crate::ehdb::store_tier::StoreTier::Catalog => {
-                        (None, crate::ehdb::store_tier::CATALOG_APPEND_LABEL)
+                        (None, crate::ehdb::store_tier::catalog_append_label(reply))
                     }
                 };
                 if let Some(s) = seq {
