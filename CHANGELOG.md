@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.124.0](https://github.com/noetl/worker/compare/v5.123.1...v5.124.0) (2026-08-29)
+
+### Features
+
+* **ehdb:** give the catalog its own store tier ([b04ea4c](https://github.com/noetl/worker/commit/b04ea4c6783ccfee622200ca1f11034c151a00b2)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+* **ehdb:** serve-and-append the catalog tier through the tier service ([9a2b48f](https://github.com/noetl/worker/commit/9a2b48fe878d2d0b982bc6ec6af47202613b8c6e)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+
+### Bug Fixes
+
+* **ehdb:** a refused catalog append must not be labelled 'appended' ([07ef53b](https://github.com/noetl/worker/commit/07ef53bfe7ebf753be441d5182c2bdfdc319e790)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+* **ehdb:** honour the caller's scan limit and paging cursor ([c3d7d98](https://github.com/noetl/worker/commit/c3d7d98674279b8a4613bc9182bde32ce3a2ab0a)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#311](https://github.com/noetl/ai-meta/issues/311)
+
 ## [5.123.1](https://github.com/noetl/worker/compare/v5.123.0...v5.123.1) (2026-08-28)
 
 ### Bug Fixes
