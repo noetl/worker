@@ -24,7 +24,7 @@
 //!   process that holds the durable PVCs. Parsing first means the filename
 //!   comes from this file, not from the network.
 //!
-//! # Deliberately only two variants
+//! # A variant only ever arrives with a store
 //!
 //! `kv`, `object` and `vector` are **not** here. They have tier drivers and
 //! shadow paths, but nothing behind the tier service, and adding a variant for
@@ -37,6 +37,40 @@
 //! the list says what is true, and a test re-derives it rather than a doc
 //! comment asserting it.
 
+/// Append outcome labels for the catalog tier.
+///
+/// Constants rather than inline literals so they cannot drift between the batch
+/// and single append paths, which is how one of two copies ends up spelling a
+/// metric label differently.
+pub const CATALOG_APPEND_LABEL: &str = "appended";
+
+/// The catalog tier's append **failure** label.
+///
+/// ⚠ This exists because its absence was a fail-open. The first version of the
+/// catalog append arm returned [`CATALOG_APPEND_LABEL`] without inspecting the
+/// reply at all, so an append the tier service REFUSED was reported as
+/// `appended`. Caught in kind: three registrations reported `recorded` against a
+/// writer that did not yet know the tier, and the bytes went nowhere — a silent
+/// loss during exactly the rolling-upgrade window where the server is ahead of
+/// the writer.
+pub const CATALOG_APPEND_FAILED_LABEL: &str = "append_failed";
+
+/// Classify a catalog append reply. Split out so the rule is asserted by a test
+/// rather than living twice inside two match arms.
+pub fn catalog_append_label(reply: Result<&str, &str>) -> &'static str {
+    match reply {
+        Ok(_) => CATALOG_APPEND_LABEL,
+        Err(_) => CATALOG_APPEND_FAILED_LABEL,
+    }
+}
+
+/// The serve-state label for the catalog tier.
+///
+/// `not_wired` rather than something that reads like a healthy serve state:
+/// nothing serves catalog reads from EHDB yet, and a label an operator could
+/// mistake for "serving" is exactly the drift this codebase keeps finding.
+pub const CATALOG_SERVE_STATE: &str = "not_wired";
+
 /// A tier with a durable store behind the tier service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StoreTier {
@@ -44,6 +78,19 @@ pub enum StoreTier {
     Eventlog,
     /// The orchestrator read-model mirror (`noetl.projection_snapshot`).
     Projection,
+    /// The **catalog log** (noetl/ai-meta#311 step 2, `docs/rfc/ehdb-catalog-relation.md`).
+    ///
+    /// `noetl.catalog` is not event-sourced — `register` is a direct `INSERT`
+    /// with no emit site — so a catalog *relation*, which is by definition a
+    /// fold of a log, had nothing to fold. This tier is that log.
+    ///
+    /// ⚠ **Deliberately not the event log.** A catalog record carries no
+    /// `execution_id` and has no row in `noetl.event`, so appending one to
+    /// [`StoreTier::Eventlog`] would make the cross-store parity comparator
+    /// report `extra_event` — a tier record with no authoritative row — which
+    /// **pages**. Its own store is what keeps a new log from setting off the
+    /// alarm that guards the old one.
+    Catalog,
 }
 
 impl StoreTier {
@@ -51,6 +98,7 @@ impl StoreTier {
         match self {
             Self::Eventlog => "eventlog",
             Self::Projection => "projection",
+            Self::Catalog => "catalog",
         }
     }
 
@@ -64,6 +112,7 @@ impl StoreTier {
         match self {
             Self::Eventlog => "eventlog.jsonl",
             Self::Projection => "projection.jsonl",
+            Self::Catalog => "catalog.jsonl",
         }
     }
 
@@ -76,6 +125,7 @@ impl StoreTier {
         match raw.trim().to_ascii_lowercase().as_str() {
             "eventlog" => Some(Self::Eventlog),
             "projection" => Some(Self::Projection),
+            "catalog" => Some(Self::Catalog),
             _ => None,
         }
     }
@@ -112,7 +162,8 @@ impl StoreTier {
 
     /// Every tier with a store. Used by the pin sites and by the tests that
     /// assert per-tier isolation, so adding a variant cannot leave one behind.
-    pub const ALL: &'static [StoreTier] = &[StoreTier::Eventlog, StoreTier::Projection];
+    pub const ALL: &'static [StoreTier] =
+        &[StoreTier::Eventlog, StoreTier::Projection, StoreTier::Catalog];
 }
 
 #[cfg(test)]
@@ -182,6 +233,79 @@ mod tests {
                 "{n:?} is not a bare filename"
             );
         }
+    }
+
+    /// An append the tier service REFUSED must not be labelled `appended`.
+    ///
+    /// The regression this pins was real and silent: the first version of the
+    /// catalog arm ignored the reply, so three registrations reported success
+    /// against a writer that did not know the tier and the records were lost.
+    #[test]
+    fn a_refused_catalog_append_is_not_reported_as_appended() {
+        assert_eq!(catalog_append_label(Ok("ok")), CATALOG_APPEND_LABEL);
+        assert_eq!(
+            catalog_append_label(Err("unknown tier")),
+            CATALOG_APPEND_FAILED_LABEL,
+            "a refused append reported as `appended` loses records silently during \
+             a rolling upgrade"
+        );
+        assert_ne!(CATALOG_APPEND_LABEL, CATALOG_APPEND_FAILED_LABEL);
+    }
+
+    /// The catalog log parses, round-trips, and keeps its own store file.
+    #[test]
+    fn the_catalog_tier_has_a_store_of_its_own() {
+        assert_eq!(StoreTier::parse("catalog"), Some(StoreTier::Catalog));
+        assert_eq!(StoreTier::parse(" CATALOG "), Some(StoreTier::Catalog));
+        assert_eq!(StoreTier::Catalog.file_name(), "catalog.jsonl");
+        assert_ne!(
+            StoreTier::Catalog.file_name(),
+            StoreTier::Eventlog.file_name(),
+            "the catalog log must not share the event log's store — that is the \
+             whole reason it exists as a separate tier"
+        );
+    }
+
+    /// ⭐ The catalog tier must NOT be serve-wired.
+    ///
+    /// Nothing reads catalog rows from EHDB yet. A tier listed as serve-wired
+    /// while no read path exists is precisely the inert-but-advertised shape
+    /// this codebase keeps finding — and here it would also imply the catalog
+    /// could serve reads, which is the one cutover the owner reserved.
+    #[test]
+    fn the_catalog_tier_is_not_serve_wired() {
+        assert!(
+            !super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::Catalog.as_str()),
+            "catalog appears in SERVE_WIRED_TIERS, which would advertise a read \
+             path that does not exist"
+        );
+        // The positive control: the two that ARE wired still are, so this test
+        // is checking membership rather than an empty list.
+        assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::Eventlog.as_str()));
+        assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::Projection.as_str()));
+    }
+
+    /// Every tier reads its OWN mirror-source variable.
+    ///
+    /// The match in `mirror_source::for_tier` is exhaustive on purpose, so a new
+    /// tier cannot silently inherit the event log's producer setting. This
+    /// asserts the outcome of that discipline rather than trusting the comment.
+    #[test]
+    fn each_tier_reads_a_distinct_mirror_source_variable() {
+        use super::super::mirror_source::MirrorSource;
+        let mut keys: Vec<&str> = StoreTier::ALL
+            .iter()
+            .map(|t| MirrorSource::env_key_for(*t))
+            .collect();
+        let n = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            n,
+            "two tiers share a mirror-source variable; one would be configured \
+             by the other's setting"
+        );
     }
 
     #[test]

@@ -50,6 +50,15 @@ pub const MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_EVENTLOG_MIRROR_SOURCE";
 /// and that is the default.
 pub const PROJECTION_MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_PROJECTION_MIRROR_SOURCE";
 
+/// `NOETL_EHDB_CATALOG_MIRROR_SOURCE` — the catalog log's producer.
+///
+/// The catalog tier's only writer is the **server** (`POST /api/catalog/register`);
+/// the worker never produces catalog records. It gets its own variable anyway
+/// rather than borrowing the event log's, because a tier whose producer is
+/// configured by another tier's variable is a coupling nobody would predict from
+/// reading either one.
+pub const CATALOG_MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_CATALOG_MIRROR_SOURCE";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirrorSource {
     /// Today's behaviour: the worker's emit chokepoint mirrors what it emits.
@@ -89,6 +98,7 @@ impl MirrorSource {
         let key = match tier {
             StoreTier::Eventlog => MIRROR_SOURCE_ENV,
             StoreTier::Projection => PROJECTION_MIRROR_SOURCE_ENV,
+            StoreTier::Catalog => CATALOG_MIRROR_SOURCE_ENV,
         };
         Self::from_env_key(env, key)
     }
@@ -100,6 +110,7 @@ impl MirrorSource {
         match tier {
             StoreTier::Eventlog => MIRROR_SOURCE_ENV,
             StoreTier::Projection => PROJECTION_MIRROR_SOURCE_ENV,
+            StoreTier::Catalog => CATALOG_MIRROR_SOURCE_ENV,
         }
     }
 
