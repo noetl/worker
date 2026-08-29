@@ -436,6 +436,13 @@ fn current_serve_state_for(tier: crate::ehdb::store_tier::StoreTier) -> &'static
     }
 }
 
+/// Upper bound on a single tier scan.
+///
+/// Generous, because the fold that reads this needs the WHOLE log to be correct
+/// — a partial fold is not a smaller answer, it is a wrong one. Bounded anyway,
+/// so a caller cannot ask the writer for unbounded work.
+const SCAN_LIMIT_MAX: usize = 100_000;
+
 /// `GET /ehdb/tiers/{projection|catalog}` — read a **service-resolved** tier.
 ///
 /// Service-resolved **only**, for the same reason the append is: a pod-local
@@ -498,7 +505,26 @@ async fn ehdb_service_tier_query(
     // in QueryParams, and reading by it would silently query the wrong key.
     let reply = match params.execution.as_deref() {
         Some(eid) => client.read_execution_tier(tier, eid).await,
-        None => client.scan_tier(tier, None, 100).await,
+        // ⚠ The caller's `limit` is HONOURED here. It was hardcoded to 100, which
+        // silently truncated every scan: a catalog fold over 2,528 backfilled
+        // records folded a 100-record prefix and reported coverage of 100 — and
+        // the caller's own cap-detection could not see it, because the
+        // truncation happened on this side. A cap the requester cannot observe
+        // is worse than a small one.
+        // `after` is the paging cursor. It must be honoured, because a tier
+        // service frame is capped at 1 MiB and a catalog log carrying playbook
+        // content runs to megabytes — so a whole-log fold is necessarily a
+        // SEQUENCE of scans, and without a cursor the caller can only ever read
+        // the first page.
+        None => {
+            client
+                .scan_tier(
+                    tier,
+                    params.after,
+                    params.limit.unwrap_or(100).clamp(1, SCAN_LIMIT_MAX),
+                )
+                .await
+        }
     };
     match reply {
         Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
