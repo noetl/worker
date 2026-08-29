@@ -420,6 +420,12 @@ fn current_serve_state_for(tier: crate::ehdb::store_tier::StoreTier) -> &'static
         crate::ehdb::store_tier::StoreTier::Projection => {
             crate::ehdb::projection::current_serve_state()
         }
+        // The catalog log is append-and-read only; it has no serve path and is
+        // deliberately absent from SERVE_WIRED_TIERS. Reporting a serve state
+        // for it would publish a label describing a decision nothing makes.
+        crate::ehdb::store_tier::StoreTier::Catalog => {
+            crate::ehdb::store_tier::CATALOG_SERVE_STATE
+        }
     }
 }
 
@@ -743,6 +749,14 @@ async fn ehdb_tier_append_handler(
                             );
                             (serve.sequence, serve.decision.outcome_label())
                         }
+                        // The catalog log has no primary-serve path (it is absent
+                        // from SERVE_WIRED_TIERS on purpose: nothing reads catalog
+                        // rows from EHDB yet). Appends are recorded, not scored —
+                        // a serve decision here would be a verdict about a read
+                        // path that does not exist.
+                        crate::ehdb::store_tier::StoreTier::Catalog => {
+                            (None, crate::ehdb::store_tier::CATALOG_APPEND_LABEL)
+                        }
                     };
                     if let Some(s) = seq {
                         previous_sequence = s;
@@ -788,6 +802,11 @@ async fn ehdb_tier_append_handler(
                             elapsed,
                         );
                         (serve.sequence, serve.decision.outcome_label())
+                    }
+                    // See the batch path above: catalog appends are recorded,
+                    // not scored.
+                    crate::ehdb::store_tier::StoreTier::Catalog => {
+                        (None, crate::ehdb::store_tier::CATALOG_APPEND_LABEL)
                     }
                 };
                 if let Some(s) = seq {
