@@ -47,6 +47,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use ehdb_reference::fencing as ehdb_fencing;
+use ehdb_reference::fencing::FencingMetrics;
 use ehdb_reference::{
     DurableSegmentStore, EventLogAppendOutcome, EventLogAppendRequest, EventLogDriver,
     EventLogScanRequest, EventLogStorageBackend, FilesystemSharedBackend,
@@ -182,6 +184,86 @@ fn durable_base_from_log(log: Option<&Path>) -> PathBuf {
 /// only affects new rotations — replay is size-agnostic).
 pub const SEGMENT_MAX_BYTES_ENV: &str = "NOETL_EHDB_EVENTLOG_SEGMENT_MAX_BYTES";
 
+/// Stale-writer fencing over the shared segment store (noetl/ehdb#330).
+///
+/// `off` (the default, and any unrecognised value) does not wrap the backend at
+/// all — byte-for-byte today's behaviour. `shadow` wraps it and **counts** a
+/// write from an epoch below the shard's highest accepted epoch while letting it
+/// through. `enforce` refuses it.
+///
+/// ⚠⚠ `enforce` is **owner-gated**: it changes what the store does, not just
+/// what it reports.
+///
+/// ⚠ Until an election issues real tokens (noetl/ehdb#331) every writer's epoch
+/// is `0`, so `shadow` can only ever observe `0 < 0` — false — and will record
+/// zero stale writes. That zero is *meaningful only because* `writes_checked`
+/// climbs beside it; a zero with a flat `writes_checked` says the decorator is
+/// unreached, not that the system is healthy.
+pub const FENCING_ENV: &str = "NOETL_EHDB_FENCING";
+
+/// Process-wide fencing counters.
+///
+/// ⚠ [`build_durable_stack`] constructs the whole stack **per operation** and
+/// drops it, so per-instance counters would be discarded on every call. These
+/// have to outlive the stack to mean anything.
+pub static FENCING_METRICS: std::sync::LazyLock<Arc<FencingMetrics>> =
+    std::sync::LazyLock::new(FencingMetrics::new);
+
+/// Whether fencing wraps the shared store, and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FencingSetting {
+    /// Not wrapped at all — today's behaviour.
+    #[default]
+    Off,
+    /// Wrapped, counting stale epochs, refusing nothing.
+    Shadow,
+    /// ⚠⚠ Wrapped and refusing. Owner-gated.
+    Enforce,
+}
+
+impl FencingSetting {
+    /// Parse from the env map. ⚠ Anything unrecognised is [`Self::Off`] — the
+    /// fail-safe direction here is "change nothing", not "start refusing".
+    pub fn from_env(env: &EnvMap) -> Self {
+        match env
+            .get(FENCING_ENV)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("shadow") => Self::Shadow,
+            Some("enforce") => Self::Enforce,
+            _ => Self::Off,
+        }
+    }
+
+    fn wraps(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// Render the fencing counters.
+///
+/// ⚠ Emitted **whatever the setting**, including `off`. A family that appears
+/// only once fencing is enabled would make "not wrapped" indistinguishable from
+/// "wrapped and quiet" — and the whole point of the shadow period is being able
+/// to tell those apart. `ehdb_fencing_active` says which state this is.
+pub fn render_fencing(setting: FencingSetting) -> String {
+    let mode = match setting {
+        FencingSetting::Enforce => ehdb_fencing::FencingMode::Enforce,
+        _ => ehdb_fencing::FencingMode::Shadow,
+    };
+    let mut out = FENCING_METRICS.render_prometheus(mode);
+    out.push_str(
+        "# HELP ehdb_fencing_active Whether the shared store is wrapped by the fencing decorator at all (0 = not wrapped, today's behaviour).\n",
+    );
+    out.push_str("# TYPE ehdb_fencing_active gauge\n");
+    out.push_str(&format!(
+        "ehdb_fencing_active {}\n",
+        u8::from(setting.wraps())
+    ));
+    out
+}
+
 /// Resolve the segment rollover threshold from [`SEGMENT_MAX_BYTES_ENV`], falling
 /// back to the engine default. A non-numeric / zero value uses the default.
 fn segment_max_bytes(env: &EnvMap) -> u64 {
@@ -202,8 +284,31 @@ pub fn build_durable_stack(
 ) -> Result<SharedTierEventLog, String> {
     let paths = DurablePaths::resolve(env, contract);
     let ownership = ownership_from_env(env);
-    let shared: Arc<dyn SharedSegmentBackend> =
-        Arc::new(FilesystemSharedBackend::open(&paths.shared_root).map_err(|e| e.to_string())?);
+    let plain = FilesystemSharedBackend::open(&paths.shared_root).map_err(|e| e.to_string())?;
+    let setting = FencingSetting::from_env(env);
+    let shared: Arc<dyn SharedSegmentBackend> = match setting {
+        FencingSetting::Off => Arc::new(plain),
+        FencingSetting::Shadow | FencingSetting::Enforce => {
+            // The ledger lives beside the shared objects, not inside them: it is
+            // metadata about who may write, not a segment.
+            let ledger = ehdb_fencing::FencingLedger::new(paths.shared_root.join(".fencing"))
+                .map_err(|e| e.to_string())?;
+            let mode = if setting == FencingSetting::Enforce {
+                ehdb_fencing::FencingMode::Enforce
+            } else {
+                ehdb_fencing::FencingMode::Shadow
+            };
+            let fenced = ehdb_fencing::FencedSharedBackend::new(plain, ledger)
+                .with_mode(mode)
+                .with_metrics(Arc::clone(&FENCING_METRICS));
+            // ⚠ No election yet (noetl/ehdb#331), so this writer holds no token
+            // and its epoch stays 0. Shadow therefore observes nothing —
+            // deliberately: the point of wiring it now is that `writes_checked`
+            // starts climbing, which is what makes a later zero on
+            // `stale_observed` mean anything at all.
+            Arc::new(fenced)
+        }
+    };
     SharedTierEventLog::open_with_segment_size(
         &paths.local_root,
         ownership,
@@ -689,6 +794,126 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(d1, AppendDispatch::Served(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod fencing_tests {
+    use super::*;
+    use ehdb_reference::durable_eventlog_shared::SharedSegmentBackend;
+
+    fn env_with(v: Option<&str>) -> EnvMap {
+        let mut m = EnvMap::new();
+        if let Some(v) = v {
+            m.insert(FENCING_ENV.to_string(), v.to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn fencing_is_off_unless_asked_for() {
+        // ⚠ The safety claim: an untouched deployment must not start wrapping
+        // the shared store. Unset AND unrecognised both mean Off — the
+        // fail-safe direction here is "change nothing", never "start refusing".
+        assert_eq!(FencingSetting::from_env(&env_with(None)), FencingSetting::Off);
+        assert_eq!(FencingSetting::default(), FencingSetting::Off);
+        for junk in ["", "  ", "on", "true", "enfroce", "shadw", "1"] {
+            assert_eq!(
+                FencingSetting::from_env(&env_with(Some(junk))),
+                FencingSetting::Off,
+                "unrecognised value {junk:?} must not enable fencing"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_and_enforce_are_recognised_and_case_insensitive() {
+        for v in ["shadow", "SHADOW", " Shadow "] {
+            assert_eq!(
+                FencingSetting::from_env(&env_with(Some(v))),
+                FencingSetting::Shadow
+            );
+        }
+        assert_eq!(
+            FencingSetting::from_env(&env_with(Some("enforce"))),
+            FencingSetting::Enforce
+        );
+    }
+
+    #[test]
+    fn only_off_leaves_the_store_unwrapped() {
+        assert!(!FencingSetting::Off.wraps());
+        assert!(FencingSetting::Shadow.wraps());
+        assert!(FencingSetting::Enforce.wraps());
+    }
+
+    #[test]
+    fn the_counters_render_at_zero_and_say_whether_fencing_is_active() {
+        // ⚠ A family that appeared only once fencing was enabled would make
+        // "not wrapped" indistinguishable from "wrapped and quiet" — and telling
+        // those apart is the entire purpose of the shadow period.
+        let off = render_fencing(FencingSetting::Off);
+        assert!(off.contains("ehdb_fencing_active 0\n"), "{off}");
+        assert!(off.contains("# TYPE ehdb_fencing_stale_observed_total counter"), "{off}");
+        assert!(off.contains("ehdb_fencing_enforcing 0\n"), "{off}");
+
+        let shadow = render_fencing(FencingSetting::Shadow);
+        assert!(shadow.contains("ehdb_fencing_active 1\n"), "{shadow}");
+        assert!(
+            shadow.contains("ehdb_fencing_enforcing 0\n"),
+            "shadow must never report itself as enforcing: {shadow}"
+        );
+
+        let enforce = render_fencing(FencingSetting::Enforce);
+        assert!(enforce.contains("ehdb_fencing_active 1\n"), "{enforce}");
+        assert!(enforce.contains("ehdb_fencing_enforcing 1\n"), "{enforce}");
+    }
+
+    #[test]
+    fn the_writes_checked_counter_is_what_makes_a_zero_meaningful() {
+        // ⚠⚠ The gate reads two numbers. `stale_observed == 0` is only evidence
+        // when `writes_checked` is climbing beside it; a zero with a flat
+        // checked-counter means the decorator is unreached, which is the exact
+        // failure this programme keeps finding. So prove the counter moves when
+        // a fenced store is actually written through.
+        let dir = std::env::temp_dir().join(format!(
+            "noetl-fencing-reach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let objects = dir.join("objects");
+        let ledger_dir = dir.join(".fencing");
+        std::fs::create_dir_all(&objects).unwrap();
+
+        let plain =
+            ehdb_reference::durable_eventlog_shared::FilesystemSharedBackend::open(&objects)
+                .unwrap();
+        let ledger = ehdb_fencing::FencingLedger::new(&ledger_dir).unwrap();
+        let metrics = FencingMetrics::new();
+        let fenced = ehdb_fencing::FencedSharedBackend::new(plain, ledger)
+            .with_mode(ehdb_fencing::FencingMode::Shadow)
+            .with_metrics(std::sync::Arc::clone(&metrics));
+
+        let before = metrics.writes_checked.load(std::sync::atomic::Ordering::Relaxed);
+        fenced.put_segment(0, 1, b"payload").unwrap();
+        let after = metrics.writes_checked.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(after, before + 1, "a write through the fenced store must be counted");
+        assert_eq!(
+            metrics.stale_observed.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "with no election issuing tokens every epoch is 0, so nothing is stale"
+        );
+        // And the bytes really landed — shadow refuses nothing.
+        assert_eq!(
+            fenced.get_segment(0, 1).unwrap().as_deref(),
+            Some(&b"payload"[..])
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
