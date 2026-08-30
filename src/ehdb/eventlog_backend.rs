@@ -209,6 +209,37 @@ pub const FENCING_ENV: &str = "NOETL_EHDB_FENCING";
 pub static FENCING_METRICS: std::sync::LazyLock<Arc<FencingMetrics>> =
     std::sync::LazyLock::new(FencingMetrics::new);
 
+/// Whether a shard-lease election is running and issuing fencing tokens.
+///
+/// ⚠⚠ **Always 0 today, and that is the point.** `ShardElection`
+/// (noetl/ehdb#331) is implemented, tested and merged — and has **no call sites
+/// anywhere**. Without it every writer's epoch is `0`, which has two
+/// consequences an operator cannot otherwise see:
+///
+/// * single-writer-per-shard still rests entirely on `StatefulSet replicas: 1`,
+///   an orchestration preference rather than a mutual-exclusion primitive; and
+/// * fencing in `enforce` mode would be an **outage**, not a degradation,
+///   because the first writer to advance the marker fences every other one.
+///
+/// A dead feature that reports nothing is indistinguishable from a live one that
+/// has nothing to report. This gauge makes the difference legible on the scrape
+/// instead of requiring someone to grep the source.
+///
+/// ⚠ It is deliberately **not** wired to a fake election. The Kubernetes
+/// `LeaseStore` adapter needs an HTTP/`kube` dependency decision; driving the
+/// in-memory store here would publish a token nothing else honours and a `1`
+/// that means nothing.
+pub fn render_election() -> String {
+    let mut out = String::new();
+    out.push_str("# HELP ehdb_election_active Whether a shard-lease election is running and issuing fencing tokens. 0 means single-writer rests on StatefulSet replicas:1 alone, and fencing enforce would be an outage.\n");
+    out.push_str("# TYPE ehdb_election_active gauge\n");
+    out.push_str("ehdb_election_active 0\n");
+    out.push_str("# HELP ehdb_election_epoch The fencing token this writer holds. 0 means no token has been issued.\n");
+    out.push_str("# TYPE ehdb_election_epoch gauge\n");
+    out.push_str("ehdb_election_epoch 0\n");
+    out
+}
+
 /// The age-based seal trigger (noetl/ehdb#329), read from the process env.
 ///
 /// `None` — the default, and any unparsable value — is today's behaviour: seal on
@@ -1189,5 +1220,57 @@ mod seal_age_env_tests {
                 "{junk:?} must not enable the trigger"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod election_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn the_election_reports_itself_as_not_running() {
+        // ⚠⚠ This test is a placeholder that must FAIL when the election is
+        // actually wired — that is deliberate. If someone implements the K8s
+        // LeaseStore adapter and forgets to publish real state here, the scrape
+        // would keep asserting `0` while tokens were being issued, which is
+        // worse than no gauge: it would say fencing enforce is unsafe when it
+        // had become safe.
+        let text = render_election();
+        assert!(text.contains("ehdb_election_active 0\n"), "{text}");
+        assert!(text.contains("ehdb_election_epoch 0\n"), "{text}");
+    }
+
+    #[test]
+    fn the_election_is_still_unwired_in_this_build() {
+        // The guard that pairs with the gauge: if `ShardElection` ever gains a
+        // call site in this crate, `render_election` must stop hard-coding 0.
+        // Counts CODE, not prose.
+        let sources = [
+            include_str!("eventlog_backend.rs"),
+            include_str!("../command_bus.rs"),
+            include_str!("../event_bus.rs"),
+        ];
+        // ⚠⚠ Scan only the NON-TEST portion of each file. `include_str!` yields
+        // the whole file including this module, so the first two attempts both
+        // matched their own source: once on the bare name, and again on the very
+        // needle literals written to avoid that. A guard that counts itself is
+        // the same family as a counter that counts its own doc comment — and it
+        // took two turns to stop being self-referential.
+        let needle = concat!("Shard", "Election");
+        let wired = sources.iter().any(|src| {
+            src.split("#[cfg(test)]")
+                .next()
+                .unwrap_or("")
+                .lines()
+                .map(str::trim_start)
+                .filter(|l| !l.starts_with("//") && !l.starts_with('*'))
+                .any(|l| l.contains(needle))
+        });
+        assert!(
+            !wired,
+            "ShardElection now has a call site — render_election() must publish \
+             real state instead of a hard-coded 0, and noetl/ehdb#331's gate \
+             needs revisiting"
+        );
     }
 }

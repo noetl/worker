@@ -183,6 +183,12 @@ async fn metrics_handler() -> impl IntoResponse {
         body.extend_from_slice(
             crate::ehdb::eventlog_backend::render_replica_domains().as_bytes(),
         );
+        // ⚠⚠ Election state, alongside the domains — always 0 today.
+        // `ShardElection` (noetl/ehdb#331) has no call sites, so every writer's
+        // epoch is 0 and single-writer rests on `replicas: 1` alone. A dead
+        // feature that reports nothing looks exactly like a live one with
+        // nothing to report; this makes the difference readable on the scrape.
+        body.extend_from_slice(crate::ehdb::eventlog_backend::render_election().as_bytes());
     }
     (
         StatusCode::OK,
