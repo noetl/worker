@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.128.1](https://github.com/noetl/worker/compare/v5.128.0...v5.128.1) (2026-08-30)
+
+### Bug Fixes
+
+* **metrics:** the domain and election gauges were gated on the very state they report ([86fdead](https://github.com/noetl/worker/commit/86fdeade9d8ff93fe1cde850309366a7be8ec3e5)), closes [noetl/ehdb#332](https://github.com/noetl/ehdb/issues/332) [noetl/ehdb#331](https://github.com/noetl/ehdb/issues/331) [noetl/ehdb#324](https://github.com/noetl/ehdb/issues/324)
+
 ## [5.128.0](https://github.com/noetl/worker/compare/v5.127.0...v5.128.0) (2026-08-30)
 
 ### Features
