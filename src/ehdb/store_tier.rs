@@ -75,7 +75,7 @@ pub const CATALOG_SERVE_STATE: &str = "not_wired";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StoreTier {
     /// The authoritative event log's mirror (`noetl.event`).
-    Eventlog,
+    EventLog,
     /// The orchestrator read-model mirror (`noetl.projection_snapshot`).
     Projection,
     /// The **catalog log** (noetl/ai-meta#311 step 2, `docs/rfc/ehdb-catalog-relation.md`).
@@ -86,7 +86,7 @@ pub enum StoreTier {
     ///
     /// ⚠ **Deliberately not the event log.** A catalog record carries no
     /// `execution_id` and has no row in `noetl.event`, so appending one to
-    /// [`StoreTier::Eventlog`] would make the cross-store parity comparator
+    /// [`StoreTier::EventLog`] would make the cross-store parity comparator
     /// report `extra_event` — a tier record with no authoritative row — which
     /// **pages**. Its own store is what keeps a new log from setting off the
     /// alarm that guards the old one.
@@ -96,7 +96,7 @@ pub enum StoreTier {
 impl StoreTier {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Eventlog => "eventlog",
+            Self::EventLog => "eventlog",
             Self::Projection => "projection",
             Self::Catalog => "catalog",
         }
@@ -110,7 +110,7 @@ impl StoreTier {
     /// serving primary in production.
     pub fn file_name(self) -> &'static str {
         match self {
-            Self::Eventlog => "eventlog.jsonl",
+            Self::EventLog => "eventlog.jsonl",
             Self::Projection => "projection.jsonl",
             Self::Catalog => "catalog.jsonl",
         }
@@ -123,14 +123,14 @@ impl StoreTier {
     /// would be a refusal an operator has to debug rather than read.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "eventlog" => Some(Self::Eventlog),
+            "eventlog" => Some(Self::EventLog),
             "projection" => Some(Self::Projection),
             "catalog" => Some(Self::Catalog),
             _ => None,
         }
     }
 
-    /// Parse a wire value, defaulting to [`StoreTier::Eventlog`] when the field
+    /// Parse a wire value, defaulting to [`StoreTier::EventLog`] when the field
     /// is **absent**.
     ///
     /// The default is what keeps a pre-#265 client working against a #265
@@ -145,7 +145,7 @@ impl StoreTier {
     /// scored as a correct one.
     pub fn parse_or_default(raw: Option<&str>) -> Result<Self, String> {
         match raw.map(str::trim).filter(|s| !s.is_empty()) {
-            None => Ok(Self::Eventlog),
+            None => Ok(Self::EventLog),
             Some(v) => Self::parse(v).ok_or_else(|| {
                 format!(
                     "unknown tier {:?} — the tier service stores {}",
@@ -163,7 +163,7 @@ impl StoreTier {
     /// Every tier with a store. Used by the pin sites and by the tests that
     /// assert per-tier isolation, so adding a variant cannot leave one behind.
     pub const ALL: &'static [StoreTier] =
-        &[StoreTier::Eventlog, StoreTier::Projection, StoreTier::Catalog];
+        &[StoreTier::EventLog, StoreTier::Projection, StoreTier::Catalog];
 }
 
 #[cfg(test)]
@@ -173,11 +173,11 @@ mod tests {
     #[test]
     fn absent_tier_is_the_event_log() {
         // The rolling-upgrade property: a pre-#265 frame carries no tier.
-        assert_eq!(StoreTier::parse_or_default(None), Ok(StoreTier::Eventlog));
-        assert_eq!(StoreTier::parse_or_default(Some("")), Ok(StoreTier::Eventlog));
+        assert_eq!(StoreTier::parse_or_default(None), Ok(StoreTier::EventLog));
+        assert_eq!(StoreTier::parse_or_default(Some("")), Ok(StoreTier::EventLog));
         assert_eq!(
             StoreTier::parse_or_default(Some("   ")),
-            Ok(StoreTier::Eventlog)
+            Ok(StoreTier::EventLog)
         );
     }
 
@@ -214,7 +214,7 @@ mod tests {
     fn file_names_are_distinct_and_the_event_log_keeps_its_name() {
         // A rename here would present the writer's populated, primary-serving
         // event-log store as empty.
-        assert_eq!(StoreTier::Eventlog.file_name(), "eventlog.jsonl");
+        assert_eq!(StoreTier::EventLog.file_name(), "eventlog.jsonl");
         let mut names: Vec<&str> = StoreTier::ALL.iter().map(|t| t.file_name()).collect();
         names.sort_unstable();
         let n = names.len();
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(StoreTier::Catalog.file_name(), "catalog.jsonl");
         assert_ne!(
             StoreTier::Catalog.file_name(),
-            StoreTier::Eventlog.file_name(),
+            StoreTier::EventLog.file_name(),
             "the catalog log must not share the event log's store — that is the \
              whole reason it exists as a separate tier"
         );
@@ -281,7 +281,7 @@ mod tests {
         );
         // The positive control: the two that ARE wired still are, so this test
         // is checking membership rather than an empty list.
-        assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::Eventlog.as_str()));
+        assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::EventLog.as_str()));
         assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::Projection.as_str()));
     }
 

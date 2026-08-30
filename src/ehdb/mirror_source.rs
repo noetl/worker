@@ -89,14 +89,14 @@ impl MirrorSource {
 
     /// Resolve the mirror source for one tier's own variable.
     ///
-    /// [`StoreTier::Eventlog`] reads [`MIRROR_SOURCE_ENV`],
+    /// [`StoreTier::EventLog`] reads [`MIRROR_SOURCE_ENV`],
     /// [`StoreTier::Projection`] reads [`PROJECTION_MIRROR_SOURCE_ENV`]. The
     /// match is exhaustive rather than a fallback, so a tier added without a
     /// variable fails the build instead of silently inheriting the event log's.
     pub fn for_tier(env: &EnvMap, tier: super::store_tier::StoreTier) -> Self {
         use super::store_tier::StoreTier;
         let key = match tier {
-            StoreTier::Eventlog => MIRROR_SOURCE_ENV,
+            StoreTier::EventLog => MIRROR_SOURCE_ENV,
             StoreTier::Projection => PROJECTION_MIRROR_SOURCE_ENV,
             StoreTier::Catalog => CATALOG_MIRROR_SOURCE_ENV,
         };
@@ -108,7 +108,7 @@ impl MirrorSource {
     pub fn env_key_for(tier: super::store_tier::StoreTier) -> &'static str {
         use super::store_tier::StoreTier;
         match tier {
-            StoreTier::Eventlog => MIRROR_SOURCE_ENV,
+            StoreTier::EventLog => MIRROR_SOURCE_ENV,
             StoreTier::Projection => PROJECTION_MIRROR_SOURCE_ENV,
             StoreTier::Catalog => CATALOG_MIRROR_SOURCE_ENV,
         }
@@ -173,14 +173,14 @@ mod tests {
             MirrorSource::Server
         );
         assert_eq!(
-            MirrorSource::for_tier(&proj_only, StoreTier::Eventlog),
+            MirrorSource::for_tier(&proj_only, StoreTier::EventLog),
             MirrorSource::Worker,
             "arming the projection mirror must not arm the event log's"
         );
 
         let el_only = env(&[(MIRROR_SOURCE_ENV, "server")]);
         assert_eq!(
-            MirrorSource::for_tier(&el_only, StoreTier::Eventlog),
+            MirrorSource::for_tier(&el_only, StoreTier::EventLog),
             MirrorSource::Server
         );
         assert_eq!(
@@ -190,7 +190,7 @@ mod tests {
              sets it TODAY, so inheriting it would arm tier 2 on the next rollout"
         );
         assert_ne!(
-            MirrorSource::env_key_for(StoreTier::Eventlog),
+            MirrorSource::env_key_for(StoreTier::EventLog),
             MirrorSource::env_key_for(StoreTier::Projection)
         );
     }

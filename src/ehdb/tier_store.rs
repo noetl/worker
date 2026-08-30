@@ -95,7 +95,7 @@ impl TierStoreConfig {
 
     /// Back-compat alias for the event-log store path.
     pub fn eventlog_path(&self) -> PathBuf {
-        self.path_for(StoreTier::Eventlog)
+        self.path_for(StoreTier::EventLog)
     }
 }
 
@@ -498,7 +498,7 @@ mod tests {
     /// Every pre-#265 test addresses the event log, which is also the tier the
     /// wire default resolves to — so these keep asserting exactly what they
     /// asserted before the tier argument existed.
-    const EL: StoreTier = StoreTier::Eventlog;
+    const EL: StoreTier = StoreTier::EventLog;
     const PROJ: StoreTier = StoreTier::Projection;
 
     fn tmp_cfg(name: &str) -> TierStoreConfig {
