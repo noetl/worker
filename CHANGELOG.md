@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.127.0](https://github.com/noetl/worker/compare/v5.126.0...v5.127.0) (2026-08-30)
+
+### Features
+
+* **ehdb:** make two DEAD remediation features reachable (F5 observe, F3 knob) ([127a817](https://github.com/noetl/worker/commit/127a817505dfd0bf94c30f30456053c17ab89a0b)), closes [noetl/ehdb#332](https://github.com/noetl/ehdb/issues/332) [noetl/ehdb#329](https://github.com/noetl/ehdb/issues/329) [noetl/ehdb#324](https://github.com/noetl/ehdb/issues/324)
+
 ## [5.126.0](https://github.com/noetl/worker/compare/v5.125.2...v5.126.0) (2026-08-30)
 
 ### Features
