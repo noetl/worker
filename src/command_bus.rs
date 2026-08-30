@@ -366,6 +366,7 @@ pub async fn spawn_writer_host(
         // drops the others silently (noetl/ai-meta#208 follow-up).
         let resume_reports = coordinator.resume_report().into_iter().collect::<Vec<_>>();
         let integrity_engine = writer.clone();
+        let durability_engine = writer.clone();
         tokio::spawn(serve_writer_metrics(
             addr,
             resume_reports,
@@ -384,8 +385,18 @@ pub async fn spawn_writer_host(
                     .ok()
                     .map(|e| e.metrics().snapshot())
             },
+            move || {
+                let engine = durability_engine.engine();
+                let e = engine.lock().ok()?;
+                // Rendered under the lock: the gauges and the histogram must
+                // describe the same instant, or a shard could read "nothing
+                // pending" beside a latency sample for the record it just shed.
+                let mut out = ehdb_feed::render_unreplicated(&e.unreplicated_snapshot());
+                out.push_str(&ehdb_feed::render_replicated_lag(&e.metrics()));
+                Some(out)
+            },
         ));
-        tracing::info!(%addr, "EHDB command-bus /metrics lag + resume + integrity endpoint up");
+        tracing::info!(%addr, "EHDB command-bus /metrics lag + resume + integrity + durability-window endpoint up");
     }
 
     Ok((writer, shutdown))
@@ -408,6 +419,22 @@ pub async fn spawn_writer_host(
 ///
 /// `appends` rides along as the denominator — a rate of zero out-of-order appends
 /// is only meaningful next to how many appends actually happened.
+/// Published alongside the durability window so a scrape states whether the
+/// sample succeeded. Without it, per-shard rows missing because the engine lock
+/// was contended look exactly like per-shard rows missing because the binary
+/// predates the metric.
+const DURABILITY_SAMPLE_OK: &str = concat!(
+    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or could not acquire the engine lock (0).\n",
+    "# TYPE ehdb_l0_durability_sample_ok gauge\n",
+    "ehdb_l0_durability_sample_ok 1\n"
+);
+
+const DURABILITY_SAMPLE_FAILED: &str = concat!(
+    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or could not acquire the engine lock (0).\n",
+    "# TYPE ehdb_l0_durability_sample_ok gauge\n",
+    "ehdb_l0_durability_sample_ok 0\n"
+);
+
 fn render_integrity(m: &ehdb_l0::metrics::L0MetricsSnapshot) -> String {
     let mut out = String::new();
     out.push_str(
@@ -452,15 +479,17 @@ fn render_integrity(m: &ehdb_l0::metrics::L0MetricsSnapshot) -> String {
 /// The lag + resume halves are rendered by ehdb's own public renderers, so their
 /// byte shape — which KEDA prefix-matches — stays owned by the crate that tests
 /// it.
-async fn serve_writer_metrics<L, I>(
+async fn serve_writer_metrics<L, I, D>(
     addr: SocketAddr,
     reports: Vec<ehdb_feed::ResumeReport>,
     lag: L,
     integrity: I,
+    durability: D,
 ) -> std::io::Result<()>
 where
     L: Fn() -> ehdb_feed::LagSnapshot + Send + Sync + 'static,
     I: Fn() -> Option<ehdb_l0::metrics::L0MetricsSnapshot> + Send + Sync + 'static,
+    D: Fn() -> Option<String> + Send + Sync + 'static,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -468,9 +497,15 @@ where
     let resume = Arc::new(ehdb_feed::render_resume(&reports));
     let lag = Arc::new(lag);
     let integrity = Arc::new(integrity);
+    let durability = Arc::new(durability);
     loop {
         let (mut sock, _peer) = listener.accept().await?;
-        let (lag, resume, integrity) = (lag.clone(), resume.clone(), integrity.clone());
+        let (lag, resume, integrity, durability) = (
+            lag.clone(),
+            resume.clone(),
+            integrity.clone(),
+            durability.clone(),
+        );
         tokio::spawn(async move {
             let mut scratch = [0u8; 1024];
             let _ = sock.read(&mut scratch).await;
@@ -480,6 +515,24 @@ where
             // the autoscaler's lag series would vanish with it.
             if let Some(m) = integrity() {
                 body.push_str(&render_integrity(&m));
+            }
+            // The D1 durability window (noetl/ehdb#328).
+            //
+            // ⚠ On a contended engine lock the provider yields `None`. Emitting
+            // nothing would make the window's series VANISH from that scrape,
+            // which reads identically to a binary too old to have them — the
+            // absent-vs-zero trap these metrics exist to avoid. So the sample's
+            // own success is published as a gauge and the family headers are
+            // emitted either way.
+            match durability() {
+                Some(rendered) => {
+                    body.push_str(&rendered);
+                    body.push_str(DURABILITY_SAMPLE_OK);
+                }
+                None => {
+                    body.push_str(&ehdb_feed::render_unreplicated(&[]));
+                    body.push_str(DURABILITY_SAMPLE_FAILED);
+                }
             }
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -741,7 +794,10 @@ mod tests {
     #[test]
     fn unset_or_invalid_never_silently_selects_nats() {
         // Valid values still resolve, case- and whitespace-insensitively.
-        assert_eq!(CommandBusMode::parse_strict("ehdb").unwrap(), CommandBusMode::Ehdb);
+        assert_eq!(
+            CommandBusMode::parse_strict("ehdb").unwrap(),
+            CommandBusMode::Ehdb
+        );
         assert_eq!(
             CommandBusMode::parse_strict(" SHADOW ").unwrap(),
             CommandBusMode::Shadow
@@ -760,17 +816,27 @@ mod tests {
         // Each failure mode names itself, so the operator is not sent looking
         // for a `nats` that nothing set.
         let unset = CommandBusMode::parse_strict("").unwrap_err().to_string();
-        assert!(unset.contains("NOETL_COMMAND_BUS"), "must name the var: {unset}");
+        assert!(
+            unset.contains("NOETL_COMMAND_BUS"),
+            "must name the var: {unset}"
+        );
         assert!(unset.contains("unset"), "must say what is wrong: {unset}");
 
-        let stale = CommandBusMode::parse_strict("nats").unwrap_err().to_string();
+        let stale = CommandBusMode::parse_strict("nats")
+            .unwrap_err()
+            .to_string();
         assert!(
             stale.contains("no longer exists"),
             "an explicit stale `nats` gets its own actionable error: {stale}"
         );
 
-        let typo = CommandBusMode::parse_strict("ehbd").unwrap_err().to_string();
-        assert!(typo.contains("ehbd"), "must echo the offending value: {typo}");
+        let typo = CommandBusMode::parse_strict("ehbd")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            typo.contains("ehbd"),
+            "must echo the offending value: {typo}"
+        );
 
         // ehdb consumes EHDB; shadow keeps consuming NATS (authoritative).
         assert!(CommandBusMode::Ehdb.consumes_ehdb() && !CommandBusMode::Shadow.consumes_ehdb());
@@ -798,8 +864,14 @@ mod tests {
             "the error must reach the config builder, not be swallowed"
         );
         std::env::set_var("NOETL_COMMAND_BUS", "ehdb");
-        assert_eq!(CommandBusMode::from_env_strict().unwrap(), CommandBusMode::Ehdb);
-        assert_eq!(CommandBusConfig::from_env().unwrap().mode, CommandBusMode::Ehdb);
+        assert_eq!(
+            CommandBusMode::from_env_strict().unwrap(),
+            CommandBusMode::Ehdb
+        );
+        assert_eq!(
+            CommandBusConfig::from_env().unwrap().mode,
+            CommandBusMode::Ehdb
+        );
         std::env::remove_var("NOETL_COMMAND_BUS");
     }
 

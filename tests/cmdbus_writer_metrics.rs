@@ -164,3 +164,59 @@ async fn a_restarted_writer_reports_a_drained_pool_as_zero_rather_than_omitting_
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_durability_window_is_on_the_deployed_scrape() {
+    // noetl/worker#290 / noetl/ehdb#328. The D1 durability window — how long an
+    // acknowledged record has sat on one disk without reaching the substrate —
+    // is the instrument the whole durability story reads from. Proving it moves
+    // in ehdb's tests is not the same as proving the deployed pod SERVES it, and
+    // the gap between those two is exactly the reachability trap this programme
+    // has hit before: a recorder that exists and is never called.
+    let dir = unique_dir("durability");
+    let addr = free_addr().await;
+    let (_writer, _shutdown) = spawn_writer_host(&config_at(&dir, addr)).await.unwrap();
+
+    let resp = scrape(addr).await;
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+
+    // ⚠ Present AND zero on an idle writer. Prometheus prunes empty families, so
+    // an unpinned labelled gauge is absent until it first fires — "nothing
+    // pending" would read identically to "this binary has no such metric".
+    assert!(
+        resp.contains("# TYPE ehdb_l0_unreplicated_age_seconds gauge"),
+        "durability window family missing from the deployed endpoint: {resp}"
+    );
+    assert!(
+        resp.contains("ehdb_l0_unreplicated_age_seconds{shard=\"0\"} 0.000\n"),
+        "an idle shard must read 0, not vanish: {resp}"
+    );
+    assert!(
+        resp.contains("ehdb_l0_unreplicated_records{shard=\"0\"} 0\n"),
+        "{resp}"
+    );
+
+    // The end-to-end histogram, present at zero for the same reason.
+    assert!(
+        resp.contains("# TYPE ehdb_l0_replicated_lag_seconds histogram"),
+        "{resp}"
+    );
+    assert!(
+        resp.contains("ehdb_l0_replicated_lag_seconds_count 0\n"),
+        "{resp}"
+    );
+    assert!(
+        resp.contains("ehdb_l0_replicated_lag_seconds_bucket{le=\"+Inf\"} 0\n"),
+        "{resp}"
+    );
+
+    // ⚠ And the scrape states whether it actually sampled. Without this, rows
+    // missing because the engine lock was contended look exactly like rows
+    // missing because the binary predates the metric.
+    assert!(
+        resp.contains("ehdb_l0_durability_sample_ok 1\n"),
+        "the sample-success gauge must say the window was really read: {resp}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

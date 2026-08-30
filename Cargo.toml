@@ -309,8 +309,8 @@ ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "8ac9ac201f235c0
 # no listener binds unless NOETL_EHDB_FLIGHT_SQL is truthy AND the role is a
 # data-plane role.
 ehdb-service = { git = "https://github.com/noetl/ehdb", rev = "8ac9ac201f235c074dca1dcf6408eaa1573c737d" }
-ehdb-feed = { git = "https://github.com/noetl/ehdb", rev = "8ac9ac201f235c074dca1dcf6408eaa1573c737d" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", rev = "8ac9ac201f235c074dca1dcf6408eaa1573c737d" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", rev = "20441cdb3c3172a844473742992d24adf43fad4c" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", rev = "20441cdb3c3172a844473742992d24adf43fad4c" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
