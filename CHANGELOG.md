@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.128.0](https://github.com/noetl/worker/compare/v5.127.0...v5.128.0) (2026-08-30)
+
+### Features
+
+* **ehdb:** make the election's DEAD state observable rather than silent ([a3773f0](https://github.com/noetl/worker/commit/a3773f04ffc3c37ba9760d81d5ec747e3d57d2ff)), closes [noetl/ehdb#331](https://github.com/noetl/ehdb/issues/331) [noetl/ehdb#324](https://github.com/noetl/ehdb/issues/324)
+
 ## [5.127.0](https://github.com/noetl/worker/compare/v5.126.0...v5.127.0) (2026-08-30)
 
 ### Features
