@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.125.2](https://github.com/noetl/worker/compare/v5.125.1...v5.125.2) (2026-08-30)
+
+### Bug Fixes
+
+* **ehdb:** repin to 229ab6a so recovered records are counted as pending ([8f0d0f0](https://github.com/noetl/worker/commit/8f0d0f00911209bd09faa4a5207ef1aae888f485)), closes [noetl/ehdb#338](https://github.com/noetl/ehdb/issues/338) [noetl/worker#290](https://github.com/noetl/worker/issues/290) [noetl/ehdb#328](https://github.com/noetl/ehdb/issues/328)
+
 ## [5.125.1](https://github.com/noetl/worker/compare/v5.125.0...v5.125.1) (2026-08-30)
 
 ### Bug Fixes
