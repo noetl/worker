@@ -150,6 +150,29 @@ async fn metrics_handler() -> impl IntoResponse {
         body.extend_from_slice(ehdb_lines.join("\n").as_bytes());
         body.push(b'\n');
     }
+    // Stale-writer fencing counters (noetl/ehdb#330).
+    //
+    // ⚠ Emitted only once fencing is configured, or once the decorator has
+    // actually checked a write — so a build with fencing off and EHDB inert
+    // still produces byte-identical output, while a configured shadow period is
+    // always observable at 0 rather than absent.
+    //
+    // ⚠⚠ The gate this serves reads TWO numbers, not one:
+    // `ehdb_fencing_stale_observed_total == 0` is only evidence when
+    // `ehdb_fencing_writes_checked_total` is climbing beside it. A zero with a
+    // flat checked-counter means the decorator is unreached, which is the
+    // failure this whole programme keeps finding.
+    let fencing = crate::ehdb::eventlog_backend::FencingSetting::from_env(
+        &crate::ehdb::process_env(),
+    );
+    let checked = crate::ehdb::eventlog_backend::FENCING_METRICS
+        .writes_checked
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if fencing != crate::ehdb::eventlog_backend::FencingSetting::Off || checked > 0 {
+        body.extend_from_slice(
+            crate::ehdb::eventlog_backend::render_fencing(fencing).as_bytes(),
+        );
+    }
     (
         StatusCode::OK,
         [(
