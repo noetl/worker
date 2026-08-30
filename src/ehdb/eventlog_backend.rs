@@ -257,6 +257,78 @@ pub fn render_election() -> String {
 /// was not read at all, so setting it on prod would have silently done nothing.
 pub const SEAL_MAX_AGE_ENV: &str = "NOETL_EHDB_SEAL_MAX_AGE_MS";
 
+/// Spawn the age-seal sweep for a writer, **only when the trigger is set**.
+///
+/// WHY a sweep is needed at all: `should_seal()` is consulted only on append, so
+/// a shard that stops taking traffic never re-evaluates, and its records sit
+/// unreplicated indefinitely -- which is precisely the shard the age trigger
+/// exists to protect. The flag without this is inert on exactly the case it was
+/// added for.
+///
+/// Returns `None` when `NOETL_EHDB_SEAL_MAX_AGE_MS` is unset, so nothing is
+/// spawned and the engine lock is never taken on a schedule. "Switched off" has
+/// to cost nothing, or it is not a real rollback.
+pub fn spawn_seal_age_sweep<D>(
+    engine: std::sync::Arc<std::sync::Mutex<ehdb_l0::L0Engine<D>>>,
+    label: &'static str,
+    shard: u32,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    D: ehdb_l0::Dataset + Send + 'static,
+{
+    let age = seal_max_age_from_env()?;
+    let every = seal_sweep_interval();
+    tracing::info!(
+        %label,
+        shard,
+        seal_max_age_ms = age.as_millis() as u64,
+        sweep_every_ms = every.as_millis() as u64,
+        "EHDB age-seal sweep armed (noetl/ehdb#329)"
+    );
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            // Hold the engine lock only for the sweep itself. `seal_aged_parts`
+            // short-circuits when nothing has aged out, so the common case is a
+            // cheap scan of the writer map.
+            let sealed = match engine.lock() {
+                Ok(mut e) => e.seal_aged_parts(),
+                // A poisoned lock means a writer thread panicked; the sweep is
+                // not the place to decide what that means.
+                Err(_) => continue,
+            };
+            match sealed {
+                Ok(n) if n > 0 => {
+                    tracing::debug!(%label, shard, sealed = n, "age-seal sweep sealed parts")
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(%label, shard, error = %e, "age-seal sweep failed")
+                }
+            }
+        }
+    }))
+}
+
+/// How often the writer sweeps for aged-out parts.
+///
+/// Only meaningful when [`SEAL_MAX_AGE_ENV`] is set. Default 1s — comfortably
+/// under the 5s trigger, so a bounded window is bounded promptly rather than
+/// within one tick of the limit.
+pub const SEAL_SWEEP_INTERVAL_MS_ENV: &str = "NOETL_EHDB_SEAL_SWEEP_INTERVAL_MS";
+
+/// The sweep interval, defaulting to 1s.
+pub fn seal_sweep_interval() -> std::time::Duration {
+    std::env::var(SEAL_SWEEP_INTERVAL_MS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_millis(1_000))
+}
+
 /// Parse [`SEAL_MAX_AGE_ENV`] from the process env.
 pub fn seal_max_age_from_env() -> Option<std::time::Duration> {
     std::env::var(SEAL_MAX_AGE_ENV)
@@ -1272,5 +1344,131 @@ mod election_visibility_tests {
              real state instead of a hard-coded 0, and noetl/ehdb#331's gate \
              needs revisiting"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod seal_sweep_tests {
+    use super::*;
+
+    /// Mutates the process env, so serialised. `cargo test` does NOT serialise.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_age<T>(ms: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(SEAL_MAX_AGE_ENV).ok();
+        match ms {
+            Some(v) => std::env::set_var(SEAL_MAX_AGE_ENV, v),
+            None => std::env::remove_var(SEAL_MAX_AGE_ENV),
+        }
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var(SEAL_MAX_AGE_ENV, v),
+            None => std::env::remove_var(SEAL_MAX_AGE_ENV),
+        }
+        out
+    }
+
+    fn engine(dir: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<ehdb_l0::L0Engine<ehdb_l0::D1EventLog>>> {
+        let store: std::sync::Arc<dyn ehdb_l0::substrate::DurableSubstrate> =
+            std::sync::Arc::new(ehdb_l0::LocalFsSubstrate::new(dir).unwrap());
+        let cfg = ehdb_l0::L0Config::d1(dir)
+            .with_shard_count(1)
+            .with_seal_max_age(seal_max_age_from_env());
+        std::sync::Arc::new(std::sync::Mutex::new(
+            ehdb_l0::L0Engine::<ehdb_l0::D1EventLog>::open(cfg, store).unwrap(),
+        ))
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "noetl-sweep-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[tokio::test]
+    async fn nothing_is_spawned_when_the_trigger_is_unset() {
+        // The safety property: "switched off" must cost nothing, not even a
+        // periodic lock on the engine the writer is appending through.
+        let d = tmp("off");
+        let e = with_age(None, || engine(&d));
+        let h = with_age(None, || spawn_seal_age_sweep(e, "test", 0));
+        assert!(h.is_none(), "no sweep task may exist while the flag is unset");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_is_spawned_when_the_trigger_is_set() {
+        let d = tmp("on");
+        let e = with_age(Some("5000"), || engine(&d));
+        let h = with_age(Some("5000"), || spawn_seal_age_sweep(e, "test", 0));
+        assert!(h.is_some(), "the sweep must exist once the flag is set");
+        h.unwrap().abort();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_seals_an_idle_shard_which_is_the_whole_point() {
+        // The end-to-end property. `should_seal()` runs only on append, so
+        // without this task an idle shard never seals and its records never
+        // reach the substrate. One append, then silence, then the sweep must
+        // seal it with no further traffic.
+        let d = tmp("idle");
+        let e = with_age(Some("60"), || engine(&d));
+        {
+            let mut g = e.lock().unwrap();
+            g.append_record(ehdb_l0::EventRecord::new(1, "exec-idle", "t1", "p1"))
+                .unwrap();
+            assert_eq!(g.metrics().snapshot().seals, 0, "nothing seals on one append");
+        }
+        let h = with_age(Some("60"), || {
+            std::env::set_var(SEAL_SWEEP_INTERVAL_MS_ENV, "20");
+            let h = spawn_seal_age_sweep(e.clone(), "test", 0);
+            std::env::remove_var(SEAL_SWEEP_INTERVAL_MS_ENV);
+            h
+        })
+        .expect("sweep spawned");
+
+        // No further appends. Only the sweep can seal this.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if e.lock().unwrap().metrics().snapshot().seals > 0 {
+                break;
+            }
+        }
+        h.abort();
+        assert!(
+            e.lock().unwrap().metrics().snapshot().seals > 0,
+            "an IDLE shard must be sealed by the sweep -- this is the behaviour \
+             the flag alone cannot produce"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn an_idle_shard_is_not_sealed_without_the_sweep() {
+        // The negative control for the test above. Same fixture, no sweep task:
+        // nothing seals, which is exactly today's production behaviour.
+        let d = tmp("idle-control");
+        let e = with_age(Some("60"), || engine(&d));
+        {
+            let mut g = e.lock().unwrap();
+            g.append_record(ehdb_l0::EventRecord::new(1, "exec-idle", "t1", "p1"))
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            e.lock().unwrap().metrics().snapshot().seals,
+            0,
+            "without the sweep an idle shard never seals -- if this fails, the \
+             sweep is not what makes the difference"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
