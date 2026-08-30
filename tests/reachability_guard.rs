@@ -87,6 +87,23 @@ const EXPECTATIONS: &[Expect] = &[
               bus and shipped a window for the wrong log while looking complete.",
     },
     Expect {
+        feature: "F3 age-seal sweep (command bus)",
+        needle: "spawn_seal_age_sweep(",
+        source: "command_bus",
+        reachable: true,
+        why: "should_seal() runs only on append, so without this timer the age \
+              trigger is inert on an IDLE shard -- the exact shard it protects. \
+              Setting SEAL_MAX_AGE_MS would then bound busy shards only.",
+    },
+    Expect {
+        feature: "F3 age-seal sweep (event bus)",
+        needle: "spawn_seal_age_sweep(",
+        source: "event_bus",
+        reachable: true,
+        why: "The event log is the primary tier; sweeping only the command bus \
+              bounds the wrong log.",
+    },
+    Expect {
         feature: "F5 replica-domain observation",
         needle: "REPLICA_DOMAINS",
         source: "eventlog_backend",
@@ -216,7 +233,7 @@ fn the_registry_covers_every_flagged_feature() {
     // review rather than silent.
     assert_eq!(
         EXPECTATIONS.len(),
-        7,
+        9,
         "add the new feature to EXPECTATIONS and bump this count — an \
          unregistered feature is exactly what this guard exists to catch"
     );

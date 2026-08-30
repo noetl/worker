@@ -271,6 +271,13 @@ pub async fn spawn_event_writer_host(
         "EHDB events-feed engine opened (recovered_active_records>0 means an unsealed part was replayed after an unclean exit)"
     );
     let writer = Arc::new(FeedWriter::new(engine));
+    // noetl/ehdb#329 -- see the command bus. This is the EVENT log, the tier that
+    // is `primary` on prod, so it is the one that matters most.
+    let _seal_sweep = crate::ehdb::eventlog_backend::spawn_seal_age_sweep(
+        writer.engine(),
+        "events-feed",
+        config.shard,
+    );
 
     // noetl/ai-meta#209: the host owns the ingest face's lifetime, so shutdown
     // can close the listener before it seals rather than sealing underneath a

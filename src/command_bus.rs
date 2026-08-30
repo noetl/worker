@@ -247,6 +247,14 @@ pub async fn spawn_writer_host(
         "EHDB command-bus engine opened (recovered_active_records>0 means an unsealed part was replayed after an unclean exit)"
     );
     let writer = Arc::new(FeedWriter::new(engine));
+    // noetl/ehdb#329 -- the timer that makes the age trigger reach an IDLE shard.
+    // A no-op unless NOETL_EHDB_SEAL_MAX_AGE_MS is set: nothing is spawned at
+    // all, so the engine lock is never taken on a schedule.
+    let _seal_sweep = crate::ehdb::eventlog_backend::spawn_seal_age_sweep(
+        writer.engine(),
+        "command-bus",
+        config.shard,
+    );
 
     // noetl/ai-meta#209: the host owns the ingest face's lifetime now. The
     // acceptor runs under a `select!` against `stop_ingest`, so shutdown can
