@@ -256,7 +256,10 @@ pub async fn spawn_event_writer_host(
     std::fs::create_dir_all(&dir)?;
     let store: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&dir)?);
     let engine = L0Engine::<D1EventLog>::open(
-        L0Config::d1(&dir).with_shard_count(config.shard_count.max(1)),
+        L0Config::d1(&dir)
+            .with_shard_count(config.shard_count.max(1))
+            // noetl/ehdb#329: unset means None means today's behaviour.
+            .with_seal_max_age(crate::ehdb::eventlog_backend::seal_max_age_from_env()),
         store,
     )?;
     // noetl/ai-meta#209 — same startup visibility for the EVENTS engine; the

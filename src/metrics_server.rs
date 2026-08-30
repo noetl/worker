@@ -173,6 +173,17 @@ async fn metrics_handler() -> impl IntoResponse {
             crate::ehdb::eventlog_backend::render_fencing(fencing).as_bytes(),
         );
     }
+    // Replica failure domains (noetl/ehdb#332).
+    //
+    // ⚠ Emitted only once the durable stack has been opened, so a build that
+    // never touches it stays byte-identical. `ehdb_replica_domains_observed`
+    // distinguishes "clean" from "never computed" — without it a reading of zero
+    // violations would be indistinguishable from never having looked.
+    if crate::ehdb::eventlog_backend::REPLICA_DOMAINS.get().is_some() {
+        body.extend_from_slice(
+            crate::ehdb::eventlog_backend::render_replica_domains().as_bytes(),
+        );
+    }
     (
         StatusCode::OK,
         [(
