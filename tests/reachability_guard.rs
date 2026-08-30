@@ -221,3 +221,41 @@ fn the_registry_covers_every_flagged_feature() {
          unregistered feature is exactly what this guard exists to catch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The gauges must not be gated on the thing they report about.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_domain_and_election_gauges_are_not_gated_on_the_observation_itself() {
+    // ⚠⚠ The bug this pins: the first wiring rendered these only when
+    // REPLICA_DOMAINS was already set. But `build_durable_stack` runs only under
+    // NOETL_EHDB_EVENTLOG_BACKEND=durable_segment, which prod leaves unset — so
+    // the observation is never made, and gating on it meant the scrape said
+    // nothing at all about precisely the state the gauges exist to report.
+    //
+    // `ehdb_replica_domains_observed 0` is the useful reading. Absence says the
+    // same thing silently, which is the failure mode this whole programme keeps
+    // finding.
+    let src = SOURCES
+        .iter()
+        .find(|(n, _)| *n == "metrics_server")
+        .map(|(_, s)| *s)
+        .expect("metrics_server registered");
+    let gated_on_observation = production_lines(src)
+        .any(|l| l.contains("REPLICA_DOMAINS.get().is_some()"));
+    assert!(
+        !gated_on_observation,
+        "the replica-domain and election gauges must not be gated on \
+         REPLICA_DOMAINS being set — that hides them in the exact case they \
+         report on"
+    );
+    assert!(
+        production_lines(src).any(|l| l.contains("render_replica_domains()")),
+        "the domain gauges must still be rendered"
+    );
+    assert!(
+        production_lines(src).any(|l| l.contains("render_election()")),
+        "the election gauge must still be rendered"
+    );
+}
