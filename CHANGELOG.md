@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.125.1](https://github.com/noetl/worker/compare/v5.125.0...v5.125.1) (2026-08-30)
+
+### Bug Fixes
+
+* **event-bus:** the durability window was on the WRONG log ([32fa7e8](https://github.com/noetl/worker/commit/32fa7e8e0eea62778e938dd99cbc8340290f63d2)), closes [noetl/worker#291](https://github.com/noetl/worker/issues/291) [noetl/worker#290](https://github.com/noetl/worker/issues/290) [noetl/ehdb#328](https://github.com/noetl/ehdb/issues/328) [#291](https://github.com/noetl/worker/issues/291) [noetl/ehdb#322](https://github.com/noetl/ehdb/issues/322) [noetl/ehdb#324](https://github.com/noetl/ehdb/issues/324)
+
 ## [5.125.0](https://github.com/noetl/worker/compare/v5.124.0...v5.125.0) (2026-08-30)
 
 ### Features
