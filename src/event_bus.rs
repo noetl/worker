@@ -490,7 +490,7 @@ pub async fn spawn_event_writer_host(
 
     if let Some(addr) = config.metrics_bind {
         tokio::spawn(serve_event_metrics(addr, coordinator.clone()));
-        tracing::info!(%addr, "EHDB events-feed /metrics endpoint up");
+        tracing::info!(%addr, "EHDB events-feed /metrics + durability-window endpoint up");
     }
 
     Ok((coordinator, shutdown))
@@ -502,6 +502,18 @@ pub async fn spawn_event_writer_host(
 /// Per-group lag is the number the cutover gates read: whole-feed lag would mix
 /// three consumers that are deliberately at different positions, so "is the
 /// durable-log materializer keeping up" is only answerable per group.
+const EVENT_DURABILITY_SAMPLE_OK: &str = concat!(
+    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or could not acquire the engine lock (0).\n",
+    "# TYPE ehdb_l0_durability_sample_ok gauge\n",
+    "ehdb_l0_durability_sample_ok 1\n"
+);
+
+const EVENT_DURABILITY_SAMPLE_FAILED: &str = concat!(
+    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or could not acquire the engine lock (0).\n",
+    "# TYPE ehdb_l0_durability_sample_ok gauge\n",
+    "ehdb_l0_durability_sample_ok 0\n"
+);
+
 async fn render_event_metrics(coordinator: &GroupCoordinator<D1EventLog>) -> String {
     let mut out = String::new();
     out.push_str("# HELP ehdb_events_group_committed Committed cursor per named group.\n");
@@ -555,6 +567,36 @@ async fn render_event_metrics(coordinator: &GroupCoordinator<D1EventLog>) -> Str
         "ehdb_events_cursor_errors {}\n",
         coordinator.cursor_errors()
     ));
+
+    // ---- The D1 durability window for the EVENT LOG (noetl/ehdb#328) --------
+    //
+    // ⚠⚠ This endpoint, not the command bus's, is the one that matters for the
+    // durability story. The writer process hosts TWO L0 engines -- /data/cmdbus
+    // and /data/eventbus -- and the event-log tier that is `primary` on prod is
+    // this one. Instrumenting only `serve_writer_metrics` (the command bus)
+    // published a window for the wrong log while looking complete.
+    //
+    // Rendered under one engine lock so the gauges and the histogram describe
+    // the same instant, and `ehdb_l0_durability_sample_ok` states whether the
+    // sample was taken at all -- a contended lock must not make the series
+    // silently vanish, which reads identically to a binary too old to have them.
+    {
+        let writer = coordinator.writer();
+        let engine = writer.engine();
+        let locked = engine.lock();
+        match locked {
+            Ok(e) => {
+                out.push_str(&ehdb_feed::render_unreplicated(&e.unreplicated_snapshot()));
+                out.push_str(&ehdb_feed::render_replicated_lag(&e.metrics()));
+                out.push_str(EVENT_DURABILITY_SAMPLE_OK);
+            }
+            Err(_) => {
+                out.push_str(&ehdb_feed::render_unreplicated(&[]));
+                out.push_str(EVENT_DURABILITY_SAMPLE_FAILED);
+            }
+        }
+    }
+
     out
 }
 
@@ -676,6 +718,68 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("NOETL_EVENT_BUS_WRITER_DIR"));
+    }
+
+    /// ⚠⚠ The **event log's** durability window must be on THIS endpoint.
+    ///
+    /// The writer process hosts two L0 engines — `/data/cmdbus` and
+    /// `/data/eventbus` — and the tier that is `primary` on prod is the event
+    /// one. noetl/worker#290 instrumented `serve_writer_metrics`, which is the
+    /// **command** bus, so the window shipped for the wrong log while the change
+    /// looked complete. Verified on prod after the roll: 9102 carried the
+    /// families and 9106 did not.
+    #[tokio::test]
+    async fn the_event_log_durability_window_is_on_the_events_endpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "noetl-eventbus-durability-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = EventBusConfig {
+            host: true,
+            shard: 0,
+            shard_count: 1,
+            writer_dir: Some(dir.clone()),
+            ingest_bind: None,
+            claim_bind: None,
+            sse_bind: None,
+            kv_bind: None,
+            kv_dir: None,
+            wal_bind: None,
+            metrics_bind: None,
+            ack_wait: Duration::from_secs(30),
+            cursor_persist: Duration::ZERO,
+            cursor_fallback: CursorFallback::Tail,
+        };
+        let (coordinator, _shutdown) = spawn_event_writer_host(&config).await.unwrap();
+        let body = render_event_metrics(&coordinator).await;
+
+        // Present AND zero on an idle writer: Prometheus prunes empty families,
+        // so an absent gauge reads identically to a binary without the metric.
+        assert!(
+            body.contains("# TYPE ehdb_l0_unreplicated_age_seconds gauge"),
+            "the event log's durability window is missing from its own \
+             endpoint:\n{body}"
+        );
+        assert!(
+            body.contains("ehdb_l0_unreplicated_age_seconds{shard=\"0\"} 0.000\n"),
+            "an idle shard must read 0, not vanish:\n{body}"
+        );
+        assert!(body.contains("ehdb_l0_unreplicated_records{shard=\"0\"} 0\n"), "{body}");
+        assert!(
+            body.contains("# TYPE ehdb_l0_replicated_lag_seconds histogram"),
+            "{body}"
+        );
+        assert!(body.contains("ehdb_l0_durability_sample_ok 1\n"), "{body}");
+
+        // And it still carries what it carried before — the window is additive.
+        assert!(body.contains("ehdb_events_cursor_errors 0"), "{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The three groups are opened at startup and each reports its own lag line,
