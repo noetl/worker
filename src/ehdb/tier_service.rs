@@ -771,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn a_bad_request_is_not_a_degraded_service() {
         let bad = encode_response_observed(&TierRequest::Append {
-            tier: StoreTier::Eventlog,
+            tier: StoreTier::EventLog,
             execution_id: String::new(),
             payload: "{}".to_string(),
         })

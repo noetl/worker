@@ -1407,10 +1407,10 @@ mod tests {
         let _guard = serialised();
         reset();
         pin_tier_service_series(&[]);
-        record_tier_service_append(StoreTier::Eventlog, 7, 512);
-        record_tier_service_append(StoreTier::Eventlog, 9, 900);
+        record_tier_service_append(StoreTier::EventLog, 7, 512);
+        record_tier_service_append(StoreTier::EventLog, 9, 900);
         // An out-of-order sequence must not rewind the gauge.
-        record_tier_service_append(StoreTier::Eventlog, 4, 950);
+        record_tier_service_append(StoreTier::EventLog, 4, 950);
         // A second tier's appends must land on their OWN series (#265) — if the
         // gauges were still process-wide, this would rewrite the event log's.
         record_tier_service_append(StoreTier::Projection, 2, 64);

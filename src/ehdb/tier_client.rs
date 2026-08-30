@@ -208,7 +208,7 @@ impl TierClient {
     /// what the wire default resolves to. Tier-addressed callers use
     /// [`TierClient::append_tier`].
     pub async fn append(&self, execution_id: &str, payload: &str) -> Result<String, String> {
-        self.append_tier(StoreTier::Eventlog, execution_id, payload)
+        self.append_tier(StoreTier::EventLog, execution_id, payload)
             .await
     }
 
@@ -252,7 +252,7 @@ impl TierClient {
         execution_id: &str,
         payloads: &[String],
     ) -> Result<String, String> {
-        self.append_batch_tier(StoreTier::Eventlog, execution_id, payloads)
+        self.append_batch_tier(StoreTier::EventLog, execution_id, payloads)
             .await
     }
 
@@ -280,7 +280,7 @@ impl TierClient {
 
     /// Read every record the remote **event-log** tier holds for one execution.
     pub async fn read_execution(&self, execution_id: &str) -> Result<String, String> {
-        self.read_execution_tier(StoreTier::Eventlog, execution_id)
+        self.read_execution_tier(StoreTier::EventLog, execution_id)
             .await
     }
 
@@ -301,7 +301,7 @@ impl TierClient {
 
     /// Bounded global scan of the remote **event-log** tier.
     pub async fn scan(&self, after: Option<u64>, limit: usize) -> Result<String, String> {
-        self.scan_tier(StoreTier::Eventlog, after, limit).await
+        self.scan_tier(StoreTier::EventLog, after, limit).await
     }
 
     /// Bounded global scan of `tier` (#265).

@@ -70,7 +70,7 @@ const DEFAULT_QUERY_LIMIT: usize = 100;
 /// The four raw data-plane tiers this handler serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryTier {
-    Eventlog,
+    EventLog,
     Kv,
     Object,
     Vector,
@@ -79,7 +79,7 @@ pub enum QueryTier {
 impl QueryTier {
     pub fn as_str(&self) -> &'static str {
         match self {
-            QueryTier::Eventlog => "eventlog",
+            QueryTier::EventLog => "eventlog",
             QueryTier::Kv => "kv",
             QueryTier::Object => "object",
             QueryTier::Vector => "vector",
@@ -89,7 +89,7 @@ impl QueryTier {
     /// Parse a tier token (case-insensitive). `None` = unknown tier.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "eventlog" => Some(QueryTier::Eventlog),
+            "eventlog" => Some(QueryTier::EventLog),
             "kv" => Some(QueryTier::Kv),
             "object" => Some(QueryTier::Object),
             "vector" => Some(QueryTier::Vector),
@@ -348,7 +348,7 @@ pub fn run_query(env: &EnvMap, tier: QueryTier, params: &QueryParams) -> QueryRe
     let _e = span.enter();
 
     let (operation, outcome, body) = match tier {
-        QueryTier::Eventlog => query_eventlog(env, &contract, params),
+        QueryTier::EventLog => query_eventlog(env, &contract, params),
         QueryTier::Kv => query_kv(&contract, params),
         QueryTier::Object => query_object(&contract, params),
         QueryTier::Vector => query_vector(&contract, params),
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn tier_parse_is_case_insensitive() {
-        assert_eq!(QueryTier::parse("EventLog"), Some(QueryTier::Eventlog));
+        assert_eq!(QueryTier::parse("EventLog"), Some(QueryTier::EventLog));
         assert_eq!(QueryTier::parse(" kv "), Some(QueryTier::Kv));
         assert_eq!(QueryTier::parse("object"), Some(QueryTier::Object));
         assert_eq!(QueryTier::parse("vector"), Some(QueryTier::Vector));
@@ -959,7 +959,7 @@ mod tests {
         // `disabled_records_nothing` test covers the "no line emitted" property
         // without racing the process-global metrics state that parallel tests
         // share.
-        let r = run_query(&env(&[]), QueryTier::Eventlog, &QueryParams::default());
+        let r = run_query(&env(&[]), QueryTier::EventLog, &QueryParams::default());
         assert_eq!(r.outcome, QueryOutcome::Disabled);
         assert_eq!(r.body["outcome"], "disabled");
     }
@@ -986,7 +986,7 @@ mod tests {
     fn eventlog_scan_empty_is_absent() {
         let (log, dir) = tmp_log("el-empty");
         let e = worker_env(log.to_str().unwrap());
-        let r = run_query(&e, QueryTier::Eventlog, &QueryParams::default());
+        let r = run_query(&e, QueryTier::EventLog, &QueryParams::default());
         assert_eq!(r.outcome, QueryOutcome::Absent);
         let _ = std::fs::remove_dir_all(&dir);
     }

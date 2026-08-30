@@ -270,7 +270,7 @@ async fn ehdb_tier_query_handler(
     // event-log tier: it is that tier's state, and a bare `serve_state` on a `kv`
     // body would describe the wrong thing to a reader who has no way to tell.
     let serve_state =
-        matches!(tier, QueryTier::Eventlog).then(crate::ehdb::eventlog::current_serve_state);
+        matches!(tier, QueryTier::EventLog).then(crate::ehdb::eventlog::current_serve_state);
 
     use crate::ehdb::tier_query_source::Resolution;
     match &resolution {
@@ -307,7 +307,7 @@ async fn ehdb_tier_query_handler(
             // other tier would be answered with event-log records under a `kv` /
             // `object` / `vector` label.  Refuse instead: a wrong-tier answer is
             // worse than no answer, and it would be scored as data.
-            if !matches!(tier, QueryTier::Eventlog) {
+            if !matches!(tier, QueryTier::EventLog) {
                 return (
                     StatusCode::NOT_IMPLEMENTED,
                     Json(stamp_source(
@@ -473,7 +473,7 @@ fn stamp_source(
 /// a demote on one cannot be reported as the other's state.
 fn current_serve_state_for(tier: crate::ehdb::store_tier::StoreTier) -> &'static str {
     match tier {
-        crate::ehdb::store_tier::StoreTier::Eventlog => {
+        crate::ehdb::store_tier::StoreTier::EventLog => {
             crate::ehdb::eventlog::current_serve_state()
         }
         crate::ehdb::store_tier::StoreTier::Projection => {
@@ -833,7 +833,7 @@ async fn ehdb_tier_append_handler(
                 for out in &per_record {
                     let reply = out.as_deref().map_err(String::as_str);
                     let (seq, label) = match store_tier {
-                        crate::ehdb::store_tier::StoreTier::Eventlog => {
+                        crate::ehdb::store_tier::StoreTier::EventLog => {
                             let serve = crate::ehdb::eventlog::serve_service_append(
                                 &env,
                                 reply,
@@ -887,7 +887,7 @@ async fn ehdb_tier_append_handler(
                 let elapsed = started.elapsed().as_secs_f64();
                 let reply = out.as_deref().map_err(String::as_str);
                 let (seq, label) = match store_tier {
-                    crate::ehdb::store_tier::StoreTier::Eventlog => {
+                    crate::ehdb::store_tier::StoreTier::EventLog => {
                         let serve = crate::ehdb::eventlog::serve_service_append(
                             &env,
                             reply,
