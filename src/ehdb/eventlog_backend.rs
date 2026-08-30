@@ -209,6 +209,127 @@ pub const FENCING_ENV: &str = "NOETL_EHDB_FENCING";
 pub static FENCING_METRICS: std::sync::LazyLock<Arc<FencingMetrics>> =
     std::sync::LazyLock::new(FencingMetrics::new);
 
+/// The age-based seal trigger (noetl/ehdb#329), read from the process env.
+///
+/// `None` — the default, and any unparsable value — is today's behaviour: seal on
+/// size or record count only, which leaves the durability window **unbounded in
+/// time** on a shard that goes quiet.
+///
+/// ⚠⚠ Setting this is **not sufficient on its own**. `should_seal()` is only
+/// consulted on append, so the flag bounds the window on a shard that keeps
+/// taking traffic and does **nothing** for an idle one — which is precisely the
+/// shard it exists to protect. Bounding an idle shard needs a timer driving
+/// `L0Engine::seal_aged_parts()`, and that timer touches the live writer loop, so
+/// it stays owner-gated.
+///
+/// Plumbing the knob is inert: unset means `None` means unchanged. Before this it
+/// was not read at all, so setting it on prod would have silently done nothing.
+pub const SEAL_MAX_AGE_ENV: &str = "NOETL_EHDB_SEAL_MAX_AGE_MS";
+
+/// Parse [`SEAL_MAX_AGE_ENV`] from the process env.
+pub fn seal_max_age_from_env() -> Option<std::time::Duration> {
+    std::env::var(SEAL_MAX_AGE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+}
+
+/// The replica-domain observation, computed where the real paths are known.
+///
+/// ⚠ **Observation only — this never refuses anything.** It uses
+/// `check_replica_domains` (which returns findings) rather than
+/// `validate_replica_domains` (which errors), because refusing to open the
+/// durable stack on a domain violation would be a startup outage, and prod's
+/// current layout *does* violate it: the shared root sits inside the writer's
+/// own data dir on one PVC.
+///
+/// It exists to make noetl/ehdb#332's G4 verify-before **evaluable from the
+/// running system** instead of by reading manifests. Before this, nothing
+/// computed the domains against the live paths at all.
+pub static REPLICA_DOMAINS: std::sync::OnceLock<DomainObservation> = std::sync::OnceLock::new();
+
+/// What the live paths look like as failure domains.
+#[derive(Debug, Clone)]
+pub struct DomainObservation {
+    pub shared: ehdb_l0::FailureDomain,
+    pub local: ehdb_l0::FailureDomain,
+    pub violations: Vec<ehdb_l0::DomainViolation>,
+    pub survives_node_loss: bool,
+}
+
+impl DomainObservation {
+    fn of(local_root: &Path, shared_root: &Path) -> Self {
+        let replicas = vec![
+            ehdb_l0::ReplicaDomain {
+                replica: "writer-local".to_string(),
+                domain: ehdb_l0::FailureDomain::for_path(local_root),
+                root: Some(local_root.to_path_buf()),
+            },
+            ehdb_l0::ReplicaDomain {
+                replica: "shared-substrate".to_string(),
+                domain: ehdb_l0::FailureDomain::for_path(shared_root),
+                root: Some(shared_root.to_path_buf()),
+            },
+        ];
+        Self {
+            local: replicas[0].domain.clone(),
+            shared: replicas[1].domain.clone(),
+            violations: ehdb_l0::check_replica_domains(&replicas),
+            survives_node_loss: ehdb_l0::survives_node_loss(&replicas),
+        }
+    }
+}
+
+/// Render the replica-domain observation.
+///
+/// ⚠ Pinned: emitted with a count of 0 when clean, so "no violations" is
+/// distinguishable from "never computed". `ehdb_replica_domains_observed` says
+/// which of those it is.
+pub fn render_replica_domains() -> String {
+    let mut out = String::new();
+    out.push_str("# HELP ehdb_replica_domains_observed Whether the durable stack has been opened and its replica failure domains computed.\n");
+    out.push_str("# TYPE ehdb_replica_domains_observed gauge\n");
+    let obs = REPLICA_DOMAINS.get();
+    out.push_str(&format!(
+        "ehdb_replica_domains_observed {}\n",
+        u8::from(obs.is_some())
+    ));
+
+    out.push_str("# HELP ehdb_replica_domain_violations Replica-set failure-domain violations by kind. A non-zero shared_domain or nested_path means replication buys no independent failure domain.\n");
+    out.push_str("# TYPE ehdb_replica_domain_violations gauge\n");
+    let (mut shared_domain, mut nested, mut undeclared) = (0u32, 0u32, 0u32);
+    if let Some(o) = obs {
+        for v in &o.violations {
+            match v {
+                ehdb_l0::DomainViolation::SharedDomain { .. } => shared_domain += 1,
+                ehdb_l0::DomainViolation::NestedPath { .. } => nested += 1,
+                ehdb_l0::DomainViolation::Undeclared { .. } => undeclared += 1,
+            }
+        }
+    }
+    // ⚠ All three label values pinned, so a clean reading is 0 rather than an
+    // absent series — the label set is closed, so this is exactly the case
+    // pinning is for.
+    for (kind, n) in [
+        ("shared_domain", shared_domain),
+        ("nested_path", nested),
+        ("undeclared", undeclared),
+    ] {
+        out.push_str(&format!(
+            "ehdb_replica_domain_violations{{kind=\"{kind}\"}} {n}\n"
+        ));
+    }
+
+    out.push_str("# HELP ehdb_replica_survives_node_loss Whether any replica lives in a failure domain independent of this node. 0 means losing the node loses every copy.\n");
+    out.push_str("# TYPE ehdb_replica_survives_node_loss gauge\n");
+    out.push_str(&format!(
+        "ehdb_replica_survives_node_loss {}\n",
+        u8::from(obs.map(|o| o.survives_node_loss).unwrap_or(false))
+    ));
+    out
+}
+
 /// Whether fencing wraps the shared store, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FencingSetting {
@@ -284,6 +405,10 @@ pub fn build_durable_stack(
 ) -> Result<SharedTierEventLog, String> {
     let paths = DurablePaths::resolve(env, contract);
     let ownership = ownership_from_env(env);
+    // Observe (never enforce) the replica failure domains, once per process.
+    let _ = REPLICA_DOMAINS
+        .get_or_init(|| DomainObservation::of(&paths.local_root, &paths.shared_root));
+
     let plain = FilesystemSharedBackend::open(&paths.shared_root).map_err(|e| e.to_string())?;
     let setting = FencingSetting::from_env(env);
     let shared: Arc<dyn SharedSegmentBackend> = match setting {
@@ -915,5 +1040,154 @@ mod fencing_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod domain_observation_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "noetl-dom-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn the_prod_layout_is_reported_as_violating() {
+        // ⚠⚠ This is prod's actual shape: NOETL_EHDB_TIER_SERVICE_DIR sits
+        // INSIDE NOETL_EVENT_BUS_WRITER_DIR on one PVC. The observation must say
+        // so — that is the whole point of computing it against the live paths
+        // rather than reading manifests, and it is G4's verify-before.
+        let base = tmp("nested");
+        let local = base.join("local");
+        let shared = base.join("local").join("ehdb-tier");
+        std::fs::create_dir_all(&shared).unwrap();
+
+        let obs = DomainObservation::of(&local, &shared);
+        assert!(
+            !obs.violations.is_empty(),
+            "a shared root nested inside the local root must be reported: {obs:?}"
+        );
+        assert!(
+            !obs.survives_node_loss,
+            "two paths on one node never survive losing it"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn it_observes_and_never_refuses() {
+        // The safety property. `DomainObservation::of` returns findings; it has
+        // no error path at all, so it cannot turn a misconfigured layout into a
+        // startup failure. Prod violates the check today, so an enforcing
+        // version here would be an outage by construction.
+        let base = tmp("nofail");
+        let local = base.join("a");
+        let shared = base.join("a").join("inside");
+        std::fs::create_dir_all(&shared).unwrap();
+        let obs = DomainObservation::of(&local, &shared); // returns, does not Err
+        assert!(!obs.violations.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_gauges_are_pinned_so_clean_is_not_absent() {
+        // Before the stack is opened nothing has been computed, and the render
+        // must say that rather than reporting a reassuring zero.
+        let text = render_replica_domains();
+        assert!(text.contains("# TYPE ehdb_replica_domain_violations gauge"), "{text}");
+        for kind in ["shared_domain", "nested_path", "undeclared"] {
+            assert!(
+                text.contains(&format!("ehdb_replica_domain_violations{{kind=\"{kind}\"}}")),
+                "label {kind} must be pinned, not absent: {text}"
+            );
+        }
+        assert!(text.contains("ehdb_replica_domains_observed"), "{text}");
+        assert!(text.contains("ehdb_replica_survives_node_loss"), "{text}");
+    }
+
+    #[test]
+    fn separate_roots_on_one_node_are_clean_but_still_die_with_it() {
+        // ⚠ The positive control AND the distinction that matters: passing the
+        // domain check is not the same as surviving node loss. A validator that
+        // reported violations for everything would fail this.
+        let base = tmp("separate");
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let obs = DomainObservation::of(&a, &b);
+        // Same device in a test env, so a shared-domain finding is expected and
+        // correct; what must NOT appear is a nesting finding.
+        assert!(
+            !obs.violations.iter().any(|v| matches!(
+                v,
+                ehdb_l0::DomainViolation::NestedPath { .. }
+            )),
+            "sibling dirs are not nested: {obs:?}"
+        );
+        assert!(!obs.survives_node_loss);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod seal_age_env_tests {
+    use super::*;
+
+    /// ⚠ These mutate the process env, so they are serialised behind one lock.
+    /// `cargo test` does NOT serialise tests — a SAFETY note claiming it does
+    /// was wrong once before on this platform.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var(SEAL_MAX_AGE_ENV).ok();
+        match value {
+            Some(v) => std::env::set_var(SEAL_MAX_AGE_ENV, v),
+            None => std::env::remove_var(SEAL_MAX_AGE_ENV),
+        }
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var(SEAL_MAX_AGE_ENV, v),
+            None => std::env::remove_var(SEAL_MAX_AGE_ENV),
+        }
+        out
+    }
+
+    #[test]
+    fn unset_is_none_which_is_todays_behaviour() {
+        assert_eq!(with_env(None, seal_max_age_from_env), None);
+    }
+
+    #[test]
+    fn a_value_is_read_so_setting_it_is_no_longer_a_silent_no_op() {
+        // ⚠⚠ The regression this closes: the knob existed on L0Config and was
+        // never read from the env, so setting NOETL_EHDB_SEAL_MAX_AGE_MS on prod
+        // would have done NOTHING — the gate would have looked taken and changed
+        // nothing at all.
+        assert_eq!(
+            with_env(Some("5000"), seal_max_age_from_env),
+            Some(std::time::Duration::from_millis(5000))
+        );
+    }
+
+    #[test]
+    fn junk_and_zero_fail_safe_to_off() {
+        // Fail-safe direction is "today's behaviour", never an accidental seal
+        // storm from a typo.
+        for junk in ["", "  ", "abc", "-1", "5s", "0"] {
+            assert_eq!(
+                with_env(Some(junk), seal_max_age_from_env),
+                None,
+                "{junk:?} must not enable the trigger"
+            );
+        }
     }
 }
