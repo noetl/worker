@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.125.0](https://github.com/noetl/worker/compare/v5.124.0...v5.125.0) (2026-08-30)
+
+### Features
+
+* **cmdbus:** serve the D1 durability window on the writer's /metrics ([1ae6e58](https://github.com/noetl/worker/commit/1ae6e58496729ee94be0b3259014e8fb99ca0920)), closes [noetl/worker#290](https://github.com/noetl/worker/issues/290) [noetl/ehdb#333](https://github.com/noetl/ehdb/issues/333) [ehdb#333](https://github.com/noetl/ehdb/issues/333) [noetl/ehdb#328](https://github.com/noetl/ehdb/issues/328) [noetl/ehdb#322](https://github.com/noetl/ehdb/issues/322) [noetl/ehdb#324](https://github.com/noetl/ehdb/issues/324)
+
 ## [5.124.0](https://github.com/noetl/worker/compare/v5.123.1...v5.124.0) (2026-08-29)
 
 ### Features
