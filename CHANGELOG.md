@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.126.0](https://github.com/noetl/worker/compare/v5.125.2...v5.126.0) (2026-08-30)
+
+### Features
+
+* **ehdb:** make shadow fencing REACHABLE, behind a default-off flag ([b006af4](https://github.com/noetl/worker/commit/b006af4e9171a617d25cd370073ae43ecb1948e7)), closes [noetl/ehdb#330](https://github.com/noetl/ehdb/issues/330) [noetl/ehdb#324](https://github.com/noetl/ehdb/issues/324) [ehdb#335](https://github.com/noetl/ehdb/issues/335) [ehdb#336](https://github.com/noetl/ehdb/issues/336) [ehdb#331](https://github.com/noetl/ehdb/issues/331)
+
 ## [5.125.2](https://github.com/noetl/worker/compare/v5.125.1...v5.125.2) (2026-08-30)
 
 ### Bug Fixes
