@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.129.0](https://github.com/noetl/worker/compare/v5.128.1...v5.129.0) (2026-08-30)
+
+### Features
+
+* **ehdb:** the timer that makes the age-seal trigger reach an IDLE shard ([7828177](https://github.com/noetl/worker/commit/7828177c91289bd8318caeeff4cd505d55fe1186)), closes [noetl/ehdb#329](https://github.com/noetl/ehdb/issues/329)
+
 ## [5.128.1](https://github.com/noetl/worker/compare/v5.128.0...v5.128.1) (2026-08-30)
 
 ### Bug Fixes
