@@ -179,7 +179,19 @@ async fn metrics_handler() -> impl IntoResponse {
     // never touches it stays byte-identical. `ehdb_replica_domains_observed`
     // distinguishes "clean" from "never computed" — without it a reading of zero
     // violations would be indistinguishable from never having looked.
-    if crate::ehdb::eventlog_backend::REPLICA_DOMAINS.get().is_some() {
+    // ⚠⚠ Gated on EHDB being active, NOT on the observation having been made.
+    //
+    // The first version rendered these only when `REPLICA_DOMAINS` was already
+    // set — which hid them in exactly the case that matters. `build_durable_stack`
+    // is reached only when NOETL_EHDB_EVENTLOG_BACKEND=durable_segment, and prod
+    // leaves it unset, so the durable stack is never opened and the observation
+    // is never computed. Gating on it meant the scrape said **nothing at all**
+    // about a state it was added to report.
+    //
+    // `ehdb_replica_domains_observed 0` is the useful reading: it says the stack
+    // has not been opened, so G4's verify-before cannot be answered from this
+    // process. Absence would have said the same thing silently.
+    if !ehdb_lines.is_empty() {
         body.extend_from_slice(
             crate::ehdb::eventlog_backend::render_replica_domains().as_bytes(),
         );
