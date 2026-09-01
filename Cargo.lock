@@ -1518,7 +1518,7 @@ dependencies = [
 [[package]]
 name = "ehdb-catalog"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1528,7 +1528,7 @@ dependencies = [
 [[package]]
 name = "ehdb-core"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "arrow-schema 53.4.1",
  "serde",
@@ -1537,7 +1537,7 @@ dependencies = [
 [[package]]
 name = "ehdb-feed"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "ehdb-core",
  "ehdb-l0",
@@ -1551,7 +1551,7 @@ dependencies = [
 [[package]]
 name = "ehdb-l0"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1562,7 +1562,7 @@ dependencies = [
 [[package]]
 name = "ehdb-reference"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "arrow-array 53.4.1",
  "arrow-ipc",
@@ -1582,7 +1582,7 @@ dependencies = [
 [[package]]
 name = "ehdb-retrieval"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1591,7 +1591,7 @@ dependencies = [
 [[package]]
 name = "ehdb-service"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "arrow-array 53.4.1",
  "arrow-flight",
@@ -1615,7 +1615,7 @@ dependencies = [
 [[package]]
 name = "ehdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1625,7 +1625,7 @@ dependencies = [
 [[package]]
 name = "ehdb-stream"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1635,7 +1635,7 @@ dependencies = [
 [[package]]
 name = "ehdb-system"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1646,7 +1646,7 @@ dependencies = [
 [[package]]
 name = "ehdb-transaction"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef#229ab6a0137e2bfa5cdddfcb1008c4cdc9d804ef"
+source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",

@@ -459,6 +459,46 @@ fn render_integrity(m: &ehdb_l0::metrics::L0MetricsSnapshot) -> String {
     out.push_str("# HELP ehdb_l0_appends Total appends to this writer's log — the denominator for the counter above.\n");
     out.push_str("# TYPE ehdb_l0_appends counter\n");
     out.push_str(&format!("ehdb_l0_appends {}\n", m.appends));
+    // noetl/ehdb#345 — the ingest face used to answer BOTH of its failure modes
+    // with a bare `return`: socket closed, no ack, no log, no metric.  On
+    // 2026-09-01 that hid a 100%-full `/data/cmdbus` while this pod reported
+    // Ready with zero WARN lines and every `POST /api/execute` on the platform
+    // returned 500.  Rendered unconditionally — a labelled family would be
+    // *pruned while zero*, which is exactly the "absent is indistinguishable
+    // from healthy" shape that made the outage invisible in the first place.
+    //
+    // The two are separate because the remedies are unrelated: append-failed
+    // means the volume or the writer is sick, decode-failed means the publisher
+    // and this writer disagree on the record shape.  Conflating them would send
+    // an operator to check disk space on a healthy disk.
+    out.push_str("# HELP ehdb_l0_ingest_append_failed Publishes the writer refused to append (noetl/ehdb#345) — check free space on the writer volume first. Must stay 0.\n");
+    out.push_str("# TYPE ehdb_l0_ingest_append_failed counter\n");
+    out.push_str(&format!(
+        "ehdb_l0_ingest_append_failed {}\n",
+        m.ingest_append_failed
+    ));
+    out.push_str("# HELP ehdb_l0_ingest_decode_failed Publish frames that did not deserialize (noetl/ehdb#345) — publisher/writer record-shape skew, NOT a disk problem. Must stay 0.\n");
+    out.push_str("# TYPE ehdb_l0_ingest_decode_failed counter\n");
+    out.push_str(&format!(
+        "ehdb_l0_ingest_decode_failed {}\n",
+        m.ingest_decode_failed
+    ));
+    // noetl/ehdb#344 — the retention policy that keeps the manifest from filling
+    // the volume.  `retained` is the bound actually being enforced, as opposed to
+    // the one configured, so a policy that silently stops pruning is visible
+    // before the volume fills rather than after.
+    out.push_str("# HELP ehdb_l0_manifest_versions_pruned Superseded manifest snapshots deleted by the retention policy (noetl/ehdb#344).\n");
+    out.push_str("# TYPE ehdb_l0_manifest_versions_pruned counter\n");
+    out.push_str(&format!(
+        "ehdb_l0_manifest_versions_pruned {}\n",
+        m.manifest_versions_pruned
+    ));
+    out.push_str("# HELP ehdb_l0_manifest_versions_retained Manifest snapshots on the substrate after the last prune — the bound being enforced, not the one configured (noetl/ehdb#344).\n");
+    out.push_str("# TYPE ehdb_l0_manifest_versions_retained gauge\n");
+    out.push_str(&format!(
+        "ehdb_l0_manifest_versions_retained {}\n",
+        m.manifest_versions_retained
+    ));
     // noetl/ai-meta#209 — records replayed from an unsealed active part left by
     // a crash.  Exposed for the same reason as the counter above: the recovery
     // exists in the engine and is asserted in ehdb's tests, but until it is on
@@ -929,5 +969,61 @@ mod tests {
         let m = ehdb_l0::metrics::L0Metrics::new().snapshot();
         assert_eq!(m.recovered_active_records, 0);
         assert!(render_integrity(&m).contains("ehdb_l0_recovered_active_records 0"));
+    }
+
+    /// noetl/ehdb#345 — the ingest failure counters must be on the endpoint AT
+    /// ZERO.  This is the whole point of the change: on 2026-09-01 a 100%-full
+    /// `/data/cmdbus` stopped every command publish on the platform while this
+    /// pod reported Ready with zero WARN lines, and there was no series anywhere
+    /// that distinguished "healthy" from "refusing every write".  A metric that
+    /// only appears once non-zero would reintroduce exactly that ambiguity —
+    /// absent would again be indistinguishable from fine.
+    #[test]
+    fn the_ingest_failure_counters_are_rendered_even_at_zero() {
+        let m = ehdb_l0::metrics::L0Metrics::new().snapshot();
+        assert_eq!(m.ingest_append_failed, 0);
+        assert_eq!(m.ingest_decode_failed, 0);
+        let out = render_integrity(&m);
+        assert!(
+            out.contains("ehdb_l0_ingest_append_failed 0"),
+            "a writer refusing every append must be distinguishable from a healthy one:\n{out}"
+        );
+        assert!(
+            out.contains("ehdb_l0_ingest_decode_failed 0"),
+            "publisher/writer record-shape skew needs its own series — conflating it with \
+             the append failure would send an operator to check disk space on a healthy \
+             disk:\n{out}"
+        );
+        assert!(out.contains("# TYPE ehdb_l0_ingest_append_failed counter"));
+        assert!(out.contains("# TYPE ehdb_l0_ingest_decode_failed counter"));
+    }
+
+    /// noetl/ehdb#344 — the retention counters, same reasoning.  `retained` is
+    /// the bound actually being enforced rather than the one configured, so a
+    /// policy that silently stops pruning shows up before the volume fills.
+    #[test]
+    fn the_manifest_retention_counters_are_rendered_even_at_zero() {
+        let m = ehdb_l0::metrics::L0Metrics::new().snapshot();
+        let out = render_integrity(&m);
+        assert!(out.contains("ehdb_l0_manifest_versions_pruned 0"), "{out}");
+        assert!(
+            out.contains("ehdb_l0_manifest_versions_retained 0"),
+            "{out}"
+        );
+        assert!(out.contains("# TYPE ehdb_l0_manifest_versions_pruned counter"));
+        assert!(out.contains("# TYPE ehdb_l0_manifest_versions_retained gauge"));
+    }
+
+    /// The values must be the engine's, not constants.  A renderer that always
+    /// printed `0` would pass every assertion above.
+    #[test]
+    fn the_rendered_values_track_the_snapshot() {
+        let metrics = ehdb_l0::metrics::L0Metrics::new();
+        metrics.incr_ingest_append_failed();
+        metrics.incr_ingest_append_failed();
+        metrics.incr_ingest_decode_failed();
+        let out = render_integrity(&metrics.snapshot());
+        assert!(out.contains("ehdb_l0_ingest_append_failed 2"), "{out}");
+        assert!(out.contains("ehdb_l0_ingest_decode_failed 1"), "{out}");
     }
 }
