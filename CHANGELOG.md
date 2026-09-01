@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.129.1](https://github.com/noetl/worker/compare/v5.129.0...v5.129.1) (2026-09-01)
+
+### Bug Fixes
+
+* **ehdb:** adopt bounded manifest retention and expose ingest failures ([63dc62a](https://github.com/noetl/worker/commit/63dc62a03609fdd4e4f19eb9415348c19cc60a75)), closes [noetl/ehdb#344](https://github.com/noetl/ehdb/issues/344) [noetl/ehdb#345](https://github.com/noetl/ehdb/issues/345) [#339](https://github.com/noetl/worker/issues/339) [#340](https://github.com/noetl/worker/issues/340) [#341](https://github.com/noetl/worker/issues/341) [#342](https://github.com/noetl/worker/issues/342) [noetl/ehdb#344](https://github.com/noetl/ehdb/issues/344) [noetl/ehdb#345](https://github.com/noetl/ehdb/issues/345)
+
 ## [5.129.0](https://github.com/noetl/worker/compare/v5.128.1...v5.129.0) (2026-08-30)
 
 ### Features
