@@ -487,6 +487,26 @@ fn render_integrity(m: &ehdb_l0::metrics::L0MetricsSnapshot) -> String {
     // the volume.  `retained` is the bound actually being enforced, as opposed to
     // the one configured, so a policy that silently stops pruning is visible
     // before the volume fills rather than after.
+    // noetl/ai-meta#313 — append-time idempotency. Rendered here because the
+    // engine's counters are invisible until they reach this endpoint, and "the
+    // dedupe is working" and "the dedupe never fires" are otherwise the same
+    // scrape.
+    //
+    // ⚠ `hits` stays 0 until a producer sends an `event_id`; that zero is the
+    // inert state, not a fault. `window_evictions` above 0 is the real signal:
+    // the idempotency window is a CAPACITY, not a guarantee, and a redelivery
+    // arriving after that many intervening appends on its shard is NOT
+    // deduplicated. An undersized window is otherwise indistinguishable from a
+    // working one.
+    out.push_str("# HELP ehdb_l0_dedupe_hits Appends answered from the idempotency window instead of written (noetl/ai-meta#313). 0 while no producer sends an event_id.\n");
+    out.push_str("# TYPE ehdb_l0_dedupe_hits counter\n");
+    out.push_str(&format!("ehdb_l0_dedupe_hits {}\n", m.dedupe_hits));
+    out.push_str("# HELP ehdb_l0_dedupe_window_evictions Keys the idempotency window forgot at capacity (noetl/ai-meta#313). Above 0 means the window is undersized for the redelivery pattern.\n");
+    out.push_str("# TYPE ehdb_l0_dedupe_window_evictions gauge\n");
+    out.push_str(&format!(
+        "ehdb_l0_dedupe_window_evictions {}\n",
+        m.dedupe_window_evictions
+    ));
     out.push_str("# HELP ehdb_l0_manifest_versions_pruned Superseded manifest snapshots deleted by the retention policy (noetl/ehdb#344).\n");
     out.push_str("# TYPE ehdb_l0_manifest_versions_pruned counter\n");
     out.push_str(&format!(
