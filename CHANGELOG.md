@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.130.0](https://github.com/noetl/worker/compare/v5.129.2...v5.130.0) (2026-09-04)
+
+### Features
+
+* **metrics:** render the dedupe counters; bump ehdb to dc3c1a4 ([651b0f9](https://github.com/noetl/worker/commit/651b0f99e77c5aec83b1f5bdb8e71490b16107db)), closes [noetl/ai-meta#313](https://github.com/noetl/ai-meta/issues/313) [ehdb#350](https://github.com/noetl/ehdb/issues/350) [worker#305](https://github.com/noetl/worker/issues/305)
+
 ## [5.129.2](https://github.com/noetl/worker/compare/v5.129.1...v5.129.2) (2026-09-04)
 
 ### Bug Fixes
