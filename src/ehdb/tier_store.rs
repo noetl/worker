@@ -180,6 +180,30 @@ fn store_lock(cfg: &TierStoreConfig, tier: StoreTier) -> Arc<RwLock<()>> {
 /// that #257's soak paid for — the serialised replay → sequence → write window
 /// — protects the new tier from its first append rather than being reproduced
 /// for it.
+/// The producer's `event_id`, lifted out of a mirrored payload.
+///
+/// The payload is the server's `mirror_payload` JSON, whose first field is
+/// `event_id` — a snowflake, minted once and immutable, and the only value in
+/// the body that identifies the event across redeliveries (noetl/ai-meta#313).
+///
+/// ⚠ Extracted HERE rather than inside the driver. The driver's append is the
+/// write path of a `primary`-serving tier; a parse per record there would be on
+/// that path, and it would silently degrade to "never matches" — a dedupe that
+/// stops working while still reporting success — the day the payload shape moved.
+/// Doing it at the boundary means a shape change shows up as `event_id: None`,
+/// i.e. dedupe simply off, which is the safe direction.
+///
+/// Accepts both the numeric and string spellings: the server emits `event_id` as
+/// a JSON number, but a re-serialised payload can carry it quoted.
+fn event_id_from_payload(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    match v.get("event_id")? {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 fn driver(cfg: &TierStoreConfig, tier: StoreTier) -> LocalReferenceEventLogDriver {
     LocalReferenceEventLogDriver::new(
         cfg.path_for(tier),
@@ -286,9 +310,8 @@ fn append_batch_locked(
         .map(|payload| EventLogAppendRequest {
             execution_id: execution_id.to_string(),
             transaction_id: super::eventlog::new_transaction_id(),
+            event_id: event_id_from_payload(payload),
             payload: payload.clone(),
-            // Deploy A: inert.  Deploy B populates this from the payload's event_id.
-            event_id: None,
         })
         .collect();
 
@@ -311,6 +334,14 @@ fn append_batch_locked(
                             "appended": true,
                             "global_sequence": out.global_sequence,
                             "log_record_count": out.log_record_count,
+                            // ⚠ The caller checks the reply for strictly
+                            // increasing sequences and for
+                            // log_record_count == global_sequence.  A dedupe
+                            // satisfies NEITHER — it returns the existing
+                            // position and does not advance the count — so
+                            // without this flag a working dedupe reports as a
+                            // parity divergence (noetl/ai-meta#313).
+                            "deduplicated": out.deduplicated,
                         }))
                         .unwrap_or_else(|_| "{}".to_string()),
                     )
@@ -348,7 +379,7 @@ fn append_locked(
         transaction_id: super::eventlog::new_transaction_id(),
         payload: payload.to_string(),
         // Deploy A: inert.  Deploy B populates this from the payload's event_id.
-        event_id: None,
+        event_id: event_id_from_payload(payload),
     };
     match driver(cfg, tier).append(&request) {
         Ok(out) => {
@@ -376,6 +407,9 @@ fn append_locked(
                     "appended": true,
                     "global_sequence": out.global_sequence,
                     "log_record_count": out.log_record_count,
+                    // See the batch path: a dedupe fails both parity checks
+                    // unless the caller is told it was one.
+                    "deduplicated": out.deduplicated,
                 }))
                 .unwrap_or_else(|_| "{}".to_string()),
             )

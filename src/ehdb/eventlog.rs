@@ -576,15 +576,16 @@ pub fn mirror_event(
             // in name only.  Reachability is now derived from real tier-service
             // operations (see `reachability`), and "never contacted" is not
             // reachable.
-            let durable_service_reachable =
-                super::tier_client::TierClientConfig::from_env().is_some()
-                    && super::reachability::is_reachable();
+            let durable_service_reachable = super::tier_client::TierClientConfig::from_env()
+                .is_some()
+                && super::reachability::is_reachable();
             let decision = super::primary_serve::decide(
                 serving_primary,
                 durable_service_reachable,
                 report.holds(),
             );
-            let result_outcome = match (serving_primary, report.holds(), decision.served_by_ehdb()) {
+            let result_outcome = match (serving_primary, report.holds(), decision.served_by_ehdb())
+            {
                 // Primary AND the policy agreed EHDB may serve.
                 (true, true, true) => EventLogOutcome::ServedPrimary,
                 // Primary, parity diverged ⇒ demote.  The incumbent's write already
@@ -814,6 +815,13 @@ pub struct ServiceAppendAck {
     /// and the writer run the same image in a coherent deployment).  Absent means
     /// the strong check cannot run, not that it failed; see [`Self::parity`].
     pub log_record_count: Option<u64>,
+    /// True when the store ACKNOWLEDGED an existing record rather than writing a
+    /// new one (noetl/ai-meta#313).
+    ///
+    /// Absent on a writer that predates the field, which parses as `false` — the
+    /// pre-dedupe behaviour, and the safe direction: an old writer never claims a
+    /// dedupe it did not perform.
+    pub deduplicated: bool,
 }
 
 impl ServiceAppendAck {
@@ -832,6 +840,10 @@ impl ServiceAppendAck {
         Some(Self {
             global_sequence: v.get("global_sequence").and_then(|s| s.as_u64())?,
             log_record_count: v.get("log_record_count").and_then(|c| c.as_u64()),
+            deduplicated: v
+                .get("deduplicated")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false),
         })
     }
 
@@ -866,6 +878,27 @@ impl ServiceAppendAck {
     /// record landed" means — on exactly the two tiers whose verdicts an
     /// operator compares during a cutover.
     pub(crate) fn parity(&self, previous_sequence: u64) -> Result<Option<&'static str>, String> {
+        // ⚠⚠ A deduplicated append satisfies NEITHER check, and both failures are
+        // correct readings of the wrong question (noetl/ai-meta#313).
+        //
+        // The store acknowledged a record that was already there: the sequence is
+        // the EXISTING one, so it is not greater than the previous append's, and
+        // the record count did not advance, so it no longer equals the sequence.
+        // Running either check on a dedupe reports a divergence for a store that
+        // behaved exactly as designed.
+        //
+        // ⚠ The skip is NARROW on purpose. It is taken only when the store itself
+        // says `deduplicated`, and it returns a NAMED outcome rather than `Ok(None)`
+        // — a silent pass here would let a store that reported dedupe on every
+        // append suppress every divergence it ever had. Named, that pattern is
+        // visible as an outcome nobody expected to see at volume, instead of as
+        // silence. Everything else takes the checks unchanged.
+        if self.deduplicated {
+            return Ok(Some(
+                "tier-service acknowledged an existing record (deduplicated); ordering \
+                 and gapless-count are not meaningful for a record that was not written",
+            ));
+        }
         if self.global_sequence <= previous_sequence {
             return Err(format!(
                 "ordering divergence: tier-service sequence {} not > previous {previous_sequence}",
@@ -1525,15 +1558,15 @@ mod tests {
 
     #[test]
     fn primary_without_a_durable_service_is_unavailable_not_served() {
-            // CONTRACT CHANGE (ai-meta#257 PR 6).  This previously asserted
-            // `ServedPrimary`: `primary` + parity was treated as sufficient to serve
-            // authoritatively from a POD-LOCAL log while the incumbent held all
-            // history — authoritative in name only, and the failure the RFC exists
-            // to prevent.  Serving now also requires a reachable durable tier
-            // service; none is configured here, so PrimaryUnavailable is correct.
-            // The append still happens and parity is still computed — what changed
-            // is that EHDB no longer CLAIMS to have served it.  No tier is `primary`
-            // in any environment, so no deployed behaviour changes.
+        // CONTRACT CHANGE (ai-meta#257 PR 6).  This previously asserted
+        // `ServedPrimary`: `primary` + parity was treated as sufficient to serve
+        // authoritatively from a POD-LOCAL log while the incumbent held all
+        // history — authoritative in name only, and the failure the RFC exists
+        // to prevent.  Serving now also requires a reachable durable tier
+        // service; none is configured here, so PrimaryUnavailable is correct.
+        // The append still happens and parity is still computed — what changed
+        // is that EHDB no longer CLAIMS to have served it.  No tier is `primary`
+        // in any environment, so no deployed behaviour changes.
         let (log, dir) = tmp_log("primary");
         let e = worker_env(log.to_str().unwrap(), "primary");
         // Phase 9 tier 1: primary is activated, so a primary append is served
@@ -1701,10 +1734,14 @@ mod tests {
         let s = serve_service_append_with(&e, Ok(&body), 6, 0.001, false);
         assert_eq!(s.outcome, EventLogOutcome::PrimaryUnavailable);
         assert!(!s.decision.served_by_ehdb(), "must not serve: {s:?}");
-        assert!(s.decision.degraded(), "asking for primary and not getting it is degraded");
+        assert!(
+            s.decision.degraded(),
+            "asking for primary and not getting it is degraded"
+        );
         assert_eq!(s.decision.outcome_label(), "no_durable_service");
         assert!(
-            s.detail.is_some_and(|d| d.contains("nothing authoritative")),
+            s.detail
+                .is_some_and(|d| d.contains("nothing authoritative")),
             "the demote must say why"
         );
     }
@@ -1785,7 +1822,10 @@ mod tests {
         let e = worker_env("/tmp/svc-rej.jsonl", "primary");
         let rejected = serve_service_append_with(&e, Ok("invalid payload is empty"), 0, 0.0, true);
         assert_eq!(rejected.outcome, EventLogOutcome::Rejected);
-        assert!(!rejected.outcome.degraded(), "a refused record is not a degraded tier");
+        assert!(
+            !rejected.outcome.degraded(),
+            "a refused record is not a degraded tier"
+        );
 
         for body in ["unavailable no tier store configured", "error disk full"] {
             let s = serve_service_append_with(&e, Ok(body), 0, 0.0, true);
@@ -1950,7 +1990,13 @@ mod tests {
         let (log, dir) = tmp_log("live-fire");
         let e = worker_env(log.to_str().unwrap(), "shadow");
         // A real (long) numeric execution id, mirrored via the runtime hook.
-        let outcome = mirror_live_event(&e, "478775660589088776", "{\"event_type\":\"call.done\"}", None).outcome;
+        let outcome = mirror_live_event(
+            &e,
+            "478775660589088776",
+            "{\"event_type\":\"call.done\"}",
+            None,
+        )
+        .outcome;
         assert_eq!(outcome, EventLogOutcome::Mirrored);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2130,5 +2176,103 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tier_dedupe_parity_tests {
+    //! **noetl/ai-meta#313 Deploy B** — the parity skip must fire ONLY for genuine
+    //! dedupes, and must never mask a real divergence.
+    //!
+    //! The tier-append reply is checked for two invariants: strictly increasing
+    //! sequences, and `log_record_count == global_sequence`. A deduplicated append
+    //! satisfies **neither** — it returns the position of a record already there,
+    //! and the count did not advance. So the skip is necessary; and because it
+    //! suppresses both checks, it is also the most dangerous thing in this change.
+    //! Every test here exists to bound it.
+    use super::ServiceAppendAck;
+
+    fn reply(seq: u64, count: Option<u64>, deduplicated: bool) -> String {
+        let mut v = serde_json::json!({"appended": true, "global_sequence": seq});
+        if let Some(c) = count {
+            v["log_record_count"] = serde_json::json!(c);
+        }
+        if deduplicated {
+            v["deduplicated"] = serde_json::json!(true);
+        }
+        v.to_string()
+    }
+
+    fn parse(body: &str) -> ServiceAppendAck {
+        ServiceAppendAck::parse(body).expect("an appended reply must parse")
+    }
+
+    /// ⭐ A genuine dedupe does not trip parity, and says so by name.
+    ///
+    /// ⚠ Mutation verified: removing the `if self.deduplicated` early return makes
+    /// this fail on the ordering check — the false divergence the skip prevents.
+    #[test]
+    fn a_deduplicated_reply_does_not_trip_parity_and_is_named() {
+        let r = parse(&reply(7, Some(42), true));
+        let verdict = r.parity(41).expect("a dedupe must not be a divergence");
+        let note = verdict.expect("the skip must be NAMED, never a silent Ok(None)");
+        assert!(
+            note.contains("deduplicated"),
+            "the outcome must say why parity was not applied: {note}"
+        );
+    }
+
+    /// ⚠⚠ THE NEGATIVE CONTROL — a REAL divergence still trips.
+    ///
+    /// Without this, a skip that fired unconditionally would pass the test above
+    /// perfectly while silencing every divergence the tier could report. That is
+    /// strictly worse than the duplicates this removes: a rewound or forgetful
+    /// `primary` store would look healthy.
+    #[test]
+    fn a_real_divergence_still_trips_when_not_deduplicated() {
+        let backwards = parse(&reply(7, Some(7), false));
+        let err = backwards
+            .parity(41)
+            .expect_err("a non-deduplicated backwards sequence is a real divergence");
+        assert!(err.contains("ordering divergence"), "{err}");
+
+        let gappy = parse(&reply(42, Some(40), false));
+        let err = gappy
+            .parity(41)
+            .expect_err("a non-deduplicated count mismatch is a real divergence");
+        assert!(err.contains("count divergence"), "{err}");
+    }
+
+    /// ⚠ The skip is keyed on the STORE's claim, never inferred from the numbers.
+    ///
+    /// A reply that merely *looks* like a dedupe — older sequence, unchanged count
+    /// — but carries no flag must still be a divergence. Inferring it from shape
+    /// would silence exactly the case the check exists for: a rewound store looks
+    /// identical to a dedupe.
+    #[test]
+    fn a_dedupe_shaped_reply_without_the_flag_is_still_a_divergence() {
+        let looks_like_one = parse(&reply(7, Some(42), false));
+        looks_like_one
+            .parity(41)
+            .expect_err("without the flag this is a rewound store, not a dedupe");
+    }
+
+    /// A writer predating the field parses as not-deduplicated — the safe
+    /// direction. An old writer must never claim a dedupe it did not perform.
+    #[test]
+    fn a_reply_without_the_field_is_not_deduplicated() {
+        let legacy = parse(&reply(42, Some(42), false));
+        assert!(!legacy.deduplicated);
+        assert!(
+            legacy.parity(41).is_ok(),
+            "a healthy legacy reply still passes"
+        );
+    }
+
+    /// A normal append is unaffected: both checks run and pass.
+    #[test]
+    fn a_normal_append_still_runs_both_checks() {
+        let ok = parse(&reply(42, Some(42), false));
+        assert_eq!(ok.parity(41).expect("healthy"), None, "no skip, no note");
     }
 }
