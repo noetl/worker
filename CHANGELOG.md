@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.131.0](https://github.com/noetl/worker/compare/v5.130.1...v5.131.0) (2026-09-04)
+
+### Features
+
+* **tier:** activate idempotency on the tier append path — Deploy B ([be6de11](https://github.com/noetl/worker/commit/be6de11982c481273af74067845114ce7a93a91d)), closes [noetl/ai-meta#313](https://github.com/noetl/ai-meta/issues/313)
+
 ## [5.130.1](https://github.com/noetl/worker/compare/v5.130.0...v5.130.1) (2026-09-04)
 
 ### Bug Fixes
