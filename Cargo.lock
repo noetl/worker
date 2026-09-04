@@ -370,7 +370,7 @@ dependencies = [
  "arrow-schema 53.4.1",
  "chrono",
  "half",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "lexical-core",
  "num",
  "serde",
@@ -1518,7 +1518,7 @@ dependencies = [
 [[package]]
 name = "ehdb-catalog"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1528,7 +1528,7 @@ dependencies = [
 [[package]]
 name = "ehdb-core"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "arrow-schema 53.4.1",
  "serde",
@@ -1537,7 +1537,7 @@ dependencies = [
 [[package]]
 name = "ehdb-feed"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "ehdb-core",
  "ehdb-l0",
@@ -1551,7 +1551,7 @@ dependencies = [
 [[package]]
 name = "ehdb-l0"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1562,7 +1562,7 @@ dependencies = [
 [[package]]
 name = "ehdb-reference"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "arrow-array 53.4.1",
  "arrow-ipc",
@@ -1582,7 +1582,7 @@ dependencies = [
 [[package]]
 name = "ehdb-retrieval"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1591,7 +1591,7 @@ dependencies = [
 [[package]]
 name = "ehdb-service"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "arrow-array 53.4.1",
  "arrow-flight",
@@ -1615,7 +1615,7 @@ dependencies = [
 [[package]]
 name = "ehdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1625,7 +1625,7 @@ dependencies = [
 [[package]]
 name = "ehdb-stream"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1635,7 +1635,7 @@ dependencies = [
 [[package]]
 name = "ehdb-system"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1646,7 +1646,7 @@ dependencies = [
 [[package]]
 name = "ehdb-transaction"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=09801830dc45214bb3d248708bfce3ce905ce2f6#09801830dc45214bb3d248708bfce3ce905ce2f6"
+source = "git+https://github.com/noetl/ehdb?rev=9c7da44eb70d4ad9a370ab2fcf4227f67d239986#9c7da44eb70d4ad9a370ab2fcf4227f67d239986"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1716,7 +1716,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2026,7 +2026,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 dependencies = [
  "fallible-iterator 0.3.0",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "stable_deref_trait",
 ]
 
@@ -2042,7 +2042,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "slab",
  "tokio",
  "tokio-util",
@@ -2257,9 +2257,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.11.1"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27b501faa50e7a26c3d3560ca625132f4078a17771f4810baf70475ae48cbe43"
+checksum = "d22053281f852e11534f5198498373cbb59295120a20771d90f7ed1897490a72"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2344,7 +2344,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2502,9 +2502,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.14.1"
+version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
+checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
@@ -2550,15 +2550,6 @@ name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -3395,7 +3386,7 @@ checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "crc32fast",
  "hashbrown 0.15.5",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "memchr",
 ]
 
@@ -3773,7 +3764,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3872,7 +3863,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3910,9 +3901,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4258,7 +4249,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4271,7 +4262,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4598,7 +4589,7 @@ version = "0.9.34+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
 dependencies = [
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "itoa",
  "ryu",
  "serde",
@@ -4975,7 +4966,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5264,7 +5255,7 @@ version = "0.22.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
 dependencies = [
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "serde",
  "serde_spanned",
  "toml_datetime 0.6.11",
@@ -5278,7 +5269,7 @@ version = "0.25.13+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
 dependencies = [
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
  "winnow 1.0.4",
@@ -5797,7 +5788,7 @@ dependencies = [
  "ahash 0.8.12",
  "bitflags 2.13.1",
  "hashbrown 0.14.5",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "semver",
  "serde",
 ]
@@ -5809,7 +5800,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9a61719f93a87b16d325921e251800c4833f8fab50fa21c7de73aed50086313"
 dependencies = [
  "bitflags 2.13.1",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "semver",
 ]
 
@@ -5841,7 +5832,7 @@ dependencies = [
  "fxprof-processed-profile",
  "gimli",
  "hashbrown 0.14.5",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "ittapi",
  "libc",
  "libm",
@@ -5967,7 +5958,7 @@ dependencies = [
  "cranelift-bitset",
  "cranelift-entity",
  "gimli",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "log",
  "object 0.36.7",
  "postcard",
@@ -6063,7 +6054,7 @@ checksum = "bf3963c9c29df91564d8bd181eb00d0dbaeafa1b2a01e15952bb7391166b704e"
 dependencies = [
  "anyhow",
  "heck 0.5.0",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "wit-parser",
 ]
 
@@ -6162,7 +6153,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6413,7 +6404,7 @@ checksum = "ca004bb251010fe956f4a5b9d4bf86b4e415064160dd6669569939e8cbf2504f"
 dependencies = [
  "anyhow",
  "id-arena",
- "indexmap 2.14.1",
+ "indexmap 2.14.0",
  "log",
  "semver",
  "serde",
