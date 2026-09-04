@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.130.1](https://github.com/noetl/worker/compare/v5.130.0...v5.130.1) (2026-09-04)
+
+### Bug Fixes
+
+* **repo:** ignore the local cargo vendor directory ([3291f29](https://github.com/noetl/worker/commit/3291f29b91658b7f77491d0f3baee5189fc860a2)), closes [noetl/ai-meta#313](https://github.com/noetl/ai-meta/issues/313) [worker#307](https://github.com/noetl/worker/issues/307)
+
 ## [5.130.0](https://github.com/noetl/worker/compare/v5.129.2...v5.130.0) (2026-09-04)
 
 ### Features
