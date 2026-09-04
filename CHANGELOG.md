@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.129.2](https://github.com/noetl/worker/compare/v5.129.1...v5.129.2) (2026-09-04)
+
+### Bug Fixes
+
+* **ehdb:** bump ehdb pin to 9c7da44 — tolerate the event_id column ([d3247b7](https://github.com/noetl/worker/commit/d3247b72879fb33847dcfbe64b29b831c4fef13c)), closes [noetl/ai-meta#313](https://github.com/noetl/ai-meta/issues/313) [ehdb#348](https://github.com/noetl/ehdb/issues/348) [ehdb#348](https://github.com/noetl/ehdb/issues/348)
+
 ## [5.129.1](https://github.com/noetl/worker/compare/v5.129.0...v5.129.1) (2026-09-01)
 
 ### Bug Fixes
