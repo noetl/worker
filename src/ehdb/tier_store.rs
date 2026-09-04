@@ -287,6 +287,8 @@ fn append_batch_locked(
             execution_id: execution_id.to_string(),
             transaction_id: super::eventlog::new_transaction_id(),
             payload: payload.clone(),
+            // Deploy A: inert.  Deploy B populates this from the payload's event_id.
+            event_id: None,
         })
         .collect();
 
@@ -345,6 +347,8 @@ fn append_locked(
         execution_id: execution_id.to_string(),
         transaction_id: super::eventlog::new_transaction_id(),
         payload: payload.to_string(),
+        // Deploy A: inert.  Deploy B populates this from the payload's event_id.
+        event_id: None,
     };
     match driver(cfg, tier).append(&request) {
         Ok(out) => {

@@ -733,6 +733,7 @@ mod tests {
             execution_id: execution_id.to_string(),
             transaction_id: format!("txn-{execution_id}-{}", payload.len()),
             payload: payload.to_string(),
+            event_id: None,
         }
     }
 

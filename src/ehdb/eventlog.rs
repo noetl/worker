@@ -524,6 +524,8 @@ pub fn mirror_event(
             .clone()
             .unwrap_or_else(new_transaction_id),
         payload: payload.to_string(),
+        // Deploy A: inert.  Deploy B populates this from the payload's event_id.
+        event_id: None,
     };
 
     // Storage-backend selection (durable event-log backend, slice 4): the
