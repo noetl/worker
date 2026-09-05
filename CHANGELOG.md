@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.131.1](https://github.com/noetl/worker/compare/v5.131.0...v5.131.1) (2026-09-05)
+
+### Bug Fixes
+
+* **ehdb:** split the tier append timeout from the read timeout ([aa823ff](https://github.com/noetl/worker/commit/aa823ff2e7e5786b0c55195b8b19bb7dd64e603f)), closes [#155](https://github.com/noetl/worker/issues/155) [ai-meta#320](https://github.com/noetl/ai-meta/issues/320) [ai-meta#320](https://github.com/noetl/ai-meta/issues/320) [noetl/ai-meta#324](https://github.com/noetl/ai-meta/issues/324) [noetl/ai-meta#320](https://github.com/noetl/ai-meta/issues/320)
+
 ## [5.131.0](https://github.com/noetl/worker/compare/v5.130.1...v5.131.0) (2026-09-04)
 
 ### Features
