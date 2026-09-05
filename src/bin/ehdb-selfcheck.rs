@@ -2303,6 +2303,7 @@ fn run_tier_concurrency(flags: &Flags) -> ExitCode {
         let client = TierClient::new(TierClientConfig {
             addr: addr.clone(),
             timeout: std::time::Duration::from_secs(30),
+            append_timeout: std::time::Duration::from_secs(30),
         });
 
         let mut tasks = Vec::with_capacity(clients);

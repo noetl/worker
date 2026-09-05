@@ -85,6 +85,7 @@ async fn start_service(dir: &std::path::Path) -> TierClient {
     TierClient::new(TierClientConfig {
         addr: addr.to_string(),
         timeout: std::time::Duration::from_secs(30),
+        append_timeout: std::time::Duration::from_secs(30),
     })
 }
 
