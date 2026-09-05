@@ -35,9 +35,30 @@ pub const TIER_SERVICE_ADDR_ENV: &str = "NOETL_EHDB_TIER_SERVICE_ADDR";
 /// Env var overriding the connect/request timeout, in milliseconds.
 pub const TIER_SERVICE_TIMEOUT_MS_ENV: &str = "NOETL_EHDB_TIER_SERVICE_TIMEOUT_MS";
 
-/// Default timeout. Short on purpose: this is an auxiliary verification path,
-/// and it must never become a latency contributor on the caller's hot path.
+/// Env var overriding the **append** timeout, in milliseconds.
+///
+/// Separate from the read timeout because the two have opposite risk
+/// (noetl/ai-meta#324). A slow read should give up quickly — the event-log tier
+/// serves `primary`, so a read that blocks is latency a user can feel. A slow
+/// *append* that gives up early is different: the record is not written, and
+/// under the pre-noetl/ai-meta#320 mirror that meant an event the tier would
+/// never hold. Sharing one 2s bound made the safe choice for reads the unsafe
+/// one for writes.
+pub const TIER_SERVICE_APPEND_TIMEOUT_MS_ENV: &str = "NOETL_EHDB_TIER_SERVICE_APPEND_TIMEOUT_MS";
+
+/// Default read/connect timeout. Short on purpose: a read on this path is
+/// latency the caller can feel, and the event-log tier serves `primary`.
 pub const DEFAULT_TIMEOUT_MS: u64 = 2_000;
+
+/// Default append timeout.
+///
+/// **Measured, not guessed.** Under load the writer's tier append exceeded the
+/// shared 2s bound and returned `502 ... "timed out after 2s"`; the server's
+/// mirror then retried, which is why noetl/ai-meta#320 reports zero loss but a
+/// visible `recovered` count. 4s sits under the server's own 5s per-attempt
+/// `APPEND_TIMEOUT`, so a slow append can still finish inside one attempt
+/// instead of consuming a retry.
+pub const DEFAULT_APPEND_TIMEOUT_MS: u64 = 4_000;
 
 /// Split a `host:port` authority, accepting DNS names as well as IP literals.
 ///
@@ -72,6 +93,8 @@ pub struct TierClientConfig {
     /// a pod that no longer exists after a writer restart.
     pub addr: String,
     pub timeout: Duration,
+    /// Bound for append requests. See [`DEFAULT_APPEND_TIMEOUT_MS`].
+    pub append_timeout: Duration,
 }
 
 impl TierClientConfig {
@@ -84,6 +107,9 @@ impl TierClientConfig {
         Self::build(
             std::env::var(TIER_SERVICE_ADDR_ENV).ok().as_deref(),
             std::env::var(TIER_SERVICE_TIMEOUT_MS_ENV).ok().as_deref(),
+            std::env::var(TIER_SERVICE_APPEND_TIMEOUT_MS_ENV)
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -98,10 +124,16 @@ impl TierClientConfig {
         Self::build(
             env.get(TIER_SERVICE_ADDR_ENV).map(|s| s.as_str()),
             env.get(TIER_SERVICE_TIMEOUT_MS_ENV).map(|s| s.as_str()),
+            env.get(TIER_SERVICE_APPEND_TIMEOUT_MS_ENV)
+                .map(|s| s.as_str()),
         )
     }
 
-    fn build(raw: Option<&str>, raw_timeout: Option<&str>) -> Option<Self> {
+    fn build(
+        raw: Option<&str>,
+        raw_timeout: Option<&str>,
+        raw_append_timeout: Option<&str>,
+    ) -> Option<Self> {
         let raw = raw?.trim();
         if raw.is_empty() {
             return None;
@@ -128,9 +160,14 @@ impl TierClientConfig {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_TIMEOUT_MS);
+        let append_timeout_ms = raw_append_timeout
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_APPEND_TIMEOUT_MS);
         Some(Self {
             addr,
             timeout: Duration::from_millis(timeout_ms),
+            append_timeout: Duration::from_millis(append_timeout_ms),
         })
     }
 }
@@ -181,6 +218,18 @@ impl TierClient {
     /// caller forever, which is precisely the shape of stall this platform has
     /// been bitten by before.
     pub async fn request(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        self.request_within(payload, self.cfg.timeout).await
+    }
+
+    /// Send one request frame bounded by an explicit deadline.
+    ///
+    /// Exists so appends and reads can carry different bounds without a second
+    /// transport: one code path, two deadlines (noetl/ai-meta#324).
+    pub async fn request_within(
+        &self,
+        payload: &[u8],
+        budget: Duration,
+    ) -> Result<Vec<u8>, String> {
         let fut = async {
             // Connect by NAME: tokio resolves it per call, so a moved pod is
             // picked up on the next attempt rather than cached forever.
@@ -196,9 +245,9 @@ impl TierClient {
                 Err(e) => Err(format!("read: {e}")),
             }
         };
-        match tokio::time::timeout(self.cfg.timeout, fut).await {
+        match tokio::time::timeout(budget, fut).await {
             Ok(r) => r,
-            Err(_) => Err(format!("timed out after {:?}", self.cfg.timeout)),
+            Err(_) => Err(format!("timed out after {budget:?}")),
         }
     }
 
@@ -234,7 +283,7 @@ impl TierClient {
         // per tier would let a tier that happens to be idle read as unreachable
         // and demote a healthy one.
         let out = self
-            .request(req.to_string().as_bytes())
+            .request_within(req.to_string().as_bytes(), self.cfg.append_timeout)
             .await
             .map(|b| String::from_utf8_lossy(&b).to_string());
         super::reachability::record(super::reachability::classify(&out));
@@ -271,7 +320,7 @@ impl TierClient {
         });
         // Same reachability contract as `append`: the batch IS the probe.
         let out = self
-            .request(req.to_string().as_bytes())
+            .request_within(req.to_string().as_bytes(), self.cfg.append_timeout)
             .await
             .map(|b| String::from_utf8_lossy(&b).to_string());
         super::reachability::record(super::reachability::classify(&out));
@@ -429,6 +478,154 @@ pub async fn probe_at_startup() {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- noetl/ai-meta#324: appends and reads carry different deadlines -----
+
+    /// A listener that ACCEPTS and then never replies, so a caller can only be
+    /// released by its own timeout. That is the exact production shape: the
+    /// writer's tier service accepted the connection and was simply slow, which
+    /// is why the failure read `timed out after 2s` rather than a connect error.
+    async fn black_hole() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // hold it open; never reply
+            }
+        });
+        addr
+    }
+
+    /// **The gate.** An append must get the append budget and a read the read
+    /// budget — measured on the wire, not asserted about a field.
+    #[tokio::test]
+    async fn an_append_waits_longer_than_a_read() {
+        let addr = black_hole().await;
+        let client = TierClient::new(TierClientConfig {
+            addr,
+            timeout: Duration::from_millis(150),
+            append_timeout: Duration::from_millis(900),
+        });
+
+        let t = std::time::Instant::now();
+        let r = client.read_execution("e1").await;
+        let read_ms = t.elapsed().as_millis();
+        assert!(r.is_err(), "the black hole cannot reply");
+
+        let t = std::time::Instant::now();
+        let a = client.append("e1", "{}").await;
+        let append_ms = t.elapsed().as_millis();
+        assert!(a.is_err(), "the black hole cannot reply");
+
+        assert!(
+            read_ms < 500,
+            "a read must give up on the READ budget (150ms), took {read_ms}ms — the event-log \
+             tier serves `primary`, so a slow read is latency a user feels"
+        );
+        assert!(
+            append_ms >= 800,
+            "an append must wait for the APPEND budget (900ms), gave up after {append_ms}ms — \
+             giving up early on a write is how noetl/ai-meta#320 lost events"
+        );
+    }
+
+    /// The batch append is the path the server's mirror actually uses, so it has
+    /// to carry the same budget as the single append.
+    #[tokio::test]
+    async fn a_batch_append_also_gets_the_append_budget() {
+        let addr = black_hole().await;
+        let client = TierClient::new(TierClientConfig {
+            addr,
+            timeout: Duration::from_millis(150),
+            append_timeout: Duration::from_millis(900),
+        });
+        let t = std::time::Instant::now();
+        let _ = client
+            .append_batch("e1", &["{}".to_string(), "{}".to_string()])
+            .await;
+        let ms = t.elapsed().as_millis();
+        assert!(
+            ms >= 800,
+            "append_batch gave up after {ms}ms — it is the mirror's real path and must not be \
+             the one that kept the short bound"
+        );
+    }
+
+    /// Config independence, driven through `from_map` rather than the process
+    /// environment.
+    ///
+    /// Deliberately NOT `std::env::set_var` + a serial attribute: `cargo test`
+    /// does not serialise tests, this crate carries no `serial_test`, and two
+    /// env-mutating tests racing would fail intermittently in a way that reads
+    /// like a real defect. `from_map` is the same parse over a snapshot, which
+    /// is why it exists.
+    #[test]
+    fn the_append_timeout_is_independent_of_the_read_timeout() {
+        fn cfg(pairs: &[(&str, &str)]) -> TierClientConfig {
+            let mut m = super::super::EnvMap::new();
+            m.insert(TIER_SERVICE_ADDR_ENV.to_string(), "w:9110".to_string());
+            for (k, v) in pairs {
+                m.insert(k.to_string(), v.to_string());
+            }
+            TierClientConfig::from_map(&m).expect("address is valid")
+        }
+
+        let c = cfg(&[]);
+        assert_eq!(c.timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
+        assert_eq!(
+            c.append_timeout,
+            Duration::from_millis(DEFAULT_APPEND_TIMEOUT_MS),
+            "the append default must not silently inherit the read default"
+        );
+        assert!(
+            DEFAULT_APPEND_TIMEOUT_MS > DEFAULT_TIMEOUT_MS,
+            "the whole point is that a write may wait longer than a read"
+        );
+
+        // Setting one must not move the other, in either direction.
+        let c = cfg(&[(TIER_SERVICE_TIMEOUT_MS_ENV, "111")]);
+        assert_eq!(c.timeout, Duration::from_millis(111));
+        assert_eq!(
+            c.append_timeout,
+            Duration::from_millis(DEFAULT_APPEND_TIMEOUT_MS)
+        );
+
+        let c = cfg(&[(TIER_SERVICE_APPEND_TIMEOUT_MS_ENV, "222")]);
+        assert_eq!(c.timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
+        assert_eq!(c.append_timeout, Duration::from_millis(222));
+
+        let c = cfg(&[
+            (TIER_SERVICE_TIMEOUT_MS_ENV, "111"),
+            (TIER_SERVICE_APPEND_TIMEOUT_MS_ENV, "222"),
+        ]);
+        assert_eq!(c.timeout, Duration::from_millis(111));
+        assert_eq!(c.append_timeout, Duration::from_millis(222));
+
+        // Junk and zero fall back rather than disabling the client.
+        for bad in ["banana", "0", ""] {
+            let c = cfg(&[(TIER_SERVICE_APPEND_TIMEOUT_MS_ENV, bad)]);
+            assert_eq!(
+                c.append_timeout,
+                Duration::from_millis(DEFAULT_APPEND_TIMEOUT_MS),
+                "{bad:?} must fall back to the default"
+            );
+        }
+    }
+
+    /// The append budget must stay under the SERVER's per-attempt POST timeout,
+    /// or a slow append burns a whole retry instead of finishing inside one.
+    #[test]
+    fn the_append_budget_fits_inside_the_servers_attempt() {
+        const SERVER_APPEND_TIMEOUT_MS: u64 = 5_000; // server: APPEND_TIMEOUT
+        assert!(
+            DEFAULT_APPEND_TIMEOUT_MS < SERVER_APPEND_TIMEOUT_MS,
+            "a {DEFAULT_APPEND_TIMEOUT_MS}ms append inside a {SERVER_APPEND_TIMEOUT_MS}ms POST \
+             leaves no room for connect + framing; the server would abandon the attempt first \
+             and the longer worker budget would be unreachable"
+        );
+    }
+
     use super::*;
     use crate::ehdb::tier_service::serve_tier;
     use tokio::net::TcpListener;
@@ -495,6 +692,7 @@ mod tests {
         let client = TierClient::new(TierClientConfig {
             addr: addr.to_string(),
             timeout: Duration::from_millis(2_000),
+            append_timeout: Duration::from_millis(2_000),
         });
         assert_eq!(
             client.probe().await,
@@ -513,6 +711,7 @@ mod tests {
         let client = TierClient::new(TierClientConfig {
             addr: addr.to_string(),
             timeout: Duration::from_millis(2_000),
+            append_timeout: Duration::from_millis(2_000),
         });
         let body = client
             .request(b"append")
@@ -544,6 +743,7 @@ mod tests {
         let client = TierClient::new(TierClientConfig {
             addr: addr.to_string(),
             timeout: Duration::from_millis(3_000),
+            append_timeout: Duration::from_millis(3_000),
         });
 
         let appended = client
@@ -624,6 +824,7 @@ mod tests {
         let client = TierClient::new(TierClientConfig {
             addr: format!("localhost:{port}"),
             timeout: Duration::from_millis(3_000),
+            append_timeout: Duration::from_millis(3_000),
         });
         assert_eq!(
             client.probe().await,
@@ -658,6 +859,7 @@ mod tests {
         let client = TierClient::new(TierClientConfig {
             addr: "10.255.255.1:9110".to_string(),
             timeout: Duration::from_millis(400),
+            append_timeout: Duration::from_millis(400),
         });
 
         // An append against it fails at the transport, which demotes.
@@ -679,6 +881,7 @@ mod tests {
         let good = TierClient::new(TierClientConfig {
             addr: format!("127.0.0.1:{}", addr.port()),
             timeout: Duration::from_millis(2_000),
+            append_timeout: Duration::from_millis(2_000),
         });
         assert_eq!(
             good.probe().await,
@@ -699,6 +902,7 @@ mod tests {
         let client = TierClient::new(TierClientConfig {
             addr: "127.0.0.1:1".to_string(),
             timeout: Duration::from_millis(500),
+            append_timeout: Duration::from_millis(500),
         });
         match client.probe().await {
             TierProbe::Unreachable(_) => {}
