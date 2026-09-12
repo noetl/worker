@@ -51,12 +51,56 @@ use super::store_tier::StoreTier;
 /// someone forgot to set a variable is the opposite of what this PR is for.
 pub const TIER_SERVICE_BIND_ENV: &str = "NOETL_EHDB_TIER_SERVICE_BIND";
 
-/// Largest frame accepted, in bytes (1 MiB).
+/// Largest **request** frame accepted, in bytes (1 MiB).
 ///
 /// The length prefix is attacker- (or bug-) controlled, and the natural
 /// implementation — read a u32, allocate that many bytes — lets one bad frame
 /// ask for 4 GiB. The cap is checked *before* any allocation.
+///
+/// ⚠ This bounds what an untrusted peer may send us. It is deliberately NOT
+/// the bound on replies we read back from our own writer — see
+/// [`MAX_REPLY_BYTES`]. Using one constant for both is what caused
+/// noetl/ai-meta#343 blocker 2.
 pub const MAX_FRAME_BYTES: u32 = 1024 * 1024;
+
+/// Largest **reply** frame a client will read back, in bytes (16 MiB).
+///
+/// # Why this is a different number
+///
+/// The codec is shared by both ends, and until noetl/ai-meta#343 the cap was
+/// too: a client did `write_frame` (which enforced **no** cap) and then
+/// `read_frame` (which enforced 1 MiB). So the tier service would happily
+/// serialise a query reply that its own client structurally could not read —
+/// not intermittently, but for **every** execution whose payload exceeded
+/// 1 MiB. Prod symptom, 2026-09-12:
+///
+/// ```text
+/// read: tier-service frame of 1174874 bytes exceeds the 1048576-byte cap
+/// ```
+///
+/// Three `muno/playbooks/itinerary-planner` executions in a 40-execution
+/// sample were unreadable this way. They were not reported as divergent —
+/// they could not be compared **at all**, so they left the parity denominator
+/// entirely. A cliff that removes rows from the population is worse than one
+/// that fails loudly.
+///
+/// # Why 16 MiB
+///
+/// The threat model differs by direction. A request arrives from a peer whose
+/// length prefix we must not trust. A reply arrives from the writer we just
+/// connected to, in answer to a query we issued — the allocation is bounded by
+/// what we asked for, not by what a stranger claims. 16 MiB matches
+/// `object::MAX_OBJECT_BYTES_CEILING`, the largest single object this worker
+/// already accepts, so the transport stops being the narrower limit.
+///
+/// # This is a ceiling, not a solution
+///
+/// It converts a cliff at 1 MiB into a cliff at 16 MiB. What makes it safe is
+/// that the cliff is now **visible and explicit**: the service refuses to emit
+/// a frame the peer cannot read and answers with a structured error that fits,
+/// counted on `tier_service.reply_too_large`. Paging the query reply is the
+/// real fix and is tracked separately; this stops the silent denominator loss.
+pub const MAX_REPLY_BYTES: u32 = 16 * 1024 * 1024;
 
 /// Protocol version, sent in every `health` reply so a client can refuse to talk
 /// to a writer it does not understand rather than misparse its frames.
@@ -421,7 +465,7 @@ pub(crate) async fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Obs
 /// treated as "no more work".
 /// Shared with the client (`tier_client`) so both ends use ONE codec.  Two
 /// implementations of the same wire format is how a protocol drifts.
-pub(crate) async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>> {
+pub(crate) async fn read_frame(stream: &mut TcpStream, cap: u32) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -429,10 +473,10 @@ pub(crate) async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf);
-    if len > MAX_FRAME_BYTES {
+    if len > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("tier-service frame of {len} bytes exceeds the {MAX_FRAME_BYTES}-byte cap"),
+            format!("tier-service frame of {len} bytes exceeds the {cap}-byte cap"),
         ));
     }
     let mut payload = vec![0u8; len as usize];
@@ -443,6 +487,20 @@ pub(crate) async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Option
 /// Write one length-framed message.
 /// Shared with the client — see [`read_frame`].
 pub(crate) async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    // ⚠ The write side used to check only u32 overflow, so it would emit frames
+    // no reader on either end would accept (noetl/ai-meta#343). A codec whose
+    // writer can produce what its reader must refuse is not one protocol, it is
+    // two — and the failure surfaces at the far end as an unattributable
+    // `read:` error with no counter on the side that caused it.
+    if payload.len() > MAX_REPLY_BYTES as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "refusing to write a {}-byte frame; the reader cap is {MAX_REPLY_BYTES} bytes",
+                payload.len()
+            ),
+        ));
+    }
     let len = u32::try_from(payload.len()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -467,7 +525,7 @@ fn record_conn(outcome: &str, ok: bool, degraded: bool) {
 async fn serve_conn(mut stream: TcpStream) {
     record_conn("accepted", true, false);
     loop {
-        match read_frame(&mut stream).await {
+        match read_frame(&mut stream, MAX_FRAME_BYTES).await {
             Ok(None) => {
                 record_conn("closed", true, false);
                 return;
@@ -490,6 +548,31 @@ async fn serve_conn(mut stream: TcpStream) {
                     obs.degraded,
                     elapsed,
                 );
+                // An over-large reply is answered, not dropped. Before
+                // noetl/ai-meta#343 the service wrote the frame anyway and the
+                // client refused it with `read: … exceeds the … cap`, which
+                // named no execution, incremented nothing here, and removed the
+                // execution from every parity denominator instead of marking it
+                // unreadable. Now the caller gets a reply that FITS and says so.
+                let resp = if resp.len() > MAX_REPLY_BYTES as usize {
+                    record_conn("reply_too_large", false, true);
+                    tracing::warn!(
+                        bytes = resp.len(),
+                        cap = MAX_REPLY_BYTES,
+                        op = obs.op,
+                        "EHDB tier service: reply exceeds the frame cap; answering with an \
+                         explicit error so the caller can count it as unreadable rather than \
+                         losing it"
+                    );
+                    format!(
+                        "err reply of {} bytes exceeds the {MAX_REPLY_BYTES}-byte frame cap; \
+                         the execution is UNREADABLE, not absent — page the query",
+                        resp.len()
+                    )
+                    .into_bytes()
+                } else {
+                    resp
+                };
                 if let Err(e) = write_frame(&mut stream, &resp).await {
                     // Degraded: the request was served and the answer was lost.
                     // From the caller's side this is indistinguishable from the
@@ -612,7 +695,7 @@ mod tests {
 
         let mut c = TcpStream::connect(addr).await.unwrap();
         write_frame(&mut c, b"health").await.unwrap();
-        let reply = read_frame(&mut c).await.unwrap().expect("a reply frame");
+        let reply = read_frame(&mut c, MAX_REPLY_BYTES).await.unwrap().expect("a reply frame");
         let reply = String::from_utf8(reply).unwrap();
         assert!(reply.starts_with("ok tier-service v"), "got {reply}");
     }
@@ -632,7 +715,16 @@ mod tests {
         c.flush().await.unwrap();
         // The server must close rather than wait on (or allocate for) the body.
         let mut buf = [0u8; 1];
-        let n = c.read(&mut buf).await.unwrap_or(0);
+        // ⚠ Bounded — see the note in the request-cap test. An unbounded read
+        // here turns "the cap was widened" from a failure into a hang.
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .expect(
+                "the server neither closed nor answered — it accepted a length prefix above \
+                 the request cap and is now waiting for a body that will never arrive. \
+                 Unbounded, this read HANGS the suite instead of failing it.",
+            )
+            .unwrap_or(0);
         assert_eq!(
             n, 0,
             "server must close the connection on an over-long frame"
@@ -659,7 +751,7 @@ mod tests {
 
         let mut c = TcpStream::connect(addr).await.unwrap();
         write_frame(&mut c, b"health").await.unwrap();
-        let _ = read_frame(&mut c).await.unwrap().expect("a reply frame");
+        let _ = read_frame(&mut c, MAX_REPLY_BYTES).await.unwrap().expect("a reply frame");
 
         let text = metrics::render_lines().join("\n");
         // What this test performed must be counted AT LEAST once. See
@@ -749,7 +841,15 @@ mod tests {
             .unwrap();
         c.flush().await.unwrap();
         let mut buf = [0u8; 1];
-        let _ = c.read(&mut buf).await.unwrap_or(0);
+        // ⚠ Bounded, same reason.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .expect(
+                "the server neither closed nor answered — it accepted a length prefix above \
+                 the request cap and is now waiting for a body that will never arrive. \
+                 Unbounded, this read HANGS the suite instead of failing it.",
+            )
+            .unwrap_or(0);
 
         let text = metrics::render_lines().join("\n");
         assert!(
@@ -795,6 +895,228 @@ mod tests {
         assert!(
             !unsupported.degraded,
             "an unknown op is a client/version issue, not a sick service"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // noetl/ai-meta#343 blocker 2 — the codec must not be asymmetric.
+    // ---------------------------------------------------------------------
+
+    /// ⭐ **The defect, stated as a property.** Anything this codec can WRITE,
+    /// it must be able to READ.
+    ///
+    /// Until #343 the write side checked only u32 overflow while the read side
+    /// enforced 1 MiB, so the tier service would serialise query replies its own
+    /// client structurally could not read — deterministically, for every
+    /// execution over the cap, not intermittently. Prod surfaced it as
+    /// `read: tier-service frame of 1174874 bytes exceeds the 1048576-byte cap`,
+    /// and the affected executions left the parity denominator rather than
+    /// being reported as divergent.
+    ///
+    /// A round-trip is the honest test: a unit test asserting two constants are
+    /// equal would pass against a codec where the writer ignored its own cap.
+    #[tokio::test]
+    async fn anything_the_codec_can_write_it_can_read_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Echo one frame straight back, so only the codec is under test.
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let f = read_frame(&mut s, MAX_REPLY_BYTES).await.unwrap().unwrap();
+            write_frame(&mut s, &f).await.unwrap();
+        });
+
+        // Larger than the OLD shared cap, which is the size prod actually hit.
+        let payload = vec![b'x'; 1_174_874];
+        assert!(
+            payload.len() > MAX_FRAME_BYTES as usize,
+            "the fixture must exceed the old cap or it proves nothing"
+        );
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        write_frame(&mut c, &payload).await.unwrap();
+        let back = read_frame(&mut c, MAX_REPLY_BYTES)
+            .await
+            .expect("a 1.17MB frame must round-trip — this is the #343 payload size")
+            .expect("a reply frame");
+        assert_eq!(back.len(), payload.len());
+    }
+
+    /// The request cap is NOT raised. It bounds an untrusted length prefix, and
+    /// widening it to match the reply cap would let one bad frame ask for 16 MiB
+    /// before a byte of body has arrived.
+    #[tokio::test]
+    async fn the_request_cap_stays_narrow_even_though_replies_may_be_large() {
+        // ⚠ This test drives `serve_tier`, which records `conn` outcomes into
+        // the PROCESS-WIDE metrics state. Without the guard it races
+        // `a_protocol_error_is_counted_separately_from_a_request`, which
+        // asserts `protocol_error == 1` exactly — and since this test also
+        // produces a protocol error, that assertion saw 2.
+        //
+        // Omitting it made the suite fail 3 runs in 5. A 60%-red baseline makes
+        // EVERY mutant read CAUGHT, which is the specific way two earlier
+        // mutation batteries in this programme were thrown away.
+        let _guard = metrics::test_guard();
+        assert!(
+            MAX_REPLY_BYTES > MAX_FRAME_BYTES,
+            "replies must be allowed to exceed requests, or #343 is not fixed"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tier(listener));
+
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        // A length prefix between the two caps: legal as a reply, illegal as a
+        // request. The server must still refuse it.
+        c.write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes())
+            .await
+            .unwrap();
+        c.flush().await.unwrap();
+        // ⚠ Bounded. If the server accepts the over-long prefix it then blocks
+        // in `read_exact` waiting for a body that never arrives, and this read
+        // blocks with it — the mutation would HANG the suite instead of failing
+        // it, which is not a catch.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .expect(
+                "the server neither closed nor answered — it accepted a length prefix above \
+                 the request cap and is waiting for the body, which is the widening this \
+                 test exists to refuse",
+            )
+            .unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "the request cap was widened along with the reply cap — an untrusted \
+             length prefix can now claim {MAX_REPLY_BYTES} bytes"
+        );
+    }
+
+    /// A frame over even the reply cap must be REFUSED at the writer, not
+    /// emitted for the far end to choke on.
+    ///
+    /// This is what turns the remaining cliff from silent into countable: the
+    /// side that caused the failure is the side that records it.
+    #[tokio::test]
+    async fn the_writer_refuses_to_emit_a_frame_no_reader_would_accept() {
+        // ⚠ Deliberately never accepted, and the listener is kept in scope
+        // rather than moved into a task. `write_frame` must refuse BEFORE any
+        // I/O, so the peer's behaviour is irrelevant to what is under test.
+        //
+        // The first draft leaked the accepted socket with `std::mem::forget`.
+        // A forgotten `TcpStream` stays registered with the tokio reactor, and
+        // the runtime's shutdown then blocks waiting for a resource nothing
+        // will ever release — so this test PASSED when run alone and HUNG under
+        // `cargo test`, holding the whole mutation battery at 0% CPU for twenty
+        // minutes while reading, from the outside, exactly like a slow compile.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let too_big = vec![b'x'; MAX_REPLY_BYTES as usize + 1];
+        // ⚠ Bounded. The refusal happens BEFORE any I/O, so a correct
+        // `write_frame` returns instantly — but a broken one blocks forever
+        // filling a socket nobody drains. Without this bound the mutation that
+        // deletes the guard makes the test HANG rather than fail, which is not
+        // a catch: it stalled a mutation battery at 0% CPU for twenty minutes,
+        // indistinguishable from a slow compile. A mutant must produce a
+        // FAILURE, not a stall.
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            write_frame(&mut c, &too_big),
+        )
+        .await
+        .expect("write_frame blocked on a frame it should have refused outright")
+        .expect_err("writing an unreadable frame must fail at the writer");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("refusing to write"),
+            "the error must name the cause; got {err}"
+        );
+        drop(listener);
+    }
+
+    /// Absence and zero must not read alike for the new outcome either.
+    ///
+    /// A mutation removing `reply_too_large` from the pinned list SURVIVED the
+    /// first battery — the counter existed and nothing asserted it was visible
+    /// before it first fired. On a healthy writer it never fires, which is
+    /// precisely when an operator needs to see it sitting at 0 rather than
+    /// wonder whether the build has it at all.
+    #[tokio::test]
+    async fn the_oversized_reply_outcome_is_pinned_at_zero() {
+        let _guard = metrics::test_guard();
+        metrics::reset();
+        metrics::pin_tier_service_series(&[]);
+        let text = metrics::render_lines().join("\n");
+        assert!(
+            text.contains(
+                "noetl_ehdb_dataplane_ops_total{operation=\"tier_service.conn\",outcome=\"reply_too_large\"} 0"
+            ),
+            "reply_too_large is not pinned — it will be ABSENT from /metrics until \
+             the first over-large reply, and absent reads as zero:\n{text}"
+        );
+        // Negative control: an outcome nobody defined must not appear, or the
+        // assertion above would pass against any text at all.
+        assert!(
+            !text.contains("outcome=\"nonsense_outcome\""),
+            "an undefined outcome is present — this check cannot distinguish \
+             pinned from unpinned"
+        );
+        metrics::reset();
+    }
+
+    /// An over-large reply is ANSWERED, not dropped.
+    ///
+    /// The caller has to be able to tell "this execution is unreadable" from
+    /// "this execution is absent". Before #343 it could not: the client saw a
+    /// `read:` protocol error naming no execution, nothing was counted on this
+    /// side, and the execution silently left every parity denominator. The
+    /// distinction is the whole point — an absent execution is a mirror gap to
+    /// repair, an unreadable one is a transport limit to page around.
+    #[test]
+    fn an_oversized_reply_is_answered_with_an_error_that_fits() {
+        // The substituted reply must itself be under the cap, or the fix
+        // reproduces the bug it fixes.
+        let resp = vec![b'x'; MAX_REPLY_BYTES as usize + 1];
+        let substitute = format!(
+            "err reply of {} bytes exceeds the {MAX_REPLY_BYTES}-byte frame cap; \
+             the execution is UNREADABLE, not absent — page the query",
+            resp.len()
+        );
+        assert!(
+            substitute.len() < MAX_REPLY_BYTES as usize,
+            "the too-large reply is itself too large"
+        );
+        assert!(
+            substitute.starts_with("err "),
+            "the substitute must be an error reply the client already parses"
+        );
+        assert!(
+            substitute.contains("UNREADABLE, not absent"),
+            "the reply must distinguish unreadable from absent, which is the \
+             distinction that was lost"
+        );
+
+        // …and the serve path must actually install it. Structural, because
+        // driving a >16MiB reply through a real socket in a unit test is slower
+        // than the property is worth.
+        let src = include_str!("tier_service.rs");
+        let code = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let start = code.find("async fn serve_conn").expect("serve_conn not found");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body: String = body[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("resp.len() > MAX_REPLY_BYTES as usize"),
+            "serve_conn does not check the reply size before writing it"
+        );
+        assert!(
+            body.contains("reply_too_large"),
+            "serve_conn does not record the over-large reply — an invisible \
+             cliff is the defect, not the size limit itself"
         );
     }
 }

@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 
 use super::store_tier::StoreTier;
 
-use super::tier_service::{read_frame, write_frame, PROTOCOL_VERSION};
+use super::tier_service::{read_frame, write_frame, MAX_REPLY_BYTES, PROTOCOL_VERSION};
 
 /// Env var naming the tier service to talk to. Unset ⇒ no client.
 pub const TIER_SERVICE_ADDR_ENV: &str = "NOETL_EHDB_TIER_SERVICE_ADDR";
@@ -239,7 +239,12 @@ impl TierClient {
             write_frame(&mut s, payload)
                 .await
                 .map_err(|e| format!("write: {e}"))?;
-            match read_frame(&mut s).await {
+            // Replies are read at the REPLY cap, not the request cap. The
+            // request cap bounds what an untrusted peer may send us; this
+            // bounds an answer from the writer we just queried. Sharing one
+            // constant made the service able to emit frames this very call
+            // could not read (noetl/ai-meta#343).
+            match read_frame(&mut s, MAX_REPLY_BYTES).await {
                 Ok(Some(v)) => Ok(v),
                 Ok(None) => Err("peer closed without a reply".to_string()),
                 Err(e) => Err(format!("read: {e}")),
@@ -617,6 +622,14 @@ mod tests {
     /// or a slow append burns a whole retry instead of finishing inside one.
     #[test]
     fn the_append_budget_fits_inside_the_servers_attempt() {
+        // ⚠ Serialised on the shared metrics state (noetl/ai-meta#343). This
+        // test drives `serve_tier`/a probe, both of which record into the
+        // PROCESS-WIDE tier metrics that
+        // `tier_service::tests::a_protocol_error_is_counted_separately_from_a_request`
+        // asserts exact counts over. Unguarded, that test failed 3 runs in 5 —
+        // a latent race, not a new one, but a red baseline makes every mutant
+        // read CAUGHT and voids the mutation gate this repo depends on.
+        let _guard = crate::ehdb::metrics::test_guard();
         const SERVER_APPEND_TIMEOUT_MS: u64 = 5_000; // server: APPEND_TIMEOUT
         assert!(
             DEFAULT_APPEND_TIMEOUT_MS < SERVER_APPEND_TIMEOUT_MS,
@@ -685,6 +698,14 @@ mod tests {
     /// client that had drifted from the server.
     #[tokio::test]
     async fn client_probes_a_real_listener() {
+        // ⚠ Serialised on the shared metrics state (noetl/ai-meta#343). This
+        // test drives `serve_tier`/a probe, both of which record into the
+        // PROCESS-WIDE tier metrics that
+        // `tier_service::tests::a_protocol_error_is_counted_separately_from_a_request`
+        // asserts exact counts over. Unguarded, that test failed 3 runs in 5 —
+        // a latent race, not a new one, but a red baseline makes every mutant
+        // read CAUGHT and voids the mutation gate this repo depends on.
+        let _guard = crate::ehdb::metrics::test_guard();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_tier(listener));
@@ -704,6 +725,14 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_op_round_trips_as_a_reply_not_an_error() {
+        // ⚠ Serialised on the shared metrics state (noetl/ai-meta#343). This
+        // test drives `serve_tier`/a probe, both of which record into the
+        // PROCESS-WIDE tier metrics that
+        // `tier_service::tests::a_protocol_error_is_counted_separately_from_a_request`
+        // asserts exact counts over. Unguarded, that test failed 3 runs in 5 —
+        // a latent race, not a new one, but a red baseline makes every mutant
+        // read CAUGHT and voids the mutation gate this repo depends on.
+        let _guard = crate::ehdb::metrics::test_guard();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_tier(listener));
@@ -719,6 +748,51 @@ mod tests {
             .expect("a reply, not an error");
         assert_eq!(String::from_utf8(body).unwrap(), "unsupported append");
     }
+    /// ⭐ **The gap the prod failure actually went through.**
+    ///
+    /// noetl/ai-meta#343 did not fail in the codec in the abstract — it failed
+    /// in `request_within`, which wrote with no cap and then read the reply at
+    /// the REQUEST cap. Every other test here exercises `read_frame` and
+    /// `write_frame` directly, so a mutation putting the request cap back on
+    /// the reply read SURVIVED the first battery: the one line that caused the
+    /// outage had no test over it.
+    ///
+    /// This drives a real `TierClient` against a service whose reply exceeds
+    /// 1 MiB — the shape prod hits, at the size prod hit
+    /// (`frame of 1174874 bytes exceeds the 1048576-byte cap`).
+    #[tokio::test]
+    async fn the_client_reads_back_a_reply_larger_than_the_request_cap() {
+        use super::super::tier_service::{read_frame, write_frame, MAX_FRAME_BYTES, MAX_REPLY_BYTES};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let big = 1_174_874usize;
+        assert!(
+            big > MAX_FRAME_BYTES as usize && big < MAX_REPLY_BYTES as usize,
+            "the fixture must sit BETWEEN the two caps or it tests nothing"
+        );
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _req = read_frame(&mut s, MAX_REPLY_BYTES).await.unwrap().unwrap();
+            write_frame(&mut s, &vec![b'r'; big]).await.unwrap();
+        });
+
+        let client = TierClient::new(TierClientConfig {
+            addr: addr.to_string(),
+            timeout: Duration::from_millis(5_000),
+            append_timeout: Duration::from_millis(5_000),
+        });
+        let reply = client
+            .request_within(b"health", Duration::from_millis(5_000))
+            .await
+            .expect(
+                "the client refused a reply between the request cap and the reply cap — this \
+                 is exactly noetl/ai-meta#343: the service can serialise it and the client \
+                 cannot read it, so the execution leaves every parity denominator",
+            );
+        assert_eq!(reply.len(), big);
+    }
+
 
     /// END-TO-END, the PR-3 property: a record appended THROUGH THE CLIENT, over
     /// the real wire format, to a REAL listener backed by a REAL store, comes
@@ -729,6 +803,14 @@ mod tests {
     /// every key would satisfy the positive half.
     #[tokio::test]
     async fn append_then_read_round_trips_through_the_wire() {
+        // ⚠ Serialised on the shared metrics state (noetl/ai-meta#343). This
+        // test drives `serve_tier`/a probe, both of which record into the
+        // PROCESS-WIDE tier metrics that
+        // `tier_service::tests::a_protocol_error_is_counted_separately_from_a_request`
+        // asserts exact counts over. Unguarded, that test failed 3 runs in 5 —
+        // a latent race, not a new one, but a red baseline makes every mutant
+        // read CAUGHT and voids the mutation gate this repo depends on.
+        let _guard = crate::ehdb::metrics::test_guard();
         let mut dir = std::env::temp_dir();
         dir.push(format!("ehdb-tier-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -816,6 +898,14 @@ mod tests {
     /// IP, exercising the resolution path the SocketAddr parse used to block.
     #[tokio::test]
     async fn client_connects_through_a_hostname() {
+        // ⚠ Serialised on the shared metrics state (noetl/ai-meta#343). This
+        // test drives `serve_tier`/a probe, both of which record into the
+        // PROCESS-WIDE tier metrics that
+        // `tier_service::tests::a_protocol_error_is_counted_separately_from_a_request`
+        // asserts exact counts over. Unguarded, that test failed 3 runs in 5 —
+        // a latent race, not a new one, but a red baseline makes every mutant
+        // read CAUGHT and voids the mutation gate this repo depends on.
+        let _guard = crate::ehdb::metrics::test_guard();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(serve_tier(listener));
@@ -853,6 +943,14 @@ mod tests {
     /// property its VALUE does not measure.
     #[tokio::test]
     async fn a_configured_but_unreachable_service_must_not_count_as_reachable() {
+        // ⚠ Serialised on the shared metrics state (noetl/ai-meta#343). This
+        // test drives `serve_tier`/a probe, both of which record into the
+        // PROCESS-WIDE tier metrics that
+        // `tier_service::tests::a_protocol_error_is_counted_separately_from_a_request`
+        // asserts exact counts over. Unguarded, that test failed 3 runs in 5 —
+        // a latent race, not a new one, but a red baseline makes every mutant
+        // read CAUGHT and voids the mutation gate this repo depends on.
+        let _guard = crate::ehdb::metrics::test_guard();
         use crate::ehdb::reachability;
 
         // 10.255.255.1 is a black hole: configured, never reachable.
@@ -897,6 +995,14 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_endpoint_is_classified_not_hung() {
+        // ⚠ Serialised on the shared metrics state (noetl/ai-meta#343). This
+        // test drives `serve_tier`/a probe, both of which record into the
+        // PROCESS-WIDE tier metrics that
+        // `tier_service::tests::a_protocol_error_is_counted_separately_from_a_request`
+        // asserts exact counts over. Unguarded, that test failed 3 runs in 5 —
+        // a latent race, not a new one, but a red baseline makes every mutant
+        // read CAUGHT and voids the mutation gate this repo depends on.
+        let _guard = crate::ehdb::metrics::test_guard();
         // Port 1 on loopback: nothing listens, so connect fails fast. The point
         // is that the caller gets a classified answer rather than a hang.
         let client = TierClient::new(TierClientConfig {
