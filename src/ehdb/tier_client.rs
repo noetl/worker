@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 
 use super::store_tier::StoreTier;
 
-use super::tier_service::{read_frame, write_frame, MAX_REPLY_BYTES, PROTOCOL_VERSION};
+use super::tier_service::{read_frame, write_request_frame, MAX_REPLY_BYTES, PROTOCOL_VERSION};
 
 /// Env var naming the tier service to talk to. Unset ⇒ no client.
 pub const TIER_SERVICE_ADDR_ENV: &str = "NOETL_EHDB_TIER_SERVICE_ADDR";
@@ -236,7 +236,11 @@ impl TierClient {
             let mut s = TcpStream::connect(self.cfg.addr.as_str())
                 .await
                 .map_err(|e| format!("connect: {e}"))?;
-            write_frame(&mut s, payload)
+            // ⚠ REQUEST frame: bounded by the cap the SERVICE reads requests at
+            // (1 MiB), not by the reply cap. Validating against the reply cap
+            // let a 1.25 MB request pass locally and be refused remotely as a
+            // connection reset (noetl/worker#311's own bug).
+            write_request_frame(&mut s, payload)
                 .await
                 .map_err(|e| format!("write: {e}"))?;
             // Replies are read at the REPLY cap, not the request cap. The
