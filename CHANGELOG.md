@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.131.2](https://github.com/noetl/worker/compare/v5.131.1...v5.131.2) (2026-09-13)
+
+### Bug Fixes
+
+* **ehdb:** stop the tier service emitting frames its own client cannot read ([3a33a69](https://github.com/noetl/worker/commit/3a33a69f7ab999448d9a7e83a20d840e7262d5d1)), closes [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343)
+
 ## [5.131.1](https://github.com/noetl/worker/compare/v5.131.0...v5.131.1) (2026-09-05)
 
 ### Bug Fixes
