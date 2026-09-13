@@ -823,13 +823,36 @@ async fn ehdb_tier_append_handler(
             if batch_appends_enabled() && records.len() > 1 {
                 crate::ehdb::metrics::record_tier_append_path(true, records.len());
                 let started = std::time::Instant::now();
-                let raw = client
-                    .append_batch_tier(store_tier, &execution_id, &records)
-                    .await;
+
+                // ⚠ CHUNKED (noetl/ai-meta#344). One frame per chunk, each under
+                // the tier service's REQUEST cap.
+                //
+                // `append_batch_tier` puts every payload in a single frame, and
+                // the service reads requests at `MAX_FRAME_BYTES` (1 MiB) —
+                // which noetl/ai-meta#343 deliberately left alone, because it
+                // bounds an untrusted length prefix. A 64-event
+                // itinerary-planner batch is ~1.17 MB, so an unchunked batch
+                // would have fixed the small executions and hard-failed exactly
+                // the large ones that fail today. The two limits are coupled;
+                // this is the coupling.
+                //
+                // Results are concatenated in request order, because
+                // `batch_results` is positional and the per-record serve
+                // decision below consumes it that way.
+                let chunks = chunk_for_frame(&records, batch_frame_budget());
+                let mut per_record: Vec<Result<String, String>> =
+                    Vec::with_capacity(records.len());
+                for range in &chunks {
+                    let slice = &records[range.clone()];
+                    let raw = client
+                        .append_batch_tier(store_tier, &execution_id, slice)
+                        .await;
+                    per_record.extend(batch_results(&raw, slice.len()));
+                }
+                debug_assert_eq!(per_record.len(), records.len());
                 let elapsed = started.elapsed().as_secs_f64() / records.len() as f64;
                 let mut previous_sequence = 0u64;
                 let mut serve_state = current_serve_state_for(store_tier);
-                let per_record = batch_results(&raw, records.len());
                 for out in &per_record {
                     let reply = out.as_deref().map_err(String::as_str);
                     let (seq, label) = match store_tier {
@@ -1039,6 +1062,71 @@ async fn ehdb_tier_append_handler(
 ///
 /// Default **false**: the per-record loop stays the shipped behaviour, so
 /// enabling and reverting are both per-deployment and immediate.
+/// Budget for one batched request frame, in bytes.
+///
+/// The tier service reads REQUESTS at
+/// [`crate::ehdb::tier_service::MAX_FRAME_BYTES`] (1 MiB), and
+/// noetl/ai-meta#343 deliberately did **not** raise that — it bounds a length
+/// prefix from a peer we must not trust, checked before any allocation. Only
+/// the REPLY cap was widened.
+///
+/// So batching has to live under the request cap rather than around it. The
+/// headroom covers the request envelope (`op`, `tier`, `execution_id`, the JSON
+/// punctuation of the `payloads` array) and leaves margin, because a frame that
+/// overshoots does not degrade gracefully — it is refused whole.
+const BATCH_FRAME_HEADROOM: usize = 64 * 1024;
+
+fn batch_frame_budget() -> usize {
+    (crate::ehdb::tier_service::MAX_FRAME_BYTES as usize).saturating_sub(BATCH_FRAME_HEADROOM)
+}
+
+/// What one record costs **inside the request frame**, in bytes.
+///
+/// ⚠ Not `record.len()`. The payloads are JSON documents embedded as JSON
+/// *strings*, so every `"` becomes `\"` and the serialised cost approaches
+/// **twice** the raw length on real event payloads. Budgeting on the raw length
+/// would build frames that pass the local check and are refused by the service
+/// — precisely the failure this chunking exists to prevent.
+///
+/// `serde_json::to_string` on the string yields the exact escaped length,
+/// surrounding quotes included, in one pass.
+fn framed_cost(record: &str) -> usize {
+    serde_json::to_string(record)
+        .map(|s| s.len())
+        .unwrap_or_else(|_| record.len() * 2 + 2)
+        + 1 // the separating comma
+}
+
+/// Split records into batches whose request frame fits under the cap.
+///
+/// Returns index ranges rather than slices so the per-record result mapping
+/// stays positional — `batch_results` is positional and the serve decision
+/// downstream reads it that way, so a chunking that reordered anything would
+/// mis-attribute sequences silently.
+///
+/// ⚠ A single record larger than the whole budget gets a chunk of its own. It
+/// will still be refused by the service, but as **one** record's failure rather
+/// than as the failure of every record batched beside it. Failing wide is how a
+/// transport limit becomes an outage.
+pub(crate) fn chunk_for_frame(records: &[String], budget: usize) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut running = 0usize;
+    for (i, r) in records.iter().enumerate() {
+        let cost = framed_cost(r);
+        if i > start && running + cost > budget {
+            out.push(start..i);
+            start = i;
+            running = 0;
+        }
+        running += cost;
+    }
+    if start < records.len() {
+        out.push(start..records.len());
+    }
+    out
+}
+
 fn batch_appends_enabled() -> bool {
     matches!(
         std::env::var("NOETL_EHDB_TIER_APPEND_BATCH")
@@ -1430,6 +1518,257 @@ mod tests {
 
 #[cfg(test)]
 mod tier_append_batch_tests {
+
+
+    use super::{batch_frame_budget, chunk_for_frame};
+    use crate::ehdb::tier_service::MAX_FRAME_BYTES;
+
+    /// Build the request frame exactly as `append_batch_tier` does, so the test
+    /// measures the bytes that actually go on the wire rather than a proxy.
+    fn framed_request(execution_id: &str, payloads: &[String]) -> usize {
+        serde_json::json!({
+            "op": "append_batch",
+            "tier": "eventlog",
+            "execution_id": execution_id,
+            "payloads": payloads,
+        })
+        .to_string()
+        .len()
+    }
+
+    /// A record shaped like a real mirrored event: JSON, quote-heavy, so the
+    /// escaped cost is near twice the raw length.
+    fn record(i: usize, pad: usize) -> String {
+        format!(
+            r#"{{"event_id":{i},"event_type":"step.completed","result":{{"context":{{"rows":"{}"}}}}}}"#,
+            "x".repeat(pad)
+        )
+    }
+
+    /// ⭐ **The prod case.** A batch at the size that broke #343 must be split,
+    /// and every chunk must fit.
+    ///
+    /// 1,174,874 bytes is the measured tier payload of a 64-event
+    /// `muno/playbooks/itinerary-planner` execution — the exact size the tier
+    /// service refused. Arming batching without chunking would have sent that
+    /// as ONE frame against a 1 MiB request cap, fixing the small executions
+    /// and hard-failing the large ones that were already failing.
+    #[test]
+    fn a_prod_sized_batch_is_split_and_every_chunk_fits() {
+        // ~1.17 MB of raw payload across 64 records.
+        let records: Vec<String> = (0..64).map(|i| record(i, 18_000)).collect();
+        let raw_total: usize = records.iter().map(|r| r.len()).sum();
+        assert!(
+            raw_total > 1_000_000,
+            "fixture is {raw_total} bytes — too small to exercise the cap"
+        );
+
+        // The control: unchunked, this WOULD have been refused.
+        let unchunked = framed_request("e1", &records);
+        assert!(
+            unchunked > MAX_FRAME_BYTES as usize,
+            "the fixture does not exceed the cap unchunked ({unchunked} bytes), \
+             so this test would pass even without chunking"
+        );
+
+        let chunks = chunk_for_frame(&records, batch_frame_budget());
+        assert!(
+            chunks.len() > 1,
+            "a {raw_total}-byte batch was not split; it would be refused whole"
+        );
+        for c in &chunks {
+            let n = framed_request("e1", &records[c.clone()]);
+            assert!(
+                n <= MAX_FRAME_BYTES as usize,
+                "chunk {c:?} frames to {n} bytes, over the {MAX_FRAME_BYTES}-byte \
+                 request cap — the budget does not account for JSON escaping"
+            );
+        }
+    }
+
+    /// Chunking must preserve every record, exactly once, in order.
+    ///
+    /// `batch_results` is positional and the serve decision reads sequences in
+    /// request order, so a chunking that dropped, duplicated or reordered a
+    /// record would mis-attribute tier sequences **silently** — no error, a
+    /// wrong answer.
+    #[test]
+    fn chunking_preserves_every_record_exactly_once_in_order() {
+        let records: Vec<String> = (0..50).map(|i| record(i, 40_000)).collect();
+        let chunks = chunk_for_frame(&records, batch_frame_budget());
+        assert!(chunks.len() > 1, "fixture must actually split");
+
+        let mut seen: Vec<usize> = Vec::new();
+        for c in &chunks {
+            assert!(!c.is_empty(), "an empty chunk would send a pointless frame");
+            seen.extend(c.clone());
+        }
+        assert_eq!(
+            seen,
+            (0..records.len()).collect::<Vec<_>>(),
+            "chunking lost, duplicated or reordered records"
+        );
+        // Contiguity: chunk N must start where chunk N-1 ended.
+        for w in chunks.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "chunks are not contiguous: {chunks:?}");
+        }
+    }
+
+    /// A batch that already fits stays ONE frame.
+    ///
+    /// The point of batching is one round trip and one `fsync`. Chunking that
+    /// split a small batch would hand back the per-record fan-out this exists
+    /// to remove — the fix silently becoming the bug.
+    #[test]
+    fn a_small_batch_is_not_split() {
+        let records: Vec<String> = (0..29).map(|i| record(i, 200)).collect();
+        let chunks = chunk_for_frame(&records, batch_frame_budget());
+        assert_eq!(
+            chunks.len(),
+            1,
+            "a 29-record batch well under the cap was split into {} frames — \
+             that reintroduces the sequential fan-out",
+            chunks.len()
+        );
+        assert_eq!(chunks[0], 0..29);
+    }
+
+    /// ⚠ The escaping trap, isolated.
+    ///
+    /// Budgeting on `record.len()` instead of the escaped length builds frames
+    /// that pass the local check and are refused by the service. This pins that
+    /// the budget uses the escaped cost, by constructing records whose escaped
+    /// size is far larger than their raw size.
+    #[test]
+    fn the_budget_counts_escaped_bytes_not_raw_bytes() {
+        // Almost all quotes: raw length N, escaped length ~2N.
+        // ⚠ Sized deliberately. Raw total must sit UNDER the cap while the
+        // escaped total sits OVER the budget, or the test cannot tell the two
+        // ways of counting apart. The first draft used 120k quotes per record:
+        // escaped that is ~960 KB against a ~983 KB budget, so it fit, and the
+        // test failed for want of a fixture rather than for want of the fix.
+        let quoted = format!("{{\"k\":\"{}\"}}", "\"".repeat(200_000));
+        let records = vec![quoted.clone(), quoted.clone(), quoted.clone(), quoted];
+        let raw_total: usize = records.iter().map(|r| r.len()).sum();
+        assert!(
+            raw_total < MAX_FRAME_BYTES as usize,
+            "fixture must fit when measured RAW ({raw_total}), or it cannot \
+             distinguish the two ways of counting"
+        );
+
+        let chunks = chunk_for_frame(&records, batch_frame_budget());
+        assert!(
+            chunks.len() > 1,
+            "records that fit raw but not escaped were left in one frame — the \
+             budget is counting raw bytes"
+        );
+        for c in &chunks {
+            let n = framed_request("e1", &records[c.clone()]);
+            assert!(n <= MAX_FRAME_BYTES as usize, "chunk frames to {n} bytes");
+        }
+    }
+
+    /// ⭐ **The handler must actually chunk, and actually concatenate.**
+    ///
+    /// Every other test here calls `chunk_for_frame` directly, so the batch
+    /// branch could stop calling it — or overwrite `per_record` instead of
+    /// extending it — and they would all still pass. A mutation battery proved
+    /// exactly that: three mutants of the CALL SITE survived while the helper
+    /// stayed perfectly tested. **Testing a function is not testing its use.**
+    #[test]
+    fn the_handler_chunks_and_concatenates() {
+        let src = include_str!("metrics_server.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("if batch_appends_enabled() && records.len() > 1 {")
+            .expect("the batch branch was not found — extraction broke");
+        let body = &code[start..];
+        let end = body
+            .find("previous_sequence")
+            .expect("batch branch slice broke");
+        let body = &body[..end];
+        assert!(
+            body.len() > 400,
+            "batch branch extracted as {} bytes — implausibly small",
+            body.len()
+        );
+        assert!(
+            body.contains("chunk_for_frame(&records, batch_frame_budget())"),
+            "the batch branch does not chunk. It sends every payload in one \
+             frame against a 1 MiB request cap, which hard-fails exactly the \
+             large executions noetl/ai-meta#343 is about."
+        );
+        assert!(
+            body.contains("per_record.extend(batch_results("),
+            "the batch branch does not CONCATENATE per-chunk results. \
+             Overwriting keeps only the last chunk, so every record before it \
+             loses its serve decision — silently, with no error."
+        );
+        assert!(
+            !body.contains("per_record = batch_results("),
+            "per_record is assigned rather than extended — earlier chunks are \
+             discarded"
+        );
+        assert!(
+            body.contains("append_batch_tier(store_tier, &execution_id, slice)"),
+            "the batch call no longer sends the CHUNK; sending `&records` would \
+             make the chunking decorative"
+        );
+    }
+
+    /// The budget must leave room for the request envelope.
+    ///
+    /// `chunk_for_frame` budgets the PAYLOADS; the frame also carries `op`,
+    /// `tier`, `execution_id` and the JSON punctuation of the array. Budgeting
+    /// at the full cap builds frames that are a few hundred bytes over it, and
+    /// a frame that overshoots is refused whole rather than truncated.
+    #[test]
+    fn the_budget_leaves_room_for_the_request_envelope() {
+        assert!(
+            batch_frame_budget() < MAX_FRAME_BYTES as usize,
+            "the budget is the whole cap, leaving nothing for the envelope"
+        );
+        // Saturate the budget exactly, then confirm the framed request still
+        // fits — this is what the headroom is FOR, asserted rather than assumed.
+        let mut records: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        while used < batch_frame_budget() {
+            let r = record(records.len(), 4_000);
+            used += serde_json::to_string(&r).map(|s| s.len()).unwrap_or(0) + 1;
+            records.push(r);
+        }
+        let chunks = chunk_for_frame(&records, batch_frame_budget());
+        for c in &chunks {
+            let n = framed_request("execution-id-of-realistic-length-1234567890", &records[c.clone()]);
+            assert!(
+                n <= MAX_FRAME_BYTES as usize,
+                "a budget-saturating chunk frames to {n} bytes, over the \
+                 {MAX_FRAME_BYTES}-byte cap — the headroom does not cover the \
+                 envelope"
+            );
+        }
+    }
+
+    /// An oversized single record gets its own chunk rather than poisoning the
+    /// batch around it.
+    #[test]
+    fn one_oversized_record_is_isolated_not_batched_with_others() {
+        let huge = record(0, (MAX_FRAME_BYTES as usize) + 1);
+        let records = vec![record(1, 100), huge, record(2, 100)];
+        let chunks = chunk_for_frame(&records, batch_frame_budget());
+        let owning: Vec<_> = chunks.iter().filter(|c| c.contains(&1)).collect();
+        assert_eq!(owning.len(), 1);
+        assert_eq!(
+            owning[0].len(),
+            1,
+            "the oversized record was batched with neighbours, so its refusal \
+             takes them down with it: {chunks:?}"
+        );
+    }
 
     /// Both store paths must be instrumented, and instrumented once each.
     ///
