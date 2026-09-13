@@ -486,21 +486,72 @@ pub(crate) async fn read_frame(stream: &mut TcpStream, cap: u32) -> std::io::Res
 
 /// Write one length-framed message.
 /// Shared with the client — see [`read_frame`].
+/// Write one length-framed **reply** (service → client), bounded by
+/// [`MAX_REPLY_BYTES`].
+pub(crate) async fn write_reply_frame(
+    stream: &mut TcpStream,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    write_frame_capped(stream, payload, MAX_REPLY_BYTES, "reply")
+        .await
+}
+
+/// Write one length-framed **request** (client → service), bounded by
+/// [`MAX_FRAME_BYTES`] — the cap the service actually reads requests at.
+///
+/// ⚠⚠ This split exists because noetl/worker#311 got it wrong in the other
+/// direction. That PR raised the REPLY cap to 16 MiB and made `write_frame`
+/// validate against it — for **both** directions. So a client could write a
+/// 1.25 MB *request*, pass the local check at 16 MiB, and have the service
+/// refuse it at its 1 MiB request cap and close the socket. Prod, 2026-09-13:
+///
+/// ```text
+/// relay:  write: Connection reset by peer (os error 104)
+/// writer: protocol error; closing connection
+///         error=tier-service frame of 1251646 bytes exceeds the 1048576-byte cap
+/// ```
+///
+/// 48 occurrences, and the mirror dropped the batch permanently — no retry can
+/// fix a frame the peer structurally cannot read. The failure surfaced at the
+/// far end as an unattributable reset, with nothing counted on the side that
+/// caused it. **That is the exact defect #311 was written to remove, recreated
+/// by #311's own guard**: one cap for two directions is the same mistake as one
+/// cap for two roles.
+///
+/// A writer must validate against the cap its READER uses, which means the
+/// direction has to be part of the call.
+pub(crate) async fn write_request_frame(
+    stream: &mut TcpStream,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    write_frame_capped(stream, payload, MAX_FRAME_BYTES, "request")
+        .await
+}
+
+async fn write_frame_capped(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    cap: u32,
+    what: &str,
+) -> std::io::Result<()> {
+    if payload.len() > cap as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "refusing to write a {}-byte {what} frame; the reader cap is {cap} bytes",
+                payload.len()
+            ),
+        ));
+    }
+    write_frame(stream, payload).await
+}
+
 pub(crate) async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
     // ⚠ The write side used to check only u32 overflow, so it would emit frames
     // no reader on either end would accept (noetl/ai-meta#343). A codec whose
     // writer can produce what its reader must refuse is not one protocol, it is
     // two — and the failure surfaces at the far end as an unattributable
     // `read:` error with no counter on the side that caused it.
-    if payload.len() > MAX_REPLY_BYTES as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "refusing to write a {}-byte frame; the reader cap is {MAX_REPLY_BYTES} bytes",
-                payload.len()
-            ),
-        ));
-    }
     let len = u32::try_from(payload.len()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -573,7 +624,7 @@ async fn serve_conn(mut stream: TcpStream) {
                 } else {
                     resp
                 };
-                if let Err(e) = write_frame(&mut stream, &resp).await {
+                if let Err(e) = write_reply_frame(&mut stream, &resp).await {
                     // Degraded: the request was served and the answer was lost.
                     // From the caller's side this is indistinguishable from the
                     // service being down, so it must not read as healthy here.
@@ -902,6 +953,111 @@ mod tests {
     // noetl/ai-meta#343 blocker 2 — the codec must not be asymmetric.
     // ---------------------------------------------------------------------
 
+    /// ⭐⭐ **The property #311 got wrong: a writer must validate against the cap
+    /// its READER uses — which depends on DIRECTION.**
+    ///
+    /// #311 raised the reply cap to 16 MiB and made `write_frame` validate
+    /// against it for both directions. A client could then write a 1.25 MB
+    /// *request*, pass the local check, and have the service refuse it at its
+    /// 1 MiB request cap and close the socket. Prod, 2026-09-13: 48
+    /// `protocol error … frame of 1251646 bytes exceeds the 1048576-byte cap`,
+    /// and the mirror dropped those batches **permanently** — no retry can fix a
+    /// frame the peer structurally cannot read.
+    ///
+    /// One cap for two directions is the same mistake as one cap for two roles.
+    #[tokio::test]
+    async fn a_request_is_bounded_by_the_request_cap_not_the_reply_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut c = TcpStream::connect(addr).await.unwrap();
+
+        // Between the two caps: legal as a reply, ILLEGAL as a request.
+        let between = vec![b'x'; (MAX_FRAME_BYTES as usize) + 1];
+        assert!(
+            between.len() < MAX_REPLY_BYTES as usize,
+            "fixture must sit BETWEEN the caps or it cannot tell them apart"
+        );
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            write_request_frame(&mut c, &between),
+        )
+        .await
+        .expect("write_request_frame blocked instead of refusing")
+        .expect_err(
+            "a request above the REQUEST cap was accepted locally — it will be \
+             refused by the service as a connection reset, dropped permanently, \
+             and counted nowhere",
+        );
+        assert!(
+            err.to_string().contains("request frame"),
+            "the error must name the direction; got {err}"
+        );
+
+        // Positive control: the SAME payload is a legal reply.
+        //
+        // ⚠ It needs a DRAINING reader. A >1 MB write to a socket nobody reads
+        // fills the kernel buffer and blocks, so without this the control times
+        // out and "proves" the payload is illegal in both directions — which
+        // would make the whole test about size rather than direction.
+        let (mut srv, _) = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut sink = vec![0u8; 1 << 16];
+            while srv.read(&mut sink).await.unwrap_or(0) > 0 {}
+        });
+        let mut c2 = TcpStream::connect(addr).await.unwrap();
+        let (mut srv2, _) = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut sink = vec![0u8; 1 << 16];
+            while srv2.read(&mut sink).await.unwrap_or(0) > 0 {}
+        });
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            write_reply_frame(&mut c2, &between),
+        )
+        .await
+        .expect("write_reply_frame blocked even with a draining reader");
+        assert!(
+            ok.is_ok(),
+            "a payload between the caps must be a LEGAL reply — otherwise this \
+             test proves nothing about direction, only about size: {ok:?}"
+        );
+    }
+
+    /// The client must use the request writer, and the service the reply writer.
+    ///
+    /// The behavioural test above covers the helpers; this covers the CALL
+    /// SITES, which is where #311's mistake actually lived. A mutation swapping
+    /// them back survives everything else.
+    #[test]
+    fn each_side_writes_with_its_own_direction() {
+        let code_only = |src: &str| -> String {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let client = code_only(include_str!("tier_client.rs"));
+        assert!(
+            client.contains("write_request_frame(&mut s, payload)"),
+            "the client does not write REQUEST frames — it will validate against \
+             the reply cap and emit frames the service refuses"
+        );
+        assert!(
+            !client.contains("write_frame(&mut s, payload)"),
+            "the client still calls the uncapped/reply-capped writer"
+        );
+
+        let svc = include_str!("tier_service.rs");
+        let svc_code = code_only(svc.split("\n#[cfg(test)]").next().unwrap_or(svc));
+        assert!(
+            svc_code.contains("write_reply_frame(&mut stream, &resp)"),
+            "serve_conn does not write REPLY frames"
+        );
+    }
+
     /// ⭐ **The defect, stated as a property.** Anything this codec can WRITE,
     /// it must be able to READ.
     ///
@@ -1021,10 +1177,10 @@ mod tests {
         // FAILURE, not a stall.
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            write_frame(&mut c, &too_big),
+            write_reply_frame(&mut c, &too_big),
         )
         .await
-        .expect("write_frame blocked on a frame it should have refused outright")
+        .expect("write_reply_frame blocked on a frame it should have refused outright")
         .expect_err("writing an unreadable frame must fail at the writer");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
