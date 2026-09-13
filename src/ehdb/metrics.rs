@@ -428,6 +428,12 @@ const TIER_SERVICE_SERIES: &[(&str, &str)] = &[
     ("conn", "protocol_error"),
     ("conn", "write_error"),
     ("conn", "accept_error"),
+    // A reply this service could serialise but no client could read back
+    // (noetl/ai-meta#343). Pinned like the rest: on a healthy writer it never
+    // fires, and an absent series reads exactly like a zero one to anyone
+    // diffing /metrics — which is how the 1 MiB cliff stayed invisible while it
+    // was silently removing executions from every parity denominator.
+    ("conn", "reply_too_large"),
 ];
 
 /// Operations that get a latency series pinned at count 0.
