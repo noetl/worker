@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.131.3](https://github.com/noetl/worker/compare/v5.131.2...v5.131.3) (2026-09-13)
+
+### Bug Fixes
+
+* **deps:** hold noetl-tools at 3.26.x — 3.27.0 broke the build on main ([ae5097e](https://github.com/noetl/worker/commit/ae5097e24fdc2f0d923b977d4fca23780fe63b0a)), closes [worker#183](https://github.com/noetl/worker/issues/183)
+
 ## [5.131.2](https://github.com/noetl/worker/compare/v5.131.1...v5.131.2) (2026-09-13)
 
 ### Bug Fixes
