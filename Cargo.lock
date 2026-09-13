@@ -3169,9 +3169,9 @@ checksum = "fcdc9657471e917de19608a327a65eafb0d4bef5df5271c991c85982a5ccdf07"
 
 [[package]]
 name = "noetl-tools"
-version = "3.27.0"
+version = "3.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f437bf4d25fec3cf8aa1256bda2bd4b8e3ab46349b206472e1f0cb12a2471724"
+checksum = "ff0367129db89d0be2f7ace4145b82851bccfe6cec8a142a2be2f2a797cf7901"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
