@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.132.1](https://github.com/noetl/worker/compare/v5.132.0...v5.132.1) (2026-09-13)
+
+### Bug Fixes
+
+* **ehdb:** make the frame writer direction-aware — a request is not a reply ([1d2c587](https://github.com/noetl/worker/commit/1d2c5874540f06833afd89f2be2d248d2d0f7387)), closes [#311](https://github.com/noetl/worker/issues/311) [#311](https://github.com/noetl/worker/issues/311)
+
 ## [5.132.0](https://github.com/noetl/worker/compare/v5.131.3...v5.132.0) (2026-09-13)
 
 ### Features
