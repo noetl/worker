@@ -214,7 +214,21 @@ wasmtime = { version = "27", optional = true }
 #   "reconnect 50-116x/sec" storm.  3.19.1 makes the drain hold ONE long-lived
 #   connection, matching the state-builder drain.  Runtime adoption only —
 #   no worker code change.
-noetl-tools = "3.19.1"
+# ⚠ HELD at 3.26.x, not `^3.19.1` (noetl/ai-meta#344).
+#
+# `^3.19.1` let a resolver pick **3.27.0**, which added a required
+# `child_execution_id` field to `ToolResult`. `noetl-executor 0.5.0` — which
+# this crate also depends on — constructs `ToolResult` without it, so the
+# workspace stopped compiling. It broke on the `chore(release): version
+# 5.131.2` commit itself, because that is where the lock was re-resolved: every
+# PR's CI had passed against the older lock, so nothing failed until main.
+#
+# This is the worker#183 shape again — **a caret range is a decision made later
+# by a resolver**, and there it silently dropped DuckDB from the shipped image.
+#
+# Lift this only together with `noetl-executor` (0.9.x is published and presumably
+# carries the new field); the two move as a pair.
+noetl-tools = "~3.26.3"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
