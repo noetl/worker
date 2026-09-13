@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.132.0](https://github.com/noetl/worker/compare/v5.131.3...v5.132.0) (2026-09-13)
+
+### Features
+
+* **ehdb:** batch tier appends in frame-sized chunks ([85041e0](https://github.com/noetl/worker/commit/85041e09ce8038f4706aad13a6d0238258235e4d)), closes [#343](https://github.com/noetl/worker/issues/343) [#343](https://github.com/noetl/worker/issues/343)
+
 ## [5.131.3](https://github.com/noetl/worker/compare/v5.131.2...v5.131.3) (2026-09-13)
 
 ### Bug Fixes
