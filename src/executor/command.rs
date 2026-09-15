@@ -3041,6 +3041,16 @@ fn path_satisfiable(summary: &serde_json::Value, path: &[String]) -> bool {
                 //     payload lives in object store, not in this stub; #104
                 //     Phase C — without this an over-budget upstream is never
                 //     resolved on a bulk bind).
+                // ⚠ "absent in the summary ⇒ absent in the payload" only holds
+                // for a KEY-PRESERVING summary. An object carrying a locator is
+                // not one: it is a reference container whose real payload lives
+                // in the result tier, so an absent key proves nothing about it.
+                //
+                // `is_reference_stub` was too strict here — it requires the
+                // object hold ONLY locators, so a container like
+                // `{_ref, extracted:{_truncated, …}}` slipped through and the
+                // step was handed a truncated sample. Any locator disqualifies
+                // the inference.
                 None => return !o.contains_key("_truncated") && !is_reference_stub(o),
                 Some(v) => cur = v,
             },
@@ -3064,6 +3074,16 @@ fn path_satisfiable(summary: &serde_json::Value, path: &[String]) -> bool {
     !contains_summary_bulk(cur)
 }
 
+/// True when `o` carries any externalized-result locator (`_ref` / `_store` /
+/// `_uri`) — i.e. its real payload lives in the result tier, not in this object.
+///
+/// Broader than [`is_reference_stub`], which additionally requires the object
+/// hold *nothing but* locators. For deciding whether a summary can answer a
+/// question about the payload, the mere presence of a locator is what matters.
+fn object_has_locator(o: &serde_json::Map<String, serde_json::Value>) -> bool {
+    o.contains_key("_ref") || o.contains_key("_store") || o.contains_key("_uri")
+}
+
 /// True when `o` is a bare externalized-result **reference stub** — an object
 /// carrying only the injected locator accessors (`_ref` / `_store` / `_uri`,
 /// plus a `data` that is itself just a locator), NOT a key-preserving
@@ -3084,10 +3104,13 @@ fn is_reference_stub(o: &serde_json::Map<String, serde_json::Value>) -> bool {
     }
     o.iter().all(|(k, v)| match k.as_str() {
         "_ref" | "_store" | "_uri" => true,
-        "data" => v.as_object().is_some_and(|d| {
-            d.keys()
-                .all(|k| matches!(k.as_str(), "_ref" | "_store" | "_uri"))
-        }),
+        // Metadata ABOUT the reference, not payload content. `extracted` is the
+        // reference's own predicate block and is explicitly flagged
+        // `_truncated`; an object of `{_ref, extracted}` is still a reference
+        // container, NOT a key-preserving summary, so an absent key there says
+        // nothing about the real payload.
+        "extracted" | "_truncated" | "meta" | "ipc" | "kind" | "scope" => true,
+        "data" => v.as_object().is_some_and(is_reference_stub),
         _ => false,
     })
 }
@@ -3105,6 +3128,32 @@ fn contains_summary_bulk(v: &serde_json::Value) -> bool {
                 || o.contains_key("_keys")
                 || o.contains_key("_count")
             {
+                return true;
+            }
+            // A locator (`_ref` / `_store` / `_uri`) means the real payload is
+            // NOT here — it lives in the result tier. Binding this value WHOLE
+            // therefore sees a stub, never the data, so it is "collapsed bulk"
+            // exactly like a `_truncated` marker is.
+            //
+            // #104 Phase C added the equivalent guard to the ABSENT-KEY branch
+            // of `path_satisfiable` (`!is_reference_stub(o)`) but not here, so it
+            // only fired for attribute access (`{{ step.rows[0] }}`). A
+            // whole-object bind (`{{ step }}`, `{{ step | default({}) }}`) takes
+            // the empty-accessor path straight to this function, found no
+            // marker, and was reported satisfiable — so an over-budget upstream
+            // was handed to the step as a bare reference and the step silently
+            // saw no data.
+            //
+            // Observed on prod 2026-09-15: `muno/playbooks/hotel-cards` bound
+            // `{{ search_hotels | default({}) }}` and returned 0 hotels on four
+            // consecutive runs while the child had really fetched 5 hotels /
+            // 509 images / 67 rates (214,805 bytes). No error — `status:
+            // success` and an empty list.
+            //
+            // Resolving when it was not strictly needed costs one fetch; NOT
+            // resolving loses the payload silently. The fail-safe direction is
+            // to resolve.
+            if object_has_locator(o) {
                 return true;
             }
             o.values().any(contains_summary_bulk)
@@ -3614,6 +3663,109 @@ mod tests {
         assert!(!is_reference_stub(real_summary.as_object().unwrap()));
 
         // Locator/predicate access on a stub stays satisfiable (no over-resolve).
+        let pred = r#"{"has":"{{ start._ref is defined }}","r":"{{ start._ref }}"}"#;
+        assert!(!step_needs_bulk_resolution(pred, "start", Some(&stub)));
+    }
+
+    #[test]
+    fn whole_object_bind_of_a_reference_resolves() {
+        // Regression, prod 2026-09-15: `muno/playbooks/hotel-cards` binds the
+        // child result WHOLE (`{{ search_hotels | default({}) }}`). That is an
+        // EMPTY accessor path, so `path_satisfiable` skips the absent-key branch
+        // (which does check `is_reference_stub`) and falls straight to
+        // `contains_summary_bulk`. Before this fix that found no `_len` /
+        // `_truncated` / `_keys` / `_count` marker and reported the value
+        // satisfiable, so the over-budget child result was never resolved and
+        // the step silently saw a bare reference instead of 5 hotels.
+        let summary = serde_json::json!({
+            "status": "success",
+            "data": { "_ref": "noetl://execution/358159477016371200/result/hotelbeds_dispatch/1" },
+        });
+
+        // The exact binding hotel-cards uses, plus the bare form.
+        for tpl in [
+            r#"{"search_result":"{{ search_hotels | default({}) }}"}"#,
+            r#"{"search_result":"{{ search_hotels }}"}"#,
+            r#"{"search_result":"{{ search_hotels | tojson }}"}"#,
+        ] {
+            assert!(
+                step_needs_bulk_resolution(tpl, "search_hotels", Some(&summary)),
+                "whole-object bind must resolve an externalized result: {tpl}"
+            );
+        }
+
+        // A top-level locator must behave the same way.
+        let top_level = serde_json::json!({
+            "_ref": "noetl://execution/1/result/step/9",
+            "_store": "db",
+            "status": "success",
+        });
+        assert!(step_needs_bulk_resolution(
+            r#"{"x":"{{ step }}"}"#,
+            "step",
+            Some(&top_level)
+        ));
+    }
+
+    #[test]
+    fn whole_object_bind_of_a_small_inline_result_is_unchanged() {
+        // The common case must NOT start resolving: a small result is inline,
+        // carries no locator and nothing collapsed, so binding it whole is
+        // already satisfiable. Over-resolving here would add a fetch per step.
+        let inline = serde_json::json!({
+            "status": "success",
+            "data": { "count": 2, "currency": "USD", "ok": true },
+        });
+        assert!(!step_needs_bulk_resolution(
+            r#"{"r":"{{ search_offers | default({}) }}"}"#,
+            "search_offers",
+            Some(&inline)
+        ));
+        assert!(!contains_summary_bulk(&inline));
+
+        // A step the template does not mention is never resolved.
+        assert!(!step_needs_bulk_resolution(
+            r#"{"r":"{{ something_else }}"}"#,
+            "search_offers",
+            Some(&inline)
+        ));
+    }
+
+    #[test]
+    fn truncated_sample_is_never_treated_as_complete() {
+        // The trap: the reference carries `extracted` metadata flagged
+        // `_truncated` — a SAMPLE, not the payload. It must force resolution on
+        // every binding shape; handing it to a step would report a handful of
+        // rows as though they were the whole answer, which is silently wrong and
+        // strictly worse than empty.
+        let truncated = serde_json::json!({
+            "status": "success",
+            "data": {
+                "_ref": "noetl://execution/1/result/hotelbeds_dispatch/9",
+                "extracted": { "_truncated": true, "data": { "hotels": [ { "code": 1 } ] } },
+            },
+        });
+        for tpl in [
+            r#"{"r":"{{ search_hotels | default({}) }}"}"#,
+            r#"{"r":"{{ search_hotels.data.hotels }}"}"#,
+            r#"{"n":"{{ search_hotels.data.hotels | length }}"}"#,
+        ] {
+            assert!(
+                step_needs_bulk_resolution(tpl, "search_hotels", Some(&truncated)),
+                "a _truncated sample must never satisfy a binding: {tpl}"
+            );
+        }
+        assert!(contains_summary_bulk(&truncated));
+    }
+
+    #[test]
+    fn locator_predicate_access_still_does_not_over_resolve() {
+        // Guard on the fix: reading the locator itself stays satisfiable, so a
+        // `when:` predicate testing `_ref` does not trigger a pointless fetch.
+        let stub = serde_json::json!({
+            "_ref": "noetl://execution/1/result/start/9",
+            "data": { "_ref": "noetl://execution/1/result/start/9" },
+        });
         let pred = r#"{"has":"{{ start._ref is defined }}","r":"{{ start._ref }}"}"#;
         assert!(!step_needs_bulk_resolution(pred, "start", Some(&stub)));
     }
