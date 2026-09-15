@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.132.2](https://github.com/noetl/worker/compare/v5.132.1...v5.132.2) (2026-09-15)
+
+### Bug Fixes
+
+* **consume:** hydrate externalized results on a whole-object bind ([99c6c19](https://github.com/noetl/worker/commit/99c6c19cd7569e20731b8c7637ae3077d520e290)), closes [#104](https://github.com/noetl/worker/issues/104)
+
 ## [5.132.1](https://github.com/noetl/worker/compare/v5.132.0...v5.132.1) (2026-09-13)
 
 ### Bug Fixes
