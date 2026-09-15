@@ -57,10 +57,15 @@ const COMMAND_RS: &str = include_str!("../src/executor/command.rs");
 /// inside `#[cfg(test)]` matched itself.
 fn production_source() -> String {
     let cut = COMMAND_RS.find("#[cfg(test)]").unwrap_or(COMMAND_RS.len());
+    // ⚠ Indentation is PRESERVED deliberately. An earlier cut of this helper
+    // trimmed every line, which flattened a NESTED `fn` to column 0 — so
+    // `fn_body` stopped slicing there and never saw the rest of the function.
+    // That produced a false failure on a correct implementation, which is the
+    // reassuring-direction error this file exists to avoid. Comments are still
+    // stripped (a doc comment naming a symbol has satisfied a guard here before).
     COMMAND_RS[..cut]
         .lines()
-        .map(str::trim_start)
-        .filter(|l| !l.starts_with("//"))
+        .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -68,15 +73,27 @@ fn production_source() -> String {
 /// Slice the body of a named top-level `fn`, so an assertion about one function
 /// cannot be satisfied by text somewhere else in the file.
 fn fn_body(src: &str, name: &str) -> String {
-    let sig = format!("fn {name}(");
-    let start = src.find(&sig).unwrap_or_else(|| {
-        panic!(
-            "function `{name}` not found — was it renamed? \
-             This guard must be updated deliberately, not deleted."
-        )
-    });
-    let rest = &src[start..];
-    let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
+    // Anchor at a TOP-LEVEL definition (column 0), accepting both `fn` and
+    // `async fn`, so a nested helper of the same shape cannot truncate the slice
+    // and an async function is not silently missed.
+    let start = [format!("\nfn {name}("), format!("\nasync fn {name}(")]
+        .iter()
+        .filter_map(|sig| src.find(sig.as_str()))
+        .min()
+        .unwrap_or_else(|| {
+            panic!(
+                "top-level function `{name}` not found — was it renamed or made \
+                 non-top-level? This guard must be updated deliberately, not deleted."
+            )
+        });
+    let rest = &src[start + 1..];
+    // Terminate at the next TOP-LEVEL definition. A nested `fn` is indented and
+    // therefore does not match.
+    let end = ["\nfn ", "\nasync fn "]
+        .iter()
+        .filter_map(|m| rest[1..].find(m).map(|i| i + 1))
+        .min()
+        .unwrap_or(rest.len());
     rest[..end].to_string()
 }
 
@@ -98,6 +115,17 @@ fn the_gate_accepts_the_flat_accessor_shape_the_runtime_actually_emits() {
     assert!(
         body.contains("reference"),
         "reference_locators must still handle the nested `reference` object shape too."
+    );
+    // The needle above is necessary but weak. What actually broke twice is
+    // DEPTH: the locator in a real parent `steps` entry sits at
+    // `/context/result/context/data/_ref` (prod execution 358323454170112000),
+    // deeper than any fixed path. Require a structural search, not positions.
+    assert!(
+        body.contains("find_locator") || body.contains("depth"),
+        "reference_locators looks position-based again.\n\
+         Fixed paths have now failed TWICE against real envelope nesting\n\
+         (#317 checked top level, `data` and `/context/result` — the real shape\n\
+         is one level deeper still). It must search by STRUCTURE, depth-capped."
     );
 }
 

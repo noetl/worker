@@ -2720,30 +2720,51 @@ fn reference_locators(result: &serde_json::Value) -> Option<(String, Option<Stri
             return Some((legacy.to_string(), canonical));
         }
     }
-    // Shape 2 — the FLAT accessors (`_ref` / `_uri`), at the top level or under
-    // `data`. This is what a `kind: playbook` child result actually arrives as:
+    // Shape 2 — the FLAT accessors (`_ref` / `_uri`), found at ANY depth.
     //
-    //     {"_ref": "noetl://…", "data": {"_ref": "noetl://…"}}
+    // A `kind: playbook` child result reaches the parent nested inside the
+    // call.done envelope. Captured verbatim from prod execution
+    // 358323454170112000:
     //
-    // Measured on prod 2026-09-15 (probe execution 358317531129192448): the
-    // consuming step received exactly that and **no `reference` object at all**.
-    // Shape 1 therefore matched nothing, `candidates` came back empty, and
-    // `resolve_context_references` hit its silent early return — so the
-    // over-budget upstream was never resolved and the step saw no data.
+    //     {"context": {"call_index": 0, "command_id": "…",
+    //                  "result": {"context": {"data": {"_ref": "noetl://…"},
+    //                                         "status": "success"},
+    //                             "status": "success"}},
+    //      "status": "COMPLETED"}
     //
-    // The irony worth recording: `{_ref, data:{_ref}}` is the exact shape the
-    // existing `bare_ref_stub_summary_forces_resolution` test uses. That test
-    // exercises `step_needs_bulk_resolution`, which sits DOWNSTREAM of this
-    // function — so the stub shape was covered at the predicate and completely
-    // uncovered at the gate in front of it.
-    let flat = |v: &serde_json::Value| -> Option<(String, Option<String>)> {
-        let legacy = v.get("_ref").and_then(|x| x.as_str())?.to_string();
-        let canonical = v.get("_uri").and_then(|x| x.as_str()).map(str::to_string);
-        Some((legacy, canonical))
-    };
-    flat(result)
-        .or_else(|| result.get("data").and_then(flat))
-        .or_else(|| result.pointer("/context/result").and_then(flat))
+    // The locator sits at `/context/result/context/data/_ref`.
+    //
+    // ⚠ This is the THIRD iteration of one bug, and the first two failed the
+    // same way: each was validated against a shape one layer shallower than the
+    // real one. #315 fixed the predicate (never reached). #317 fixed this gate
+    // for three FIXED paths — top level, `data`, `/context/result` — which is
+    // still one level short of the above, so the parent consume was never
+    // resolved even though the child's own step was.
+    //
+    // Fixed paths keep losing to envelope nesting, so this searches by
+    // STRUCTURE rather than by position: a bounded walk for the first `_ref`,
+    // preferring a `_uri` alongside it. Depth-capped so a pathological payload
+    // cannot turn candidate detection into a deep traversal.
+    fn find_locator(v: &serde_json::Value, depth: usize) -> Option<(String, Option<String>)> {
+        const MAX_DEPTH: usize = 8;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        match v {
+            serde_json::Value::Object(o) => {
+                if let Some(r) = o.get("_ref").and_then(|x| x.as_str()) {
+                    let uri = o.get("_uri").and_then(|x| x.as_str()).map(str::to_string);
+                    return Some((r.to_string(), uri));
+                }
+                o.values().find_map(|child| find_locator(child, depth + 1))
+            }
+            serde_json::Value::Array(a) => {
+                a.iter().find_map(|child| find_locator(child, depth + 1))
+            }
+            _ => None,
+        }
+    }
+    find_locator(result, 0)
 }
 
 /// Normalize a resolved payload to the **flattened single-tool shape** so the
@@ -3693,6 +3714,54 @@ mod tests {
         // Locator/predicate access on a stub stays satisfiable (no over-resolve).
         let pred = r#"{"has":"{{ start._ref is defined }}","r":"{{ start._ref }}"}"#;
         assert!(!step_needs_bulk_resolution(pred, "start", Some(&stub)));
+    }
+
+    #[test]
+    fn reference_locators_finds_the_locator_in_a_real_parent_steps_entry() {
+        // ⚠ THE THIRD ITERATION OF THIS BUG. Captured verbatim from prod
+        // execution 358323454170112000 (`muno/playbooks/hotel-cards`) — this is
+        // exactly what `steps["search_hotels"]` holds when the parent consumes a
+        // `kind: playbook` child whose result was externalised.
+        //
+        // #315 fixed the predicate; it was never reached.
+        // #317 fixed the gate for three FIXED paths (top level, `data`,
+        //      `/context/result`) — and was still never reached for the parent,
+        //      because the real locator sits one level deeper at
+        //      `/context/result/context/data/_ref`.
+        //
+        // Both earlier fixes were correct and both were insufficient, because
+        // each was validated against a shape that was one layer shallower than
+        // the real one. This fixture is the real one.
+        let steps_entry = serde_json::json!({
+            "context": {
+                "call_index": 0,
+                "command_id": "358323454170112000:search_hotels:358323466136461312",
+                "result": {
+                    "context": {
+                        "data": {
+                            "_ref": "noetl://execution/358323596172468224/result/hotelbeds_dispatch/358323611670421504"
+                        },
+                        "status": "success"
+                    },
+                    "status": "success"
+                }
+            },
+            "status": "COMPLETED"
+        });
+
+        let (legacy, canonical) = reference_locators(&steps_entry).expect(
+            "the locator must be found at /context/result/context/data/_ref.\n\
+             This is the REAL prod shape (execution 358323454170112000). If this \n\
+             fails, resolve_context_references forms no candidate, returns at its \n\
+             SILENT early return, and the consuming step is handed a bare \n\
+             reference — hotel-cards returns 0 hotels with no error.",
+        );
+        assert_eq!(
+            legacy,
+            "noetl://execution/358323596172468224/result/hotelbeds_dispatch/358323611670421504"
+        );
+        // This shape carries no `_uri`; resolution falls back to the legacy ref.
+        assert_eq!(canonical, None);
     }
 
     #[test]
