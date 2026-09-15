@@ -2707,15 +2707,43 @@ fn stamp_logical_uri(
 /// present (the resolve-by-URN key, #104 Phase C). `None` if there is no
 /// reference at all.
 fn reference_locators(result: &serde_json::Value) -> Option<(String, Option<String>)> {
-    let reference = result
+    // Shape 1 — the full `reference` OBJECT (`{ref, uri, extracted, meta, …}`).
+    if let Some(reference) = result
         .pointer("/context/result/reference")
-        .or_else(|| result.pointer("/reference"))?;
-    let legacy = reference.get("ref").and_then(|v| v.as_str())?.to_string();
-    let canonical = reference
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    Some((legacy, canonical))
+        .or_else(|| result.pointer("/reference"))
+    {
+        if let Some(legacy) = reference.get("ref").and_then(|v| v.as_str()) {
+            let canonical = reference
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            return Some((legacy.to_string(), canonical));
+        }
+    }
+    // Shape 2 — the FLAT accessors (`_ref` / `_uri`), at the top level or under
+    // `data`. This is what a `kind: playbook` child result actually arrives as:
+    //
+    //     {"_ref": "noetl://…", "data": {"_ref": "noetl://…"}}
+    //
+    // Measured on prod 2026-09-15 (probe execution 358317531129192448): the
+    // consuming step received exactly that and **no `reference` object at all**.
+    // Shape 1 therefore matched nothing, `candidates` came back empty, and
+    // `resolve_context_references` hit its silent early return — so the
+    // over-budget upstream was never resolved and the step saw no data.
+    //
+    // The irony worth recording: `{_ref, data:{_ref}}` is the exact shape the
+    // existing `bare_ref_stub_summary_forces_resolution` test uses. That test
+    // exercises `step_needs_bulk_resolution`, which sits DOWNSTREAM of this
+    // function — so the stub shape was covered at the predicate and completely
+    // uncovered at the gate in front of it.
+    let flat = |v: &serde_json::Value| -> Option<(String, Option<String>)> {
+        let legacy = v.get("_ref").and_then(|x| x.as_str())?.to_string();
+        let canonical = v.get("_uri").and_then(|x| x.as_str()).map(str::to_string);
+        Some((legacy, canonical))
+    };
+    flat(result)
+        .or_else(|| result.get("data").and_then(flat))
+        .or_else(|| result.pointer("/context/result").and_then(flat))
 }
 
 /// Normalize a resolved payload to the **flattened single-tool shape** so the
@@ -3665,6 +3693,61 @@ mod tests {
         // Locator/predicate access on a stub stays satisfiable (no over-resolve).
         let pred = r#"{"has":"{{ start._ref is defined }}","r":"{{ start._ref }}"}"#;
         assert!(!step_needs_bulk_resolution(pred, "start", Some(&stub)));
+    }
+
+    #[test]
+    fn reference_locators_accepts_the_flat_accessor_shape() {
+        // ⚠ THE GAP THAT MADE THE PREDICATE FIX USELESS IN PRODUCTION.
+        //
+        // `resolve_context_references` only reaches `step_needs_bulk_resolution`
+        // if `reference_locators` produced a candidate first. A `kind: playbook`
+        // child result arrives as FLAT accessors, not a `reference` object:
+        //
+        //     {"_ref": "noetl://…", "data": {"_ref": "noetl://…"}}
+        //
+        // Measured on prod (probe execution 358317531129192448) — the consuming
+        // step received exactly this and NO `reference` object. The locator
+        // matched nothing, `candidates` was empty, and the function hit its
+        // silent early return. Every downstream unit test passed and the bug was
+        // untouched, because they all start below this gate.
+        let flat = serde_json::json!({
+            "_ref": "noetl://execution/1/result/hotelbeds_dispatch/9",
+            "data": { "_ref": "noetl://execution/1/result/hotelbeds_dispatch/9" },
+        });
+        let (legacy, canonical) =
+            reference_locators(&flat).expect("flat _ref must produce a candidate");
+        assert_eq!(legacy, "noetl://execution/1/result/hotelbeds_dispatch/9");
+        assert_eq!(canonical, None);
+
+        let nested = serde_json::json!({
+            "status": "success",
+            "data": { "_ref": "noetl://execution/2/result/step/9", "_uri": "noetl://d/d/results/2/step/0/0/1" },
+        });
+        let (legacy, canonical) = reference_locators(&nested).expect("data._ref must be found");
+        assert_eq!(legacy, "noetl://execution/2/result/step/9");
+        assert_eq!(
+            canonical.as_deref(),
+            Some("noetl://d/d/results/2/step/0/0/1")
+        );
+
+        let obj = serde_json::json!({
+            "context": { "result": { "reference": {
+                "ref": "noetl://execution/3/result/step/9",
+                "uri": "noetl://d/d/results/3/step/0/0/1",
+                "extracted": { "_truncated": true },
+            }}},
+        });
+        let (legacy, canonical) = reference_locators(&obj).expect("reference object still works");
+        assert_eq!(legacy, "noetl://execution/3/result/step/9");
+        assert_eq!(
+            canonical.as_deref(),
+            Some("noetl://d/d/results/3/step/0/0/1")
+        );
+
+        // An inline result must still produce NO candidate — otherwise every
+        // ordinary step would attempt a pointless resolve.
+        let inline = serde_json::json!({ "status": "success", "data": { "count": 2 } });
+        assert!(reference_locators(&inline).is_none());
     }
 
     #[test]
