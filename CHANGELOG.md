@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.132.4](https://github.com/noetl/worker/compare/v5.132.3...v5.132.4) (2026-09-15)
+
+### Bug Fixes
+
+* **consume:** find the result locator at any depth, not at fixed paths ([f441af9](https://github.com/noetl/worker/commit/f441af99a11d13e1a5b17763d16477514594761e)), closes [#317](https://github.com/noetl/worker/issues/317)
+
 ## [5.132.3](https://github.com/noetl/worker/compare/v5.132.2...v5.132.3) (2026-09-15)
 
 ### Bug Fixes
