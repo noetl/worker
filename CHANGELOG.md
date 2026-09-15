@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.132.3](https://github.com/noetl/worker/compare/v5.132.2...v5.132.3) (2026-09-15)
+
+### Bug Fixes
+
+* **consume:** accept the flat _ref accessor shape in reference_locators ([5a6e084](https://github.com/noetl/worker/commit/5a6e084709342d61d2371183be2ba98c347ce9b4)), closes [#315](https://github.com/noetl/worker/issues/315)
+
 ## [5.132.2](https://github.com/noetl/worker/compare/v5.132.1...v5.132.2) (2026-09-15)
 
 ### Bug Fixes
