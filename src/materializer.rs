@@ -210,6 +210,31 @@ async fn run_loop(config: MaterializerConfig) -> Result<()> {
 /// their mechanics — poll options, ack handles and error taxonomy all differ —
 /// and threading a trait through would have obscured the one line that actually
 /// matters here: the batch is acked ONLY after `events/project` returns 2xx, so
+/// How long a materializer HTTP call may take before it is abandoned.
+///
+/// ⚠ `reqwest::Client::new()` has **no timeout at all**, and both drain loops
+/// used one. A control-plane that accepts the connection and then stalls would
+/// park the loop forever: no completion, no error, no retry — the drain simply
+/// stops, and because it is a background task nothing reports it. Projections
+/// then fall behind silently, which is the failure this codebase keeps paying
+/// for (see noetl/worker#316's symptom profile).
+///
+/// ⚠⚠ Deliberately generous rather than matching the control-plane client's 30s.
+/// `project` posts a whole batch, and a timeout shorter than a legitimate slow
+/// batch would convert a working-but-slow drain into a failing one — trading an
+/// unbounded hang for manufactured errors. Five minutes is far above any healthy
+/// projection POST and still bounded, so a genuine stall now fails and retries
+/// instead of wedging.
+const MATERIALIZER_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A bounded HTTP client for the drain loops.
+fn materializer_http() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(MATERIALIZER_HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| anyhow!("materializer: could not build HTTP client: {e}"))
+}
+
 /// a crash mid-batch redelivers rather than losing rows from the durable log.
 async fn run_loop_ehdb(config: MaterializerConfig) -> Result<()> {
     let claim_addr = config.event_claim_addr.clone().ok_or_else(|| {
@@ -224,7 +249,7 @@ async fn run_loop_ehdb(config: MaterializerConfig) -> Result<()> {
         (config.batch as usize).max(1),
     )
     .await?;
-    let http = reqwest::Client::new();
+    let http = materializer_http()?;
     let project_url = format!("{}/api/internal/events/project", config.server_url);
 
     tracing::info!(
@@ -341,7 +366,7 @@ fn member_id(name: &str) -> u32 {
 async fn run_loop_nats(config: MaterializerConfig) -> Result<()> {
     let source = build_source(&config.source_config()?, &ExecutionContext::default())
         .map_err(|e| anyhow!("materializer build_source failed: {e}"))?;
-    let http = reqwest::Client::new();
+    let http = materializer_http()?;
     let project_url = format!("{}/api/internal/events/project", config.server_url);
 
     tracing::info!(
