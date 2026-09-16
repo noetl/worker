@@ -995,6 +995,21 @@ impl ControlPlaneClient {
         // object path is never affected.
         if let (Some(env), Some(mb)) = (self.ehdb_object_hook.as_ref(), mirror_bytes) {
             let _ = crate::ehdb::object::mirror_live_put(env, key, &mb);
+            // noetl/ai-meta#348 — and to the DURABLE shadow store as well.
+            //
+            // The line above writes to the pod-local reference driver, which on
+            // prod resolves under `/tmp/ehdb` — the container's writable layer,
+            // destroyed on every pod roll. This one puts an identity+digest
+            // record on the writer's PVC, where it outlives the pod.
+            //
+            // Both, not one: the local driver is what `shadow_suite` and the
+            // read-back parity checks already use, and silently moving them
+            // would change what those measure. This is additive.
+            //
+            // Best-effort, after the authoritative write is durable, result
+            // discarded — the external object store stays authoritative and a
+            // shadow append that cannot reach the writer must never affect it.
+            let _ = crate::ehdb::tier_shadow::mirror_object(key, &mb).await;
         }
         Ok(())
     }

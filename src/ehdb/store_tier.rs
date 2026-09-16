@@ -26,23 +26,65 @@
 //!
 //! # A variant only ever arrives with a store
 //!
-//! `kv`, `object` and `vector` are **not** here. They have tier drivers and
-//! shadow paths, but nothing behind the tier service, and adding a variant for
-//! a tier with no store would let a caller address something that answers
-//! `unavailable` in a way indistinguishable from a misconfigured writer. A tier
-//! gains a variant in the same change set that gives it a store — not before.
+//! `vector` is **not** here. It has a tier driver and a shadow path, but
+//! nothing behind the tier service, and adding a variant for a tier with no
+//! store would let a caller address something that answers `unavailable` in a
+//! way indistinguishable from a misconfigured writer. A tier gains a variant in
+//! the same change set that gives it a store — not before.
+//!
+//! `kv` and `object` joined in noetl/ai-meta#348, under exactly that rule: the
+//! variant and the store file below arrived together. Before it, their shadow
+//! records were written to `/tmp/ehdb` — the container's writable layer, with
+//! no volumeMount — and were **destroyed on every pod roll**. Measured across
+//! three prod pods: each store had been created within ~3 minutes of its own
+//! pod's start, and a pod rolled minutes earlier had no store at all. A shadow
+//! tier exists to accumulate the evidence that justifies a cutover, and one
+//! that resets on every roll cannot accumulate anything.
 //!
 //! This is the same discipline as
 //! [`primary_serve::SERVE_WIRED_TIERS`][super::primary_serve::SERVE_WIRED_TIERS]:
 //! the list says what is true, and a test re-derives it rather than a doc
 //! comment asserting it.
 
+/// Append outcome label for a tier the service stores but nothing serves from.
+///
+/// Tier-neutral because three tiers now need it and a label spelled differently
+/// in two places is how one of them ends up unqueryable.
+pub const APPEND_LABEL: &str = "appended";
+
+/// The **failure** label for such an append.
+///
+/// ⚠ This exists because its absence was a fail-open — see
+/// [`CATALOG_APPEND_FAILED_LABEL`], which is the same constant under the name
+/// the catalog work gave it.
+pub const APPEND_FAILED_LABEL: &str = "append_failed";
+
+/// Classify an append reply for a stored-but-not-served tier.
+///
+/// The rule is asserted by a test rather than living inside several match arms,
+/// which is how the catalog arm originally shipped reporting `appended` for a
+/// reply it never inspected.
+pub fn append_label(reply: Result<&str, &str>) -> &'static str {
+    match reply {
+        Ok(_) => APPEND_LABEL,
+        Err(_) => APPEND_FAILED_LABEL,
+    }
+}
+
+/// The serve-state label for a tier with a store and no read-serve path.
+///
+/// `not_wired` rather than anything an operator could mistake for "serving".
+/// KV and object are shadow mirrors of stores that remain authoritative
+/// elsewhere (NATS-KV and the external object store); having a durable home for
+/// the derived copy says nothing about serving from it.
+pub const NOT_WIRED_SERVE_STATE: &str = "not_wired";
+
 /// Append outcome labels for the catalog tier.
 ///
 /// Constants rather than inline literals so they cannot drift between the batch
 /// and single append paths, which is how one of two copies ends up spelling a
 /// metric label differently.
-pub const CATALOG_APPEND_LABEL: &str = "appended";
+pub const CATALOG_APPEND_LABEL: &str = APPEND_LABEL;
 
 /// The catalog tier's append **failure** label.
 ///
@@ -53,15 +95,12 @@ pub const CATALOG_APPEND_LABEL: &str = "appended";
 /// writer that did not yet know the tier, and the bytes went nowhere — a silent
 /// loss during exactly the rolling-upgrade window where the server is ahead of
 /// the writer.
-pub const CATALOG_APPEND_FAILED_LABEL: &str = "append_failed";
+pub const CATALOG_APPEND_FAILED_LABEL: &str = APPEND_FAILED_LABEL;
 
 /// Classify a catalog append reply. Split out so the rule is asserted by a test
 /// rather than living twice inside two match arms.
 pub fn catalog_append_label(reply: Result<&str, &str>) -> &'static str {
-    match reply {
-        Ok(_) => CATALOG_APPEND_LABEL,
-        Err(_) => CATALOG_APPEND_FAILED_LABEL,
-    }
+    append_label(reply)
 }
 
 /// The serve-state label for the catalog tier.
@@ -69,7 +108,7 @@ pub fn catalog_append_label(reply: Result<&str, &str>) -> &'static str {
 /// `not_wired` rather than something that reads like a healthy serve state:
 /// nothing serves catalog reads from EHDB yet, and a label an operator could
 /// mistake for "serving" is exactly the drift this codebase keeps finding.
-pub const CATALOG_SERVE_STATE: &str = "not_wired";
+pub const CATALOG_SERVE_STATE: &str = NOT_WIRED_SERVE_STATE;
 
 /// A tier with a durable store behind the tier service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,6 +130,26 @@ pub enum StoreTier {
     /// **pages**. Its own store is what keeps a new log from setting off the
     /// alarm that guards the old one.
     Catalog,
+    /// The **KV shadow mirror** (noetl/ai-meta#348).
+    ///
+    /// The incumbent NATS-KV path stays authoritative and untouched — this is
+    /// the derived copy `NOETL_EHDB_KV=shadow` produces, given somewhere it
+    /// survives a pod roll. Having a store here is what makes a parity
+    /// comparator possible later; it is **not** a serve path, and `kv` is
+    /// deliberately absent from
+    /// [`SERVE_WIRED_TIERS`][super::primary_serve::SERVE_WIRED_TIERS].
+    Kv,
+    /// The **object/blob shadow mirror** (noetl/ai-meta#348).
+    ///
+    /// Same shape as [`StoreTier::Kv`]: the external object store (GCS on prod)
+    /// remains authoritative, and this is the derived copy given a durable home.
+    /// Not serve-wired.
+    ///
+    /// ⚠ This store holds the object **registry** records, not the blob bytes.
+    /// Blobs are content-addressed in their own directory; mixing megabyte
+    /// payloads into a JSONL append log shared with the writer's other tiers
+    /// would put the event log's critical section behind blob I/O.
+    Object,
 }
 
 impl StoreTier {
@@ -99,6 +158,8 @@ impl StoreTier {
             Self::EventLog => "eventlog",
             Self::Projection => "projection",
             Self::Catalog => "catalog",
+            Self::Kv => "kv",
+            Self::Object => "object",
         }
     }
 
@@ -113,6 +174,8 @@ impl StoreTier {
             Self::EventLog => "eventlog.jsonl",
             Self::Projection => "projection.jsonl",
             Self::Catalog => "catalog.jsonl",
+            Self::Kv => "kv.jsonl",
+            Self::Object => "object.jsonl",
         }
     }
 
@@ -126,6 +189,8 @@ impl StoreTier {
             "eventlog" => Some(Self::EventLog),
             "projection" => Some(Self::Projection),
             "catalog" => Some(Self::Catalog),
+            "kv" => Some(Self::Kv),
+            "object" => Some(Self::Object),
             _ => None,
         }
     }
@@ -162,8 +227,13 @@ impl StoreTier {
 
     /// Every tier with a store. Used by the pin sites and by the tests that
     /// assert per-tier isolation, so adding a variant cannot leave one behind.
-    pub const ALL: &'static [StoreTier] =
-        &[StoreTier::EventLog, StoreTier::Projection, StoreTier::Catalog];
+    pub const ALL: &'static [StoreTier] = &[
+        StoreTier::EventLog,
+        StoreTier::Projection,
+        StoreTier::Catalog,
+        StoreTier::Kv,
+        StoreTier::Object,
+    ];
 }
 
 #[cfg(test)]
@@ -192,10 +262,11 @@ mod tests {
             err.contains("eventlog") && err.contains("projection"),
             "the error must name what IS accepted: {err}"
         );
-        for bad in ["kv", "object", "vector", "../../etc/passwd", "eventlog "] {
-            if bad.trim() == "eventlog" {
-                continue;
-            }
+        // `vector` still has no store behind the tier service, so it must not
+        // parse. `kv` and `object` were on this list until noetl/ai-meta#348
+        // gave them one — the rule is "a variant arrives with a store", and the
+        // list moves only when that becomes true.
+        for bad in ["vector", "../../etc/passwd", "eventlo", "kvv", "objects"] {
             assert!(
                 StoreTier::parse(bad).is_none(),
                 "{bad:?} must not parse — it has no store behind the tier service"
@@ -264,6 +335,79 @@ mod tests {
             "the catalog log must not share the event log's store — that is the \
              whole reason it exists as a separate tier"
         );
+    }
+
+    /// noetl/ai-meta#348 — the KV and object shadow tiers have a durable store.
+    ///
+    /// ⚠ THE DEFECT THIS CLOSES. Their shadow records were written under
+    /// `NOETL_EHDB_LOCAL_REFERENCE_LOG=/tmp/ehdb/ref.jsonl` — the container's
+    /// writable layer, with no volumeMount — so they were destroyed on every
+    /// pod roll. Measured across three prod pods: each store had been created
+    /// within ~3 minutes of its own pod's start, and one rolled minutes earlier
+    /// had none at all. `object_ops_total{operation="mirror"}` read 34 and
+    /// looked like a tier accumulating evidence; it was a count since that pod
+    /// started, against a store that would not outlive it.
+    ///
+    /// A shadow tier exists to accumulate the evidence that justifies a
+    /// cutover. One that resets on every roll cannot accumulate anything, which
+    /// is why both the read path and the parity comparator were unbuildable
+    /// until this landed.
+    #[test]
+    fn the_kv_and_object_shadow_tiers_have_stores_of_their_own() {
+        for (raw, tier, file) in [
+            ("kv", StoreTier::Kv, "kv.jsonl"),
+            ("object", StoreTier::Object, "object.jsonl"),
+        ] {
+            assert_eq!(StoreTier::parse(raw), Some(tier));
+            assert_eq!(tier.file_name(), file);
+            assert!(
+                StoreTier::ALL.contains(&tier),
+                "{raw} must be in ALL, or the per-tier isolation tests skip it"
+            );
+        }
+        // Their own files, not a share of the event log's. A shared store would
+        // put these tiers' writes behind the critical section of the one that
+        // serves primary in production.
+        for t in [StoreTier::Kv, StoreTier::Object] {
+            assert_ne!(t.file_name(), StoreTier::EventLog.file_name());
+            assert_ne!(t.file_name(), StoreTier::Projection.file_name());
+        }
+    }
+
+    /// ⭐ A store must not imply a serve path.
+    ///
+    /// The whole point of noetl/ai-meta#348 is a durable home for a SHADOW
+    /// copy. KV's incumbent is NATS-KV and object's is the external object
+    /// store; both stay authoritative. If giving them a store ever quietly
+    /// added them to the serve-wired set, the flip the owner reserved would
+    /// have happened as a side effect of a storage change.
+    #[test]
+    fn a_durable_store_does_not_make_kv_or_object_serve_wired() {
+        for t in [StoreTier::Kv, StoreTier::Object] {
+            assert!(
+                !super::super::primary_serve::SERVE_WIRED_TIERS.contains(&t.as_str()),
+                "{} became serve-wired by gaining a store — a cutover must be a \
+                 deliberate change, never a side effect of one",
+                t.as_str()
+            );
+        }
+        // Positive control, so this is membership-checking rather than reading
+        // an empty list.
+        assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::EventLog.as_str()));
+    }
+
+    /// A refused KV/object append must not be reported as `appended` — the same
+    /// fail-open that shipped once on the catalog arm and lost records silently
+    /// during a rolling upgrade.
+    #[test]
+    fn a_refused_shadow_append_is_not_reported_as_appended() {
+        assert_eq!(append_label(Ok("ok")), APPEND_LABEL);
+        assert_eq!(append_label(Err("unknown tier")), APPEND_FAILED_LABEL);
+        assert_ne!(APPEND_LABEL, APPEND_FAILED_LABEL);
+        // The catalog names are the same constants, so the two cannot drift
+        // apart into labels that mean the same thing and query differently.
+        assert_eq!(CATALOG_APPEND_LABEL, APPEND_LABEL);
+        assert_eq!(CATALOG_APPEND_FAILED_LABEL, APPEND_FAILED_LABEL);
     }
 
     /// ⭐ The catalog tier must NOT be serve-wired.
