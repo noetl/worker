@@ -830,37 +830,33 @@ mod tests {
                 >= 1,
             "the connection must be counted:\n{text}"
         );
-        // The negative half, kept as the property it actually guards: an
-        // operation nobody performed is PRESENT rather than absent. Its value is
-        // no longer asserted, because a concurrently-running test module can
-        // contribute to it — that contribution is the flake, not a defect in
-        // this behaviour.
-        assert!(
-            series_present(
+        // The negative half, restored to the exact value it was written as.
+        // It was weakened to a presence check by noetl/worker#299, because a
+        // sibling test module recording into the shared state could land a
+        // count inside this window. `metrics::test_guard` now gives each test
+        // thread its OWN state, so nothing else can contribute here and the
+        // stronger property — an operation nobody performed reads exactly 0,
+        // rather than being absent — is assertable again. That property is the
+        // entire reason `pin_tier_service_series` exists.
+        assert_eq!(
+            series_value(
                 &text,
                 "noetl_ehdb_dataplane_ops_total{operation=\"tier_service.append\",outcome=\"ok\"}"
             ),
-            "an unserved op must be PINNED and present, not absent:\n{text}"
+            Some(0),
+            "an unserved op must read 0, not be absent:\n{text}"
         );
         metrics::reset();
     }
 
     /// Whether a metric series is PRESENT in the exposition, at any value.
     ///
-    /// ⚠⚠ Scoped assertion (noetl/worker#299). These tests share process-wide
-    /// EHDB metric state with test modules that record WITHOUT taking
-    /// `metrics::test_guard()` — `reachability` records 8 times and
-    /// `tier_client` 6, and neither calls `reset()`, which is why a check that
-    /// counted `reset()` call sites missed them. Their counts land inside this
-    /// test's window and made exact-value assertions flaky.
-    ///
-    /// So the assertions below check what this test can actually attribute:
-    /// that a pinned series is PRESENT (the absent-vs-zero property they exist
-    /// for) and that an op this test performed was counted AT LEAST once.
-    ///
-    /// ⚠ This is deliberately weaker than the exact `== 0` / `== 1` it replaces.
-    /// The real fix is per-test metric state (noetl/worker#299 direction 1);
-    /// this stops the flake without pretending the shared state is fixed.
+    /// Kept for the checks that genuinely only care about presence. The
+    /// weakened-assertion workaround this used to carry is gone:
+    /// `metrics::test_guard` now hands each test thread its own state
+    /// (noetl/worker#302), so exact values are attributable again and the
+    /// assertions above say `== 0` / `>= 1` as they were written to.
+    #[allow(dead_code)]
     fn series_present(text: &str, series: &str) -> bool {
         text.lines().any(|l| l.starts_with(series))
     }
