@@ -1159,6 +1159,7 @@ impl CommandExecutor {
             .unwrap_or_default();
 
         // Evaluate cases
+        let mut case_exited = false;
         if !cases.is_empty() {
             if let Some(case_result) =
                 self.case_evaluator
@@ -1170,6 +1171,9 @@ impl CommandExecutor {
                         // on the EE shape; the case's status string
                         // becomes the envelope status so the projector
                         // sees the actual case outcome.
+                        // The author handled this outcome explicitly, so it
+                        // wins over the error gate below.
+                        case_exited = true;
                         let exit_status = status.clone();
                         self.emit_event_via(
                             &dispatch_client,
@@ -1217,11 +1221,33 @@ impl CommandExecutor {
             }
         }
 
-        // Emit command.completed event.  The tool's terminal status
-        // (e.g. `"success"` / `"failure"` from the tool registry)
-        // becomes the envelope status — projectors group by status
-        // to compute success/failure rates per step.
-        let completion_status = tool_result.status.to_string();
+        // noetl/server#434 — a tool that FAILED must stop the DAG, not just be
+        // labelled.
+        //
+        // A tool can signal failure two ways and, before this, only one was
+        // honoured: a Rust `Err` became `command.failed` and killed the run,
+        // while `Ok(ToolResult { status: Error })` fell through to
+        // `command.completed` and the DAG advanced. `postgres.rs` uses the
+        // first (0 occurrences of `ToolStatus::Error`), `python.rs` the second
+        // (1, at its exit-code check) — which is the entire reason a postgres
+        // error fails a run and a python raise does not.
+        //
+        // The failure was never lost from the log: it is recorded with
+        // `status = "error"`, and `has_errored_step` (noetl/ai-meta#251) finds
+        // it. But that only changes what the READ boundary reports. Downstream
+        // scheduling keys on the event TYPE, so a guard step that raised still
+        // let `refine` / `compare` / `summarize` run and produce a confident
+        // wrong answer.
+        let terminal_event = terminal_event_for(
+            tool_result.status,
+            case_exited,
+            fail_execution_on_step_error(),
+        );
+        let completion_status = if terminal_event == "command.failed" {
+            "FAILED".to_string()
+        } else {
+            tool_result.status.to_string()
+        };
         // noetl/ai-meta#227 part B — record on the event that this step is
         // parked, not finished.
         //
@@ -1244,12 +1270,12 @@ impl CommandExecutor {
         // absence as "not parked", never as "parked".
         let completed_ctx = command_completed_context(
             &command.command_id,
-            &tool_result.status.to_string(),
+            &completion_status,
             matches!(tool_result.pending_callback, Some(true)),
         );
         self.emit_event_via(
             &dispatch_client,
-            "command.completed",
+            terminal_event,
             &command.step,
             &completion_status,
             command.execution_id,
@@ -3353,6 +3379,53 @@ fn build_extracted(context: &serde_json::Value) -> serde_json::Value {
 /// A tool added here opts OUT of the step-input `args` default; everything else
 /// keeps the long-standing behaviour untouched.
 ///
+/// Does a failing step fail its execution? — noetl/server#434.
+///
+/// ⚠ Default OFF, and deliberately so. This is the same posture, for the same
+/// reason, as `NOETL_EXECUTION_STATUS_FROM_STEPS` (noetl/ai-meta#251): turning
+/// it on changes what a run DOES, not just what it reports. Any playbook that
+/// today relies on an erroring step to continue would begin failing, and that
+/// must be a deliberate flip rather than a side effect of deploying an image.
+///
+/// With it off, behaviour is byte-identical to before.
+fn fail_execution_on_step_error() -> bool {
+    matches!(
+        std::env::var("NOETL_EXECUTION_FAIL_ON_STEP_ERROR")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// The terminal event a finished tool call produces.
+///
+/// Downstream scheduling keys on the event TYPE, not on its status field, so
+/// this is the decision that determines whether the DAG advances past a failed
+/// step. See the call site for why a status of `Error` used to advance it.
+fn terminal_event_for(
+    status: noetl_tools::result::ToolStatus,
+    case_exited: bool,
+    gate_enabled: bool,
+) -> &'static str {
+    use noetl_tools::result::ToolStatus;
+
+    if !gate_enabled {
+        return "command.completed";
+    }
+    // An explicit `case` that exited named this step's outcome itself. Failing
+    // it here would override the author, and `step.exit` has already been
+    // emitted carrying the status they chose.
+    if case_exited {
+        return "command.completed";
+    }
+    match status {
+        ToolStatus::Error | ToolStatus::Timeout => "command.failed",
+        ToolStatus::Success => "command.completed",
+    }
+}
+
 /// noetl/ai-meta#186 Bug 2.
 fn tool_kind_treats_args_as_argv(kind: &str) -> bool {
     matches!(kind, "container")
@@ -5923,6 +5996,71 @@ mod tests {
     /// `kind: container`. Injecting the step-input map into a container step
     /// produced `invalid type: map, expected a sequence` on every container
     /// step that did not declare `args:` itself — which is why only
+    /// ⭐ noetl/server#434. The table that decides whether a failed step stops
+    /// the DAG.
+    ///
+    /// The flag is a PARAMETER, not read from the environment here, so these
+    /// cases cannot race another test module's env — which is the failure
+    /// noetl/worker#299 was about.
+    #[test]
+    fn a_failed_tool_produces_the_terminal_event_that_stops_the_dag() {
+        use noetl_tools::result::ToolStatus;
+
+        // --- gate ON: an error status now stops the DAG ---
+        for status in [ToolStatus::Error, ToolStatus::Timeout] {
+            assert_eq!(
+                terminal_event_for(status, false, true),
+                "command.failed",
+                "{status:?} must emit command.failed — downstream scheduling \
+                 keys on the event TYPE, so command.completed advances the DAG \
+                 past a step that failed"
+            );
+        }
+        assert_eq!(
+            terminal_event_for(ToolStatus::Success, false, true),
+            "command.completed",
+            "the gate must not fail a step that succeeded"
+        );
+
+        // --- an explicit `case` exit still wins ---
+        assert_eq!(
+            terminal_event_for(ToolStatus::Error, true, true),
+            "command.completed",
+            "a case that exited named this outcome itself; failing here would \
+             override the author and contradict the step.exit already emitted"
+        );
+
+        // --- gate OFF: byte-identical to the behaviour before #434 ---
+        for status in [ToolStatus::Error, ToolStatus::Timeout, ToolStatus::Success] {
+            assert_eq!(
+                terminal_event_for(status, false, false),
+                "command.completed",
+                "with the gate off, {status:?} must behave exactly as before — \
+                 this is what makes deploying the image a no-op"
+            );
+        }
+    }
+
+    /// The gate defaults to OFF, because turning it on changes what a run DOES.
+    ///
+    /// ⚠ Asserted on the DEFAULT only. Setting the variable to probe the `on`
+    /// branch would mutate process-wide state that every other test in this
+    /// binary shares — the noetl/worker#299 failure mode. The `on` branch is
+    /// covered above by passing the parameter directly.
+    #[test]
+    fn the_failure_gate_is_off_unless_deliberately_turned_on() {
+        if std::env::var("NOETL_EXECUTION_FAIL_ON_STEP_ERROR").is_ok() {
+            // Someone set it in this environment; the default is not observable.
+            return;
+        }
+        assert!(
+            !fail_execution_on_step_error(),
+            "an unset NOETL_EXECUTION_FAIL_ON_STEP_ERROR must leave the gate \
+             closed, so deploying this image cannot change execution outcomes \
+             as a side effect"
+        );
+    }
+
     /// `container_callback_happy_path` worked.
     #[test]
     fn args_injection_skips_tools_that_read_args_as_argv() {
