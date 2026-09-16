@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.132.6](https://github.com/noetl/worker/compare/v5.132.5...v5.132.6) (2026-09-16)
+
+### Bug Fixes
+
+* **ehdb:** give each test thread its own metric and serve state ([607e0fe](https://github.com/noetl/worker/commit/607e0fe8a8c7e1015c19774eac50e520eb2067bd)), closes [noetl/worker#299](https://github.com/noetl/worker/issues/299) [#302](https://github.com/noetl/worker/issues/302) [#299](https://github.com/noetl/worker/issues/299)
+* **executor:** a tool's error status can stop the DAG (gated, default off) ([be51cd6](https://github.com/noetl/worker/commit/be51cd623102523ecebe691a95ce79c380ccbb61)), closes [noetl/server#434](https://github.com/noetl/server/issues/434) [noetl/ai-meta#251](https://github.com/noetl/ai-meta/issues/251) [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343) [noetl/worker#299](https://github.com/noetl/worker/issues/299)
+
 ## [5.132.5](https://github.com/noetl/worker/compare/v5.132.4...v5.132.5) (2026-09-16)
 
 ### Bug Fixes

@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "noetl-worker"
-version = "5.132.5"
+version = "5.132.6"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
