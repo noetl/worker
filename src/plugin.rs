@@ -632,9 +632,27 @@ pub struct HttpPluginSource {
 impl HttpPluginSource {
     /// Build a source pointed at the control-plane base URL (e.g.
     /// `http://noetl.noetl.svc.cluster.local:8082`).
+    /// ⚠ The timeout is the point. `reqwest::Client::new()` has none, so a
+    /// control-plane that accepts the connection and stalls would park a module
+    /// fetch forever — and `ensure_loaded` awaits it, so the caller parks too.
+    /// Two minutes is far above any healthy module download and still bounded.
     pub fn new(base_url: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|e| {
+                // Only reachable on a TLS/config failure, which this plain
+                // builder has none of. Logged rather than swallowed, because the
+                // fallback is the unbounded client this exists to avoid.
+                tracing::error!(
+                    error = %e,
+                    "plugin source: timed HTTP client could not be built; \
+                     falling back to an UNBOUNDED client"
+                );
+                reqwest::Client::new()
+            });
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: base_url.into(),
         }
     }
