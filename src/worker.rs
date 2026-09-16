@@ -293,6 +293,26 @@ impl Worker {
                 }
             };
 
+        // Start the CQRS projector (noetl/server#203 phase 2b-2) when enabled
+        // (system worker pool only).  A SEPARATE events-feed consumer group from
+        // the materializer's — sharing one would split the feed between them, so
+        // each would see about half the events and neither would report an
+        // error.  It folds the feed and advances noetl.projection_snapshot via
+        // /api/internal/projection/advance, acking ONLY the events whose
+        // execution actually advanced; the rest stay un-acked and redeliver.
+        // Default off, and inert a second time behind the server-side
+        // NOETL_PROJECTOR_OWNS_SNAPSHOT.
+        //
+        // ⚠ Enabled-but-misconfigured is a startup failure, not a background
+        // task nobody reads: a projector that reports healthy and advances
+        // nothing is exactly what would let the orchestrator stop self-writing
+        // the snapshot with nothing writing in its place.
+        let projector_handle = match crate::projector::ProjectorConfig::from_env(&self.config) {
+            Ok(Some(cfg)) => Some(crate::projector::spawn(cfg)),
+            Ok(None) => None,
+            Err(e) => return Err(e),
+        };
+
         // Start the result materializer (noetl/ai-meta#104 Phase B/D) when
         // enabled (system worker pool only).  A SEPARATE noetl_events consumer
         // (noetl_result_materializer) writes the over-budget Feather/JSON result
@@ -412,6 +432,9 @@ impl Worker {
         heartbeat_handle.abort();
         metrics_handle.abort();
         if let Some(h) = materializer_handle {
+            h.abort();
+        }
+        if let Some(h) = projector_handle {
             h.abort();
         }
         if let Some(h) = result_materializer_handle {
