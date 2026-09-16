@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.133.0](https://github.com/noetl/worker/compare/v5.132.7...v5.133.0) (2026-09-16)
+
+### Features
+
+* **ehdb:** give the kv and object shadow tiers a durable store behind the tier service ([5196b7e](https://github.com/noetl/worker/commit/5196b7e884d472889978c74161f9b4ccbde21eb7)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#311](https://github.com/noetl/ai-meta/issues/311)
+* **ehdb:** route the kv and object shadow mirrors to the durable tier store ([e102c19](https://github.com/noetl/worker/commit/e102c198db28e8a8f6cc37b62e78e00a033c5a00)), closes [noetl/ai-meta#348](https://github.com/noetl/ai-meta/issues/348)
+
 ## [5.132.7](https://github.com/noetl/worker/compare/v5.132.6...v5.132.7) (2026-09-16)
 
 ### Bug Fixes
