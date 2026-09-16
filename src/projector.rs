@@ -161,13 +161,16 @@ fn projector_http() -> Result<reqwest::Client> {
 /// `BTreeSet` also makes the order deterministic, which keeps a failing batch
 /// reproducible.
 pub(crate) fn execution_ids(events: &[serde_json::Value]) -> Vec<i64> {
+    // ⚠ Must use the SAME extractor as `event_execution_id`, not a second copy
+    // of the logic. These two decide different halves of one thing: this one
+    // picks which ids get POSTed, that one picks which events may be acked. If
+    // they ever disagreed about an event, the event would be treated as
+    // unaddressable and ACKED while its id had in fact been sent and may have
+    // failed — a silent drop, which is the one outcome this module is built to
+    // prevent. One function, so they cannot disagree.
     let mut seen = BTreeSet::new();
     for e in events {
-        let id = e.get("execution_id").and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        });
-        if let Some(id) = id {
+        if let Some(id) = event_execution_id(e) {
             seen.insert(id);
         }
     }
@@ -506,6 +509,35 @@ mod tests {
             execution_ids(&[]).is_empty(),
             "an empty batch yields nothing"
         );
+    }
+
+    /// ⚠ The two extractors must agree on EVERY event, for every id shape.
+    ///
+    /// `execution_ids` picks what gets POSTed; `event_execution_id` picks what
+    /// may be acked. An event the first sees and the second does not would be
+    /// acked as "unaddressable" while its execution was in fact submitted and
+    /// may have failed — a silent drop. They are one function now; this pins
+    /// that they stay one.
+    #[test]
+    fn both_extractors_agree_on_every_id_shape() {
+        let cases = vec![
+            json!({"execution_id": 42}),
+            json!({"execution_id": "42"}),
+            json!({"execution_id": null}),
+            json!({"execution_id": "not-a-number"}),
+            json!({"execution_id": 1.5}),
+            json!({"no_execution_id": true}),
+        ];
+        for e in &cases {
+            let per_event = event_execution_id(e);
+            let in_batch = execution_ids(std::slice::from_ref(e));
+            assert_eq!(
+                per_event.into_iter().collect::<Vec<_>>(),
+                in_batch,
+                "the two extractors disagreed on {e:?} — an event that is sent \
+                 but not ack-addressable (or vice versa) is a silent drop"
+            );
+        }
     }
 
     /// ⭐⭐ THE REDELIVERY POLICY (noetl/server#203 decision 3 — nack failures).
