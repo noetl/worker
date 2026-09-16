@@ -70,8 +70,18 @@ mod dependency_ranges {
     /// This is the second time in this crate (worker#183 silently dropped
     /// DuckDB from the shipped image the same way).
     ///
-    /// Lift the hold only together with `noetl-executor` — 0.9.x is published
-    /// and presumably carries the new field. The two move as a pair.
+    /// Lift the hold only together with `noetl-executor`. The two move as a
+    /// pair, and they did: `~3.26.3` + `0.5` became `~4.0` + `0.10`
+    /// (noetl/ai-meta#330, noetl/cli#89).
+    ///
+    /// ⚠ The hold SURVIVED that lift, deliberately. noetl-tools 4.0 seals
+    /// `ToolResult` with `#[non_exhaustive]`, which removes the exact mechanism
+    /// described above — a field added to it can no longer break a downstream
+    /// literal, because downstream can no longer write one. That retires this
+    /// specific failure, not the class. A new enum variant elsewhere, or a
+    /// changed default, breaks a resolve the same way and still does it on the
+    /// release commit. So the range stays `~`, and going to `^` is a decision
+    /// someone makes with evidence rather than one a resolver makes for them.
     #[test]
     fn noetl_tools_is_held_not_caret_ranged() {
         let manifest = include_str!("../Cargo.toml");
