@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.132.7](https://github.com/noetl/worker/compare/v5.132.6...v5.132.7) (2026-09-16)
+
+### Bug Fixes
+
+* **http:** bound the three HTTP clients that had no timeout ([50540a8](https://github.com/noetl/worker/commit/50540a8b3b91aaf9b466781a21220106abb4cc09)), closes [noetl/worker#316](https://github.com/noetl/worker/issues/316) [#316](https://github.com/noetl/worker/issues/316)
+
 ## [5.132.6](https://github.com/noetl/worker/compare/v5.132.5...v5.132.6) (2026-09-16)
 
 ### Bug Fixes
