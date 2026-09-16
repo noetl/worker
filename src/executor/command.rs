@@ -4757,9 +4757,10 @@ mod tests {
         use axum::routing::{get, put};
         use axum::Router;
 
-        let objects: MockObjects = Arc::new(std::sync::Mutex::new(
-            std::collections::HashMap::<String, Vec<u8>>::new(),
-        ));
+        let objects: MockObjects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            Vec<u8>,
+        >::new()));
 
         // Mint a legacy ref without storing anything (dual-write retired).
         let put_result = |AxumPath(execution_id): AxumPath<i64>,
@@ -4798,10 +4799,7 @@ mod tests {
                 match store.lock().unwrap().get(&key).cloned() {
                     Some(bytes) => (
                         AxumStatus::OK,
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            "application/octet-stream",
-                        )],
+                        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
                         bytes,
                     )
                         .into_response(),
@@ -5004,7 +5002,9 @@ mod tests {
              element a summary would keep"
         );
         assert!(
-            received[0]["rooms"].as_array().is_some_and(|r| r.len() == 10),
+            received[0]["rooms"]
+                .as_array()
+                .is_some_and(|r| r.len() == 10),
             "nested bulk must hydrate too — the card renderer reads rooms"
         );
         assert!(
@@ -6143,5 +6143,84 @@ mod tests {
         assert_eq!(o2.max_wait.as_secs(), 120);
         std::env::remove_var("NOETL_CONTAINER_POLL_INTERVAL_SECS");
         std::env::remove_var("NOETL_CONTAINER_POLL_MAX_WAIT_SECS");
+    }
+}
+
+#[cfg(test)]
+mod probe_316_observed_shapes {
+    use super::*;
+
+    /// The context shape observed in kind on 2026-09-16, verbatim.
+    fn observed_fetch_summary() -> serde_json::Value {
+        serde_json::json!({
+            "_ref": "noetl://execution/358608606267969536/result/fetch/358608619119316992",
+            "_store": "db",
+            "_uri": "noetl://default/default/results/358608606267969536/fetch/0/0/1",
+            "data": { "filler": { "_len": 1500000 }, "n": 1500000 }
+        })
+    }
+
+    /// ⭐ Does CURRENT main decide to resolve the shape that silently delivered
+    /// a `{_len}` stub in kind?
+    #[test]
+    fn the_observed_kind_shape_demands_bulk_resolution() {
+        let summary = observed_fetch_summary();
+
+        // The field bind that received `{'_len': 1500000}` instead of 1.5 MB.
+        let src = r#"{"payload":"{{ fetch.data.filler }}"}"#;
+        assert!(
+            step_needs_bulk_resolution(src, "fetch", Some(&summary)),
+            "a template binding a field the summary collapsed to a `_len` stub \
+             must resolve; in kind it did not, and the step silently received \
+             {{'_len': 1500000}} and reported success"
+        );
+
+        // The whole-object bind.
+        let src = r#"{"whole":"{{ fetch }}"}"#;
+        assert!(
+            step_needs_bulk_resolution(src, "fetch", Some(&summary)),
+            "a whole-object bind of a reference container must resolve"
+        );
+
+        // …and the scalar that DID come through correctly must still be
+        // satisfiable, or we would resolve on every step and lose the point.
+        let src = r#"{"claimed_n":"{{ fetch.data.n }}"}"#;
+        assert!(
+            !step_needs_bulk_resolution(src, "fetch", Some(&summary)),
+            "a scalar the summary can answer must NOT force a store round-trip"
+        );
+    }
+
+    /// And the locator must be findable where it actually sits: nested under
+    /// `steps.<name>.context.result.context.data`, which is the shape
+    /// `resolve_context_references` iterates.
+    #[test]
+    fn the_locator_is_found_at_the_observed_nesting() {
+        let step_result = serde_json::json!({
+            "context": {
+                "call_index": 0,
+                "command_id": "358608606267969536:fetch:358608610248364032",
+                "result": { "context": { "data": {
+                    "_ref": "noetl://execution/358608606267969536/result/fetch/358608619119316992",
+                    "_uri": "noetl://default/default/results/358608606267969536/fetch/0/0/1",
+                    "filler": { "_len": 1500000 }
+                }}}
+            }
+        });
+        let found = reference_locators(&step_result);
+        assert!(
+            found.is_some(),
+            "no locator found at the nesting `resolve_context_references` sees; \
+             an empty candidate list makes it return before resolving anything"
+        );
+        let (legacy, canonical) = found.unwrap();
+        assert!(
+            legacy.starts_with("noetl://execution/"),
+            "legacy ref: {legacy}"
+        );
+        assert!(
+            canonical.is_some(),
+            "the canonical _uri must survive (FIX 2)"
+        );
     }
 }
