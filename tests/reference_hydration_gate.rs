@@ -185,3 +185,61 @@ fn the_gate_is_actually_called_by_the_consume_path() {
          reachability_guard.rs exists to catch."
     );
 }
+
+#[test]
+fn the_producer_always_emits_the_canonical_uri_beside_the_ref() {
+    // noetl/ai-meta#343 FIX 2 — the *fourth* iteration of this bug, and the
+    // first one on the PRODUCER side.
+    //
+    // The consume path reads `_uri` as the canonical locator and hands it to
+    // `resolve_by_urn`, which reads the #104 result tier directly. Nothing ever
+    // wrote `_uri` onto the inline accessors, so that path could not be taken
+    // and resolution always fell back to `GET /api/result/resolve` against the
+    // legacy `noetl.result_store`.
+    //
+    // Measured on prod 2026-09-15 (`kubectl get deploy -o json`):
+    //
+    //   deploy/noetl-server-rust   MINT_AUTHORITATIVE=true   DUAL_WRITE=false
+    //   deploy/noetl-worker-rust   MINT_AUTHORITATIVE=UNSET  URI_RESOLVE=true
+    //
+    // So the worker pool emitted the legacy `noetl://execution/…` ref (the
+    // non-authoritative branch), and the server — which had stopped writing
+    // legacy rows — answered 404 in 0.19 s while 214 KB sat in the tier.
+    //
+    // The emit MUST be unconditional. Gating it on `mint_authoritative()`
+    // reproduces exactly the per-pool config split that caused this outage.
+    let body = fn_body(&production_source(), "build_call_done_result");
+    let inline = body
+        .split_once("let inline_data")
+        .map(|(_, rest)| rest.split_once("});").map_or(rest, |(b, _)| b).to_string())
+        .unwrap_or_default();
+    assert!(
+        !inline.is_empty(),
+        "build_call_done_result no longer builds an `inline_data` locator block."
+    );
+    assert!(
+        inline.contains("\"_uri\""),
+        "the externalised-result emit path no longer carries the canonical `_uri`.\n\
+         Without it the consumer cannot take the resolve-by-URN tier path and\n\
+         falls back to the legacy result_store, which is NOT written when\n\
+         NOETL_RESULT_STORE_DUAL_WRITE=false — a 404, and a step silently bound\n\
+         to its summary (prod: hotel-cards returned 0 hotels for two days)."
+    );
+    assert!(
+        !inline.contains("mint_authoritative"),
+        "the `_uri` emit looks conditional on mint_authoritative again.\n\
+         That flag is set PER POOL: on prod 2026-09-15 the server had it and\n\
+         deploy/noetl-worker-rust did not, which is what broke result delivery.\n\
+         `_uri` must be emitted unconditionally so a config split cannot\n\
+         silently disable hydration."
+    );
+}
+
+// NOTE: the "unstamped `reference` must not mask the accessor `_uri`" property is
+// guarded by the unit test `an_unstamped_reference_object_does_not_hide_the_accessor_uri`
+// in `src/executor/command.rs`, not here. That test calls `reference_locators`
+// directly — it IS at the gate, so the "a test below the gate cannot tell you the
+// gate is shut" problem this file exists for does not apply to it, and it was
+// verified to fail when the fall-through is removed. A source-level grep for the
+// same property matched dead code under a negative control and was dropped rather
+// than kept as a guard that cannot fail.

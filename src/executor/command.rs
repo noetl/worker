@@ -1979,7 +1979,34 @@ async fn build_call_done_result(
             } else {
                 durable.r#ref.clone()
             };
-            let inline_data = serde_json::json!({ "_ref": ref_accessor });
+            // noetl/ai-meta#343 — ALWAYS expose the canonical logical URI as
+            // `_uri`, alongside whichever accessor `_ref` carries.
+            //
+            // `reference_locators` on the consume side reads `_uri` as the
+            // canonical locator and hands it to `resolve_by_urn`, which reads the
+            // tier directly. Nothing ever populated it, so that fast path could
+            // not be taken and resolution fell back to `resolve_ref` against the
+            // legacy `noetl.result_store`.
+            //
+            // ⚠ Measured on prod 2026-09-15: `NOETL_RESULT_MINT_AUTHORITATIVE`
+            // is set on the SERVER and on two worker pools, but NOT on
+            // `deploy/noetl-worker-rust`. So that pool took the `else` branch
+            // above, emitted the legacy `noetl://execution/…` ref, and the
+            // server — which IS mint-authoritative and therefore never wrote the
+            // legacy row — answered `GET /api/result/resolve` with 404 in 0.19 s.
+            // The client maps 404 to `Ok(None)`, the resolver keeps the summary,
+            // and the consuming step silently receives a bare reference:
+            // hotel-cards returned 0 hotels while 214 KB sat in the tier.
+            //
+            // Emitting `_uri` unconditionally makes the fast path work
+            // regardless of how that flag happens to be set on the pool that
+            // runs the step, so a per-pool config split cannot silently disable
+            // result delivery again. `_ref` is unchanged for back-compat.
+            let canonical_uri = cycle_logical_uri(execution_id, step, render_context);
+            let inline_data = serde_json::json!({
+                "_ref": ref_accessor,
+                "_uri": canonical_uri,
+            });
             Ok(serde_json::json!({
                 "status": status,
                 "context": { "data": inline_data },
@@ -2707,6 +2734,25 @@ fn stamp_logical_uri(
 /// present (the resolve-by-URN key, #104 Phase C). `None` if there is no
 /// reference at all.
 fn reference_locators(result: &serde_json::Value) -> Option<(String, Option<String>)> {
+    fn find_locator(v: &serde_json::Value, depth: usize) -> Option<(String, Option<String>)> {
+        const MAX_DEPTH: usize = 8;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        match v {
+            serde_json::Value::Object(o) => {
+                if let Some(r) = o.get("_ref").and_then(|x| x.as_str()) {
+                    let uri = o.get("_uri").and_then(|x| x.as_str()).map(str::to_string);
+                    return Some((r.to_string(), uri));
+                }
+                o.values().find_map(|child| find_locator(child, depth + 1))
+            }
+            serde_json::Value::Array(a) => {
+                a.iter().find_map(|child| find_locator(child, depth + 1))
+            }
+            _ => None,
+        }
+    }
     // Shape 1 — the full `reference` OBJECT (`{ref, uri, extracted, meta, …}`).
     if let Some(reference) = result
         .pointer("/context/result/reference")
@@ -2717,7 +2763,21 @@ fn reference_locators(result: &serde_json::Value) -> Option<(String, Option<Stri
                 .get("uri")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            return Some((legacy.to_string(), canonical));
+            if canonical.is_some() {
+                return Some((legacy.to_string(), canonical));
+            }
+            // noetl/ai-meta#343 — a `reference` WITHOUT `uri` must not short-
+            // circuit the search. `reference.uri` is stamped by the executor
+            // (`stamp_logical_uri`) *after* `build_call_done_result` returns, so
+            // any emit path that does not run that stamp — the container
+            // callback, a re-serialised envelope — yields a reference object
+            // with `ref` and no `uri`. Returning `(legacy, None)` here would
+            // discard the `_uri` that FIX 2 puts on the inline accessors one
+            // level down, forcing resolution onto the legacy store the server
+            // no longer writes. Fall through and take the accessor's canonical
+            // URI if it has one; the legacy ref is unchanged either way.
+            let from_accessors = find_locator(result, 0).and_then(|(_, c)| c);
+            return Some((legacy.to_string(), from_accessors));
         }
     }
     // Shape 2 — the FLAT accessors (`_ref` / `_uri`), found at ANY depth.
@@ -2745,25 +2805,6 @@ fn reference_locators(result: &serde_json::Value) -> Option<(String, Option<Stri
     // STRUCTURE rather than by position: a bounded walk for the first `_ref`,
     // preferring a `_uri` alongside it. Depth-capped so a pathological payload
     // cannot turn candidate detection into a deep traversal.
-    fn find_locator(v: &serde_json::Value, depth: usize) -> Option<(String, Option<String>)> {
-        const MAX_DEPTH: usize = 8;
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        match v {
-            serde_json::Value::Object(o) => {
-                if let Some(r) = o.get("_ref").and_then(|x| x.as_str()) {
-                    let uri = o.get("_uri").and_then(|x| x.as_str()).map(str::to_string);
-                    return Some((r.to_string(), uri));
-                }
-                o.values().find_map(|child| find_locator(child, depth + 1))
-            }
-            serde_json::Value::Array(a) => {
-                a.iter().find_map(|child| find_locator(child, depth + 1))
-            }
-            _ => None,
-        }
-    }
     find_locator(result, 0)
 }
 
@@ -3717,6 +3758,87 @@ mod tests {
     }
 
     #[test]
+    fn externalised_results_carry_the_canonical_uri_for_the_fast_path() {
+        // noetl/ai-meta#343 FIX 2. The consume side reads `_uri` as the canonical
+        // locator and hands it to resolve_by_urn (the tier read). Nothing ever
+        // populated it, so that path could never be taken and resolution fell
+        // back to the legacy result_store — which is not written under
+        // MINT_AUTHORITATIVE, giving a 404 and a silent empty result.
+        //
+        // This asserts the two accessors travel together, and that
+        // reference_locators surfaces the canonical one.
+        let emitted = serde_json::json!({
+            "_ref": "noetl://execution/1/result/step/9",
+            "_uri": "noetl://default/default/results/1/step/0/0/1",
+        });
+        let (legacy, canonical) = reference_locators(&emitted).expect("a candidate must be formed");
+        assert_eq!(legacy, "noetl://execution/1/result/step/9");
+        assert_eq!(
+            canonical.as_deref(),
+            Some("noetl://default/default/results/1/step/0/0/1"),
+            "the canonical _uri must reach resolve_by_urn — without it the fast \
+             path is skipped and resolution falls back to the legacy store, \
+             which is not written under MINT_AUTHORITATIVE"
+        );
+
+        // A legacy `_ref`-only result (pre-fix-2, or a pool without the flag)
+        // must STILL form a candidate — that is what server-side fix 3 resolves.
+        let legacy_only = serde_json::json!({ "_ref": "noetl://execution/2/result/step/9" });
+        let (l2, c2) = reference_locators(&legacy_only).expect("legacy-only must still resolve");
+        assert_eq!(l2, "noetl://execution/2/result/step/9");
+        assert_eq!(c2, None, "no canonical uri available on the legacy shape");
+    }
+
+    #[test]
+    fn an_unstamped_reference_object_does_not_hide_the_accessor_uri() {
+        // noetl/ai-meta#343. `reference.uri` is stamped by `stamp_logical_uri`,
+        // which the executor runs AFTER `build_call_done_result` returns — so an
+        // emit path that skips that stamp (the container callback, a
+        // re-serialised envelope) produces a `reference` with `ref` and no
+        // `uri`, while the inline accessors one level down DO carry `_uri`.
+        //
+        // Shape 1 used to win and return `(legacy, None)`, throwing away the
+        // only canonical locator present. That sends resolution to the legacy
+        // `result_store`, which is not written under
+        // `NOETL_RESULT_STORE_DUAL_WRITE=false` — a 404, and a step silently
+        // bound to its summary.
+        let unstamped = serde_json::json!({
+            "status": "COMPLETED",
+            "context": { "data": {
+                "_ref": "noetl://execution/5/result/s/9",
+                "_uri": "noetl://default/default/results/5/s/0/0/1",
+            }},
+            "reference": { "kind": "result_ref", "ref": "noetl://execution/5/result/s/9" },
+        });
+        let (legacy, canonical) = reference_locators(&unstamped).expect("a candidate must form");
+        assert_eq!(legacy, "noetl://execution/5/result/s/9");
+        assert_eq!(
+            canonical.as_deref(),
+            Some("noetl://default/default/results/5/s/0/0/1"),
+            "an unstamped `reference` must not mask the accessor `_uri`",
+        );
+
+        // A STAMPED reference still wins — its `uri` is the authoritative one.
+        let stamped = serde_json::json!({
+            "reference": {
+                "kind": "result_ref",
+                "ref": "noetl://execution/5/result/s/9",
+                "uri": "noetl://default/default/results/5/s/0/0/7",
+            },
+            "context": { "data": {
+                "_ref": "noetl://execution/5/result/s/9",
+                "_uri": "noetl://default/default/results/5/s/0/0/1",
+            }},
+        });
+        let (_, canonical) = reference_locators(&stamped).expect("a candidate must form");
+        assert_eq!(
+            canonical.as_deref(),
+            Some("noetl://default/default/results/5/s/0/0/7"),
+            "the stamped reference.uri stays authoritative",
+        );
+    }
+
+    #[test]
     fn reference_locators_finds_the_locator_in_a_real_parent_steps_entry() {
         // ⚠ THE THIRD ITERATION OF THIS BUG. Captured verbatim from prod
         // execution 358323454170112000 (`muno/playbooks/hotel-cards`) — this is
@@ -4518,6 +4640,386 @@ mod tests {
         Arc::new(ArrowIpcSharedMemoryCache::with_config(config))
     }
 
+    // ------------------------------------------------------------
+    // END-TO-END externalised-result hydration gate (noetl/ai-meta#343)
+    //
+    // Every earlier fix for this bug (#315, #317, #319) was a unit test on one
+    // function, and every one of them passed while production returned zero
+    // hotels — because the defect was never inside a single function. It lived
+    // in the seam between the PRODUCER (which emits the locator) and the
+    // CONSUMER (which resolves it), and no test in this repo had ever joined
+    // those two halves.
+    //
+    // This harness joins them: a real `build_call_done_result` produces an
+    // over-budget result against a mock control plane, and a real
+    // `resolve_context_references` consumes it from the parent's context.
+    // Nothing about the locator is hand-written.
+    // ------------------------------------------------------------
+
+    /// The in-memory object tier the mock control plane serves.
+    type MockObjects = Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>;
+
+    /// A mock control plane that reproduces **prod's measured configuration**
+    /// on 2026-09-15 (`kubectl get deploy/noetl-worker-rust -o json`):
+    ///
+    /// * `PUT /api/result/{eid}` mints a legacy `noetl://execution/…` ref but
+    ///   stores NOTHING — that is `NOETL_RESULT_STORE_DUAL_WRITE=false` on the
+    ///   server, which is how prod runs.
+    /// * `GET /api/result/resolve` therefore answers **404, always**. This is
+    ///   not a pessimisation for the test's benefit; it is the exact response
+    ///   measured from prod (0.19 s, HTTP 404) while 214 KB of the result sat
+    ///   in the object tier.
+    /// * `PUT/GET /api/internal/objects/{key}` is a real read-write object
+    ///   tier, so a producer-staged object is genuinely fetched back.
+    /// * `GET /api/internal/cells` serves a registry, so the §7 physical key
+    ///   the producer writes and the one the consumer reads are derived the
+    ///   same way they are in production.
+    ///
+    /// Consequence: **any** successful hydration in a test using this mock came
+    /// from the object tier via the canonical `_uri`. The legacy path cannot
+    /// contribute a single byte.
+    async fn start_mock_control_plane() -> (String, tokio::task::JoinHandle<()>, MockObjects) {
+        use axum::extract::Path as AxumPath;
+        use axum::response::IntoResponse;
+        use axum::routing::{get, put};
+        use axum::Router;
+
+        let objects: MockObjects = Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::<String, Vec<u8>>::new(),
+        ));
+
+        // Mint a legacy ref without storing anything (dual-write retired).
+        let put_result = |AxumPath(execution_id): AxumPath<i64>,
+                          Json(body): Json<serde_json::Value>| async move {
+            let name = body
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("result")
+                .to_string();
+            Json(serde_json::json!({
+                "ref": format!("noetl://execution/{execution_id}/result/{name}/1"),
+                "store": "db",
+                "scope": body.get("scope").and_then(|v| v.as_str()).unwrap_or("execution"),
+                "bytes": 0,
+                "sha256": null,
+                "expires_at": null,
+            }))
+        };
+
+        // The legacy row was never written, so resolution is 404 — always.
+        let resolve = || async { AxumStatus::NOT_FOUND };
+
+        let put_obj_store = objects.clone();
+        let put_object = move |AxumPath(key): AxumPath<String>, body: axum::body::Bytes| {
+            let store = put_obj_store.clone();
+            async move {
+                store.lock().unwrap().insert(key, body.to_vec());
+                AxumStatus::OK
+            }
+        };
+
+        let get_obj_store = objects.clone();
+        let get_object = move |AxumPath(key): AxumPath<String>| {
+            let store = get_obj_store.clone();
+            async move {
+                match store.lock().unwrap().get(&key).cloned() {
+                    Some(bytes) => (
+                        AxumStatus::OK,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "application/octet-stream",
+                        )],
+                        bytes,
+                    )
+                        .into_response(),
+                    None => AxumStatus::NOT_FOUND.into_response(),
+                }
+            }
+        };
+
+        let cells = || async {
+            Json(serde_json::json!({
+                "shard_count": 4,
+                "default_cell": "test-cell",
+                "cells": [{
+                    "cell": "test-cell",
+                    "env": "test",
+                    "region": "us-central1",
+                    "provider": "postgres",
+                    "bucket": "",
+                    "endpoint": "",
+                }],
+            }))
+        };
+
+        let app = Router::new()
+            .route("/api/result/{execution_id}", put(put_result))
+            .route("/api/result/resolve", get(resolve))
+            .route("/api/internal/cells", get(cells))
+            .route(
+                "/api/internal/objects/{*key}",
+                put(put_object).get(get_object),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("axum serve");
+        });
+        (base, handle, objects)
+    }
+
+    /// ⚠ THE GATE THIS BUG NEEDED FROM THE START.
+    ///
+    /// A parent step consuming a `kind: playbook` child whose result was
+    /// externalised must receive the **hydrated payload** — not a bare locator,
+    /// not a one-element truncated sample.
+    ///
+    /// Production symptom this reproduces (`muno/playbooks/hotel-cards`,
+    /// 2026-09-13 → 09-15): the child fetched 20 hotels, the parent bound
+    /// `{{ search_hotels.data.hotels }}`, and the card renderer emitted **0
+    /// hotels with no error** on every run for two days.
+    ///
+    /// The environment below is `deploy/noetl-worker-rust` as measured on prod:
+    /// `NOETL_RESULT_URI_RESOLVE=true`, `NOETL_RESULT_PRODUCER_STAGE=true`,
+    /// and `NOETL_RESULT_MINT_AUTHORITATIVE` **unset** — while the server
+    /// (`deploy/noetl-server-rust`) has `MINT_AUTHORITATIVE=true` and
+    /// `STORE_DUAL_WRITE=false`. That split is the whole bug: the producer took
+    /// the non-authoritative branch and emitted the legacy ref, while the server
+    /// that would have to resolve it had stopped writing legacy rows.
+    ///
+    /// RED without FIX 2: no `_uri` is emitted, so the consumer cannot take the
+    /// resolve-by-URN path, falls back to `GET /api/result/resolve`, gets the
+    /// 404 this mock (like prod) returns, logs one `warn`, and leaves the step
+    /// bound to its summary. The final assertion below fails with the payload
+    /// the step actually received.
+    #[tokio::test]
+    async fn parent_consuming_an_externalised_child_receives_the_hydrated_payload() {
+        let _uri_resolve = EnvGuard::set("NOETL_RESULT_URI_RESOLVE", "true");
+        let _mint = EnvGuard::unset("NOETL_RESULT_MINT_AUTHORITATIVE");
+        let _stage = EnvGuard::set("NOETL_RESULT_PRODUCER_STAGE", "true");
+
+        let (base, handle, objects) = start_mock_control_plane().await;
+        let client = ControlPlaneClient::new(&base);
+        let cache = test_cache("wkr-test-e2e-hydration");
+
+        // --- PRODUCE -------------------------------------------------------
+        // A `kind: playbook` child returning 20 hotels. Each hotel carries the
+        // field set the card renderer actually reads, which is what pushes the
+        // result over the 100 KB inline budget — the same reason the real one
+        // externalises.
+        let hotels: Vec<serde_json::Value> = (0..20)
+            .map(|i| {
+                serde_json::json!({
+                    "code": format!("HTL{i:05}"),
+                    "name": format!("Test Hotel Number {i}"),
+                    "description": "x".repeat(8_000),
+                    "images": (0..8).map(|j| format!("https://img.example/{i}/{j}.jpg")).collect::<Vec<_>>(),
+                    "rooms": (0..10).map(|r| serde_json::json!({
+                        "code": format!("ROOM{r}"),
+                        "name": format!("Room type {r}"),
+                        "rate": 100.0 + (r as f64) * 25.0,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let child_context = serde_json::json!({
+            "status": "success",
+            "data": { "hotels": hotels, "count": 20 },
+        });
+
+        let execution_id = 358323596172468224_i64;
+        let step = "search_hotels";
+        let render_context = std::collections::HashMap::new();
+        let emitted = build_call_done_result(
+            &child_context,
+            "COMPLETED",
+            execution_id,
+            step,
+            &render_context,
+            cache.as_ref(),
+            &client,
+        )
+        .await
+        .expect("the child's call.done result must build");
+
+        // The result really did go out of line — otherwise this test would be
+        // proving nothing about hydration.
+        let locator = &emitted["context"]["data"];
+        assert!(
+            locator["_ref"].is_string(),
+            "the result must have been externalised for this test to mean \
+             anything; got {emitted}"
+        );
+        assert!(
+            locator["_uri"].is_string(),
+            "FIX 2: the canonical _uri must be emitted alongside _ref"
+        );
+        assert!(
+            !objects.lock().unwrap().is_empty(),
+            "producer-staging must have written the tier object the consumer \
+             will read back"
+        );
+
+        // --- CONSUME -------------------------------------------------------
+        // The parent's context, shaped as `build_context` assembles it: the
+        // flat `<step>` binding is the bounded summary (locators only, because
+        // the payload went out of line) and `steps.<step>` nests the child's
+        // whole `call.done` result.
+        let summary = locator.clone();
+        let mut variables = std::collections::HashMap::new();
+        variables.insert(step.to_string(), summary);
+        // ⚠ The `reference` block is deliberately NOT carried here. With
+        // `NOETL_REFS_IN_STATE` unset — which is how prod runs — the
+        // orchestrator strips it, and the parent receives only the inline
+        // accessors. That is verbatim what prod execution 358323454170112000
+        // delivered (see
+        // `reference_locators_finds_the_locator_in_a_real_parent_steps_entry`),
+        // and it is precisely why FIX 2 is the fix: with `reference.uri` gone,
+        // the accessor `_uri` is the ONLY canonical locator that reaches the
+        // consumer.
+        let mut child_result = emitted.clone();
+        child_result.as_object_mut().unwrap().remove("reference");
+        variables.insert(
+            "steps".to_string(),
+            serde_json::json!({
+                step: {
+                    "status": "COMPLETED",
+                    "context": {
+                        "call_index": 0,
+                        "command_id": format!("{execution_id}:{step}:1"),
+                        "result": child_result,
+                    },
+                },
+            }),
+        );
+
+        // What `muno/playbooks/hotel-cards` binds.
+        let template_src = serde_json::to_string(&serde_json::json!({
+            "hotels": format!("{{{{ {step}.data.hotels }}}}"),
+        }))
+        .unwrap();
+
+        resolve_context_references(&mut variables, &template_src, &client).await;
+
+        // --- ASSERT --------------------------------------------------------
+        let bound = variables
+            .get(step)
+            .expect("the step binding must still be present");
+        let received = bound
+            .pointer("/data/hotels")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the consuming step was handed no hotel array at all. This \
+                     is the production symptom: the step binds a locator or a \
+                     truncated sample and renders zero cards, with no error \
+                     anywhere. Bound value was:\n{bound:#}"
+                )
+            });
+        assert_eq!(
+            received.len(),
+            20,
+            "the parent must receive ALL 20 hotels the child fetched, not a \
+             truncated sample. Got {} — bound value:\n{bound:#}",
+            received.len()
+        );
+        assert_eq!(
+            received[19]["code"], "HTL00019",
+            "the tail of the array must survive hydration, not just the first \
+             element a summary would keep"
+        );
+        assert!(
+            received[0]["rooms"].as_array().is_some_and(|r| r.len() == 10),
+            "nested bulk must hydrate too — the card renderer reads rooms"
+        );
+        assert!(
+            bound.get("_truncated").is_none() && bound["data"].get("_truncated").is_none(),
+            "a `_truncated` marker means a summary was served as the answer"
+        );
+
+        handle.abort();
+    }
+
+    /// The other half of the contract: a result that carries **only** a legacy
+    /// `_ref` and no `_uri` — every execution that predates FIX 2, and anything
+    /// emitted by a pool that never gets it — must still hydrate.
+    ///
+    /// The worker cannot resolve that itself: with no canonical URI there is no
+    /// resolve-by-URN path to take, so it calls `GET /api/result/resolve` and
+    /// depends entirely on the server answering. FIX 3 is what makes the real
+    /// server answer it (by falling back to the #104 tier when the legacy row is
+    /// missing); this test pins the worker's half — that a `_uri`-less result
+    /// still forms a candidate, still requests resolution, and still splices the
+    /// payload in when the server provides it.
+    ///
+    /// It is a NON-REGRESSION gate for FIX 2, not a proof of FIX 3: the
+    /// server-side behaviour is guarded in `noetl/server`
+    /// (`tests/result_resolve_tier_fallback.rs`) and measured end-to-end in kind.
+    #[tokio::test]
+    async fn a_legacy_ref_without_a_uri_still_hydrates_when_the_server_resolves_it() {
+        use axum::routing::get;
+        use axum::Router;
+
+        let _uri_resolve = EnvGuard::set("NOETL_RESULT_URI_RESOLVE", "true");
+        let _mint = EnvGuard::unset("NOETL_RESULT_MINT_AUTHORITATIVE");
+
+        // A server that DOES resolve the legacy ref — i.e. one carrying FIX 3.
+        let payload = serde_json::json!({
+            "status": "success",
+            "data": {
+                "hotels": (0..20)
+                    .map(|i| serde_json::json!({ "code": format!("HTL{i:05}") }))
+                    .collect::<Vec<_>>(),
+                "count": 20,
+            },
+        });
+        let served = payload.clone();
+        let app = Router::new().route(
+            "/api/result/resolve",
+            get(move || {
+                let body = served.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = ControlPlaneClient::new(&format!("http://{addr}"));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("axum serve");
+        });
+
+        // The pre-FIX-2 emit shape: `_ref` and nothing else.
+        let legacy_ref = format!("noetl://execution/{}/result/search_hotels/1", 42);
+        let summary = serde_json::json!({ "_ref": legacy_ref, "data": { "_ref": legacy_ref } });
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("search_hotels".to_string(), summary.clone());
+        variables.insert(
+            "steps".to_string(),
+            serde_json::json!({ "search_hotels": { "context": { "result": { "context": { "data": { "_ref": legacy_ref } } } } } }),
+        );
+
+        let template_src = r#"{"hotels":"{{ search_hotels.data.hotels }}"}"#;
+        resolve_context_references(&mut variables, template_src, &client).await;
+
+        let bound = variables.get("search_hotels").expect("binding present");
+        let received = bound
+            .pointer("/data/hotels")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| {
+                panic!("a `_uri`-less legacy result must still hydrate; got:\n{bound:#}")
+            });
+        assert_eq!(received.len(), 20);
+        assert_eq!(
+            bound["_ref"], legacy_ref,
+            "the locator accessor must survive the splice so `{{ step._ref }}` \
+             still renders"
+        );
+
+        handle.abort();
+    }
+
     /// Spin up an in-test axum mock of the Python server's
     /// `PUT /api/result/{execution_id}` endpoint.  Returns the
     /// bound `(base_url, server_handle)`; drop the handle to stop
@@ -4934,6 +5436,14 @@ mod tests {
             .get("context")
             .expect("context.data._ref must be embedded inline");
         assert!(inline_ctx["data"]["_ref"].is_string());
+        // noetl/ai-meta#343 FIX 2 — the canonical `_uri` must travel with `_ref`.
+        // Without it the consume side cannot take the resolve_by_urn fast path and
+        // falls back to the legacy result_store, which is not written under
+        // MINT_AUTHORITATIVE → 404 → silent empty result.
+        assert!(
+            inline_ctx["data"]["_uri"].is_string(),
+            "externalised result emitted without the canonical _uri"
+        );
         let reference = result.get("reference").expect("must have reference");
         // The `ipc` field carries the Arrow IPC bytes — but the
         // ROWS that landed in shm must have had their sensitive
@@ -5010,6 +5520,14 @@ mod tests {
             .get("context")
             .expect("context.data._ref must be embedded inline");
         assert!(inline_ctx["data"]["_ref"].is_string());
+        // noetl/ai-meta#343 FIX 2 — the canonical `_uri` must travel with `_ref`.
+        // Without it the consume side cannot take the resolve_by_urn fast path and
+        // falls back to the legacy result_store, which is not written under
+        // MINT_AUTHORITATIVE → 404 → silent empty result.
+        assert!(
+            inline_ctx["data"]["_uri"].is_string(),
+            "externalised result emitted without the canonical _uri"
+        );
         let reference = result.get("reference").expect("must have reference");
         assert_eq!(reference["kind"], "result_ref");
 
