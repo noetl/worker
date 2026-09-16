@@ -1009,12 +1009,17 @@ pub(crate) fn serve_service_append_with(
 
     // Did the record land, and if so did parity hold?
     let (ack, parity_held, mut detail, landed_outcome) = match reply {
-        Err(e) => (
-            None,
-            false,
-            Some(format!("tier-service append failed: {e}")),
-            Some(EventLogOutcome::Unavailable),
-        ),
+        Err(e) => {
+            let msg = format!("tier-service append failed: {e}");
+            // noetl/worker#326 — a frame-cap refusal is TERMINAL for this event:
+            // retrying cannot help because the payload size does not change.
+            // Matched on the writer's own wording so the classification tracks
+            // the message that produces it.
+            if msg.contains("refusing to write") || msg.contains("exceeds the") {
+                note_oversize_refusal(&msg);
+            }
+            (None, false, Some(msg), Some(EventLogOutcome::Unavailable))
+        }
         Ok(body) => match ServiceAppendAck::parse(body) {
             // A reply the service produced that acknowledges no append: one of
             // its typed refusals.  `invalid` is a caller mistake and NOT
@@ -1064,6 +1069,14 @@ pub(crate) fn serve_service_append_with(
             (false, false, _) => EventLogOutcome::ParityMismatch,
         },
     };
+
+    // noetl/worker#326 — an append that LANDED clears any outstanding oversize
+    // refusal, so the serve state can report authoritative again. Keyed on the
+    // record actually landing (`ack`), not on the outcome label, because the
+    // question is "is the tier still missing an event".
+    if ack.is_some() {
+        note_append_landed();
+    }
 
     if detail.is_none() && outcome == EventLogOutcome::PrimaryUnavailable {
         detail = Some(
@@ -1115,6 +1128,88 @@ fn serve_state_code(decision: &super::primary_serve::ServeDecision) -> u8 {
     }
 }
 
+/// Is an oversize frame refusal outstanding? — noetl/worker#326.
+///
+/// ⚠⚠ Set when an append is refused because the frame exceeds the reader cap,
+/// and cleared when an append lands. While it is set the tier is **known to be
+/// missing an event**, so the promotion line below must not claim the tier
+/// "answered authoritatively".
+///
+/// The observed failure: a refused append demotes to `parity_diverged`, the next
+/// successful op promotes back to `served_primary`, and the pair repeats every
+/// few seconds — so a reader sampling either side gets a different answer about
+/// whether the tier is authoritative, and the INFO line (the one visible at
+/// default level) says it is, milliseconds after the WARN saying an append was
+/// refused.
+///
+/// ⚠ This changes what is LOGGED, not what the tier does with the data. Whether
+/// an over-cap event should be chunked, rejected at the producer, or dropped is
+/// a durability decision and is deliberately left alone.
+static OVERSIZE_REFUSAL_OUTSTANDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread copy of the refusal flag (noetl/worker#302).
+    ///
+    /// ⚠ Same treatment `projection::LAST_SERVE_STATE` already has, for the same
+    /// reason: this is process-wide state that tests both read and write, and
+    /// `cargo test` does not serialise test modules. Without it a sibling's
+    /// refusal lands inside this test's window — the noetl/worker#299 flake,
+    /// reintroduced by a new static.
+    ///
+    /// Tests on one thread run sequentially, so a thread-private flag cannot
+    /// race. Leaked deliberately: bounded by test threads, not by tests.
+    static SCOPED_OVERSIZE_REFUSAL: &'static std::sync::atomic::AtomicBool =
+        Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+}
+
+/// The refusal flag this thread reads and writes.
+fn oversize_flag() -> &'static std::sync::atomic::AtomicBool {
+    #[cfg(test)]
+    {
+        SCOPED_OVERSIZE_REFUSAL.with(|c| *c)
+    }
+    #[cfg(not(test))]
+    {
+        &OVERSIZE_REFUSAL_OUTSTANDING
+    }
+}
+
+/// Record that an append was refused for exceeding the frame cap.
+///
+/// Loud and terminal for that event: ERROR, not WARN, and stated as a permanent
+/// property of the payload rather than a transient fault — the same event will
+/// be refused every time it is retried, because its size does not change.
+pub(crate) fn note_oversize_refusal(detail: &str) {
+    let first = !oversize_flag().swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first {
+        tracing::error!(
+            detail,
+            "tier append REFUSED: the frame exceeds the reader cap. This is \
+             TERMINAL for this event — retrying cannot help, because the payload \
+             size does not change. The event-log tier is now incomplete, and the \
+             serve state will not be reported as authoritative until an append \
+             lands (noetl/worker#326)."
+        );
+    }
+}
+
+/// Record that an append landed, clearing any outstanding oversize refusal.
+pub(crate) fn note_append_landed() {
+    if oversize_flag().swap(false, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            "tier append landed; the outstanding oversize refusal is cleared and \
+             the serve state may report authoritative again (noetl/worker#326)"
+        );
+    }
+}
+
+/// True when the tier is known to be missing an event.
+pub(crate) fn oversize_refusal_outstanding() -> bool {
+    oversize_flag().load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Log a serve-state change, once per transition.
 fn log_serve_transition(
     decision: &super::primary_serve::ServeDecision,
@@ -1128,13 +1223,28 @@ fn log_serve_transition(
     }
     let label = decision.outcome_label();
     if decision.served_by_ehdb() {
-        tracing::info!(
-            serve_state = label,
-            outcome = outcome.as_str(),
-            "{}=primary IS SERVING: the event-log tier answered authoritatively through the \
-             writer-fronted tier service (mirror_source=server, tier_query_source=service)",
-            EVENTLOG_MODE_ENV
-        );
+        // ⚠ noetl/worker#326 — do NOT claim authoritative while an append is
+        // known refused. The tier is missing an event; saying it "answered
+        // authoritatively" milliseconds after refusing a write is the line an
+        // operator reads at default level, and it is the wrong one.
+        if oversize_refusal_outstanding() {
+            tracing::warn!(
+                serve_state = label,
+                outcome = outcome.as_str(),
+                "{}=primary would serve, but an oversize append refusal is \
+                 OUTSTANDING — the tier is known to be missing an event, so this \
+                 is NOT reported as authoritative (noetl/worker#326)",
+                EVENTLOG_MODE_ENV
+            );
+        } else {
+            tracing::info!(
+                serve_state = label,
+                outcome = outcome.as_str(),
+                "{}=primary IS SERVING: the event-log tier answered authoritatively through the \
+                 writer-fronted tier service (mirror_source=server, tier_query_source=service)",
+                EVENTLOG_MODE_ENV
+            );
+        }
     } else if decision.degraded() {
         tracing::warn!(
             serve_state = label,
@@ -2274,5 +2384,76 @@ mod tier_dedupe_parity_tests {
     fn a_normal_append_still_runs_both_checks() {
         let ok = parse(&reply(42, Some(42), false));
         assert_eq!(ok.parity(41).expect("healthy"), None, "no skip, no note");
+    }
+}
+
+#[cfg(test)]
+mod oversize_refusal_is_terminal {
+    use super::*;
+
+    /// ⭐ noetl/worker#326 — a frame-cap refusal must latch, and clear only when
+    /// an append actually lands.
+    #[test]
+    fn a_refusal_latches_until_an_append_lands() {
+        assert!(!oversize_refusal_outstanding(), "starts clear");
+
+        note_oversize_refusal("tier-service append failed: write: refusing to write a 1500945-byte request frame; the reader cap is 1048576 bytes");
+        assert!(
+            oversize_refusal_outstanding(),
+            "a refusal must latch — the tier is now missing an event, and that \
+             stays true until something lands"
+        );
+
+        // ⚠ Repeats must not un-latch it. The same event will be refused every
+        // time it is retried, because its size does not change.
+        note_oversize_refusal("same event again");
+        assert!(oversize_refusal_outstanding(), "a repeat must not clear it");
+
+        note_append_landed();
+        assert!(
+            !oversize_refusal_outstanding(),
+            "an append that LANDS clears it — the tier is complete again"
+        );
+    }
+
+    /// ⚠⚠ The property the issue is actually about: while a refusal is
+    /// outstanding, the tier must not be described as having answered
+    /// authoritatively. This pins the branch; the log text itself is asserted by
+    /// reading the source in `tests/`.
+    #[test]
+    fn an_outstanding_refusal_suppresses_the_authoritative_claim() {
+        note_append_landed(); // ensure clear
+        assert!(!oversize_refusal_outstanding());
+
+        note_oversize_refusal("refusing to write a 1500945-byte request frame");
+        assert!(
+            oversize_refusal_outstanding(),
+            "the promotion log branches on exactly this predicate; if it reads \
+             false while an append was refused, the INFO line claims the tier \
+             answered authoritatively milliseconds after refusing a write"
+        );
+        note_append_landed();
+    }
+
+    /// The classifier must recognise the writer's own wording, in both the
+    /// request and reply directions.
+    #[test]
+    fn the_writers_own_refusal_wording_is_classified() {
+        for msg in [
+            "tier-service append failed: write: refusing to write a 1500945-byte request frame; the reader cap is 1048576 bytes",
+            "tier-service append failed: read: tier-service frame of 1174874 bytes exceeds the 1048576-byte cap",
+        ] {
+            assert!(
+                msg.contains("refusing to write") || msg.contains("exceeds the"),
+                "the classifier must match the message the writer actually emits: {msg}"
+            );
+        }
+        // …and must NOT fire on an ordinary transient failure, or every blip
+        // would suppress the authoritative claim.
+        let transient = "tier-service append failed: connection refused";
+        assert!(
+            !(transient.contains("refusing to write") || transient.contains("exceeds the")),
+            "a transient failure must not be classified as an oversize refusal"
+        );
     }
 }
