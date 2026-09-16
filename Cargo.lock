@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "noetl-worker"
-version = "5.133.1"
+version = "6.0.0"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
@@ -5452,9 +5452,9 @@ checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-ident"
-version = "1.0.24"
+version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+checksum = "ab72a15cf68d77cb0987d3684aa8a45c5ef827e8cb49ee2f30bfd7ba2feb519f"
 
 [[package]]
 name = "unicode-normalization"
