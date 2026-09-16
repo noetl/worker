@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.132.5](https://github.com/noetl/worker/compare/v5.132.4...v5.132.5) (2026-09-16)
+
+### Bug Fixes
+
+* **result:** emit the canonical _uri so hydration cannot depend on a per-pool flag ([2938909](https://github.com/noetl/worker/commit/293890933a207200ae1c7d48bc7bd49ef650c0a4)), closes [#104](https://github.com/noetl/worker/issues/104)
+
 ## [5.132.4](https://github.com/noetl/worker/compare/v5.132.3...v5.132.4) (2026-09-15)
 
 ### Bug Fixes
