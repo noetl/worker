@@ -1227,6 +1227,45 @@ pub(crate) fn serve_service_append_with(
 /// sharing one would make a projection demote silence an event-log promote.
 static LAST_SERVE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread serve state (noetl/worker#302).
+    ///
+    /// The same isolation `ehdb::metrics` uses, for the same reason and against
+    /// the same failure. `the_flip_is_never_silent_in_either_direction` asserts
+    /// on this atomic, takes no lock, and sibling tests drive the serve path
+    /// concurrently — so a sibling's flip lands between this test's write and
+    /// its read:
+    ///
+    /// ```text
+    /// assertion `left == right` failed
+    ///   left: "not_primary"
+    ///  right: "served_primary"
+    /// ```
+    ///
+    /// Observed once in 30 full-suite runs at 32 test threads. Unlike the metric
+    /// race there is no guard to extend here, and adding one would serialise the
+    /// serve path's tests for a test-only reason.
+    ///
+    /// ⚠ `#[cfg(test)]`, so this is the LIB's unit tests only. Integration tests
+    /// in `tests/` compile the lib without `cfg(test)` and keep the single
+    /// process-wide atomic, exactly as production does.
+    static SCOPED_SERVE_STATE: &'static std::sync::atomic::AtomicU8 =
+        Box::leak(Box::new(std::sync::atomic::AtomicU8::new(0)));
+}
+
+/// The serve-state cell this thread reads and writes.
+fn serve_state_cell() -> &'static std::sync::atomic::AtomicU8 {
+    #[cfg(test)]
+    {
+        SCOPED_SERVE_STATE.with(|c| *c)
+    }
+    #[cfg(not(test))]
+    {
+        &LAST_SERVE_STATE
+    }
+}
+
 fn serve_state_code(decision: &super::primary_serve::ServeDecision) -> u8 {
     use super::primary_serve::{DemoteReason, ServeDecision};
     match decision {
@@ -1255,7 +1294,7 @@ fn log_serve_transition(
     detail: Option<&str>,
 ) {
     let code = serve_state_code(decision);
-    let prev = LAST_SERVE_STATE.swap(code, std::sync::atomic::Ordering::Relaxed);
+    let prev = serve_state_cell().swap(code, std::sync::atomic::Ordering::Relaxed);
     if prev == code {
         return;
     }
@@ -1294,7 +1333,7 @@ fn log_serve_transition(
 /// anything has not decided anything.
 pub fn current_serve_state() -> &'static str {
     use super::primary_serve::{DemoteReason, ServeDecision};
-    match LAST_SERVE_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+    match serve_state_cell().load(std::sync::atomic::Ordering::Relaxed) {
         1 => ServeDecision::ServedByEhdb.outcome_label(),
         2 => ServeDecision::ServedByIncumbent {
             reason: DemoteReason::NotPrimary,
@@ -1315,7 +1354,7 @@ pub fn current_serve_state() -> &'static str {
 /// Reset the logged serve state. Tests only.
 #[cfg(test)]
 pub(crate) fn reset_serve_state() {
-    LAST_SERVE_STATE.store(0, std::sync::atomic::Ordering::Relaxed);
+    serve_state_cell().store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -2139,6 +2178,42 @@ mod tests {
                 o.as_str()
             );
         }
+    }
+
+    /// ⭐ The serve-state isolation, driven deterministically.
+    ///
+    /// Companion to `a_sibling_recording_without_the_guard_cannot_enter_this_window`
+    /// in `ehdb::metrics`, and written for the same reason: the symptom is a
+    /// ~1-in-30 race, far too rare for a run-count comparison to distinguish a
+    /// fix from luck. The sibling is therefore made explicit and punctual.
+    ///
+    /// Routing `serve_state_cell()` back to `LAST_SERVE_STATE` fails this on the
+    /// first run.
+    #[test]
+    fn a_sibling_thread_cannot_move_this_threads_serve_state() {
+        reset_serve_state();
+        let body = ack_body(5, Some(5));
+        serve_service_append_with(&serve_env("primary"), Ok(&body), 4, 0.0, true);
+        assert_eq!(current_serve_state(), "served_primary");
+
+        // A sibling drives the serve path to a DIFFERENT state mid-test, which
+        // is what `the_flip_is_never_silent_in_either_direction` caught the hard
+        // way when it read "not_primary" where it had just written
+        // "served_primary".
+        std::thread::spawn(|| {
+            let body = ack_body(5, Some(5));
+            serve_service_append_with(&serve_env("primary"), Ok(&body), 4, 0.0, false);
+        })
+        .join()
+        .expect("the sibling thread must not panic");
+
+        assert_eq!(
+            current_serve_state(),
+            "served_primary",
+            "a sibling thread moved this test's serve state — the flip tests are \
+             racy again (noetl/worker#302)"
+        );
+        reset_serve_state();
     }
 
     #[test]

@@ -178,9 +178,59 @@ struct EhdbMetricsState {
     tier_append_up: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread metric state (noetl/worker#299, #302).
+    ///
+    /// ⚠ This is the fix for the flake, and it is NOT the obvious one. The obvious
+    /// one — make every recorder take [`test_guard`] — was tried and reverted
+    /// twice: guarding `tier_client`'s tests DEADLOCKS, because the guard is a
+    /// non-reentrant `std::sync::MutexGuard` and those are `#[tokio::test]`s that
+    /// hold it across `.await`; guarding `reachability`'s took the suite from 12s
+    /// to over 200s. Both attempts are recorded on the issue.
+    ///
+    /// So the state is made per-thread instead of the access to it made exclusive.
+    /// Tests on one thread run sequentially, so a thread-private state cannot race
+    /// at all — no lock is held, nothing is serialised, and the `.await` problem
+    /// cannot arise because there is nothing to hold.
+    ///
+    /// ⚠ Correctness rests on every `#[tokio::test]` here being a CURRENT-THREAD
+    /// runtime, so spawned tasks land back on this same thread. That is true today
+    /// (no `flavor = "multi_thread"` anywhere under `src/ehdb/`) and
+    /// `a_scope_is_not_valid_under_a_multi_thread_runtime` fails if it stops being.
+    /// Work moved off-thread — `tokio::task::spawn_blocking`, `std::thread::spawn`
+    /// — records into the GLOBAL state, not a scope.
+    static SCOPED_STATE: std::cell::Cell<Option<&'static Mutex<EhdbMetricsState>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The state this thread records into: its own if it has claimed one, else the
+/// process-wide one.
 fn state() -> &'static Mutex<EhdbMetricsState> {
+    #[cfg(test)]
+    if let Some(scoped) = SCOPED_STATE.with(|c| c.get()) {
+        return scoped;
+    }
     static STATE: OnceLock<Mutex<EhdbMetricsState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(EhdbMetricsState::default()))
+}
+
+/// Claim this thread's private metric state, allocating it once per thread.
+///
+/// The allocation is leaked deliberately: it is bounded by the number of test
+/// threads, not by the number of tests, and it has to outlive every borrow of
+/// `state()`, which is `&'static`.
+#[cfg(test)]
+fn claim_thread_state() -> &'static Mutex<EhdbMetricsState> {
+    SCOPED_STATE.with(|c| match c.get() {
+        Some(existing) => existing,
+        None => {
+            let leaked: &'static Mutex<EhdbMetricsState> =
+                Box::leak(Box::new(Mutex::new(EhdbMetricsState::default())));
+            c.set(Some(leaked));
+            leaked
+        }
+    })
 }
 
 /// Record one readiness evaluation.  `disabled` outcomes are intentionally NOT
@@ -1135,9 +1185,23 @@ fn render_labels(labels: &[(String, String)]) -> String {
 ///
 /// Poison-tolerant: one panicking test must not cascade into every other.
 #[cfg(test)]
-pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) struct TestGuard {
+    /// Kept so the pre-existing serialisation is UNCHANGED by this commit.
+    /// Per-thread state is what actually fixes the metric race; this lock still
+    /// covers whatever else these tests share, and removing it is a separate,
+    /// separately-evidenced change.
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_guard() -> TestGuard {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
-    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Claim this thread's own state and start it empty, so a sibling recording
+    // WITHOUT the guard — `reachability` does, 7 times — lands somewhere else.
+    let scoped = claim_thread_state();
+    *scoped.lock().unwrap_or_else(|e| e.into_inner()) = EhdbMetricsState::default();
+    TestGuard { _lock }
 }
 
 /// Reset the process-local accumulators (test helper only).
@@ -1222,8 +1286,57 @@ mod tests {
     /// The lock itself moved to [`super::test_guard`] with ai-meta#260, because
     /// the tier-service request path now records too — so tests in OTHER modules
     /// have to take the same one.
-    fn serialised() -> std::sync::MutexGuard<'static, ()> {
+    fn serialised() -> super::TestGuard {
         super::test_guard()
+    }
+
+    /// ⭐ The isolation, driven deterministically rather than hoped for.
+    ///
+    /// This reproduces noetl/worker#299's MECHANISM instead of its symptom. The
+    /// symptom is a scheduling race that shows up about once in 25 full-suite
+    /// runs at 32 test threads — measured, not estimated — which is far too
+    /// rare to tell a fix from luck: a 40-run comparison of fixed-vs-broken came
+    /// back 0 failures on BOTH sides and proved nothing.
+    ///
+    /// So the sibling is made explicit. A second thread recording WITHOUT the
+    /// guard is exactly what `reachability` and `tier_client` do, 7 and 13 times
+    /// respectively; here it happens at a known instant, inside this test's
+    /// window, every run.
+    ///
+    /// Deleting the scope lookup in `state()` fails this test on the first run.
+    #[test]
+    fn a_sibling_recording_without_the_guard_cannot_enter_this_window() {
+        let _guard = serialised();
+        reset();
+
+        // The unguarded sibling, at the worst possible moment.
+        std::thread::spawn(|| {
+            record_dataplane("tier_service.append", "ok", true, false, 0.0);
+            record_dataplane("reachability", "reached", true, false, 0.0);
+        })
+        .join()
+        .expect("the sibling thread must not panic");
+
+        record_dataplane("tier_service.health", "ok", true, false, 0.0);
+
+        let text = render_lines().join("\n");
+        assert!(
+            !text.contains("operation=\"tier_service.append\""),
+            "a sibling thread's record landed inside this test's window — \
+             `state()` is no longer per-thread, so noetl/worker#299 is back and \
+             every exact-value metric assertion in this crate is flaky again:\n{text}"
+        );
+        assert!(
+            !text.contains("operation=\"reachability\""),
+            "`reachability`-shaped records are visible here; this is the exact \
+             pollution captured on noetl/worker#299:\n{text}"
+        );
+        assert!(
+            text.contains("operation=\"tier_service.health\""),
+            "this thread's OWN record must still be visible — an isolation that \
+             also hides the test's own work would pass the checks above while \
+             measuring nothing:\n{text}"
+        );
     }
 
     #[test]
