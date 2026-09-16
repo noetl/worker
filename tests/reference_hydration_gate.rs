@@ -243,3 +243,80 @@ fn the_producer_always_emits_the_canonical_uri_beside_the_ref() {
 // verified to fail when the fall-through is removed. A source-level grep for the
 // same property matched dead code under a negative control and was dropped rather
 // than kept as a guard that cannot fail.
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#348 — the kv/object shadow tiers write somewhere durable.
+// ---------------------------------------------------------------------------
+
+const CONTROL_PLANE_RS: &str = include_str!("../src/client/control_plane.rs");
+const SPOOL_RUNTIME_RS: &str = include_str!("../src/spool_runtime.rs");
+
+/// Both live shadow mirrors must reach the DURABLE tier store, not only the
+/// pod-local reference driver.
+///
+/// ⚠ THE DEFECT. `mirror_live_put` writes under
+/// `NOETL_EHDB_LOCAL_REFERENCE_LOG`, which on prod resolves inside `/tmp/ehdb`
+/// — the container's writable layer, with no volumeMount. Measured across three
+/// prod pods: every store had been created within ~3 minutes of its own pod's
+/// start, and a pod rolled minutes earlier had none at all. The kv and object
+/// shadow tiers were destroyed on every roll, so `object_ops_total{mirror} 34`
+/// described a count since that pod booted rather than a tier accumulating
+/// anything.
+///
+/// A shadow tier exists to accumulate the evidence that justifies a cutover.
+/// If either of these call sites loses its durable append, that stops being
+/// true again — silently, because the local mirror keeps succeeding and the
+/// metric keeps moving.
+#[test]
+fn both_live_shadow_mirrors_also_append_to_the_durable_tier_store() {
+    for (label, src, needle) in [
+        (
+            "client/control_plane.rs (object)",
+            CONTROL_PLANE_RS,
+            "tier_shadow::mirror_object(",
+        ),
+        (
+            "spool_runtime.rs (kv)",
+            SPOOL_RUNTIME_RS,
+            "tier_shadow::mirror_kv(",
+        ),
+    ] {
+        let prod: String = src
+            .split_once("\n#[cfg(test)]")
+            .map_or(src, |(b, _)| b)
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prod.contains(needle),
+            "{label} no longer appends to the durable shadow tier ({needle}).\n\
+             Its records would go only to the pod-local reference driver, which\n\
+             on prod lives on ephemeral container storage and is destroyed on\n\
+             every pod roll."
+        );
+    }
+}
+
+/// The durable append must not replace the local one.
+///
+/// The local reference driver is what `shadow_suite` and the read-back parity
+/// checks already exercise; silently moving them onto the tier store would
+/// change what those measure while looking like a storage improvement.
+#[test]
+fn the_durable_append_is_additive_to_the_local_mirror() {
+    for (label, src, local) in [
+        (
+            "control_plane object hook",
+            CONTROL_PLANE_RS,
+            "object::mirror_live_put(",
+        ),
+        ("spool_runtime kv hook", SPOOL_RUNTIME_RS, "kv::mirror_live_put("),
+    ] {
+        assert!(
+            src.contains(local),
+            "{label} dropped the local mirror ({local}) — the durable append is \
+             additive, not a replacement"
+        );
+    }
+}

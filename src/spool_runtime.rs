@@ -734,6 +734,12 @@ impl SpoolRuntime {
         // failure so the authoritative NATS-KV path is never affected.
         if let (Some(env), Some(value)) = (&self.ehdb_kv_hook, mirror_value) {
             let _ = crate::ehdb::kv::mirror_live_put(env, CIRCUIT_KV_BUCKET, &self.kv_key, &value);
+            // noetl/ai-meta#348 — and to the DURABLE shadow store as well. See
+            // the object hook in `client/control_plane.rs` for why both: the
+            // line above writes to the pod-local reference driver, which does
+            // not survive a pod roll.
+            let _ = crate::ehdb::tier_shadow::mirror_kv(CIRCUIT_KV_BUCKET, &self.kv_key, &value)
+                .await;
         }
     }
 
