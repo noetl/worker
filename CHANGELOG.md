@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.133.1](https://github.com/noetl/worker/compare/v5.133.0...v5.133.1) (2026-09-16)
+
+### Bug Fixes
+
+* **ehdb:** an oversize frame refusal is terminal, and stops the false claim ([69b4716](https://github.com/noetl/worker/commit/69b47160c6432e0775ae0b1847582de2cf030aa3)), closes [noetl/worker#326](https://github.com/noetl/worker/issues/326) [noetl/worker#302](https://github.com/noetl/worker/issues/302) [noetl/worker#299](https://github.com/noetl/worker/issues/299)
+
 ## [5.133.0](https://github.com/noetl/worker/compare/v5.132.7...v5.133.0) (2026-09-16)
 
 ### Features
