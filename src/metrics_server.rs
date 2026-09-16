@@ -238,7 +238,15 @@ async fn ehdb_tier_query_handler(
     // exist.
     match crate::ehdb::store_tier::StoreTier::parse(&tier) {
         Some(t @ crate::ehdb::store_tier::StoreTier::Projection)
-        | Some(t @ crate::ehdb::store_tier::StoreTier::Catalog) => {
+        | Some(t @ crate::ehdb::store_tier::StoreTier::Catalog)
+        // noetl/ai-meta#348 — kv and object gained a durable store behind the
+        // tier service, so they are read from it too. Before that their shadow
+        // records lived in `/tmp/ehdb` on the container's writable layer and
+        // did not survive a pod roll; a read path over that would have
+        // advertised a surface answering empty indistinguishably from a
+        // misconfigured writer.
+        | Some(t @ crate::ehdb::store_tier::StoreTier::Kv)
+        | Some(t @ crate::ehdb::store_tier::StoreTier::Object) => {
             return ehdb_service_tier_query(t, &raw).await;
         }
         _ => {}
@@ -484,6 +492,16 @@ fn current_serve_state_for(tier: crate::ehdb::store_tier::StoreTier) -> &'static
         // for it would publish a label describing a decision nothing makes.
         crate::ehdb::store_tier::StoreTier::Catalog => {
             crate::ehdb::store_tier::CATALOG_SERVE_STATE
+        }
+        // KV and object have a durable store (noetl/ai-meta#348) and no
+        // read-serve path. Their incumbents — NATS-KV and the external object
+        // store — remain authoritative; giving the derived shadow copy a home
+        // that survives a pod roll says nothing about serving from it, and a
+        // label an operator could read as "serving" is the drift this codebase
+        // keeps finding.
+        crate::ehdb::store_tier::StoreTier::Kv
+        | crate::ehdb::store_tier::StoreTier::Object => {
+            crate::ehdb::store_tier::NOT_WIRED_SERVE_STATE
         }
     }
 }
@@ -882,6 +900,13 @@ async fn ehdb_tier_append_handler(
                         crate::ehdb::store_tier::StoreTier::Catalog => {
                             (None, crate::ehdb::store_tier::catalog_append_label(reply))
                         }
+                        // Same as catalog: stored, not served, so the append is
+                        // recorded rather than scored. A serve decision here
+                        // would be a verdict about a read nothing performs.
+                        crate::ehdb::store_tier::StoreTier::Kv
+                        | crate::ehdb::store_tier::StoreTier::Object => {
+                            (None, crate::ehdb::store_tier::append_label(reply))
+                        }
                     };
                     if let Some(s) = seq {
                         previous_sequence = s;
@@ -932,6 +957,11 @@ async fn ehdb_tier_append_handler(
                     // not scored.
                     crate::ehdb::store_tier::StoreTier::Catalog => {
                         (None, crate::ehdb::store_tier::catalog_append_label(reply))
+                    }
+                    // See the batch path above.
+                    crate::ehdb::store_tier::StoreTier::Kv
+                    | crate::ehdb::store_tier::StoreTier::Object => {
+                        (None, crate::ehdb::store_tier::append_label(reply))
                     }
                 };
                 if let Some(s) = seq {

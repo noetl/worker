@@ -59,6 +59,12 @@ pub const PROJECTION_MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_PROJECTION_MIRROR_SOU
 /// reading either one.
 pub const CATALOG_MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_CATALOG_MIRROR_SOURCE";
 
+/// The KV shadow tier's mirror source (noetl/ai-meta#348).
+pub const KV_MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_KV_MIRROR_SOURCE";
+
+/// The object shadow tier's mirror source (noetl/ai-meta#348).
+pub const OBJECT_MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_OBJECT_MIRROR_SOURCE";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirrorSource {
     /// Today's behaviour: the worker's emit chokepoint mirrors what it emits.
@@ -99,6 +105,8 @@ impl MirrorSource {
             StoreTier::EventLog => MIRROR_SOURCE_ENV,
             StoreTier::Projection => PROJECTION_MIRROR_SOURCE_ENV,
             StoreTier::Catalog => CATALOG_MIRROR_SOURCE_ENV,
+            StoreTier::Kv => KV_MIRROR_SOURCE_ENV,
+            StoreTier::Object => OBJECT_MIRROR_SOURCE_ENV,
         };
         Self::from_env_key(env, key)
     }
@@ -111,6 +119,8 @@ impl MirrorSource {
             StoreTier::EventLog => MIRROR_SOURCE_ENV,
             StoreTier::Projection => PROJECTION_MIRROR_SOURCE_ENV,
             StoreTier::Catalog => CATALOG_MIRROR_SOURCE_ENV,
+            StoreTier::Kv => KV_MIRROR_SOURCE_ENV,
+            StoreTier::Object => OBJECT_MIRROR_SOURCE_ENV,
         }
     }
 
