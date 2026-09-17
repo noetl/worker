@@ -28,3 +28,10 @@ target
 # (CI resolves from the network); it exists so offline `--locked --offline`
 # builds work locally.
 vendor/
+
+# Alternate cargo target dirs used for the musl/kind image builds. `target` is
+# already ignored, but that pattern does not match these siblings — and they are
+# build output, recreated on demand. Untracked 1.7 GB of `target-kind` sat here
+# until 2026-09-17, one `git add -A` away from a rejected push.
+target-kind/
+target-*/
