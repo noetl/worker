@@ -602,6 +602,27 @@ pub struct WorkerMetrics {
     pub state_materializer_open_shards: IntGauge,
     /// Latency of one state-materializer drain→project→write→ack cycle.
     pub state_materializer_cycle_duration_seconds: Histogram,
+
+    // --- CQRS projector (noetl/server#203 phase 2b-2) ------------------------
+    /// Events drained from the events feed by the projector loop.
+    pub projector_drained_total: IntCounter,
+    /// Executions `projection/advance` reported as advanced.
+    pub projector_advanced_total: IntCounter,
+    /// Events acked — their execution advanced, so the cursor may move past them.
+    pub projector_acked_total: IntCounter,
+    /// ⚠ THE NACK SURFACE. Events deliberately left UN-ACKED because the
+    /// execution they belong to did not advance. Nothing is lost: they
+    /// redeliver. A number that keeps climbing without `advanced` climbing is a
+    /// stuck execution, which is what this metric exists to make visible.
+    pub projector_held_total: IntCounter,
+    /// Events carrying no usable `execution_id`. Acked, because nothing can
+    /// ever advance them and holding them would poison-loop the cursor — but
+    /// counted, because "acked without doing anything" must never be silent.
+    pub projector_unaddressable_total: IntCounter,
+    /// Projector cycle failures by `reason` (`http`, `partial`, `ack`).
+    pub projector_errors_total: IntCounterVec,
+    /// Latency of one projector drain→advance→ack cycle.
+    pub projector_cycle_duration_seconds: Histogram,
 }
 
 impl WorkerMetrics {
@@ -1757,6 +1778,74 @@ impl WorkerMetrics {
             .register(Box::new(state_materializer_cycle_duration_seconds.clone()))
             .expect("register state_materializer_cycle_duration_seconds");
 
+        let projector_drained_total = IntCounter::new(
+            "noetl_worker_projector_drained_total",
+            "Events drained from the events feed by the CQRS projector (noetl/server#203).",
+        )
+        .expect("projector_drained_total metric");
+        registry
+            .register(Box::new(projector_drained_total.clone()))
+            .expect("register projector_drained_total");
+
+        let projector_advanced_total = IntCounter::new(
+            "noetl_worker_projector_advanced_total",
+            "Executions advanced by projection/advance (its `advanced[]` length).",
+        )
+        .expect("projector_advanced_total metric");
+        registry
+            .register(Box::new(projector_advanced_total.clone()))
+            .expect("register projector_advanced_total");
+
+        let projector_acked_total = IntCounter::new(
+            "noetl_worker_projector_acked_total",
+            "Events acked by the projector — their execution advanced.",
+        )
+        .expect("projector_acked_total metric");
+        registry
+            .register(Box::new(projector_acked_total.clone()))
+            .expect("register projector_acked_total");
+
+        let projector_held_total = IntCounter::new(
+            "noetl_worker_projector_held_total",
+            "Events deliberately left UN-ACKED because their execution did not advance; they redeliver. Climbing while advanced_total is flat means a stuck execution.",
+        )
+        .expect("projector_held_total metric");
+        registry
+            .register(Box::new(projector_held_total.clone()))
+            .expect("register projector_held_total");
+
+        let projector_unaddressable_total = IntCounter::new(
+            "noetl_worker_projector_unaddressable_total",
+            "Events with no usable execution_id: acked so they cannot poison-loop the cursor, counted so that ack is never silent.",
+        )
+        .expect("projector_unaddressable_total metric");
+        registry
+            .register(Box::new(projector_unaddressable_total.clone()))
+            .expect("register projector_unaddressable_total");
+
+        let projector_errors_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_projector_errors_total",
+                "Projector cycle failures by reason (http, partial, ack).",
+            ),
+            &["reason"],
+        )
+        .expect("projector_errors_total metric");
+        registry
+            .register(Box::new(projector_errors_total.clone()))
+            .expect("register projector_errors_total");
+
+        let projector_cycle_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_worker_projector_cycle_duration_seconds",
+                "Latency of one projector drain-advance-ack cycle.",
+            ),
+        )
+        .expect("projector_cycle_duration_seconds metric");
+        registry
+            .register(Box::new(projector_cycle_duration_seconds.clone()))
+            .expect("register projector_cycle_duration_seconds");
+
         Self {
             registry,
             pulls_total,
@@ -1853,6 +1942,13 @@ impl WorkerMetrics {
             state_materializer_evicted_total,
             state_materializer_open_shards,
             state_materializer_cycle_duration_seconds,
+            projector_drained_total,
+            projector_advanced_total,
+            projector_acked_total,
+            projector_held_total,
+            projector_unaddressable_total,
+            projector_errors_total,
+            projector_cycle_duration_seconds,
         }
     }
 
@@ -2079,6 +2175,54 @@ pub fn record_container_poll_terminal(state: &str, duration_secs: f64) {
         .inc();
     m.container_poll_duration_seconds.observe(duration_secs);
 }
+/// Record one projector cycle (noetl/server#203 phase 2b-2).
+///
+/// ⚠ `held` is not an error count and not a loss count — it is the number of
+/// events this cycle deliberately did NOT ack because their execution failed to
+/// advance. They redeliver. It is reported separately from `acked` precisely so
+/// a stuck execution shows up as "held climbing while advanced stays flat",
+/// rather than hiding inside a single throughput number.
+pub fn record_projector_cycle(
+    drained: u64,
+    advanced: u64,
+    acked: u64,
+    held: u64,
+    duration_seconds: f64,
+) {
+    let m = WorkerMetrics::global();
+    if drained > 0 {
+        m.projector_drained_total.inc_by(drained);
+    }
+    if advanced > 0 {
+        m.projector_advanced_total.inc_by(advanced);
+    }
+    if acked > 0 {
+        m.projector_acked_total.inc_by(acked);
+    }
+    if held > 0 {
+        m.projector_held_total.inc_by(held);
+    }
+    m.projector_cycle_duration_seconds.observe(duration_seconds);
+}
+
+/// Events acked without advancing anything, because they carry no usable
+/// `execution_id`. Counted so that ack is never silent.
+pub fn record_projector_unaddressable(n: u64) {
+    if n > 0 {
+        WorkerMetrics::global()
+            .projector_unaddressable_total
+            .inc_by(n);
+    }
+}
+
+/// A projector cycle failure. `reason` is `http`, `partial` or `ack`.
+pub fn record_projector_error(reason: &str) {
+    WorkerMetrics::global()
+        .projector_errors_total
+        .with_label_values(&[reason])
+        .inc();
+}
+
 
 /// Record one materializer drain→project→ack cycle (noetl/ai-meta#103).
 /// `drained` messages were pulled; `projected`/`duplicates` came back from
