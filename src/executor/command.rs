@@ -4379,6 +4379,61 @@ mod tests {
         )));
     }
 
+    /// noetl/ai-meta#199 Slice A — the shape a REAL command actually carries.
+    ///
+    /// The tests above build `ToolConfig` by hand. In kind, a playbook step
+    /// declaring `sink: true` produced this `command.issued` payload (copied
+    /// verbatim from `noetl.event`):
+    ///
+    /// ```json
+    /// {"args":{},"tool_config":{"args":{"message":"sink probe"},
+    ///  "code":"result = {\"status\": \"ok\"}\n","sink":true}, ...}
+    /// ```
+    ///
+    /// and the step ran to `command.completed success` while
+    /// `noetl_worker_sink_signal_total` stayed absent — i.e. the predicate
+    /// returned false on a step the author had marked. Note the inner object
+    /// carries **no `kind`**, which the hand-built fixtures always supply.
+    ///
+    /// ⚠ MEASURED, because the shape matters more than it looks. Feeding that
+    /// payload to `ToolConfig` *verbatim* does not yield a config with the sink
+    /// flag missing — it **fails outright**: `missing field `kind``.
+    /// `ToolConfig` carries `#[serde(flatten)] config`, so `kind` is a required
+    /// named field and every other key lands in `config`. That is precisely why
+    /// the dispatch path injects `kind` from `Command.tool_kind` before
+    /// deserializing; this test supplies it for the same reason, so the `sink`
+    /// question is isolated rather than masked by a deserialization error.
+    ///
+    /// ⚠ So this does NOT reproduce the original observation — it cannot, since
+    /// the verbatim payload never deserializes. What it pins is the half no
+    /// other test covers: that `#[serde(flatten)]` actually routes `sink` into
+    /// `config`, where `command_declares_sink` looks for it. Every other sink
+    /// test builds `ToolConfig` by hand via `tc()`, so a change to that serde
+    /// contract — a rename, a `deny_unknown_fields`, a move to a named field —
+    /// would leave them all green while the real path silently stopped seeing
+    /// author-declared sinks. This is the only test in this file that
+    /// deserializes a `ToolConfig` at all.
+    #[test]
+    fn command_declares_sink_on_the_real_command_shape() {
+        let inner = serde_json::json!({
+            "args": { "message": "sink probe" },
+            "code": "result = {\"status\": \"ok\"}\n",
+            "sink": true,
+            // `kind` is injected by the dispatch path before deserialization;
+            // supply it here so this test isolates the `sink` question.
+            "kind": "python"
+        });
+        let cfg: ToolConfig =
+            serde_json::from_value(inner).expect("the real command shape must deserialize");
+        assert_eq!(cfg.kind, "python");
+        assert!(
+            command_declares_sink(&cfg),
+            "a step whose command carries sink:true must be treated as a sink; \
+             config was {:?}",
+            cfg.config
+        );
+    }
+
     #[test]
     fn command_declares_sink_looks_through_task_sequence() {
         // The orchestrator wraps a step's tool(s) in a task_sequence, so the sink
