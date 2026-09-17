@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [6.0.0](https://github.com/noetl/worker/compare/v5.133.1...v6.0.0) (2026-09-16)
+
+### ⚠ BREAKING CHANGES
+
+* lift the noetl-tools hold to 4.0.x with noetl-executor 0.10
+
+### Build System
+
+* lift the noetl-tools hold to 4.0.x with noetl-executor 0.10 ([2a0a598](https://github.com/noetl/worker/commit/2a0a5985ac17da9b91d852f1c7c9348d3d2a85bc)), closes [noetl/cli#89](https://github.com/noetl/cli/issues/89) [noetl/tools#99](https://github.com/noetl/tools/issues/99) [#100](https://github.com/noetl/worker/issues/100) [noetl/ai-meta#330](https://github.com/noetl/ai-meta/issues/330) [noetl/ai-meta#344](https://github.com/noetl/ai-meta/issues/344)
+
 ## [5.133.1](https://github.com/noetl/worker/compare/v5.133.0...v5.133.1) (2026-09-16)
 
 ### Bug Fixes

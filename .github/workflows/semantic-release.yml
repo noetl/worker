@@ -62,5 +62,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)"
+          # ⚠ Take the version from semantic-release, NOT from Cargo.toml.
+          # Since noetl/ai-meta#330 the bot no longer pushes the version bump to
+          # `main` (a required status check rejects that push), so Cargo.toml is
+          # a stale FLOOR here. Reading it would dispatch a release for the
+          # PREVIOUS version — and it would look entirely successful.
+          VERSION="${{ steps.semantic.outputs.new_release_version }}"
+          if [[ -z "${VERSION}" ]]; then
+            echo "no new_release_version from semantic-release; refusing to guess" >&2
+            exit 1
+          fi
           gh workflow run release.yml --ref main -f version="${VERSION}"

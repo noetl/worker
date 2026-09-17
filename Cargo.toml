@@ -1,6 +1,6 @@
 [package]
 name = "noetl-worker"
-version = "5.133.1"
+version = "6.0.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"
@@ -226,9 +226,25 @@ wasmtime = { version = "27", optional = true }
 # This is the worker#183 shape again — **a caret range is a decision made later
 # by a resolver**, and there it silently dropped DuckDB from the shipped image.
 #
-# Lift this only together with `noetl-executor` (0.9.x is published and presumably
-# carries the new field); the two move as a pair.
-noetl-tools = "~3.26.3"
+# Lift this only together with `noetl-executor`; the two move as a pair.
+#
+# ⚠ LIFTED TO 4.0.x, AND STILL HELD (noetl/ai-meta#330).  noetl-tools 4.0 seals
+# `ToolResult` with `#[non_exhaustive]`, which removes the EXACT mechanism that
+# broke 3.27.0: a field added to that struct can no longer break a downstream
+# literal, because downstream can no longer write one.  That is the whole point
+# of spending a major on it.
+#
+# It is still `~4.0` rather than `^4`, because what 4.0 bought is that ONE class
+# of accidental breakage is gone -- not that minor releases are now provably
+# safe.  A new enum variant elsewhere in the crate, or a changed default, would
+# break a resolve exactly as before, and it would still happen on the RELEASE
+# commit, after every PR gate has passed.  The guard in src/lib.rs holds the
+# shape; lifting to `^4` is a deliberate decision with evidence, not a default.
+#
+# Requires noetl-executor >= 0.10.0 (noetl/cli#89), which is the first version
+# built against noetl-tools 4.x.  4.0.1 also carries noetl/tools#99 and #100,
+# which have been merged and undeployable behind this pin.
+noetl-tools = "~4.0"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
@@ -243,7 +259,7 @@ noetl-tools = "~3.26.3"
 # See Appendix H of the global hybrid cloud blueprint at
 # https://noetl.dev/docs/architecture/noetl_global_hybrid_cloud_grid_distributed_architecture_blueprint
 # and especially § H.10 (the tree-walker vs pull-model finding).
-noetl-executor = "0.5"
+noetl-executor = "0.10"
 
 # Same-node zero-copy IPC cache for over-budget tool results
 # (R-2.1 / noetl/cli#39).  When `call.done`'s serialised
