@@ -48,6 +48,107 @@ pub use config::WorkerConfig;
 pub use subscription::SubscriptionRuntime;
 pub use worker::Worker;
 
+/// Release-pipeline guards (noetl/ai-meta#330).
+///
+/// Nothing here runs at runtime — these assert facts about the release
+/// workflows that no unit test could otherwise reach.
+#[cfg(test)]
+mod release_pipeline {
+    /// ⚠⚠ **Every job that builds an artifact MUST stamp the version first.**
+    ///
+    /// The bot no longer pushes a version bump to `main` — a required status
+    /// check rejects that push, because the commit is `[skip ci]` so the check
+    /// never runs on it and stays "expected" forever. The tag is authoritative
+    /// now, and the checked-out tree carries a stale floor in `Cargo.toml`.
+    ///
+    /// `CARGO_PKG_VERSION` is compiled into the binary and reported as
+    /// `noetl_worker_build_info{version="..."}`. A build job that skips the
+    /// stamp still compiles, still pushes an image, still deploys, still passes
+    /// every health check — and reports the PREVIOUS version forever. There is
+    /// no failure to notice. That is exactly the shape this repo keeps paying
+    /// for, so it gets a guard rather than a comment.
+    #[test]
+    fn every_artifact_build_job_stamps_the_version() {
+        let wf = include_str!("../.github/workflows/release.yml");
+
+        // Split into top-level jobs: a line with exactly 2 spaces of indent
+        // ending in `:` starts one.
+        let mut jobs: Vec<(String, String)> = Vec::new();
+        let mut name = String::new();
+        let mut body = String::new();
+        for line in wf.lines() {
+            let is_job_header = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.trim_end().ends_with(':')
+                && !line.trim_start().starts_with('#');
+            if is_job_header {
+                if !name.is_empty() {
+                    jobs.push((name.clone(), std::mem::take(&mut body)));
+                }
+                name = line.trim().trim_end_matches(':').to_string();
+            } else if !name.is_empty() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        if !name.is_empty() {
+            jobs.push((name, body));
+        }
+        assert!(
+            jobs.len() >= 4,
+            "job extraction broke — found {} jobs, so this guard is not \
+             inspecting what it claims to",
+            jobs.len()
+        );
+
+        // A job builds a shipped artifact if it invokes a container build.
+        let builders: Vec<&(String, String)> = jobs
+            .iter()
+            .filter(|(_, b)| {
+                b.contains("docker/build-push-action") || b.contains("gcloud builds submit")
+            })
+            .collect();
+        assert!(
+            !builders.is_empty(),
+            "no artifact-building job found in release.yml — the detector is \
+             matching nothing, which would make this guard vacuously green"
+        );
+
+        for (job, b) in builders {
+            assert!(
+                b.contains("ci/stamp-version.sh"),
+                "release.yml job `{job}` builds an artifact but never runs \
+                 ci/stamp-version.sh. The image would ship reporting the \
+                 version in the committed Cargo.toml floor, which is stale by \
+                 design since the bot stopped pushing to main."
+            );
+        }
+    }
+
+    /// ⚠ The release must not reintroduce a push to `main`.
+    ///
+    /// `@semantic-release/git` is the plugin that committed the version bump
+    /// and pushed it. Re-adding it re-breaks the release the moment a required
+    /// status check is on `main` — which is the whole reason this shape exists.
+    #[test]
+    fn semantic_release_does_not_push_to_main() {
+        let rc = include_str!("../.releaserc.json");
+        // ⚠ Match the QUOTED name. `@semantic-release/git` is a prefix of
+        // `@semantic-release/github`, which is still in use — a plain
+        // `contains` here reported the plugin as present when it was not. The
+        // first version of this guard did exactly that and failed on a correct
+        // config, which is the same substring-matching class as the mutation
+        // noetl/ai-meta#330's own guard nearly shipped.
+        assert!(
+            !rc.contains("\"@semantic-release/git\""),
+            "@semantic-release/git is back in .releaserc.json. It pushes the \
+             version bump to `main`, which a required status check rejects \
+             (GH006) — the commit is [skip ci], so the check never runs on it \
+             and stays `expected` forever."
+        );
+    }
+}
+
 /// Dependency-range guards.
 ///
 /// Nothing here runs at runtime — these assert facts about `Cargo.toml` that a
