@@ -230,18 +230,32 @@ pub static FENCING_METRICS: std::sync::LazyLock<Arc<FencingMetrics>> =
 /// in-memory store here would publish a token nothing else honours and a `1`
 /// that means nothing.
 pub fn render_election() -> String {
+    render_election_from(
+        super::election::ELECTION.is_active(),
+        super::election::ELECTION.epoch(),
+        super::election::ELECTION.rounds(),
+        super::election::ELECTION.errors(),
+    )
+}
+
+/// [`render_election`] as a **pure function of the state**.
+///
+/// ⚠ Split out because the gauge's whole purpose is to DIFFER between states,
+/// and a test that drove the process-global to prove that would race every
+/// other test in the binary — `cargo test` does not serialise tests.
+pub fn render_election_from(active: bool, epoch: u64, rounds: u64, errors: u64) -> String {
     let mut out = String::new();
     out.push_str("# HELP ehdb_election_active Whether a shard-lease election is running and issuing fencing tokens. 0 means single-writer rests on StatefulSet replicas:1 alone, and fencing enforce would be an outage.\n");
     out.push_str("# TYPE ehdb_election_active gauge\n");
     out.push_str(&format!(
         "ehdb_election_active {}\n",
-        u8::from(super::election::ELECTION.is_active())
+        u8::from(active)
     ));
     out.push_str("# HELP ehdb_election_epoch The fencing token this writer holds. 0 means no token has been issued.\n");
     out.push_str("# TYPE ehdb_election_epoch gauge\n");
     out.push_str(&format!(
         "ehdb_election_epoch {}\n",
-        super::election::ELECTION.epoch()
+        epoch
     ));
     // The POSITIVE CONTROL for the two gauges above. `active=1, epoch=0` is a
     // legitimate state (this process is not the holder) and so is a wedged
@@ -250,13 +264,13 @@ pub fn render_election() -> String {
     out.push_str("# TYPE ehdb_election_rounds_total counter\n");
     out.push_str(&format!(
         "ehdb_election_rounds_total {}\n",
-        super::election::ELECTION.rounds()
+        rounds
     ));
     out.push_str("# HELP ehdb_election_errors_total Election rounds that could not reach the lease store.\n");
     out.push_str("# TYPE ehdb_election_errors_total counter\n");
     out.push_str(&format!(
         "ehdb_election_errors_total {}\n",
-        super::election::ELECTION.errors()
+        errors
     ));
     out
 }
@@ -1338,50 +1352,57 @@ mod seal_age_env_tests {
 mod election_visibility_tests {
     use super::*;
 
+    /// ⚠⚠ REPLACES two placeholder guards that PASSED ACCIDENTALLY when the
+    /// election was wired — which is the failure they existed to prevent.
+    ///
+    /// `the_election_reports_itself_as_not_running` asserted the literal
+    /// `ehdb_election_active 0`. The derived renderer still emits exactly that
+    /// when nothing is elected, so it kept passing while saying nothing about
+    /// whether the value was derived or hard-coded.
+    ///
+    /// `the_election_is_still_unwired_in_this_build` scanned
+    /// `eventlog_backend.rs`, `command_bus.rs` and `event_bus.rs` for
+    /// `ShardElection`. The wiring landed in `worker.rs` / `ehdb/election.rs` —
+    /// **outside the scanned population** — so the guard reported a clean it had
+    /// not earned. A scan that is too narrow reports a false clean, and the only
+    /// defence is to publish the population it covers.
+    ///
+    /// What replaces them is the property itself: the gauge must CHANGE with
+    /// the state. A hard-coded renderer cannot pass this.
     #[test]
-    fn the_election_reports_itself_as_not_running() {
-        // ⚠⚠ This test is a placeholder that must FAIL when the election is
-        // actually wired — that is deliberate. If someone implements the K8s
-        // LeaseStore adapter and forgets to publish real state here, the scrape
-        // would keep asserting `0` while tokens were being issued, which is
-        // worse than no gauge: it would say fencing enforce is unsafe when it
-        // had become safe.
-        let text = render_election();
-        assert!(text.contains("ehdb_election_active 0\n"), "{text}");
-        assert!(text.contains("ehdb_election_epoch 0\n"), "{text}");
+    fn the_election_gauges_are_derived_not_hardcoded() {
+        let inert = render_election_from(false, 0, 0, 0);
+        assert!(inert.contains("ehdb_election_active 0\n"), "{inert}");
+        assert!(inert.contains("ehdb_election_epoch 0\n"), "{inert}");
+
+        let elected = render_election_from(true, 7, 42, 3);
+        assert!(
+            elected.contains("ehdb_election_active 1\n"),
+            "the gauge must follow the state, not a literal: {elected}"
+        );
+        assert!(elected.contains("ehdb_election_epoch 7\n"), "{elected}");
+        assert!(elected.contains("ehdb_election_rounds_total 42\n"), "{elected}");
+        assert!(elected.contains("ehdb_election_errors_total 3\n"), "{elected}");
+        assert_ne!(
+            inert, elected,
+            "the two renderings are identical — the gauge cannot distinguish an \
+             inert election from a running one, which is exactly what the \
+             hard-coded version did"
+        );
     }
 
+    /// The round counter must be present, because it is the POSITIVE CONTROL
+    /// for `active`: an election that is `active=1, epoch=0` is a legitimate
+    /// state (this process is not the holder) and so is a wedged loop.
     #[test]
-    fn the_election_is_still_unwired_in_this_build() {
-        // The guard that pairs with the gauge: if `ShardElection` ever gains a
-        // call site in this crate, `render_election` must stop hard-coding 0.
-        // Counts CODE, not prose.
-        let sources = [
-            include_str!("eventlog_backend.rs"),
-            include_str!("../command_bus.rs"),
-            include_str!("../event_bus.rs"),
-        ];
-        // ⚠⚠ Scan only the NON-TEST portion of each file. `include_str!` yields
-        // the whole file including this module, so the first two attempts both
-        // matched their own source: once on the bare name, and again on the very
-        // needle literals written to avoid that. A guard that counts itself is
-        // the same family as a counter that counts its own doc comment — and it
-        // took two turns to stop being self-referential.
-        let needle = concat!("Shard", "Election");
-        let wired = sources.iter().any(|src| {
-            src.split("#[cfg(test)]")
-                .next()
-                .unwrap_or("")
-                .lines()
-                .map(str::trim_start)
-                .filter(|l| !l.starts_with("//") && !l.starts_with('*'))
-                .any(|l| l.contains(needle))
-        });
-        assert!(
-            !wired,
-            "ShardElection now has a call site — render_election() must publish \
-             real state instead of a hard-coded 0, and noetl/ehdb#331's gate \
-             needs revisiting"
+    fn the_round_counter_separates_not_holder_from_wedged() {
+        let not_holder = render_election_from(true, 0, 9, 0);
+        let wedged = render_election_from(true, 0, 0, 0);
+        assert!(not_holder.contains("ehdb_election_rounds_total 9\n"));
+        assert!(wedged.contains("ehdb_election_rounds_total 0\n"));
+        assert_ne!(
+            not_holder, wedged,
+            "without the round counter these two states render identically"
         );
     }
 }
