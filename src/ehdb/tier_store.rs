@@ -204,6 +204,91 @@ fn event_id_from_payload(payload: &str) -> Option<String> {
     }
 }
 
+/// Env var selecting which backend serves the tier's **reads**
+/// (multi-region spec M0.5).
+pub const TIER_BACKEND_ENV: &str = "NOETL_EHDB_TIER_BACKEND";
+
+/// Which engine serves a tier read.
+///
+/// ## Why this exists
+///
+/// The production `primary` event-log tier does not run on `ehdb-l0`. It runs
+/// on [`LocalReferenceEventLogDriver`] over `ehdb_stream` — a line-oriented
+/// append-only file with no parts, no manifest, no seal and no replication.
+/// `ehdb-reference` does not even depend on `ehdb-l0`. So every L0 capability
+/// (N-way replica sets, failure domains, the unreplicated-window tracker,
+/// cold-load) is on the two *bus* engines in the same process, on different
+/// ports, and is unreachable from the tier.
+///
+/// Placement, survival goals and cross-region replication are therefore inert
+/// on the tier until it can be served by an L0-backed driver. This enum is the
+/// seam where that becomes selectable.
+///
+/// ## ⚠ Read path only
+///
+/// Only [`read_execution_locked`] and [`scan_locked`] consult this. `append`,
+/// `append_batch`, and the read-modify-write scan inside `append_locked` stay
+/// on the concrete driver — this change does not touch the write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TierBackend {
+    /// Today, and the default: `ehdb-reference` over `ehdb_stream`.
+    #[default]
+    LocalReference,
+    /// An `ehdb-l0`-backed driver. ⚠ **Not implemented.** Selecting it makes
+    /// reads fail loudly — see [`TierBackend::from_env`].
+    L0,
+}
+
+impl TierBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocalReference => "local_reference",
+            Self::L0 => "l0",
+        }
+    }
+
+    /// Parse from the environment.
+    ///
+    /// ⚠ An unrecognised value is `LocalReference`, matching the fail-safe
+    /// precedent in `EventLogMode::from_env` ("an unknown driver never
+    /// mirrors"): a typo must not silently move the tier's read path.
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var(TIER_BACKEND_ENV).ok().as_deref())
+    }
+
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("l0") => Self::L0,
+            _ => Self::LocalReference,
+        }
+    }
+}
+
+/// Resolve the backend for a tier **read**.
+///
+/// ⭐ Returns `Err` for [`TierBackend::L0`] rather than falling back to
+/// `LocalReference`. A silent fallback would make the flag look taken while
+/// changing nothing — the exact shape of `NOETL_EHDB_SEAL_MAX_AGE_MS`, which
+/// existed on the config struct and was never read from the env, so setting it
+/// on prod would have done nothing at all while reading as a mitigation.
+/// A loud refusal is the honest state until the L0 driver exists.
+fn read_driver(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    backend: TierBackend,
+) -> Result<LocalReferenceEventLogDriver, String> {
+    match backend {
+        TierBackend::LocalReference => Ok(driver(cfg, tier)),
+        TierBackend::L0 => Err(format!(
+            "tier backend '{}' is selected but not implemented: the L0-backed \
+             tier driver does not exist yet, and falling back to '{}' would make \
+             the flag look taken while changing nothing",
+            TierBackend::L0.as_str(),
+            TierBackend::LocalReference.as_str()
+        )),
+    }
+}
+
 fn driver(cfg: &TierStoreConfig, tier: StoreTier) -> LocalReferenceEventLogDriver {
     LocalReferenceEventLogDriver::new(
         cfg.path_for(tier),
@@ -477,7 +562,11 @@ fn read_execution_locked(
         after: None,
         limit: MAX_SCAN_LIMIT,
     };
-    match driver(cfg, tier).read_execution(&request) {
+    let d = match read_driver(cfg, tier, TierBackend::from_env()) {
+        Ok(d) => d,
+        Err(e) => return TierStoreOutcome::Error(e),
+    };
+    match d.read_execution(&request) {
         Ok(out) => {
             let mut v = serde_json::to_value(&out).unwrap_or(serde_json::Value::Null);
             // ⚠ The driver reports `exists: true` for an execution it holds NO
@@ -521,10 +610,14 @@ fn scan_locked(
     limit: usize,
 ) -> TierStoreOutcome {
     let limit = limit.clamp(1, MAX_SCAN_LIMIT);
-    match driver(cfg, tier).scan_global(&EventLogScanRequest { after, limit }) {
-        Ok(out) => TierStoreOutcome::Ok(
-            serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()),
-        ),
+    let d = match read_driver(cfg, tier, TierBackend::from_env()) {
+        Ok(d) => d,
+        Err(e) => return TierStoreOutcome::Error(e),
+    };
+    match d.scan_global(&EventLogScanRequest { after, limit }) {
+        Ok(out) => {
+            TierStoreOutcome::Ok(serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()))
+        }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
     }
 }
@@ -550,9 +643,18 @@ mod tests {
     async fn no_store_configured_is_unavailable_not_empty() {
         // The distinction that matters: a caller must be able to tell "no store
         // here" from "the store is empty".
-        assert_eq!(append(None, EL, "e1", "{}").await, TierStoreOutcome::Unavailable);
-        assert_eq!(read_execution(None, EL, "e1").await, TierStoreOutcome::Unavailable);
-        assert_eq!(scan(None, EL, None, 10).await, TierStoreOutcome::Unavailable);
+        assert_eq!(
+            append(None, EL, "e1", "{}").await,
+            TierStoreOutcome::Unavailable
+        );
+        assert_eq!(
+            read_execution(None, EL, "e1").await,
+            TierStoreOutcome::Unavailable
+        );
+        assert_eq!(
+            scan(None, EL, None, 10).await,
+            TierStoreOutcome::Unavailable
+        );
     }
 
     #[tokio::test]
@@ -610,10 +712,11 @@ mod tests {
             TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
             other => panic!("{other:?}"),
         };
-        let miss: serde_json::Value = match read_execution(Some(&cfg), EL, "no-such-execution").await {
-            TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
-            other => panic!("{other:?}"),
-        };
+        let miss: serde_json::Value =
+            match read_execution(Some(&cfg), EL, "no-such-execution").await {
+                TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
+                other => panic!("{other:?}"),
+            };
         assert_eq!(hit["exists"], serde_json::Value::Bool(true));
         assert_eq!(hit["record_count"], 1);
         assert_eq!(
@@ -682,7 +785,13 @@ mod tests {
         // mirror rather than found by it.
         let cfg = tmp_cfg("isolation");
         append(Some(&cfg), EL, "exec-9", r#"{"marker":"EVENTLOG-ONLY"}"#).await;
-        append(Some(&cfg), PROJ, "exec-9", r#"{"marker":"PROJECTION-ONLY"}"#).await;
+        append(
+            Some(&cfg),
+            PROJ,
+            "exec-9",
+            r#"{"marker":"PROJECTION-ONLY"}"#,
+        )
+        .await;
 
         let el = match read_execution(Some(&cfg), EL, "exec-9").await {
             TierStoreOutcome::Ok(b) => b,
@@ -694,8 +803,14 @@ mod tests {
         };
         // POSITIVE control first: each tier must actually hold its own record,
         // or "did not see the other one" is satisfied by an empty store.
-        assert!(el.contains("EVENTLOG-ONLY"), "event-log tier lost its record: {el}");
-        assert!(proj.contains("PROJECTION-ONLY"), "projection tier lost its record: {proj}");
+        assert!(
+            el.contains("EVENTLOG-ONLY"),
+            "event-log tier lost its record: {el}"
+        );
+        assert!(
+            proj.contains("PROJECTION-ONLY"),
+            "projection tier lost its record: {proj}"
+        );
         assert!(
             !el.contains("PROJECTION-ONLY"),
             "the event-log tier can see projection records: {el}"
@@ -742,7 +857,13 @@ mod tests {
         for i in 0..n {
             let c = cfg.clone();
             set.spawn(async move {
-                append(Some(&c), PROJ, &format!("exec-{i}"), &format!(r#"{{"i":{i}}}"#)).await
+                append(
+                    Some(&c),
+                    PROJ,
+                    &format!("exec-{i}"),
+                    &format!(r#"{{"i":{i}}}"#),
+                )
+                .await
             });
         }
         let mut ok = 0;
@@ -790,5 +911,103 @@ mod tests {
             "a projection append must not move the event log's tip"
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+}
+
+#[cfg(test)]
+mod tier_backend_tests {
+    //! **M0.5 — tier-backend read dispatch.** Read path only; the three
+    //! write-path `driver()` call sites are deliberately untouched.
+    use super::*;
+
+    #[test]
+    fn default_is_local_reference_which_is_today() {
+        assert_eq!(TierBackend::default(), TierBackend::LocalReference);
+        assert_eq!(TierBackend::parse(None), TierBackend::LocalReference);
+        assert_eq!(TierBackend::LocalReference.as_str(), "local_reference");
+    }
+
+    #[test]
+    fn l0_is_selectable_by_name() {
+        assert_eq!(TierBackend::parse(Some("l0")), TierBackend::L0);
+        assert_eq!(TierBackend::parse(Some("  L0 ")), TierBackend::L0);
+        assert_eq!(TierBackend::L0.as_str(), "l0");
+    }
+
+    /// ⚠ A typo must narrow, never widen. Anything unrecognised stays on the
+    /// backend that serves prod today.
+    #[test]
+    fn an_unrecognised_backend_falls_back_to_local_reference() {
+        for junk in ["", "  ", "L-0", "ehdb-l0", "true", "1", "localreference"] {
+            assert_eq!(
+                TierBackend::parse(Some(junk)),
+                TierBackend::LocalReference,
+                "unrecognised backend {junk:?} must fail safe"
+            );
+        }
+    }
+
+    /// ⭐ The criterion that matters most here: selecting `l0` must FAIL, not
+    /// silently serve from `local_reference`.
+    ///
+    /// A silent fallback is how `NOETL_EHDB_SEAL_MAX_AGE_MS` behaved before it
+    /// was wired — the knob existed, nothing read it, and setting it on prod
+    /// would have changed nothing while reading as a mitigation. An
+    /// unimplemented backend has to say so.
+    #[test]
+    fn selecting_l0_refuses_loudly_instead_of_falling_back() {
+        let cfg = TierStoreConfig {
+            dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+        };
+        let err = read_driver(&cfg, StoreTier::EventLog, TierBackend::L0)
+            .expect_err("l0 must not resolve to a working driver yet");
+        assert!(err.contains("not implemented"), "error must say so: {err}");
+        assert!(
+            err.contains("look taken"),
+            "error must explain why it refuses rather than falling back: {err}"
+        );
+    }
+
+    /// The default path still resolves to a real driver — otherwise the test
+    /// above would pass on a dispatch that refuses everything.
+    #[test]
+    fn local_reference_still_resolves() {
+        let cfg = TierStoreConfig {
+            dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+        };
+        assert!(read_driver(&cfg, StoreTier::EventLog, TierBackend::LocalReference).is_ok());
+    }
+
+    /// ⚠ **Structural guard.** The write path must keep using `driver()`
+    /// directly. If someone routes `append` through `read_driver`, selecting
+    /// `l0` would start failing writes on a tier serving `primary` — a much
+    /// larger blast radius than this change is scoped for.
+    ///
+    /// Counts call sites in this file's own source rather than trusting a
+    /// comment, because a comment cannot fail.
+    #[test]
+    fn the_write_path_does_not_go_through_the_read_dispatch() {
+        let src = include_str!("tier_store.rs");
+        let body = src
+            .split("mod tier_backend_tests")
+            .next()
+            .expect("module body");
+        // Exactly the two read sites consult the dispatch.
+        assert_eq!(
+            body.matches("read_driver(cfg, tier, TierBackend::from_env())")
+                .count(),
+            2,
+            "expected exactly 2 dispatch call sites (read_execution, scan)"
+        );
+        // And the write path still calls the concrete driver directly.
+        for write_site in [
+            "match driver(cfg, tier).append_batch(",
+            "match driver(cfg, tier).append(",
+        ] {
+            assert!(
+                body.contains(write_site),
+                "write path must still call driver() directly: {write_site}"
+            );
+        }
     }
 }
