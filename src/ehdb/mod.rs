@@ -97,6 +97,7 @@ pub mod eventstream;
 pub mod flight_sql_endpoint;
 pub mod guard;
 pub mod kv;
+pub mod kube_lease;
 pub mod metrics;
 pub mod mirror_source;
 pub mod object;

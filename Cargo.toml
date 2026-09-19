@@ -335,6 +335,10 @@ arrow = "53"
 # noetl/ehdb#338 on ehdb main.  ⚠ ALL FOUR ehdb pins move together on every
 # bump -- reference, service, feed and l0.  A repin that matches only some of
 # them reintroduces the split this note warns about.
+# `ehdb-core` is ALREADY in the tree transitively (every ehdb-* crate depends on
+# it); naming it directly adds no new dependency, it only lets the M5 Kubernetes
+# `LeaseStore` adapter construct the `EhdbError`/`Result` the trait returns.
+ehdb-core = { git = "https://github.com/noetl/ehdb", rev = "49fdefcca9214a9a16565d141c767b4bb7dba4db" }
 ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "49fdefcca9214a9a16565d141c767b4bb7dba4db" }
 # ehdb-service: the Flight SQL projection-tier read surface the external
 # data-plane endpoint (src/ehdb/flight_sql_endpoint.rs) serves.  Inert at rest:
@@ -369,7 +373,7 @@ twox-hash = "1.6"
 time = "=0.3.47"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

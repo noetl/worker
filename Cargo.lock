@@ -3224,6 +3224,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "dotenvy",
+ "ehdb-core",
  "ehdb-feed",
  "ehdb-l0",
  "ehdb-reference",
@@ -4082,6 +4083,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
