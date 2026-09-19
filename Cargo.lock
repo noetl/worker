@@ -3224,6 +3224,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "dotenvy",
+ "ehdb-core",
  "ehdb-feed",
  "ehdb-l0",
  "ehdb-reference",

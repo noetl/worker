@@ -335,6 +335,9 @@ arrow = "53"
 # noetl/ehdb#338 on ehdb main.  ⚠ ALL FOUR ehdb pins move together on every
 # bump -- reference, service, feed and l0.  A repin that matches only some of
 # them reintroduces the split this note warns about.
+# Already transitive via every ehdb-* crate; named directly so the L0 tier
+# driver can construct the `Result`/`EhdbError` the EventLogDriver trait returns.
+ehdb-core = { git = "https://github.com/noetl/ehdb", rev = "49fdefcca9214a9a16565d141c767b4bb7dba4db" }
 ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "49fdefcca9214a9a16565d141c767b4bb7dba4db" }
 # ehdb-service: the Flight SQL projection-tier read surface the external
 # data-plane endpoint (src/ehdb/flight_sql_endpoint.rs) serves.  Inert at rest:

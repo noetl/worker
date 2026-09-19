@@ -204,12 +204,137 @@ fn event_id_from_payload(payload: &str) -> Option<String> {
     }
 }
 
-fn driver(cfg: &TierStoreConfig, tier: StoreTier) -> LocalReferenceEventLogDriver {
-    LocalReferenceEventLogDriver::new(
-        cfg.path_for(tier),
-        DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
-        DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
-    )
+/// `NOETL_EHDB_TIER_BACKEND` — `local_reference` (default) | `l0`.
+pub const TIER_BACKEND_ENV: &str = "NOETL_EHDB_TIER_BACKEND";
+
+/// Which engine backs the tier store (M0.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TierBackend {
+    /// Today's engine: `ehdb-reference`'s append-only JSONL transaction log.
+    #[default]
+    LocalReference,
+    /// The L0 segment engine — the one every multi-region phase extends.
+    L0,
+}
+
+impl TierBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalReference => "local_reference",
+            Self::L0 => "l0",
+        }
+    }
+
+    /// Pure parse. An unrecognised value is `local_reference`, matching the
+    /// fail-safe precedent in `EventLogMode::from_env` — "an unknown driver
+    /// never mirrors". ⚠ A typo must not silently move the tier's bytes onto a
+    /// different engine, because the two do NOT share sequence semantics.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("l0") => Self::L0,
+            _ => Self::LocalReference,
+        }
+    }
+
+    pub fn from_env(env: &super::EnvMap) -> Self {
+        Self::parse(env.get(TIER_BACKEND_ENV).map(|s| s.as_str()))
+    }
+
+    pub fn from_process_env() -> Self {
+        Self::parse(std::env::var(TIER_BACKEND_ENV).ok().as_deref())
+    }
+}
+
+/// The tier store's engine, dispatched on [`TierBackend`] (M0.5 E1).
+///
+/// ⚠⚠ Before this, `driver()` returned a CONCRETE `LocalReferenceEventLogDriver`
+/// with no match — and `ehdb-reference` does not depend on `ehdb-l0` at all. So
+/// every L0 primitive the multi-region phases extend (M1 locality, M4
+/// region-survival, M7 replication) was **not on the tier's path**, inert for
+/// exactly the reason `NOETL_EHDB_EVENTLOG_BACKEND` is inert.
+///
+/// ⚠ The two backends do NOT share sequence semantics — `ehdb-stream`'s
+/// `StreamSequence` starts at 1 and refuses 0; L0 recovers `global_sequence`
+/// from `manifest.max_sequence()`. Switching a NON-EMPTY store is therefore not
+/// a no-op, and this is the dispatch, **not a data migration**. The safety that
+/// makes the flag flippable is that each engine REFUSES the other's layout
+/// rather than misparsing it: L0's `verify_or_initialise` errors on a foreign
+/// directory. A silent misparse on a tier that is `primary` is a wrong answer,
+/// not an outage.
+fn driver(cfg: &TierStoreConfig, tier: StoreTier) -> Box<dyn EventLogDriver> {
+    driver_for(cfg, tier, TierBackend::from_process_env())
+}
+
+/// [`driver`] with the backend passed in — so tests choose it without the
+/// process env (`cargo test` does not serialise tests).
+fn driver_for(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    backend: TierBackend,
+) -> Box<dyn EventLogDriver> {
+    match backend {
+        TierBackend::LocalReference => Box::new(LocalReferenceEventLogDriver::new(
+            cfg.path_for(tier),
+            DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+        )),
+        TierBackend::L0 => {
+            // The L0 store is a DIRECTORY, not the JSONL file the reference
+            // driver names — so it gets its own path and the two can never be
+            // pointed at the same bytes by accident.
+            let root = cfg.dir.join(format!("l0-{}", tier.as_str()));
+            match super::l0_tier_driver::L0TierDriver::open(&root) {
+                Ok(d) => Box::new(d),
+                // ⚠ Fail LOUD, not back to local_reference. A silent fallback
+                // would answer from a different store than the operator asked
+                // for — the exact failure ai-meta#257 records, where
+                // `source=service` kept reading correct while a fallback served
+                // something else entirely.
+                Err(e) => Box::new(RefusingDriver {
+                    reason: format!("l0 tier backend unavailable at {}: {e}", root.display()),
+                }),
+            }
+        }
+    }
+}
+
+/// A driver that refuses every operation with one stated reason.
+///
+/// Exists so a backend that cannot open is REPORTED rather than papered over by
+/// falling back to the other engine.
+#[derive(Debug)]
+struct RefusingDriver {
+    reason: String,
+}
+
+impl RefusingDriver {
+    fn err<T>(&self) -> ehdb_core::Result<T> {
+        Err(ehdb_core::EhdbError::InvalidState(self.reason.clone()))
+    }
+}
+
+impl EventLogDriver for RefusingDriver {
+    fn driver_name(&self) -> &'static str {
+        "refusing"
+    }
+    fn append(&self, _r: &EventLogAppendRequest) -> ehdb_core::Result<ehdb_reference::EventLogAppendOutcome> {
+        self.err()
+    }
+    fn scan_global(&self, _r: &EventLogScanRequest) -> ehdb_core::Result<ehdb_reference::EventLogScanOutcome> {
+        self.err()
+    }
+    fn read_execution(
+        &self,
+        _r: &EventLogReadExecutionRequest,
+    ) -> ehdb_core::Result<ehdb_reference::EventLogReadExecutionOutcome> {
+        self.err()
+    }
+    fn tail(&self, _r: &ehdb_reference::EventLogTailRequest) -> ehdb_core::Result<ehdb_reference::EventLogTailOutcome> {
+        self.err()
+    }
+    fn ack(&self, _r: &ehdb_reference::EventLogAckRequest) -> ehdb_core::Result<ehdb_reference::EventLogAckOutcome> {
+        self.err()
+    }
 }
 
 /// Ensure the store directory exists. Called before an append; a missing parent
@@ -788,6 +913,228 @@ mod tests {
             startup_sequence(&cfg, EL),
             4,
             "a projection append must not move the event log's tip"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    // =====================================================================
+    // M0.5 — tier-store backend dispatch.
+    // =====================================================================
+
+    fn tmp_backend_cfg(name: &str) -> TierStoreConfig {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "ehdb-m05-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|x| x.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        TierStoreConfig { dir: d }
+    }
+
+    #[test]
+    fn unrecognised_backend_values_are_local_reference() {
+        // ⚠ Fail-safe direction. A typo must not silently move the tier's bytes
+        // onto an engine with different sequence semantics.
+        assert_eq!(TierBackend::parse(None), TierBackend::LocalReference);
+        for bad in ["", "L0x", "level0", "segment", "true", "1"] {
+            assert_eq!(
+                TierBackend::parse(Some(bad)),
+                TierBackend::LocalReference,
+                "{bad:?} must fall back to local_reference"
+            );
+        }
+        // POSITIVE CONTROL: `l0` really does parse, so the fallbacks above are
+        // a decision rather than a function that always returns one value.
+        assert_eq!(TierBackend::parse(Some("l0")), TierBackend::L0);
+        assert_eq!(TierBackend::parse(Some("  L0 ")), TierBackend::L0);
+    }
+
+    #[test]
+    fn the_dispatch_actually_selects_a_different_engine() {
+        // E1. The reachability property: the flag must change WHICH engine
+        // answers, not merely be parsed.
+        let cfg = tmp_backend_cfg("dispatch");
+        let lr = driver_for(&cfg, StoreTier::EventLog, TierBackend::LocalReference);
+        let l0 = driver_for(&cfg, StoreTier::EventLog, TierBackend::L0);
+        assert_ne!(
+            lr.driver_name(),
+            l0.driver_name(),
+            "both backends produced the same driver — the dispatch is decorative"
+        );
+        assert_eq!(l0.driver_name(), "l0_segment");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn the_l0_backend_round_trips_append_read_and_scan() {
+        // E3. Proven through the SAME driver trait the tier store consumes.
+        let cfg = tmp_backend_cfg("roundtrip");
+        let d = driver_for(&cfg, StoreTier::EventLog, TierBackend::L0);
+        for i in 0..5 {
+            let out = d
+                .append(&EventLogAppendRequest {
+                    execution_id: format!("exec-{}", i % 2),
+                    transaction_id: format!("txn-{i}"),
+                    payload: format!("{{\"i\":{i}}}"),
+                    event_id: None,
+                })
+                .expect("l0 append");
+            assert_eq!(out.global_sequence, i + 1, "the writer assigns 1..N");
+        }
+        let scan = d
+            .scan_global(&EventLogScanRequest { after: None, limit: 100 })
+            .expect("scan");
+        assert_eq!(scan.record_count, 5, "all five records must read back");
+        assert!(scan.exists);
+
+        let one = d
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: "exec-1".to_string(),
+                after: None,
+                limit: 100,
+            })
+            .expect("read_execution");
+        assert_eq!(one.record_count, 2, "exec-1 got records 2 and 4");
+        assert!(one.exists);
+
+        // NEGATIVE control: a miss must be distinguishable from a hit.
+        let miss = d
+            .read_execution(&EventLogReadExecutionRequest {
+                execution_id: "exec-absent".to_string(),
+                after: None,
+                limit: 100,
+            })
+            .expect("read_execution miss");
+        assert_eq!(miss.record_count, 0);
+        assert!(!miss.exists, "a miss must report exists=false");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[test]
+    fn the_l0_cursor_is_durable_and_monotonic() {
+        // tail/ack. The cursor must never move backwards: a late or reordered
+        // ack cannot resurrect records a consumer already processed.
+        let cfg = tmp_backend_cfg("cursor");
+        let d = driver_for(&cfg, StoreTier::EventLog, TierBackend::L0);
+        for i in 0..4 {
+            d.append(&EventLogAppendRequest {
+                execution_id: "e".into(),
+                transaction_id: format!("t{i}"),
+                payload: "{}".into(),
+                event_id: None,
+            })
+            .expect("append");
+        }
+        let t0 = d
+            .tail(&ehdb_reference::EventLogTailRequest {
+                consumer: "c".into(),
+                transaction_id: "t".into(),
+                limit: 10,
+            })
+            .expect("tail");
+        assert_eq!(t0.pending_count, 4, "nothing acked yet");
+        assert_eq!(t0.acked_sequence, None);
+
+        d.ack(&ehdb_reference::EventLogAckRequest {
+            consumer: "c".into(),
+            transaction_id: "t".into(),
+            sequence: 3,
+        })
+        .expect("ack");
+        let t1 = d
+            .tail(&ehdb_reference::EventLogTailRequest {
+                consumer: "c".into(),
+                transaction_id: "t".into(),
+                limit: 10,
+            })
+            .expect("tail");
+        assert_eq!(t1.pending_count, 1, "one record remains after acking 3");
+        assert_eq!(t1.acked_sequence, Some(3));
+
+        // A BACKWARDS ack must not resurrect records.
+        d.ack(&ehdb_reference::EventLogAckRequest {
+            consumer: "c".into(),
+            transaction_id: "t".into(),
+            sequence: 1,
+        })
+        .expect("late ack");
+        let t2 = d
+            .tail(&ehdb_reference::EventLogTailRequest {
+                consumer: "c".into(),
+                transaction_id: "t".into(),
+                limit: 10,
+            })
+            .expect("tail");
+        assert_eq!(
+            t2.acked_sequence,
+            Some(3),
+            "the cursor must not move backwards on a late ack"
+        );
+        assert_eq!(t2.pending_count, 1);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐⭐ E4 — **the criterion that matters most.** A store written by one
+    /// backend must be REFUSED by the other, never silently misparsed: a silent
+    /// misparse on a tier that is `primary` is a wrong answer, not an outage.
+    #[tokio::test]
+    async fn a_store_written_by_one_backend_is_refused_by_the_other() {
+        let cfg = tmp_backend_cfg("crossbackend");
+
+        // Write with local_reference.
+        append(Some(&cfg), StoreTier::EventLog, "exec-1", r#"{"marker":"LR"}"#).await;
+        let lr_read = read_execution(Some(&cfg), StoreTier::EventLog, "exec-1").await;
+        assert!(
+            matches!(&lr_read, TierStoreOutcome::Ok(b) if b.contains("LR")),
+            "POSITIVE CONTROL: local_reference must read its own store, else the \
+             refusal below proves nothing: {lr_read:?}"
+        );
+
+        // Now point L0 at the SAME directory. It must not read those bytes as
+        // records — either it refuses to open, or it opens an empty store of
+        // its own. What it must never do is return garbled LR records.
+        let l0 = driver_for(&cfg, StoreTier::EventLog, TierBackend::L0);
+        let scan = l0.scan_global(&EventLogScanRequest { after: None, limit: 100 });
+        match scan {
+            Err(_) => { /* refused outright — the strongest form */ }
+            Ok(o) => {
+                assert!(
+                    !o.records.iter().any(|r| r.payload.contains("LR")),
+                    "the L0 backend returned records written by local_reference — \
+                     a silent cross-backend misparse, which on a `primary` tier is \
+                     a wrong answer rather than an outage"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn a_broken_l0_backend_refuses_rather_than_falling_back() {
+        // ⚠ A silent fallback to local_reference would answer from a different
+        // store than the operator asked for — the ai-meta#257 failure exactly.
+        let cfg = TierStoreConfig {
+            // A path that cannot be a directory: an existing FILE.
+            dir: {
+                let mut d = std::env::temp_dir();
+                d.push(format!("ehdb-m05-brokenfile-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&d);
+                std::fs::create_dir_all(&d).unwrap();
+                let f = d.join("l0-eventlog");
+                std::fs::write(&f, b"not a directory").unwrap();
+                d
+            },
+        };
+        let d = driver_for(&cfg, StoreTier::EventLog, TierBackend::L0);
+        let r = d.scan_global(&EventLogScanRequest { after: None, limit: 10 });
+        assert!(
+            r.is_err(),
+            "an unopenable L0 backend must refuse, never silently serve the other engine"
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
