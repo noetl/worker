@@ -293,6 +293,22 @@ impl Worker {
                 }
             };
 
+        // Start the EHDB shard election (M5) when asked — the token ISSUER.
+        //
+        // ⚠⚠ Placed here, at startup, because the alternative is what this
+        // replaces: `ShardElection` has been implemented, tested and merged
+        // with NO CALL SITES, so every writer's epoch has been 0 and
+        // single-writer-per-shard has rested entirely on `replicas: 1` — an
+        // orchestration preference, not a mutual-exclusion primitive.
+        //
+        // Default `off` ⇒ no thread, epoch 0, byte-identical to today.
+        // `observe` runs the election and publishes the epoch to /metrics while
+        // leaving the WRITE path on 0; only `authoritative` lets a token reach
+        // the fenced backend. The hazard the ladder exists for is MIXED epochs
+        // — one node minting epoch 1 fences every writer still on 0 — so the
+        // top rung must be flipped simultaneously, not rolled.
+        crate::ehdb::election::spawn(&crate::ehdb::process_env());
+
         // Start the CQRS projector (noetl/server#203 phase 2b-2) when enabled
         // (system worker pool only).  A SEPARATE events-feed consumer group from
         // the materializer's — sharing one would split the feed between them, so

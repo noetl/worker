@@ -233,10 +233,31 @@ pub fn render_election() -> String {
     let mut out = String::new();
     out.push_str("# HELP ehdb_election_active Whether a shard-lease election is running and issuing fencing tokens. 0 means single-writer rests on StatefulSet replicas:1 alone, and fencing enforce would be an outage.\n");
     out.push_str("# TYPE ehdb_election_active gauge\n");
-    out.push_str("ehdb_election_active 0\n");
+    out.push_str(&format!(
+        "ehdb_election_active {}\n",
+        u8::from(super::election::ELECTION.is_active())
+    ));
     out.push_str("# HELP ehdb_election_epoch The fencing token this writer holds. 0 means no token has been issued.\n");
     out.push_str("# TYPE ehdb_election_epoch gauge\n");
-    out.push_str("ehdb_election_epoch 0\n");
+    out.push_str(&format!(
+        "ehdb_election_epoch {}\n",
+        super::election::ELECTION.epoch()
+    ));
+    // The POSITIVE CONTROL for the two gauges above. `active=1, epoch=0` is a
+    // legitimate state (this process is not the holder) and so is a wedged
+    // loop; only a climbing round count separates them.
+    out.push_str("# HELP ehdb_election_rounds_total Successful acquire/renew round trips. Separates 'not the holder' from 'the loop is wedged'.\n");
+    out.push_str("# TYPE ehdb_election_rounds_total counter\n");
+    out.push_str(&format!(
+        "ehdb_election_rounds_total {}\n",
+        super::election::ELECTION.rounds()
+    ));
+    out.push_str("# HELP ehdb_election_errors_total Election rounds that could not reach the lease store.\n");
+    out.push_str("# TYPE ehdb_election_errors_total counter\n");
+    out.push_str(&format!(
+        "ehdb_election_errors_total {}\n",
+        super::election::ELECTION.errors()
+    ));
     out
 }
 
@@ -502,6 +523,15 @@ fn segment_max_bytes(env: &EnvMap) -> u64 {
 /// [`DurableEventLogDriver`] segment stores (slice 1), pinned to this replica's
 /// [`ownership_from_env`] and pointed at [`DurablePaths`], with the segment
 /// rollover threshold from [`SEGMENT_MAX_BYTES_ENV`].
+/// The shard index this writer owns, as the durable stack resolves it.
+///
+/// Exposed so the ELECTION names the same shard the fencing ledger keys on. A
+/// lease for shard 0 while the writer fences shard 1 would elect nobody for the
+/// shard actually being written, and both halves would look healthy.
+pub fn writer_shard_index(env: &EnvMap) -> u32 {
+    env_u32(env, WORKER_SHARD_INDEX_ENV, 0)
+}
+
 pub fn build_durable_stack(
     env: &EnvMap,
     contract: &EhdbContract,
@@ -529,11 +559,19 @@ pub fn build_durable_stack(
             let fenced = ehdb_fencing::FencedSharedBackend::new(plain, ledger)
                 .with_mode(mode)
                 .with_metrics(Arc::clone(&FENCING_METRICS));
-            // ⚠ No election yet (noetl/ehdb#331), so this writer holds no token
-            // and its epoch stays 0. Shadow therefore observes nothing —
-            // deliberately: the point of wiring it now is that `writes_checked`
-            // starts climbing, which is what makes a later zero on
-            // `stale_observed` mean anything at all.
+            // M5 — the election's token reaches the write path HERE, and only
+            // under `NOETL_EHDB_ELECTION=authoritative`.
+            //
+            // ⚠⚠ The hazard is MIXED epochs, not enforce-without-election.
+            // `ehdb-reference`'s own
+            // `enforcing_before_any_election_fences_every_writer` shows all-zero
+            // is self-consistent, so writes succeed; what refuses every
+            // un-elected writer is ONE node minting epoch 1 and advancing the
+            // shard marker. `observe` therefore runs the election and leaves
+            // this at 0, so the lease, the CAS and failover are proven in the
+            // real cluster with the write path unchanged.
+            let setting = super::election::ElectionSetting::from_env(env);
+            fenced.set_epoch(super::election::epoch_for_write(setting));
             Arc::new(fenced)
         }
     };
