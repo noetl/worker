@@ -609,6 +609,19 @@ pub enum AppendDispatch {
     /// the execution's shard (single-writer routing). Never happens on the
     /// local-reference backend or under the single-owner default.
     RoutedAway { owner_shard: u32 },
+    /// ⚠ **This writer has been superseded.** The fencing ledger refused the
+    /// append because a later epoch has already written this shard — M5's
+    /// invariant F, under `NOETL_EHDB_FENCING=enforce`.
+    ///
+    /// Distinct from every other error on purpose. `ehdb-reference` ships
+    /// `fencing::is_stale_epoch` with the docstring *"lets a caller distinguish
+    /// 'I have been superseded' (stop, do not retry) from a transient storage
+    /// failure (retry)"* — and until this variant existed the worker called it
+    /// nowhere, so `.map_err(|e| e.to_string())` threw the distinction away one
+    /// line after the store made it and a superseded writer was reported as
+    /// `unavailable`: the retryable bucket, for the one condition that must
+    /// never be retried.
+    FencedStale { detail: String },
 }
 
 /// Append one already-authored event through the *selected* backend.
@@ -659,9 +672,20 @@ pub fn append_selected(
             let lock = shard_lock(shard);
             let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             let stack = build_durable_stack(env, contract)?;
-            match stack.append(request).map_err(|e| e.to_string())? {
-                Routed::Served(outcome) => Ok(AppendDispatch::Served(outcome)),
-                Routed::NotOwner { owner_shard } => Ok(AppendDispatch::RoutedAway { owner_shard }),
+            // ⚠ Classified BEFORE `to_string()`. The fencing refusal is typed
+            // (`EhdbError::InvalidState` with the `stale_epoch` prefix) and the
+            // discrimination has to happen while the type still exists —
+            // matching on the rendered string later works until someone
+            // reformats the message, and then fails silently open.
+            match stack.append(request) {
+                Ok(Routed::Served(outcome)) => Ok(AppendDispatch::Served(outcome)),
+                Ok(Routed::NotOwner { owner_shard }) => {
+                    Ok(AppendDispatch::RoutedAway { owner_shard })
+                }
+                Err(e) if ehdb_fencing::is_stale_epoch(&e) => Ok(AppendDispatch::FencedStale {
+                    detail: e.to_string(),
+                }),
+                Err(e) => Err(e.to_string()),
             }
         }
     }
@@ -787,6 +811,132 @@ mod tests {
             payload: payload.to_string(),
             event_id: None,
         }
+    }
+
+    /// Advance shard 0's fencing marker to `epoch` through the REAL ledger, the
+    /// way a legitimately-elected higher-epoch writer would. Not a hand-written
+    /// marker file: if the ledger's on-disk shape changes, this moves with it.
+    fn advance_real_marker(e: &EnvMap, contract: &EhdbContract, epoch: u64) {
+        let paths = DurablePaths::resolve(e, contract);
+        std::fs::create_dir_all(&paths.shared_root).unwrap();
+        let ledger =
+            ehdb_fencing::FencingLedger::new(paths.shared_root.join(".fencing")).unwrap();
+        let d = ledger.check_and_advance(0, epoch).unwrap();
+        assert!(
+            matches!(d, ehdb_fencing::FenceDecision::Fresh { advanced: true, .. }),
+            "the fixture must actually raise the high-water epoch, else the \
+             refusal below would prove nothing: {d:?}"
+        );
+        assert_eq!(ledger.highest_epoch(0).unwrap(), epoch, "marker did not stick");
+    }
+
+    /// M5 — a superseded writer is refused, and the refusal is **distinguishable
+    /// from a transient failure**.
+    ///
+    /// Drives the real stack: real ledger, real `Enforce` mode, real
+    /// `check_and_advance`. The writer's own epoch is 0 (it holds no lease,
+    /// which is exactly what a stale writer looks like) against a store that has
+    /// accepted epoch 7.
+    #[test]
+    fn a_superseded_writer_is_refused_as_fenced_not_as_unavailable() {
+        let dir = tmp_dir("fenced-stale");
+        let log = dir.join("log.jsonl");
+        let contract = contract_for(&log);
+        let e = env(&[
+            ("NOETL_EHDB_EVENTLOG_BACKEND", "durable_segment"),
+            (FENCING_ENV, "enforce"),
+        ]);
+        advance_real_marker(&e, &contract, 7);
+
+        let d = append_selected(
+            &e,
+            &contract,
+            &req("100", r#"{"seq":1}"#),
+            &EventLogOptions::default(),
+            EventLogStorageBackend::DurableSegment,
+        )
+        .expect("a fencing refusal is an OUTCOME, not an Err — that is the point");
+
+        match d {
+            AppendDispatch::FencedStale { detail } => {
+                assert!(
+                    detail.contains(ehdb_fencing::STALE_EPOCH_PREFIX),
+                    "the detail must carry the store's own refusal text: {detail}"
+                );
+            }
+            other => panic!(
+                "a stale-epoch write must surface as FencedStale, not {}",
+                match other {
+                    AppendDispatch::Served(_) => "Served (SPLIT BRAIN — the write landed)",
+                    AppendDispatch::RoutedAway { .. } => "RoutedAway",
+                    AppendDispatch::FencedStale { .. } => unreachable!(),
+                }
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ POSITIVE CONTROL for the test above. Same fixture, same epoch-0 writer,
+    /// the ONLY difference being `shadow` instead of `enforce` — and the write
+    /// must land.
+    ///
+    /// Without this, `a_superseded_writer_is_refused...` is also satisfied by a
+    /// store that refuses everything (a broken path, a missing directory, a
+    /// backend that never worked), which would read as fencing working.
+    #[test]
+    fn the_same_stale_write_SUCCEEDS_under_shadow() {
+        let dir = tmp_dir("fenced-shadow");
+        let log = dir.join("log.jsonl");
+        let contract = contract_for(&log);
+        let e = env(&[
+            ("NOETL_EHDB_EVENTLOG_BACKEND", "durable_segment"),
+            (FENCING_ENV, "shadow"),
+        ]);
+        advance_real_marker(&e, &contract, 7);
+
+        let d = append_selected(
+            &e,
+            &contract,
+            &req("100", r#"{"seq":1}"#),
+            &EventLogOptions::default(),
+            EventLogStorageBackend::DurableSegment,
+        )
+        .expect("shadow never refuses");
+        assert!(
+            matches!(d, AppendDispatch::Served(_)),
+            "under shadow the stale write must still land — otherwise the enforce \
+             test is measuring a broken store rather than fencing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other side of the discrimination: a FRESH writer at an epoch at or
+    /// above the marker is served under enforce. Without this, a decorator that
+    /// refused every write would pass the refusal test.
+    #[test]
+    fn a_writer_at_the_current_epoch_is_served_under_enforce() {
+        let dir = tmp_dir("fenced-fresh");
+        let log = dir.join("log.jsonl");
+        let contract = contract_for(&log);
+        let e = env(&[
+            ("NOETL_EHDB_EVENTLOG_BACKEND", "durable_segment"),
+            (FENCING_ENV, "enforce"),
+        ]);
+        // Marker left at 0 — the writer's own epoch 0 is not behind it.
+        let d = append_selected(
+            &e,
+            &contract,
+            &req("100", r#"{"seq":1}"#),
+            &EventLogOptions::default(),
+            EventLogStorageBackend::DurableSegment,
+        )
+        .expect("a fresh write must not error");
+        assert!(
+            matches!(d, AppendDispatch::Served(_)),
+            "enforce must serve a writer that is not behind — fencing refuses \
+             the superseded, not everyone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -972,6 +1122,9 @@ mod tests {
                 }
                 AppendDispatch::RoutedAway { .. } => {
                     panic!("single-owner default owns every shard")
+                }
+                AppendDispatch::FencedStale { detail } => {
+                    panic!("fencing is off in this fixture, yet: {detail}")
                 }
             }
         }

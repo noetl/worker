@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 
 use noetl_worker::ehdb::{
-    self, backends, contract, dataplane, eventlog, eventlog_backend, eventstream, kv, object,
-    projection, rag, readiness, systemstore, vector,
+    self, backends, contract, dataplane, election, eventlog, eventlog_backend, eventstream, kv,
+    object, projection, rag, readiness, systemstore, vector,
 };
 
 fn main() -> ExitCode {
@@ -54,6 +54,7 @@ fn main() -> ExitCode {
         Some("eventlog-suite") => run_eventlog_suite(&env, &flags),
         Some("durable-eventlog") => run_durable_eventlog(&env, &flags),
         Some("durable-eventlog-gc") => run_durable_eventlog_gc(&env, &flags),
+        Some("fencing-epoch") => run_fencing_epoch(&env, &flags),
         Some("eventlog-primary-serve") => run_eventlog_primary_serve(&env, &flags),
         Some("mirror-projection") => run_mirror_projection(&env, &flags),
         Some("projection-suite") => run_projection_suite(&env, &flags),
@@ -1065,6 +1066,164 @@ fn run_durable_eventlog(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// M5 E3 — **be one writer in a real two-writer race, and report what the store
+/// did about it.**
+///
+/// Runs the production election (`election::spawn` → `ShardElection` over the
+/// real Kubernetes Lease, real resourceVersion CAS), waits for it to settle,
+/// then performs one append through the production write path
+/// (`eventlog_backend::append_selected` → `build_durable_stack` → the fencing
+/// decorator) and prints what happened.
+///
+/// Nothing here simulates the race. Two pods run this concurrently against one
+/// Lease and one shared root; whichever wins the Lease writes, and the other is
+/// a genuinely stale writer because it genuinely lost.
+///
+/// ⚠ The `--hold` flag exists so the winner stays alive while the loser runs.
+/// A lease that expires between the two arms would let the second pod acquire
+/// it and the "stale writer" would not be stale — which is why `held` and
+/// `epoch` are reported per arm rather than assumed by the harness.
+///
+/// Flags:
+///   --settle-secs N   how long to wait for the election to reach a verdict (default 30)
+///   --hold-secs N     keep holding (renewing) for N seconds after the append (default 0)
+///   --execution-id X  the execution to append under (default: a fresh one)
+///   --appends N       how many appends to attempt (default 1)
+fn run_fencing_epoch(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
+    let settle = flags.parse_u64("settle-secs").unwrap_or(30);
+    let hold = flags.parse_u64("hold-secs").unwrap_or(0);
+    let appends = flags.parse_usize("appends").unwrap_or(1);
+    let execution_id = flags
+        .get("execution-id")
+        .unwrap_or_else(|| format!("fence-{}", std::process::id()));
+
+    let setting = election::ElectionSetting::from_env(env);
+    let backend = eventlog_backend::selected_backend(env);
+    let fencing = env
+        .get(eventlog_backend::FENCING_ENV)
+        .cloned()
+        .unwrap_or_else(|| "off".to_string());
+    let shard = eventlog_backend::writer_shard_index(env);
+
+    // The election, exactly as the worker starts it.
+    election::spawn(env);
+
+    // Settle: wait for the loop to reach a verdict rather than sleeping a guess.
+    // `rounds` moving is the signal a round COMPLETED — `active` alone is set by
+    // both the held and not-held outcomes, so waiting on it would return before
+    // the first CAS on a slow API server.
+    let started = std::time::Instant::now();
+    let mut rounds = 0u64;
+    while started.elapsed().as_secs() < settle {
+        rounds = election::ELECTION.rounds();
+        if rounds > 0 || election::ELECTION.errors() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let held_epoch = election::ELECTION.epoch();
+    let write_epoch = election::epoch_for_write(setting);
+    let settled = rounds > 0;
+
+    let contract = match contract::contract_from_env(env) {
+        Ok(c) => c,
+        Err(e) => {
+            println!(
+                "{}",
+                serde_json::json!({"suite":"ehdb-fencing-epoch","ok":false,"error":e.0})
+            );
+            return ExitCode::from(4);
+        }
+    };
+
+    let mut results = Vec::new();
+    let mut served = 0usize;
+    let mut fenced = 0usize;
+    let mut errored = 0usize;
+    for i in 0..appends {
+        let req = ehdb_reference::EventLogAppendRequest {
+            execution_id: execution_id.clone(),
+            transaction_id: format!("fence-txn-{}-{i}", std::process::id()),
+            payload: format!("{{\"pid\":{},\"i\":{i}}}", std::process::id()),
+            event_id: None,
+        };
+        let r = eventlog_backend::append_selected(
+            env,
+            &contract,
+            &req,
+            &eventlog::EventLogOptions::default(),
+            backend,
+        );
+        let entry = match r {
+            Ok(eventlog_backend::AppendDispatch::Served(o)) => {
+                served += 1;
+                serde_json::json!({"i":i,"outcome":"served","global_sequence":o.global_sequence})
+            }
+            Ok(eventlog_backend::AppendDispatch::FencedStale { detail }) => {
+                fenced += 1;
+                serde_json::json!({"i":i,"outcome":"fenced_stale","detail":detail})
+            }
+            Ok(eventlog_backend::AppendDispatch::RoutedAway { owner_shard }) => {
+                serde_json::json!({"i":i,"outcome":"routed_away","owner_shard":owner_shard})
+            }
+            Err(e) => {
+                errored += 1;
+                serde_json::json!({"i":i,"outcome":"error","detail":e})
+            }
+        };
+        results.push(entry);
+    }
+
+    // Hold the lease while the other arm runs. The election thread keeps
+    // renewing; this just keeps the process (and therefore the holder) alive.
+    if hold > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(hold));
+    }
+
+    let metrics = render_metrics();
+    // A verdict, not a pass/fail: whether this arm SHOULD have been served is
+    // the harness's call, because it is the one that knows which arm this is.
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "ehdb-fencing-epoch",
+            "identity": std::env::var("HOSTNAME").unwrap_or_default(),
+            "pid": std::process::id(),
+            "election_setting": setting.as_str(),
+            "election_settled": settled,
+            "election_rounds": election::ELECTION.rounds(),
+            "election_errors": election::ELECTION.errors(),
+            "election_active": election::ELECTION.is_active(),
+            "held_epoch": held_epoch,
+            "write_epoch": write_epoch,
+            "shard": shard,
+            "storage_backend": backend.as_str(),
+            "fencing": fencing,
+            "execution_id": execution_id,
+            "served": served,
+            "fenced_stale": fenced,
+            "errored": errored,
+            "appends": results,
+            "metrics_secret_free": metrics_is_secret_free(&metrics),
+        })
+    );
+    print!("{metrics}");
+    print!("{}", eventlog_backend::render_fencing(
+        eventlog_backend::FencingSetting::from_env(env)
+    ));
+    print!("{}", eventlog_backend::render_election());
+
+    // Exit code carries the arm's own outcome so a shell harness can assert
+    // without parsing: 0 served, 6 fenced, 5 errored.
+    if errored > 0 {
+        ExitCode::from(5)
+    } else if fenced > 0 {
+        ExitCode::from(6)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -2194,6 +2353,7 @@ fn usage() -> &'static str {
      mirror-eventlog --execution-id <id> --payload <text> [--authoritative-sequence <n>]\n  \
      eventlog-suite  [--execution-id <id>]\n  \
      durable-eventlog  [--execution-id <id>]  (slice 4: mirror via NOETL_EHDB_EVENTLOG_BACKEND; durable_segment ⇒ reopen + replay proof)\n  \
+     fencing-epoch  [--settle-secs N] [--hold-secs N] [--appends N] [--execution-id <id>]  (M5 E3: run the real election, then append; exit 0 served / 6 fenced_stale / 5 error)\n  \
      durable-eventlog-gc  [--min-retained <n>]  (drive one segment-GC pass over owned shards; reports per-shard reclamation)\n  \
      eventlog-primary-serve  (Phase 9 tier 1: serve log from EHDB + reversibility)\n  \
      mirror-projection --execution-id <id> [--events <n>] [--consumer <c>]\n  \

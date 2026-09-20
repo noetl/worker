@@ -139,6 +139,18 @@ pub enum EventLogOutcome {
     /// Never fires on the default `local_reference` backend nor under the
     /// single-owner default.
     RoutedAway,
+    /// ⚠ **This writer has been superseded** — the fencing ledger refused the
+    /// append because a later epoch already wrote this shard (M5 invariant F,
+    /// `NOETL_EHDB_FENCING=enforce`). The event did NOT land in EHDB; the
+    /// elected writer owns it.
+    ///
+    /// Separate from [`Self::Unavailable`] because the two want opposite
+    /// responses: `unavailable` is transient and should be retried, a fencing
+    /// refusal is permanent for this process and must not be. Counted as
+    /// **degraded** — unlike [`Self::RoutedAway`], which is routine sharding, a
+    /// fenced writer means this pod believes it should be writing and is being
+    /// refused, which is worth seeing.
+    FencedStale,
     /// Payload empty or over the byte cap.
     Rejected,
     /// A control-plane role reached the data-plane engine — refused.
@@ -159,6 +171,7 @@ impl EventLogOutcome {
             EventLogOutcome::PrimaryDivergence => "primary_divergence",
             EventLogOutcome::PrimaryUnavailable => "primary_unavailable",
             EventLogOutcome::RoutedAway => "routed_away",
+            EventLogOutcome::FencedStale => "fenced_stale",
             EventLogOutcome::Rejected => "rejected",
             EventLogOutcome::GuardRefused => "guard_refused",
             EventLogOutcome::Invalid => "invalid",
@@ -182,6 +195,7 @@ impl EventLogOutcome {
             EventLogOutcome::ParityMismatch
                 | EventLogOutcome::PrimaryDivergence
                 | EventLogOutcome::Unavailable
+                | EventLogOutcome::FencedStale
         )
     }
 }
@@ -616,6 +630,18 @@ pub fn mirror_event(
         // `durable_segment` refused: this replica does not own the execution's
         // shard (single-writer routing).  Correct behaviour — the owning replica
         // mirrors it — recorded as a neutral (non-ok, non-degraded) outcome.
+        // ⚠ The fencing refusal, kept out of the `Err` arm on purpose: it is a
+        // correct outcome of a working store, not an engine failure, and
+        // `classify_helper_error` would bucket it as `unavailable` — the
+        // retryable one.
+        Ok(super::eventlog_backend::AppendDispatch::FencedStale { detail }) => make_result(
+            mode,
+            EventLogOutcome::FencedStale,
+            Some(contract.role),
+            started,
+            Some(detail),
+            record_metrics,
+        ),
         Ok(super::eventlog_backend::AppendDispatch::RoutedAway { owner_shard }) => make_result(
             mode,
             EventLogOutcome::RoutedAway,
