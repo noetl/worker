@@ -1479,7 +1479,7 @@ dependencies = [
 [[package]]
 name = "ehdb-catalog"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1489,7 +1489,7 @@ dependencies = [
 [[package]]
 name = "ehdb-core"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "arrow-schema 53.4.1",
  "serde",
@@ -1498,7 +1498,7 @@ dependencies = [
 [[package]]
 name = "ehdb-feed"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "ehdb-l0",
@@ -1512,7 +1512,7 @@ dependencies = [
 [[package]]
 name = "ehdb-l0"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1523,7 +1523,7 @@ dependencies = [
 [[package]]
 name = "ehdb-reference"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "arrow-array 53.4.1",
  "arrow-ipc",
@@ -1543,7 +1543,7 @@ dependencies = [
 [[package]]
 name = "ehdb-retrieval"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "ehdb-service"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "arrow-array 53.4.1",
  "arrow-flight",
@@ -1576,7 +1576,7 @@ dependencies = [
 [[package]]
 name = "ehdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1586,7 +1586,7 @@ dependencies = [
 [[package]]
 name = "ehdb-stream"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -1596,7 +1596,7 @@ dependencies = [
 [[package]]
 name = "ehdb-system"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
@@ -1607,7 +1607,7 @@ dependencies = [
 [[package]]
 name = "ehdb-transaction"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=49fdefcca9214a9a16565d141c767b4bb7dba4db#49fdefcca9214a9a16565d141c767b4bb7dba4db"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "ehdb-storage",
