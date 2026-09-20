@@ -588,7 +588,22 @@ fn stale_epoch_precheck(env: &EnvMap, contract: &EhdbContract, shard: u32) -> Op
     // would make the CHECK itself raise the marker — the shape of ai-meta#264,
     // where the parity endpoint wrote the counter its own alert read.
     let highest = ledger.highest_epoch(shard).ok()?;
+    // ⚠ The counters move here too, on the SAME static the decorator uses.
+    // Without this, a run in which every write is refused by the precheck would
+    // render `ehdb_fencing_stale_refused_total 0` — a metric reporting "nothing
+    // was fenced" while fencing was refusing everything, which is worse than no
+    // metric because it reads as healthy. The refusal moved; the accounting has
+    // to move with it.
+    FENCING_METRICS
+        .writes_checked
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if epoch < highest {
+        FENCING_METRICS
+            .stale_observed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FENCING_METRICS
+            .stale_refused
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The crate's own constructor, so the refusal text is IDENTICAL to the
         // decorator's and `is_stale_epoch` recognises it. A hand-written message
         // here would be a second spelling of the same condition — and this
@@ -1087,6 +1102,14 @@ mod tests {
                 assert!(
                     detail.contains(ehdb_fencing::STALE_EPOCH_PREFIX),
                     "the refusal must be the store's own, recognisable text: {detail}"
+                );
+                // ⚠ The refusal must also be COUNTED. A refusal the counter does
+                // not see renders `stale_refused 0` during active fencing, which
+                // reads exactly like a healthy store.
+                let rendered = render_fencing(FencingSetting::Enforce);
+                assert!(
+                    !rendered.contains("ehdb_fencing_stale_refused_total 0\n"),
+                    "the refusal was not counted:\n{rendered}"
                 );
             }
             AppendDispatch::Served(o) => panic!(
