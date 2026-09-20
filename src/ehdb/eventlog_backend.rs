@@ -546,6 +546,59 @@ pub fn writer_shard_index(env: &EnvMap) -> u32 {
     env_u32(env, WORKER_SHARD_INDEX_ENV, 0)
 }
 
+/// Refuse a superseded writer **before it writes anything**, returning the
+/// store's own refusal text.
+///
+/// ⚠⚠ This exists because guarding the shared backend is not enough, and the
+/// kind gate for M5 E3 is what showed it.
+///
+/// `FencedSharedBackend` guards `append_segment`, and
+/// `SharedTierEventLog::publish_shard` calls `append_segment` **only when the
+/// local segment is longer than what the shared object has already committed**
+/// (`if cur_len <= published_len { continue; }` — the incremental-publish
+/// optimisation from ehdb#264). A superseded writer with its own local root
+/// therefore publishes nothing, is never guarded, and its append is reported to
+/// the caller as **served** with a global sequence — while the bytes live only
+/// in that pod's local store: not published, not refused, and gone when the pod
+/// dies. Silent loss, which is precisely what fencing exists to turn into a loud
+/// refusal. `a_stale_writer_whose_segment_is_no_longer_than_the_holders_is_NOT_fenced`
+/// pins that behaviour with the guard removed.
+///
+/// So the check moves to where the write is ACCEPTED rather than where it is
+/// published. That is also the stronger place: "a stale writer is refused a
+/// write" is a statement about the append, not about a later flush.
+///
+/// Returns `Some(detail)` only under `enforce` and only for a genuinely stale
+/// epoch. Under `shadow` it returns `None` after the decorator has counted the
+/// observation, because shadow must not change what the writer does. A ledger
+/// that cannot be opened returns `None` — fencing must not become a new way for
+/// appends to fail, and the decorator still guards the publish.
+///
+/// ⚠ The long-term home for this is `SharedTierEventLog::append` in
+/// `ehdb-reference`; it lives here because that crate is consumed by a pin.
+fn stale_epoch_precheck(env: &EnvMap, contract: &EhdbContract, shard: u32) -> Option<String> {
+    let setting = FencingSetting::from_env(env);
+    if setting != FencingSetting::Enforce {
+        return None;
+    }
+    let paths = DurablePaths::resolve(env, contract);
+    let ledger = ehdb_fencing::FencingLedger::new(paths.shared_root.join(".fencing")).ok()?;
+    let epoch = super::election::epoch_for_write(super::election::ElectionSetting::from_env(env));
+    // `highest_epoch`, not `check_and_advance`: this is a read. Advancing here
+    // would make the CHECK itself raise the marker — the shape of ai-meta#264,
+    // where the parity endpoint wrote the counter its own alert read.
+    let highest = ledger.highest_epoch(shard).ok()?;
+    if epoch < highest {
+        // The crate's own constructor, so the refusal text is IDENTICAL to the
+        // decorator's and `is_stale_epoch` recognises it. A hand-written message
+        // here would be a second spelling of the same condition — and this
+        // program has already lost a counter to exactly that.
+        Some(ehdb_fencing::stale_epoch_error(shard, epoch, highest).to_string())
+    } else {
+        None
+    }
+}
+
 pub fn build_durable_stack(
     env: &EnvMap,
     contract: &EhdbContract,
@@ -671,6 +724,11 @@ pub fn append_selected(
             let shard = ownership_from_env(env).shard_of(&request.execution_id);
             let lock = shard_lock(shard);
             let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            // Refused BEFORE the local write, so a superseded writer never
+            // accepts an event it cannot publish. See `stale_epoch_precheck`.
+            if let Some(detail) = stale_epoch_precheck(env, contract, shard) {
+                return Ok(AppendDispatch::FencedStale { detail });
+            }
             let stack = build_durable_stack(env, contract)?;
             // ⚠ Classified BEFORE `to_string()`. The fencing refusal is typed
             // (`EhdbError::InvalidState` with the `stale_epoch` prefix) and the
@@ -682,6 +740,17 @@ pub fn append_selected(
                 Ok(Routed::NotOwner { owner_shard }) => {
                     Ok(AppendDispatch::RoutedAway { owner_shard })
                 }
+                // ⚠ Defence in depth, and NOT the primary path any more: the
+                // precheck above refuses a stale writer before this runs. What
+                // reaches here is the RACE — the marker advancing between the
+                // precheck's read and the publish, i.e. another writer being
+                // elected in that window.
+                //
+                // ⚠ No test in this repo forces that window; a unit test cannot
+                // interleave the two reads deterministically without a hook this
+                // code does not have, and a mutation that deletes this arm
+                // therefore SURVIVES the battery (arm F4). Said plainly rather
+                // than covered by a test that only looks like it covers it.
                 Err(e) if ehdb_fencing::is_stale_epoch(&e) => Ok(AppendDispatch::FencedStale {
                     detail: e.to_string(),
                 }),
@@ -937,6 +1006,118 @@ mod tests {
              the superseded, not everyone"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠⚠ **THE GAP.** A superseded writer is refused only when its publish
+    /// actually reaches the shared backend — and on the incremental-publish path
+    /// it often does not.
+    ///
+    /// `SharedTierEventLog::publish_shard` sends the backend only the delta
+    /// `[published_len .. cur_len]`, and on a fresh process `published_len` is
+    /// recovered from `shared.committed_len(..)` — the length the CURRENT holder
+    /// already wrote. A stale writer whose own local segment is no longer than
+    /// that hits `if cur_len <= published_len { continue; }` and **skips
+    /// `append_segment` entirely**. The fencing decorator guards
+    /// `append_segment`, so a call that never happens is never fenced.
+    ///
+    /// The append is then reported to the caller as **served**, with a global
+    /// sequence, while the bytes exist only in that pod's local store: not
+    /// published, not refused, and gone when the pod dies. That is the silent
+    /// loss fencing exists to convert into a loud refusal.
+    ///
+    /// This test pins the behaviour as it is TODAY rather than asserting what it
+    /// should be, so the gap is recorded and a fix has something to flip. It is
+    /// the kind reproduction: holder writes first, stale writer comes second with
+    /// its own local root and the same shared root.
+    #[test]
+    fn a_stale_writer_whose_segment_is_no_longer_than_the_holders_is_still_fenced() {
+        let shared = tmp_dir("gap-shared");
+        let holder_dir = tmp_dir("gap-holder");
+        let stale_dir = tmp_dir("gap-stale");
+
+        let mk = |d: &Path| {
+            (
+                contract_for(&d.join("log.jsonl")),
+                env(&[
+                    ("NOETL_EHDB_EVENTLOG_BACKEND", "durable_segment"),
+                    (FENCING_ENV, "enforce"),
+                    (SHARED_DIR_ENV, shared.to_str().unwrap()),
+                ]),
+            )
+        };
+
+        // 1. The holder writes FIRST, committing bytes to the shared object.
+        //    Its epoch is 0 (a unit test runs no election) against a marker of
+        //    0 — self-consistent, which is the documented all-zero case.
+        let (h_contract, h_env) = mk(&holder_dir);
+        for i in 0..3 {
+            let d = append_selected(
+                &h_env,
+                &h_contract,
+                &req("race-0", &format!(r#"{{"holder":{i}}}"#)),
+                &EventLogOptions::default(),
+                EventLogStorageBackend::DurableSegment,
+            )
+            .expect("holder append");
+            assert!(
+                matches!(d, AppendDispatch::Served(_)),
+                "the holder must be served, else the fixture proves nothing"
+            );
+        }
+        // 2. A failover: a NEW holder is elected and raises the marker. From
+        //    here the first writer is superseded — which is the whole condition
+        //    fencing is supposed to act on.
+        advance_real_marker(&h_env, &h_contract, 4);
+
+        // 3. The stale writer: epoch 0 (holds no lease), its OWN local root,
+        //    the SAME shared root. Payloads the same size as the holder's, so
+        //    its segment is no longer than what is already committed.
+        let (s_contract, s_env) = mk(&stale_dir);
+        let d = append_selected(
+            &s_env,
+            &s_contract,
+            &req("race-0", r#"{{"stale":0}}"#),
+            &EventLogOptions::default(),
+            EventLogStorageBackend::DurableSegment,
+        )
+        .expect("stale append did not error");
+
+        match d {
+            AppendDispatch::FencedStale { detail } => {
+                assert!(
+                    detail.contains(ehdb_fencing::STALE_EPOCH_PREFIX),
+                    "the refusal must be the store's own, recognisable text: {detail}"
+                );
+            }
+            AppendDispatch::Served(o) => panic!(
+                "THE GAP IS BACK: the stale writer was SERVED at sequence {} — its \
+                 publish was skipped because its local segment is no longer than \
+                 what the holder committed, so `append_segment` was never called \
+                 and the decorator never saw it. The event is acknowledged, \
+                 unpublished, and lost with the pod.",
+                o.global_sequence
+            ),
+            AppendDispatch::RoutedAway { .. } => panic!("single-owner default owns every shard"),
+        }
+
+        // ⭐ NEGATIVE CONTROL for the whole fixture: nothing may have been
+        // written locally either. A refusal that still accepts the bytes is a
+        // refusal in name only.
+        let stale_paths = DurablePaths::resolve(&s_env, &s_contract);
+        let wrote_anything = stale_paths
+            .local_root
+            .join("shard-0000")
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        assert!(
+            !wrote_anything,
+            "the refused writer must not have written a local segment — the point \
+             of refusing at the append is that nothing is accepted at all"
+        );
+        for d in [&shared, &holder_dir, &stale_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

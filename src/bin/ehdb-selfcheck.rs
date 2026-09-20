@@ -1177,12 +1177,6 @@ fn run_fencing_epoch(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
         results.push(entry);
     }
 
-    // Hold the lease while the other arm runs. The election thread keeps
-    // renewing; this just keeps the process (and therefore the holder) alive.
-    if hold > 0 {
-        std::thread::sleep(std::time::Duration::from_secs(hold));
-    }
-
     let metrics = render_metrics();
     // A verdict, not a pass/fail: whether this arm SHOULD have been served is
     // the harness's call, because it is the one that knows which arm this is.
@@ -1215,6 +1209,30 @@ fn run_fencing_epoch(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
         eventlog_backend::FencingSetting::from_env(env)
     ));
     print!("{}", eventlog_backend::render_election());
+
+    // ⚠ The hold happens AFTER the report, not before it. The holding arm is
+    // the one the other arm races, so a harness has to be able to read its
+    // verdict WHILE it still holds — printing after the hold means the only way
+    // to learn who won is to wait for the winner to stop winning.
+    //
+    // The election thread keeps renewing throughout; this just keeps the
+    // process (and therefore the holder) alive.
+    if hold > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(hold));
+        // Second line: whether the token survived the hold. A holder that lost
+        // its lease mid-hold would invalidate the other arm's result silently —
+        // the other arm would have been racing nobody.
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite": "ehdb-fencing-epoch-posthold",
+                "held_epoch": election::ELECTION.epoch(),
+                "still_held": election::ELECTION.epoch() > 0,
+                "election_rounds": election::ELECTION.rounds(),
+                "election_errors": election::ELECTION.errors(),
+            })
+        );
+    }
 
     // Exit code carries the arm's own outcome so a shell harness can assert
     // without parsing: 0 served, 6 fenced, 5 errored.
