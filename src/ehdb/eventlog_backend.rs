@@ -520,6 +520,25 @@ pub fn render_fencing(setting: FencingSetting) -> String {
         "ehdb_fencing_active {}\n",
         u8::from(setting.wraps())
     ));
+    // The precheck's vantage point. Rendered whatever the setting, at 0 when
+    // nothing has run, for the same reason every counter above is.
+    use std::sync::atomic::Ordering::Relaxed;
+    out.push_str(
+        "# HELP ehdb_fencing_precheck_writes_total Durable appends checked against the shard marker BEFORE the local write. Counts every append, unlike the decorator, which sees only publishes that reached the shared backend.\n",
+    );
+    out.push_str("# TYPE ehdb_fencing_precheck_writes_total counter\n");
+    out.push_str(&format!(
+        "ehdb_fencing_precheck_writes_total {}\n",
+        PRECHECK_WRITES.load(Relaxed)
+    ));
+    out.push_str(
+        "# HELP ehdb_fencing_precheck_stale_total Appends the precheck found to be from a superseded epoch. Under shadow these still proceeded; the gap to ehdb_fencing_stale_observed_total is the publish-skip window the decorator cannot see.\n",
+    );
+    out.push_str("# TYPE ehdb_fencing_precheck_stale_total counter\n");
+    out.push_str(&format!(
+        "ehdb_fencing_precheck_stale_total {}\n",
+        PRECHECK_STALE.load(Relaxed)
+    ));
     out
 }
 
@@ -545,6 +564,25 @@ fn segment_max_bytes(env: &EnvMap) -> u64 {
 pub fn writer_shard_index(env: &EnvMap) -> u32 {
     env_u32(env, WORKER_SHARD_INDEX_ENV, 0)
 }
+
+/// The precheck's own counters, deliberately NOT the decorator's.
+///
+/// ⚠ They measure a DIFFERENT population, and summing them into
+/// `ehdb_fencing_stale_observed_total` double-counted every shadow-mode stale
+/// write that did reach the shared backend (caught by
+/// `the_same_stale_write_SUCCEEDS_under_shadow`: `0 -> 2` for one append).
+///
+/// - `ehdb_fencing_*` (the decorator) sees only writes that reached the shared
+///   backend — i.e. publishes that were not skipped.
+/// - `ehdb_fencing_precheck_*` sees EVERY durable append. That is the complete
+///   population, and the difference between the two is exactly the publish-skip
+///   window in which the decorator is blind.
+///
+/// Refusals stay on the shared `stale_refused` counter: under `enforce` the
+/// precheck short-circuits, so the decorator never sees the same write and no
+/// double count is possible.
+static PRECHECK_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PRECHECK_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Refuse a superseded writer **before it writes anything**, returning the
 /// store's own refusal text.
@@ -578,7 +616,9 @@ pub fn writer_shard_index(env: &EnvMap) -> u32 {
 /// `ehdb-reference`; it lives here because that crate is consumed by a pin.
 fn stale_epoch_precheck(env: &EnvMap, contract: &EhdbContract, shard: u32) -> Option<String> {
     let setting = FencingSetting::from_env(env);
-    if setting != FencingSetting::Enforce {
+    // `Off` means the store is not wrapped at all — nothing to check, nothing to
+    // count. Shadow and Enforce both check and both count; only Enforce refuses.
+    if setting == FencingSetting::Off {
         return None;
     }
     let paths = DurablePaths::resolve(env, contract);
@@ -594,24 +634,40 @@ fn stale_epoch_precheck(env: &EnvMap, contract: &EhdbContract, shard: u32) -> Op
     // was fenced" while fencing was refusing everything, which is worse than no
     // metric because it reads as healthy. The refusal moved; the accounting has
     // to move with it.
-    FENCING_METRICS
-        .writes_checked
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if epoch < highest {
-        FENCING_METRICS
-            .stale_observed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        FENCING_METRICS
-            .stale_refused
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // The crate's own constructor, so the refusal text is IDENTICAL to the
-        // decorator's and `is_stale_epoch` recognises it. A hand-written message
-        // here would be a second spelling of the same condition — and this
-        // program has already lost a counter to exactly that.
-        Some(ehdb_fencing::stale_epoch_error(shard, epoch, highest).to_string())
-    } else {
-        None
+    PRECHECK_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if epoch >= highest {
+        return None;
     }
+    PRECHECK_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if setting != FencingSetting::Enforce {
+        // ⚠⚠ SHADOW COUNTS BUT DOES NOT REFUSE — and the counting is the whole
+        // point of the mode.
+        //
+        // The kind gate caught the first version of this: with the mode check
+        // at the top of the function, a shadow run rendered
+        // `ehdb_fencing_stale_observed_total 0` while a superseded writer was
+        // actively writing. The decorator could not make up the difference,
+        // because the publish it guards is the one that gets skipped — the gap
+        // this precheck exists to close.
+        //
+        // A shadow period exists to answer "how many stale writes would enforce
+        // have refused?". A shadow that answers 0 by construction makes enforce
+        // look free and is the reason to run one at all.
+        eprintln!(
+            "{}: shard {shard} write at epoch {epoch}, store has accepted \
+             {highest} — SHADOW, not refused",
+            ehdb_fencing::STALE_EPOCH_PREFIX
+        );
+        return None;
+    }
+    FENCING_METRICS
+        .stale_refused
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The crate's own constructor, so the refusal text is IDENTICAL to the
+    // decorator's and `is_stale_epoch` recognises it. A hand-written message
+    // here would be a second spelling of the same condition — and this program
+    // has already lost a counter to exactly that.
+    Some(ehdb_fencing::stale_epoch_error(shard, epoch, highest).to_string())
 }
 
 pub fn build_durable_stack(
@@ -897,6 +953,30 @@ mod tests {
         }
     }
 
+    /// Read the three fencing counters. ⚠ Returned for DELTA comparison, never
+    /// absolute: `FENCING_METRICS` is process-global and `cargo test` does not
+    /// serialise tests, so an absolute assertion here passes or fails depending
+    /// on which sibling ran first. (It did: asserting
+    /// `stale_refused_total 0` in the shadow test went red as soon as the
+    /// enforce test shared the process.)
+    ///
+    /// ⚠ And a delta is NOT sufficient either — a sibling incrementing DURING
+    /// the window inflates it just the same (`0 -> 2` for a single append).
+    /// Every caller therefore holds [`super::super::metrics::test_guard`] for
+    /// the whole before/act/after sequence. Serialisation is the only fix;
+    /// the delta just makes the assertion readable.
+    fn fencing_counts() -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            PRECHECK_WRITES.load(Relaxed),
+            PRECHECK_STALE.load(Relaxed),
+            FENCING_METRICS.stale_refused.load(Relaxed),
+            // The DECORATOR's own observation count, kept separate so a
+            // precheck that starts summing into it is visible.
+            FENCING_METRICS.stale_observed.load(Relaxed),
+        )
+    }
+
     /// Advance shard 0's fencing marker to `epoch` through the REAL ledger, the
     /// way a legitimately-elected higher-epoch writer would. Not a hand-written
     /// marker file: if the ledger's on-disk shape changes, this moves with it.
@@ -923,6 +1003,8 @@ mod tests {
     /// accepted epoch 7.
     #[test]
     fn a_superseded_writer_is_refused_as_fenced_not_as_unavailable() {
+        // Serialised: the fencing counters are process-global (see `fencing_counts`).
+        let _serialised = super::super::metrics::test_guard();
         let dir = tmp_dir("fenced-stale");
         let log = dir.join("log.jsonl");
         let contract = contract_for(&log);
@@ -931,6 +1013,7 @@ mod tests {
             (FENCING_ENV, "enforce"),
         ]);
         advance_real_marker(&e, &contract, 7);
+        let before = fencing_counts();
 
         let d = append_selected(
             &e,
@@ -969,6 +1052,8 @@ mod tests {
     /// backend that never worked), which would read as fencing working.
     #[test]
     fn the_same_stale_write_SUCCEEDS_under_shadow() {
+        // Serialised: the fencing counters are process-global (see `fencing_counts`).
+        let _serialised = super::super::metrics::test_guard();
         let dir = tmp_dir("fenced-shadow");
         let log = dir.join("log.jsonl");
         let contract = contract_for(&log);
@@ -977,6 +1062,7 @@ mod tests {
             (FENCING_ENV, "shadow"),
         ]);
         advance_real_marker(&e, &contract, 7);
+        let before = fencing_counts();
 
         let d = append_selected(
             &e,
@@ -990,6 +1076,37 @@ mod tests {
             matches!(d, AppendDispatch::Served(_)),
             "under shadow the stale write must still land — otherwise the enforce \
              test is measuring a broken store rather than fencing"
+        );
+        // ⚠ And it must be COUNTED. A shadow period that reports 0 stale writes
+        // while a superseded writer is writing makes enforce look free, which is
+        // the one question the mode exists to answer.
+        let after = fencing_counts();
+        assert_eq!(
+            after.1 - before.1,
+            1,
+            "shadow observed nothing (stale_observed {} -> {})",
+            before.1,
+            after.1
+        );
+        assert_eq!(
+            after.2 - before.2,
+            0,
+            "shadow must refuse NOTHING (stale_refused {} -> {})",
+            before.2,
+            after.2
+        );
+        // ⚠ And exactly ONCE in the decorator. The precheck must not sum into
+        // `ehdb_fencing_stale_observed_total`: in this fixture the publish does
+        // reach the shared backend, so both vantage points see the same write,
+        // and a shared counter reports one stale append as two.
+        assert_eq!(
+            after.3 - before.3,
+            1,
+            "the decorator must count this stale write exactly once \
+             (stale_observed {} -> {}) — a precheck summing into the same \
+             counter double-counts every shadow write that does publish",
+            before.3,
+            after.3
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1046,6 +1163,8 @@ mod tests {
     /// its own local root and the same shared root.
     #[test]
     fn a_stale_writer_whose_segment_is_no_longer_than_the_holders_is_still_fenced() {
+        // Serialised: the fencing counters are process-global (see `fencing_counts`).
+        let _serialised = super::super::metrics::test_guard();
         let shared = tmp_dir("gap-shared");
         let holder_dir = tmp_dir("gap-holder");
         let stale_dir = tmp_dir("gap-stale");
@@ -1088,6 +1207,7 @@ mod tests {
         //    the SAME shared root. Payloads the same size as the holder's, so
         //    its segment is no longer than what is already committed.
         let (s_contract, s_env) = mk(&stale_dir);
+        let before = fencing_counts();
         let d = append_selected(
             &s_env,
             &s_contract,
@@ -1106,10 +1226,13 @@ mod tests {
                 // ⚠ The refusal must also be COUNTED. A refusal the counter does
                 // not see renders `stale_refused 0` during active fencing, which
                 // reads exactly like a healthy store.
-                let rendered = render_fencing(FencingSetting::Enforce);
-                assert!(
-                    !rendered.contains("ehdb_fencing_stale_refused_total 0\n"),
-                    "the refusal was not counted:\n{rendered}"
+                let after = fencing_counts();
+                assert_eq!(
+                    after.2 - before.2,
+                    1,
+                    "the refusal was not counted (stale_refused {} -> {})",
+                    before.2,
+                    after.2
                 );
             }
             AppendDispatch::Served(o) => panic!(
