@@ -272,6 +272,11 @@ fn driver_for(
     tier: StoreTier,
     backend: TierBackend,
 ) -> Box<dyn EventLogDriver> {
+    // E5. Recorded from the RESOLVED flag, before construction — so a process
+    // whose `l0` store fails to open still reports `l0`, which is what the
+    // operator configured and what the refusal is about. Reporting nothing
+    // there would read as "this binary has no backend dispatch".
+    super::metrics::record_tier_backend(backend.as_str());
     match backend {
         TierBackend::LocalReference => Box::new(LocalReferenceEventLogDriver::new(
             cfg.path_for(tier),
@@ -934,6 +939,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         TierStoreConfig { dir: d }
+    }
+
+    /// E2's population. Published rather than implied: a differential over an
+    /// unstated N is consistent with a differential over one record.
+    const E2_APPENDS: u64 = 64;
+
+    /// The inputs both arms of E2 see. Deterministic — a differential whose
+    /// inputs differ run-to-run cannot distinguish "the dispatch changed the
+    /// bytes" from "the fixture did".
+    fn e2_requests() -> Vec<EventLogAppendRequest> {
+        (0..E2_APPENDS)
+            .map(|i| EventLogAppendRequest {
+                execution_id: format!("exec-{:04}", i % 7),
+                transaction_id: format!("txn-{i:04}"),
+                payload: format!("{{\"i\":{i:04},\"pad\":\"aaaaaaaa\"}}"),
+                event_id: None,
+            })
+            .collect()
+    }
+
+    fn drain(d: &dyn EventLogDriver, reqs: &[EventLogAppendRequest]) -> Vec<String> {
+        reqs.iter()
+            .map(|r| format!("{:?}", d.append(r).expect("append")))
+            .collect()
+    }
+
+    /// E2 — under `local_reference`, the dispatch produces byte-identical bytes
+    /// AND byte-identical outcomes to constructing the driver directly, over
+    /// N = [`E2_APPENDS`] appends.
+    ///
+    /// Arm B is the code that runs today: `LocalReferenceEventLogDriver::new`
+    /// with the same path and the same tenant/namespace the pre-M0.5 `driver()`
+    /// passed. So this is a differential against the incumbent, not against a
+    /// second copy of the new code.
+    ///
+    /// The outcome is compared through `Debug`, deliberately: a field added to
+    /// `EventLogAppendOutcome` later is then covered without anyone remembering
+    /// to extend this list, which a hand-written field-by-field compare is not.
+    #[test]
+    fn the_dispatch_under_local_reference_is_byte_identical_to_the_incumbent() {
+        let reqs = e2_requests();
+
+        let cfg_a = tmp_backend_cfg("e2-dispatch");
+        let a_out = drain(
+            driver_for(&cfg_a, StoreTier::EventLog, TierBackend::LocalReference).as_ref(),
+            &reqs,
+        );
+        let a_bytes = std::fs::read(cfg_a.path_for(StoreTier::EventLog)).expect("dispatch store");
+
+        let cfg_b = tmp_backend_cfg("e2-incumbent");
+        let incumbent = LocalReferenceEventLogDriver::new(
+            cfg_b.path_for(StoreTier::EventLog),
+            DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+        );
+        let b_out = drain(&incumbent, &reqs);
+        let b_bytes = std::fs::read(cfg_b.path_for(StoreTier::EventLog)).expect("incumbent store");
+
+        assert_eq!(a_out.len(), E2_APPENDS as usize, "N must be what it claims");
+        assert!(
+            a_bytes.len() > 1000,
+            "the store must actually hold the appends — a differential over two \
+             empty files passes trivially (got {} bytes)",
+            a_bytes.len()
+        );
+        assert_eq!(a_out, b_out, "EventLogAppendOutcome differs across the dispatch");
+        assert_eq!(
+            a_bytes, b_bytes,
+            "produced bytes differ across the dispatch ({} vs {} bytes)",
+            a_bytes.len(),
+            b_bytes.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&cfg_a.dir);
+        let _ = std::fs::remove_dir_all(&cfg_b.dir);
+    }
+
+    /// ⭐ E2 POSITIVE CONTROL, spec planted defect #5 — split in two, because the
+    /// differential has two arms and one control cannot show both are live.
+    ///
+    /// - A payload of the **same length** leaves every outcome field identical
+    ///   (`byte_len` included) and changes only the bytes. If the byte arm were
+    ///   comparing nothing, this stays green.
+    /// - A payload of a **different length** moves `byte_len`, so the outcome
+    ///   arm must catch it on its own.
+    #[test]
+    fn the_e2_differential_actually_compares_what_it_claims() {
+        for (label, replacement) in [
+            ("same-length payload", "{\"i\":0037,\"pad\":\"bbbbbbbb\"}"),
+            ("different-length payload", "{\"i\":0037,\"pad\":\"b\"}"),
+        ] {
+            let reqs = e2_requests();
+            let mut mutated = reqs.clone();
+            mutated[37].payload = replacement.to_string();
+            assert_ne!(
+                mutated[37].payload, reqs[37].payload,
+                "{label}: the planted difference must actually be planted"
+            );
+
+            let cfg_a = tmp_backend_cfg("e2-ctl-a");
+            let a_out = drain(
+                driver_for(&cfg_a, StoreTier::EventLog, TierBackend::LocalReference).as_ref(),
+                &reqs,
+            );
+            let a_bytes = std::fs::read(cfg_a.path_for(StoreTier::EventLog)).unwrap();
+
+            let cfg_b = tmp_backend_cfg("e2-ctl-b");
+            let incumbent = LocalReferenceEventLogDriver::new(
+                cfg_b.path_for(StoreTier::EventLog),
+                DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+                DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            );
+            let b_out = drain(&incumbent, &mutated);
+            let b_bytes = std::fs::read(cfg_b.path_for(StoreTier::EventLog)).unwrap();
+
+            assert_ne!(
+                a_bytes, b_bytes,
+                "{label}: one differing record must make the BYTE differential go RED"
+            );
+            if label.starts_with("different-length") {
+                assert_ne!(
+                    a_out, b_out,
+                    "{label}: a changed byte_len must make the OUTCOME differential go RED"
+                );
+            } else {
+                assert_eq!(
+                    a_out, b_out,
+                    "{label}: a same-length payload must leave the outcomes equal — \
+                     otherwise this control is not isolating the byte arm"
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&cfg_a.dir);
+            let _ = std::fs::remove_dir_all(&cfg_b.dir);
+        }
+    }
+
+    /// E5 reachability — the recorder existing is not the recorder being called.
+    /// Four dead recorders were found in this codebase by asking exactly this.
+    #[test]
+    fn the_dispatch_records_which_backend_it_selected() {
+        for (backend, expected) in [
+            (TierBackend::LocalReference, "local_reference"),
+            (TierBackend::L0, "l0"),
+        ] {
+            let _guard = super::super::metrics::test_guard();
+            super::super::metrics::reset();
+            assert!(
+                super::super::metrics::render_lines().is_empty(),
+                "baseline must be clean, or the assertion below proves nothing"
+            );
+
+            let cfg = tmp_backend_cfg("e5-reach");
+            let _d = driver_for(&cfg, StoreTier::EventLog, backend);
+            let text = super::super::metrics::render_lines().join("\n");
+            assert!(
+                text.contains(&format!("ehdb_tier_backend_info{{backend=\"{expected}\"}} 1")),
+                "driver_for({backend:?}) must publish the backend it selected; got:\n{text}"
+            );
+            let _ = std::fs::remove_dir_all(&cfg.dir);
+        }
+        super::super::metrics::reset();
     }
 
     #[test]

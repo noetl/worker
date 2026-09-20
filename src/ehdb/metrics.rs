@@ -149,6 +149,28 @@ struct EhdbMetricsState {
     /// Size of each backing store file in bytes, sampled at pin time and after
     /// each successful append.
     tier_service_store_bytes: BTreeMap<&'static str, u64>,
+    /// Which engine backs the tier store (M0.5 E5).
+    ///
+    /// ⚠ An **info gauge**: one series per known backend, the running one at 1
+    /// and every other at 0, all present together. The alternative an operator
+    /// falls back to — reading the Deployment's image tag or env — is a
+    /// DIFFERENT representation and can disagree with what the process is
+    /// doing. This program has already answered "does this pod predate that
+    /// metric?" from an image tag once.
+    ///
+    /// ⚠ The pin is unconditional **with respect to the flag**: opening a store
+    /// under `local_reference` still emits the `l0` series at 0. Pinning only
+    /// the selected value would make the other one absent, and absent is what a
+    /// binary with no backend dispatch also renders — the exact confusion the
+    /// gauge exists to remove (server#315 pinned publish-skip reasons inside a
+    /// config branch and lost them on the one configuration that mattered).
+    ///
+    /// It is NOT unconditional with respect to whether this process has a tier
+    /// store at all: `without_a_listener_the_tier_service_renders_nothing` holds
+    /// that a worker with EHDB off emits no EHDB lines, and a process that never
+    /// opened a store has no backend to report.
+    tier_backend: BTreeMap<&'static str, u64>,
+    tier_backend_up: bool,
     /// Records the tier-append handler pushed through the **batched** store
     /// append (one open, N writes, one fsync), and through the per-record loop.
     ///
@@ -673,6 +695,27 @@ pub fn pin_tier_append_series() {
     s.tier_append_up = true;
 }
 
+/// Every tier-store backend this build can dispatch to.
+///
+/// The gauge pins one series per entry, so adding a backend here and forgetting
+/// to pin it is not possible.
+pub const TIER_BACKENDS: [&str; 2] = ["local_reference", "l0"];
+
+/// Declare which engine actually backs this process's tier store (M0.5 E5).
+///
+/// `backend` must be one of [`TIER_BACKENDS`]; an unknown value is recorded as
+/// its own series rather than dropped, because silently discarding it would
+/// render a scrape where every known backend reads 0 — "no backend running" —
+/// on a process that is demonstrably running one.
+pub fn record_tier_backend(backend: &'static str) {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    s.tier_backend_up = true;
+    for known in TIER_BACKENDS {
+        s.tier_backend.insert(known, 0);
+    }
+    s.tier_backend.insert(backend, 1);
+}
+
 pub fn record_tier_append_path(batched: bool, records: usize) {
     let mut s = state().lock().expect("ehdb metrics lock");
     // Recording implies the handler exists, so the series can never carry a
@@ -1075,6 +1118,21 @@ pub fn render_lines() -> Vec<String> {
         }
     }
 
+    // Deliberately NOT inside `if s.tier_service_up`: a worker that opens a tier
+    // store without serving tier requests still has a backend, and the whole
+    // point of the gauge is that the process answers the question rather than
+    // the image tag.
+    if s.tier_backend_up {
+        lines.push(
+            "# HELP ehdb_tier_backend_info Which engine backs the tier store (1 = running)"
+                .to_string(),
+        );
+        lines.push("# TYPE ehdb_tier_backend_info gauge".to_string());
+        for (backend, v) in &s.tier_backend {
+            lines.push(format!("ehdb_tier_backend_info{{backend=\"{backend}\"}} {v}"));
+        }
+    }
+
     // The read-only tier-query family uses the `noetl_worker_ehdb_query_*` name
     // shape (worker-scoped, distinct from the shadow-mirror `noetl_ehdb_*`
     // families), so it renders with a bespoke block rather than
@@ -1354,6 +1412,73 @@ mod tests {
         record_object("mirror", "disabled", true, false, 0.0);
         record_vector("mirror", "disabled", true, false, 0.0);
         assert!(render_lines().is_empty());
+    }
+
+    /// E5 — the pin is unconditional with respect to the FLAG.
+    ///
+    /// Both arms, because the hazard is asymmetric: a pin that only emits the
+    /// selected backend passes an assertion written against whichever arm the
+    /// author happened to run.
+    #[test]
+    fn the_backend_gauge_pins_every_label_value_under_either_backend() {
+        for (selected, other) in [("local_reference", "l0"), ("l0", "local_reference")] {
+            let _guard = serialised();
+            reset();
+            record_tier_backend(selected);
+            let text = render_lines().join("\n");
+            assert!(
+                text.contains(&format!("ehdb_tier_backend_info{{backend=\"{selected}\"}} 1")),
+                "running backend {selected} must read 1, got:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("ehdb_tier_backend_info{{backend=\"{other}\"}} 0")),
+                "the OTHER backend {other} must be present at 0 — absent is what a \
+                 binary with no dispatch renders, which is the confusion this \
+                 gauge exists to remove. Got:\n{text}"
+            );
+        }
+    }
+
+    /// The denominator, asserted rather than assumed: every backend the dispatch
+    /// knows about gets a series. Adding a `TierBackend` variant without adding
+    /// it to `TIER_BACKENDS` fails here instead of silently shipping a gauge
+    /// that omits the new engine.
+    #[test]
+    fn every_known_backend_is_pinned() {
+        let _guard = serialised();
+        reset();
+        record_tier_backend("local_reference");
+        let text = render_lines().join("\n");
+        let pinned = text
+            .lines()
+            .filter(|l| l.starts_with("ehdb_tier_backend_info{"))
+            .count();
+        assert_eq!(
+            pinned,
+            TIER_BACKENDS.len(),
+            "pinned {pinned} series for {} known backends:\n{text}",
+            TIER_BACKENDS.len()
+        );
+        for b in TIER_BACKENDS {
+            assert!(
+                text.contains(&format!("backend=\"{b}\"")),
+                "{b} missing from:\n{text}"
+            );
+        }
+    }
+
+    /// ⚠ The counterweight. The gauge must NOT break the invariant that a worker
+    /// with EHDB switched off renders byte-identical `/metrics` — a process that
+    /// never opened a tier store has no backend to report, and inventing
+    /// `l0=0` there would be a claim about a store that does not exist.
+    #[test]
+    fn a_process_that_opened_no_tier_store_renders_no_backend_gauge() {
+        let _guard = serialised();
+        reset();
+        assert!(
+            render_lines().is_empty(),
+            "the backend gauge must be gated on a store actually being opened"
+        );
     }
 
     #[test]
