@@ -676,6 +676,38 @@ fn read_execution_locked(
     }
 }
 
+/// Read a segment and RELEASE it, so a merge is bounded by one segment at a
+/// time rather than by the sum of them.
+///
+/// ⚠⚠ Without this the merge is a second route to the OOM it was built to cure.
+/// `LocalReferenceEventLogDriver` opens through the reference-runtime cache,
+/// which replays the file and then holds that state for the life of the
+/// process. Production's existing tier store is a single **4.1 GB** file, so
+/// the first seal makes it sealed segment #1 — and the first cross-segment read
+/// would replay 4.1 GB back into memory and keep it, on top of the active
+/// segment's state. Two segments later that is worse than where this started.
+///
+/// So each SEALED segment is forgotten immediately after it is read. The active
+/// segment is deliberately NOT forgotten: it is the one the append path uses on
+/// every write, and evicting it would reintroduce a full replay per append —
+/// the exact cost the runtime cache exists to avoid.
+fn read_segment_then_release<T>(
+    path: &PathBuf,
+    is_sealed: bool,
+    f: impl FnOnce(&LocalReferenceEventLogDriver) -> T,
+) -> T {
+    let d = LocalReferenceEventLogDriver::new(
+        path.clone(),
+        DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+        DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+    );
+    let out = f(&d);
+    if is_sealed {
+        ehdb_reference::forget_runtime(path);
+    }
+    out
+}
+
 /// Global scan across sealed segments + the active one, oldest first.
 ///
 /// ⚠ `after` is applied to the **merged, renumbered** sequence, not to each
@@ -692,15 +724,14 @@ fn scan_across_segments(
     let mut records: Vec<serde_json::Value> = Vec::new();
     let mut paths: Vec<PathBuf> = sealed.to_vec();
     paths.push(cfg.path_for(tier));
-    for path in paths {
-        let d = LocalReferenceEventLogDriver::new(
-            path.clone(),
-            DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
-            DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
-        );
-        match d.scan_global(&EventLogScanRequest {
-            after: None,
-            limit: MAX_SCAN_LIMIT,
+    let last = paths.len() - 1;
+    for (i, path) in paths.iter().enumerate() {
+        let sealed_seg = i < last; // the final entry is the ACTIVE segment
+        match read_segment_then_release(path, sealed_seg, |d| {
+            d.scan_global(&EventLogScanRequest {
+                after: None,
+                limit: MAX_SCAN_LIMIT,
+            })
         }) {
             Ok(out) => {
                 if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out) {
@@ -756,13 +787,10 @@ fn read_execution_across_segments(
     let mut records: Vec<serde_json::Value> = Vec::new();
     let mut paths: Vec<PathBuf> = sealed.to_vec();
     paths.push(cfg.path_for(tier));
-    for path in paths {
-        let d = LocalReferenceEventLogDriver::new(
-            path.clone(),
-            DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
-            DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
-        );
-        match d.read_execution(request) {
+    let last = paths.len() - 1;
+    for (i, path) in paths.iter().enumerate() {
+        let sealed_seg = i < last; // the final entry is the ACTIVE segment
+        match read_segment_then_release(path, sealed_seg, |d| d.read_execution(request)) {
             Ok(out) => {
                 if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out).map(|v| v)
                 {
@@ -860,6 +888,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         TierStoreConfig { dir: d }
+    }
+
+    /// ⭐⭐ A merge must be bounded by ONE segment at a time, not by their sum.
+    ///
+    /// Production's tier store is a single 4.1 GB file, so the first seal makes
+    /// it sealed segment #1. If the merge left each segment cached, the first
+    /// cross-segment read would replay 4.1 GB back into memory and KEEP it —
+    /// recreating the OOM by a second route.
+    ///
+    /// ⚠ This test SETS `NOETL_EHDB_REFERENCE_RUNTIME_CACHE`, and that is a
+    /// deliberate exception to "no `set_var` in tests". The property under test
+    /// only exists when the cache is on — with it off nothing is retained and
+    /// the assertion is vacuous, which is exactly how an earlier version of
+    /// this test passed against a planted defect. The distinction from the seal
+    /// threshold (which is injected, never set globally) is that this flag
+    /// changes only CACHING; it cannot change what a sibling test stores or
+    /// reads back. The precondition is asserted, so if that ever stops being
+    /// true the test fails rather than quietly proving nothing.
+    #[tokio::test]
+    async fn a_merged_read_does_not_leave_sealed_segments_cached() {
+        std::env::set_var("NOETL_EHDB_REFERENCE_RUNTIME_CACHE", "true");
+        assert!(
+            ehdb_reference::runtime_cache_enabled(),
+            "the runtime cache must be ON, or nothing is retained and this test \
+             proves nothing (it passed against a planted defect that way once)"
+        );
+
+        let cfg = seal_cfg("release");
+        const N: usize = 30;
+        for i in 0..N {
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-rel",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "q".repeat(120)),
+                Some(2048),
+            )
+            .await;
+        }
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert!(
+            segs.len() >= 2,
+            "need >=2 sealed segments to exercise the merge, got {}",
+            segs.len()
+        );
+
+        for sp in &segs {
+            ehdb_reference::forget_runtime(sp);
+        }
+        ehdb_reference::forget_runtime(&cfg.path_for(StoreTier::EventLog));
+
+        let got = read_execution(Some(&cfg), StoreTier::EventLog, "exec-rel").await;
+        assert!(matches!(got, TierStoreOutcome::Ok(_)), "read failed: {got:?}");
+
+        // The ACTIVE segment stays cached on purpose — the append path uses it
+        // on every write, and evicting it would reintroduce a full replay per
+        // append. Every SEALED one must be gone.
+        for sp in &segs {
+            assert!(
+                !ehdb_reference::forget_runtime(sp),
+                "sealed segment {} was STILL cached after the merge — each one \
+                 holds its whole file replayed, so leaving them is the OOM again",
+                sp.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
     /// Fail-safe: the seal is OFF unless explicitly and usably configured.
