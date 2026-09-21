@@ -54,6 +54,17 @@ fn main() -> ExitCode {
         Some("eventlog-suite") => run_eventlog_suite(&env, &flags),
         Some("durable-eventlog") => run_durable_eventlog(&env, &flags),
         Some("durable-eventlog-gc") => run_durable_eventlog_gc(&env, &flags),
+        Some("tier-load") => {
+            // `main` is sync; the load driver needs a runtime because the tier
+            // client is async.
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(run_tier_load(&flags)),
+                Err(e) => {
+                    eprintln!("tier-load: could not start a runtime: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Some("eventlog-primary-serve") => run_eventlog_primary_serve(&env, &flags),
         Some("mirror-projection") => run_mirror_projection(&env, &flags),
         Some("projection-suite") => run_projection_suite(&env, &flags),
@@ -1065,6 +1076,118 @@ fn run_durable_eventlog(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Drive the tier service over TCP: grow its store, then burst it.
+///
+/// ⚠ Over the WIRE, deliberately. The reconnect bound lives in `serve_tier`'s
+/// accept loop, so a driver that called `tier_store::append` in-process would
+/// exercise the store and never the bound — it would prove nothing about the
+/// thing that OOM-killed the writer.
+///
+/// `--records N` grows the store; `--concurrency C` opens C simultaneous
+/// connections, which is the shape a KEDA scale-out (1→20) produces.
+///
+/// Reports what the SERVICE did, not what the driver hoped: appended vs
+/// refused, wall time, and the slowest single append.
+async fn run_tier_load(flags: &Flags) -> ExitCode {
+    let records = flags.parse_usize("records").unwrap_or(1_000);
+    let concurrency = flags.parse_usize("concurrency").unwrap_or(1).max(1);
+    let pad = flags.parse_usize("pad").unwrap_or(512);
+    let addr = flags
+        .get("addr")
+        .unwrap_or_else(|| "127.0.0.1:9110".to_string());
+    let exec = flags
+        .get("execution-id")
+        .unwrap_or_else(|| "tier-load".to_string());
+
+    let cfg = match ehdb::tier_client::TierClientConfig::build(
+        Some(&addr),
+        None,
+        None,
+    ) {
+        Some(c) => c,
+        None => {
+            println!("{}", serde_json::json!({"suite":"tier-load","ok":false,
+                     "error":format!("unusable addr {addr}")}));
+            return ExitCode::from(2);
+        }
+    };
+
+    let filler = "z".repeat(pad);
+    let per = records.div_ceil(concurrency);
+    let started = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for c in 0..concurrency {
+        let cfg = cfg.clone();
+        let exec = exec.clone();
+        let filler = filler.clone();
+        tasks.push(tokio::spawn(async move {
+            let client = ehdb::tier_client::TierClient::new(cfg);
+            let (mut ok, mut err, mut slowest_ms) = (0u64, 0u64, 0u64);
+            let mut last_err = String::new();
+            for i in 0..per {
+                let t = std::time::Instant::now();
+                let r = client
+                    .append(&exec, &format!("{{\"c\":{c},\"i\":{i},\"pad\":\"{filler}\"}}"))
+                    .await;
+                let ms = t.elapsed().as_millis() as u64;
+                if ms > slowest_ms {
+                    slowest_ms = ms;
+                }
+                match r {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        err += 1;
+                        if last_err.is_empty() {
+                            last_err = e;
+                        }
+                    }
+                }
+            }
+            (ok, err, slowest_ms, last_err)
+        }));
+    }
+    let (mut ok, mut err, mut slowest, mut last_err) = (0u64, 0u64, 0u64, String::new());
+    for t in tasks {
+        match t.await {
+            Ok((o, e, s, le)) => {
+                ok += o;
+                err += e;
+                slowest = slowest.max(s);
+                if last_err.is_empty() {
+                    last_err = le;
+                }
+            }
+            Err(e) => {
+                err += per as u64;
+                if last_err.is_empty() {
+                    last_err = format!("driver task panicked: {e}");
+                }
+            }
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    println!(
+        "{}",
+        serde_json::json!({
+            "suite": "tier-load",
+            "addr": addr,
+            "requested": records,
+            "concurrency": concurrency,
+            "appended": ok,
+            "refused": err,
+            "seconds": (secs * 100.0).round() / 100.0,
+            "appends_per_sec": ((ok as f64 / secs.max(0.001)) * 10.0).round() / 10.0,
+            "slowest_append_ms": slowest,
+            "first_error": last_err,
+        })
+    );
+    if ok == 0 {
+        ExitCode::from(5)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

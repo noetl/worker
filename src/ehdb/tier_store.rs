@@ -204,6 +204,142 @@ fn event_id_from_payload(payload: &str) -> Option<String> {
     }
 }
 
+/// Seal the tier's active log once it exceeds this many bytes.
+///
+/// ⚠⚠ WHY THIS EXISTS — measured, not assumed.
+///
+/// The tier is **not** an L0 engine, so it has none of the part-sealing the
+/// command bus and events feed get from `seal_aged_parts`. It is one JSONL file
+/// that `LocalReferenceRuntime::open` replays **in full** into an in-memory
+/// `ReferenceDatabase`, which the reference-runtime cache then holds for the
+/// life of the process. Two consequences, both linear in the record count:
+///
+/// * **Memory** is proportional to the store. In production the store reached
+///   **4.0 GB** and the writer's baseline sat at ~3 GiB.
+/// * **Every append costs a copy of that state** — `LocalReferenceRuntime::append`
+///   does `self.state.clone()` before applying. Measured on a synthetic store:
+///
+///   ```text
+///   records   ms/append   on_disk
+///       400       8.12      0.7MB
+///      2000      20.87      3.6MB
+///      4000      36.56      7.2MB
+///   ```
+///
+///   A 4.5x rise in per-append cost over a 10x store growth — O(n) per append.
+///   At production size that is the observed `"timed out after 4s"`.
+///
+/// On 2026-09-20 this OOM-killed `noetl-cmdbus-writer-0`, which hosts BOTH
+/// buses, repeatedly — at a 4 GiB limit and again at 8 GiB. Raising the limit
+/// is a delay; bounding the store is the fix.
+///
+/// **Unset ⇒ no sealing ⇒ byte-identical to today.** A store that has never
+/// sealed has exactly one segment, which is the file that exists now.
+pub const TIER_SEAL_MAX_BYTES_ENV: &str = "NOETL_EHDB_TIER_SEAL_MAX_BYTES";
+
+/// Resolve the seal threshold. `None` (unset/unparsable/zero) ⇒ never seal.
+///
+/// Fail-safe direction is **off**: a typo must not start rotating a
+/// primary-serving tier's store behind the operator's back.
+pub fn tier_seal_max_bytes() -> Option<u64> {
+    parse_seal_max_bytes(std::env::var(TIER_SEAL_MAX_BYTES_ENV).ok().as_deref())
+}
+
+/// Pure parse, so the fail-safe direction is testable without the process env.
+pub fn parse_seal_max_bytes(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0)
+}
+
+/// Sealed segments of `tier`, oldest first.
+///
+/// Named `<active>.<seq>` beside the active file — same directory, **same JSONL
+/// format**, so nothing about the on-disk encoding changes. Sealing renames;
+/// it never rewrites and never deletes.
+pub fn sealed_segments(cfg: &TierStoreConfig, tier: StoreTier) -> Vec<PathBuf> {
+    let active = cfg.path_for(tier);
+    let Some(dir) = active.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = active.file_name().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{stem}.");
+    let mut found: Vec<(u64, PathBuf)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some(rest) = name.strip_prefix(&prefix) {
+            // ⚠ `parse::<u64>` IS the filter: it rejects "", "bak", "1a" and
+            // "-1" on its own. An earlier version also checked every byte was a
+            // digit; the mutation battery showed that guard was redundant
+            // (removing it changed no behaviour), so it is gone rather than left
+            // as a second rule that could drift from the first. A stray
+            // `eventlog.jsonl.bak` is still never replayed as tier data.
+            if let Ok(n) = rest.parse::<u64>() {
+                found.push((n, p));
+            }
+        }
+    }
+    found.sort_by_key(|(n, _)| *n);
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Seal the active log if it is over the threshold. Returns the sealed path.
+///
+/// ⚠ Called with the store's WRITE lock held, before an append, so no reader or
+/// writer can be mid-operation on the file being renamed.
+///
+/// ⚠ The rename is the whole operation. There is no copy and no truncate, so
+/// there is no window in which data exists in neither file and no way for this
+/// to lose a record: either the rename happened or it did not.
+fn maybe_seal(cfg: &TierStoreConfig, tier: StoreTier, max: Option<u64>) -> Option<PathBuf> {
+    let max = max?;
+    let active = cfg.path_for(tier);
+    let len = std::fs::metadata(&active).ok()?.len();
+    if len < max {
+        return None;
+    }
+    let next = sealed_segments(cfg, tier)
+        .last()
+        .and_then(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.rsplit('.').next())
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+        + 1;
+    let sealed = active.with_file_name(format!(
+        "{}.{next}",
+        active.file_name().and_then(|s| s.to_str()).unwrap_or("tier")
+    ));
+    match std::fs::rename(&active, &sealed) {
+        Ok(()) => {
+            // ⚠ The cached runtime is keyed by path and holds the replayed state
+            // of the file that just moved. Dropping it is what actually releases
+            // the memory — without this the seal bounds the FILE and not the
+            // process, which is the entire point.
+            ehdb_reference::forget_runtime(&active);
+            tracing::info!(
+                tier = tier.as_str(),
+                bytes = len,
+                sealed = %sealed.display(),
+                "EHDB tier store sealed (noetl/ai-meta#332 writer OOM)"
+            );
+            Some(sealed)
+        }
+        Err(e) => {
+            tracing::warn!(tier = tier.as_str(), error = %e, "EHDB tier seal failed; continuing unsealed");
+            None
+        }
+    }
+}
+
 fn driver(cfg: &TierStoreConfig, tier: StoreTier) -> LocalReferenceEventLogDriver {
     LocalReferenceEventLogDriver::new(
         cfg.path_for(tier),
@@ -238,8 +374,39 @@ pub async fn append(
     if payload.is_empty() {
         return TierStoreOutcome::Invalid("payload is empty".to_string());
     }
+    append_with_seal(Some(cfg), tier, execution_id, payload, tier_seal_max_bytes()).await
+}
+
+/// [`append`] with the seal threshold injected.
+///
+/// ⚠ Exists so tests can arm the seal WITHOUT `std::env::set_var`. They did
+/// once: `cargo test` does not serialise tests, the variable is process-global,
+/// and it armed sealing inside an unrelated sibling
+/// (`concurrent_appends_to_one_tier_stay_readable` went from 24 records to 8).
+/// A test that can only be written by mutating global state is a test that will
+/// eventually break a different one.
+pub async fn append_with_seal(
+    cfg: Option<&TierStoreConfig>,
+    tier: StoreTier,
+    execution_id: &str,
+    payload: &str,
+    seal_max: Option<u64>,
+) -> TierStoreOutcome {
+    let Some(cfg) = cfg else {
+        return TierStoreOutcome::Unavailable;
+    };
+    if execution_id.trim().is_empty() {
+        return TierStoreOutcome::Invalid("execution_id is empty".to_string());
+    }
+    if payload.is_empty() {
+        return TierStoreOutcome::Invalid("payload is empty".to_string());
+    }
     let lock = store_lock(cfg, tier);
     let _exclusive = lock.write().await;
+    // ⚠ Under the WRITE lock, before the append: no reader or writer can be
+    // mid-operation on the file being renamed. No-op unless a threshold is
+    // configured AND the active segment is over it.
+    let _ = maybe_seal(cfg, tier, seal_max);
     append_locked(cfg, tier, execution_id, payload)
 }
 
@@ -290,6 +457,7 @@ pub async fn append_batch(
 
     let lock = store_lock(cfg, tier);
     let _exclusive = lock.write().await;
+    let _ = maybe_seal(cfg, tier, tier_seal_max_bytes());
     append_batch_locked(cfg, tier, execution_id, payloads)
 }
 
@@ -477,6 +645,15 @@ fn read_execution_locked(
         after: None,
         limit: MAX_SCAN_LIMIT,
     };
+    // ⚠⚠ Sealed segments FIRST, then the active one. A read that consulted only
+    // the active segment would silently lose every record written before the
+    // last seal — turning a memory fix into a data-loss bug, which is strictly
+    // worse than the OOM it was meant to cure. `sealed_segments` is empty on a
+    // store that has never sealed, so this is exactly today's behaviour there.
+    let sealed = sealed_segments(cfg, tier);
+    if !sealed.is_empty() {
+        return read_execution_across_segments(cfg, tier, execution_id, &sealed, &request);
+    }
     match driver(cfg, tier).read_execution(&request) {
         Ok(out) => {
             let mut v = serde_json::to_value(&out).unwrap_or(serde_json::Value::Null);
@@ -497,6 +674,133 @@ fn read_execution_locked(
         }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
     }
+}
+
+/// Global scan across sealed segments + the active one, oldest first.
+///
+/// ⚠ `after` is applied to the **merged, renumbered** sequence, not to each
+/// segment's own numbering. Passing it down per segment would skip a different
+/// set of records in every file, because each driver numbers from 1 within its
+/// own log.
+fn scan_across_segments(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    sealed: &[PathBuf],
+    after: Option<u64>,
+    limit: usize,
+) -> TierStoreOutcome {
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut paths: Vec<PathBuf> = sealed.to_vec();
+    paths.push(cfg.path_for(tier));
+    for path in paths {
+        let d = LocalReferenceEventLogDriver::new(
+            path.clone(),
+            DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+        );
+        match d.scan_global(&EventLogScanRequest {
+            after: None,
+            limit: MAX_SCAN_LIMIT,
+        }) {
+            Ok(out) => {
+                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out) {
+                    if let Some(serde_json::Value::Array(rs)) = o.remove("records") {
+                        records.extend(rs);
+                    }
+                }
+            }
+            Err(e) => {
+                return TierStoreOutcome::Error(format!(
+                    "tier segment {} unreadable: {e}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    let total = records.len();
+    for (i, r) in records.iter_mut().enumerate() {
+        if let Some(o) = r.as_object_mut() {
+            o.insert(
+                "global_sequence".to_string(),
+                serde_json::Value::from((i + 1) as u64),
+            );
+        }
+    }
+    let skip = after.unwrap_or(0) as usize;
+    let page: Vec<serde_json::Value> = records.into_iter().skip(skip).take(limit).collect();
+    let body = serde_json::json!({
+        "action": "eventlog-scan",
+        "exists": total > 0,
+        "record_count": total,
+        "returned": page.len(),
+        "records": page,
+        "segments": sealed.len() + 1,
+    });
+    TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// Read one execution across sealed segments + the active one, oldest first.
+///
+/// ⚠ `global_sequence` is **renumbered** over the merged result. Each segment's
+/// driver numbers records from 1 within its own file, so the raw values collide
+/// across segments. Renumbering keeps the field meaning what a reader expects —
+/// a total order over what was returned — instead of handing back several
+/// records that all claim to be number 1.
+fn read_execution_across_segments(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    execution_id: &str,
+    sealed: &[PathBuf],
+    request: &EventLogReadExecutionRequest,
+) -> TierStoreOutcome {
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut paths: Vec<PathBuf> = sealed.to_vec();
+    paths.push(cfg.path_for(tier));
+    for path in paths {
+        let d = LocalReferenceEventLogDriver::new(
+            path.clone(),
+            DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+            DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+        );
+        match d.read_execution(request) {
+            Ok(out) => {
+                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out).map(|v| v)
+                {
+                    if let Some(serde_json::Value::Array(rs)) = o.remove("records") {
+                        records.extend(rs);
+                    }
+                }
+            }
+            // A segment that cannot be read is NOT silently skipped: a partial
+            // answer presented as complete is the failure this whole change is
+            // trying not to cause.
+            Err(e) => {
+                return TierStoreOutcome::Error(format!(
+                    "tier segment {} unreadable: {e}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    for (i, r) in records.iter_mut().enumerate() {
+        if let Some(o) = r.as_object_mut() {
+            o.insert(
+                "global_sequence".to_string(),
+                serde_json::Value::from((i + 1) as u64),
+            );
+        }
+    }
+    let n = records.len();
+    let body = serde_json::json!({
+        "action": "eventlog-read-execution",
+        "execution_id": execution_id,
+        "exists": n > 0,
+        "record_count": n,
+        "returned": n,
+        "records": records,
+        "segments": sealed.len() + 1,
+    });
+    TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
 /// Bounded global scan. `limit` is clamped to [`MAX_SCAN_LIMIT`].
@@ -521,6 +825,16 @@ fn scan_locked(
     limit: usize,
 ) -> TierStoreOutcome {
     let limit = limit.clamp(1, MAX_SCAN_LIMIT);
+    // ⚠⚠ Sealed segments first, same as `read_execution`. This was MISSED in the
+    // first cut of the seal — `read_execution` merged and `scan` did not — and a
+    // leaked env var in a sibling test is what exposed it: a scan that had been
+    // returning 24 records returned 8, the active segment only. Silently
+    // returning a suffix of the log is the data-loss failure this seal must not
+    // cause, so both readers go through the same merge.
+    let sealed = sealed_segments(cfg, tier);
+    if !sealed.is_empty() {
+        return scan_across_segments(cfg, tier, &sealed, after, limit);
+    }
     match driver(cfg, tier).scan_global(&EventLogScanRequest { after, limit }) {
         Ok(out) => TierStoreOutcome::Ok(
             serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()),
@@ -532,6 +846,168 @@ fn scan_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // ---- tier seal (noetl/ai-meta#332 writer OOM) --------------------------
+
+    fn seal_cfg(tag: &str) -> TierStoreConfig {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "ehdb-seal-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        TierStoreConfig { dir: d }
+    }
+
+    /// Fail-safe: the seal is OFF unless explicitly and usably configured.
+    #[test]
+    fn the_seal_is_off_unless_explicitly_configured() {
+        for raw in [None, Some(""), Some("0"), Some("abc"), Some("-1")] {
+            assert_eq!(
+                parse_seal_max_bytes(raw),
+                None,
+                "{raw:?} must leave the seal OFF — a typo must not start rotating a \
+                 primary-serving tier's store behind the operator's back"
+            );
+        }
+        assert_eq!(parse_seal_max_bytes(Some("1024")), Some(1024));
+        assert_eq!(parse_seal_max_bytes(Some(" 1024 ")), Some(1024));
+    }
+
+    /// A store that has never sealed looks exactly like today's.
+    #[test]
+    fn an_unsealed_store_has_no_segments() {
+        let cfg = seal_cfg("none");
+        assert!(
+            sealed_segments(&cfg, StoreTier::EventLog).is_empty(),
+            "a fresh store must report no sealed segments"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⚠ Only all-digit suffixes are segments. A stray `eventlog.jsonl.bak`
+    /// must never be replayed as if it were tier data.
+    #[test]
+    fn only_numbered_suffixes_count_as_segments() {
+        let cfg = seal_cfg("suffix");
+        let active = cfg.path_for(StoreTier::EventLog);
+        std::fs::write(&active, b"").unwrap();
+        for bad in ["bak", "tmp", "1a", ""] {
+            std::fs::write(active.with_file_name(format!("eventlog.jsonl.{bad}")), b"").unwrap();
+        }
+        std::fs::write(active.with_file_name("eventlog.jsonl.1"), b"").unwrap();
+        std::fs::write(active.with_file_name("eventlog.jsonl.2"), b"").unwrap();
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert_eq!(
+            segs.len(),
+            2,
+            "expected exactly the two numbered segments, got {segs:?}"
+        );
+        // Oldest first — the read path depends on this order.
+        assert!(segs[0].to_string_lossy().ends_with(".1"));
+        assert!(segs[1].to_string_lossy().ends_with(".2"));
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐⭐ THE ONE THAT MATTERS. Sealing must bound the ACTIVE segment while
+    /// losing **nothing** — every record written before a seal must still read
+    /// back, through BOTH readers.
+    ///
+    /// A seal that bounded memory by dropping records would be strictly worse
+    /// than the OOM it cures, so this asserts counts AND payloads, and asserts
+    /// the read actually spanned segments (otherwise it proves nothing about
+    /// the merge).
+    ///
+    /// ⚠ The threshold is INJECTED, never `set_var`. An earlier version set the
+    /// process env and armed sealing inside an unrelated sibling test, which is
+    /// how the missing `scan` merge was found — but it is not a technique to
+    /// keep.
+    #[tokio::test]
+    async fn sealing_bounds_the_active_segment_and_loses_no_records() {
+        let cfg = seal_cfg("roundtrip");
+        const N: usize = 40;
+        const MAX: u64 = 2048;
+        for i in 0..N {
+            let out = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-seal",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "y".repeat(120)),
+                Some(MAX),
+            )
+            .await;
+            assert!(matches!(out, TierStoreOutcome::Ok(_)), "append {i} failed: {out:?}");
+        }
+
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert!(
+            !segs.is_empty(),
+            "the fixture never crossed the threshold, so it cannot show sealing works"
+        );
+
+        // BOUND: the active segment stayed small.
+        let active_len = std::fs::metadata(cfg.path_for(StoreTier::EventLog))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            active_len < MAX * 2,
+            "active segment is {active_len} bytes against a {MAX}-byte threshold — \
+             sealing did not bound it"
+        );
+
+        // NO LOSS, reader 1: read_execution.
+        let got = read_execution(Some(&cfg), StoreTier::EventLog, "exec-seal").await;
+        let TierStoreOutcome::Ok(body) = got else { panic!("read failed: {got:?}") };
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["record_count"].as_u64().unwrap() as usize, N,
+            "read_execution LOST records: {} of {N} (segments={})", v["record_count"], v["segments"]
+        );
+        assert!(v["segments"].as_u64().unwrap() > 1, "the read did not span segments");
+
+        // ⚠ Sequences must be renumbered over the MERGE. Each segment's driver
+        // numbers from 1 within its own file, so without renumbering the merged
+        // reply contains several records all claiming to be number 1 — a total
+        // order that is not one. (The battery caught that this was unasserted.)
+        let seqs: Vec<u64> = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["global_sequence"].as_u64().unwrap_or(0))
+            .collect();
+        let expected: Vec<u64> = (1..=N as u64).collect();
+        assert_eq!(
+            seqs, expected,
+            "merged global_sequence must be 1..N with no duplicates; got {seqs:?}"
+        );
+
+        // Payloads, not just the count — a merge returning N copies of one
+        // record satisfies a count assertion.
+        let recs = v["records"].as_array().unwrap();
+        for i in 0..N {
+            let needle = format!("\\\"i\\\":{i},");
+            assert!(
+                recs.iter().any(|r| r.to_string().contains(&needle)),
+                "record {i} missing from the merged read_execution"
+            );
+        }
+
+        // NO LOSS, reader 2: scan. This is the one the first cut forgot.
+        let sc = scan(Some(&cfg), StoreTier::EventLog, None, MAX_SCAN_LIMIT).await;
+        let TierStoreOutcome::Ok(sbody) = sc else { panic!("scan failed: {sc:?}") };
+        let sv: serde_json::Value = serde_json::from_str(&sbody).unwrap();
+        assert_eq!(
+            sv["record_count"].as_u64().unwrap() as usize, N,
+            "scan LOST records: {} of {N} — a scan that returns only the active \
+             segment is silent data loss", sv["record_count"]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+
 
     /// Every pre-#265 test addresses the event log, which is also the tier the
     /// wire default resolves to — so these keep asserting exactly what they

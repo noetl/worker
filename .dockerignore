@@ -3,6 +3,15 @@ target
 # top-level `target` glob only matches at the context root, so without this a
 # locally-built plug-in ships its whole target dir in the build context.
 **/target
+# ⚠ ...but NOT inside `vendor/`. `**/target` is a NAME match, so it also
+# excludes `vendor/cc/src/target/` — a legitimate SOURCE module of the vendored
+# `cc` crate, not a build directory. The result is a vendor tree that looks
+# complete and fails at `cargo chef cook` with
+# "failed to open /app/vendor/cc/src/target/llvm.rs", which reads like a
+# corrupt vendor rather than an ignore rule. Re-include vendored sources
+# explicitly; vendored crates ship no build artifacts, so nothing is regained
+# by excluding them.
+!vendor/**
 .git
 .github
 .DS_Store

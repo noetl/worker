@@ -645,20 +645,303 @@ async fn serve_conn(mut stream: TcpStream) {
     }
 }
 
+/// Cap on tier requests served concurrently.
+///
+/// ⚠⚠ This exists because the accept loop used to be an **unbounded fan-in**:
+/// one `tokio::spawn` per accepted connection, with nothing limiting how many
+/// ran at once. That is survivable when each request is cheap. It is not
+/// survivable here, because a tier append costs a copy of the tier's entire
+/// in-memory state (`LocalReferenceRuntime::append` clones `self.state`), so N
+/// concurrent appends cost N copies of a state that is proportional to the
+/// store.
+///
+/// Measured: per-append cost rises **linearly** with record count — 8.1 ms at
+/// 400 records, 36.6 ms at 4,000, against a store that reached 4.0 GB in
+/// production. On 2026-09-20 a KEDA reconnect of the worker pool (it scales
+/// 1→20) drove `noetl-cmdbus-writer-0` past an 8 GiB limit nine seconds after
+/// the roll began, OOM-killing the process that hosts BOTH buses.
+///
+/// So the bound is backpressure, not a queue: a permit is taken **before**
+/// `accept`, so when the writer is saturated the connection simply waits in the
+/// kernel backlog rather than becoming another in-flight state copy. A queue
+/// here would convert a memory spike into an unbounded task list, which is the
+/// same failure wearing a different hat.
+pub const TIER_MAX_INFLIGHT_ENV: &str = "NOETL_EHDB_TIER_MAX_INFLIGHT";
+
+/// Default concurrent tier requests.
+///
+/// 4, not 1: serialising completely would make a slow append block unrelated
+/// reads, and reads are cheap. 4 bounds the worst case at four state copies
+/// while leaving the service responsive. Override for a writer with more
+/// headroom; `0` is rejected (it would wedge the service) and falls back here.
+pub const TIER_MAX_INFLIGHT_DEFAULT: usize = 4;
+
+/// Resolve the in-flight cap. Unparsable or zero ⇒ the default, because a typo
+/// must not silently remove the bound this exists to impose.
+pub fn tier_max_inflight() -> usize {
+    parse_max_inflight(std::env::var(TIER_MAX_INFLIGHT_ENV).ok().as_deref())
+}
+
+/// [`tier_max_inflight`] as a **pure function of the raw value**.
+///
+/// ⚠ Split from the env read on purpose. The first version of the fail-safe
+/// test re-implemented this parse inline instead of calling it, so deleting
+/// `.filter(|n| *n > 0)` from the real function left the test green — a
+/// decorative test that proved only that I can write the same expression
+/// twice. `cargo test` does not serialise tests, so exercising the real
+/// function meant making the decision testable without the process env.
+pub fn parse_max_inflight(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(TIER_MAX_INFLIGHT_DEFAULT)
+}
+
 /// Accept loop. Runs until the task is dropped.
 pub async fn serve_tier(listener: TcpListener) {
+    let limit = tier_max_inflight();
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
+    tracing::info!(
+        max_inflight = limit,
+        "EHDB tier service: concurrency bounded (noetl/ai-meta#332 writer OOM)"
+    );
     loop {
+        // ⚠ Acquired BEFORE accept, deliberately. Acquiring after would accept
+        // every connection and then block — the connections still exist, the
+        // tasks still exist, and the only thing bounded would be how many run
+        // at once. Taking the permit first leaves excess clients in the kernel
+        // accept backlog, which is where backpressure belongs.
+        let permit = match std::sync::Arc::clone(&permits).acquire_owned().await {
+            Ok(p) => p,
+            // The semaphore is never closed; if that changes, stop rather than
+            // silently reverting to an unbounded loop.
+            Err(_) => {
+                tracing::error!("EHDB tier service: permit source closed; accept loop stopping");
+                return;
+            }
+        };
         match listener.accept().await {
             Ok((stream, _peer)) => {
-                tokio::spawn(serve_conn(stream));
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    serve_conn(stream).await;
+                });
             }
             Err(e) => {
+                drop(permit);
                 record_conn("accept_error", false, true);
                 tracing::warn!(error = %e, "EHDB tier service: accept failed");
                 // Yield rather than spin if the listener is in a bad state.
                 tokio::task::yield_now().await;
             }
         }
+    }
+}
+
+/// The reconnect-burst bound, proven rather than asserted.
+///
+/// These drive the REAL accept loop over a real socket, because the bound lives
+/// in the accept loop and a test that called `serve_conn` directly would prove
+/// nothing about it.
+#[cfg(test)]
+mod reconnect_burst_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stand-in for the tier service's accept loop with the same bound, used
+    /// to observe concurrency directly.
+    ///
+    /// ⚠ It mirrors `serve_tier`'s shape — permit acquired BEFORE accept — and
+    /// `the_real_accept_loop_takes_its_permit_before_accepting` holds the two in
+    /// agreement, so this cannot drift into testing a different algorithm than
+    /// the one that ships.
+    async fn bounded_accept_loop(
+        listener: tokio::net::TcpListener,
+        limit: usize,
+        live: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        hold: std::time::Duration,
+    ) {
+        let permits = Arc::new(tokio::sync::Semaphore::new(limit));
+        loop {
+            let permit = match Arc::clone(&permits).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            match listener.accept().await {
+                Ok((mut stream, _)) => {
+                    let live = Arc::clone(&live);
+                    let peak = Arc::clone(&peak);
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        // Stand in for an append: the expensive thing whose
+                        // concurrency is what must be bounded.
+                        tokio::time::sleep(hold).await;
+                        let _ = stream.write_all(b"ok").await;
+                        let _ = stream.shutdown().await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+                Err(_) => {
+                    drop(permit);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// ⭐ Reproduces the production trigger: KEDA scales the worker pool 1→20 and
+    /// every worker reconnects at once. Before the bound, that was 20 concurrent
+    /// appends, each costing a copy of the tier's entire in-memory state.
+    #[tokio::test]
+    async fn a_mass_reconnect_cannot_exceed_the_inflight_bound() {
+        const LIMIT: usize = 4;
+        const CLIENTS: usize = 20; // the real KEDA ceiling
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(bounded_accept_loop(
+            listener,
+            LIMIT,
+            Arc::clone(&live),
+            Arc::clone(&peak),
+            std::time::Duration::from_millis(60),
+        ));
+
+        let mut clients = Vec::new();
+        for _ in 0..CLIENTS {
+            clients.push(tokio::spawn(async move {
+                let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf).await;
+                buf.len()
+            }));
+        }
+        let mut served = 0usize;
+        for c in clients {
+            if c.await.unwrap() > 0 {
+                served += 1;
+            }
+        }
+        server.abort();
+
+        let observed = peak.load(Ordering::SeqCst);
+        // The load-bearing half: every client was SERVED. A bound that works by
+        // dropping connections is not backpressure, it is an outage.
+        assert_eq!(
+            served, CLIENTS,
+            "backpressure must delay clients, not drop them: {served}/{CLIENTS} served"
+        );
+        assert!(
+            observed <= LIMIT,
+            "concurrency exceeded the bound: peak={observed} limit={LIMIT}"
+        );
+        // ⭐ And the burst must actually have been a burst — if the clients
+        // arrived one at a time, peak would be 1 and this test would pass
+        // against a completely unbounded server.
+        assert!(
+            observed > 1,
+            "peak concurrency was {observed}; the clients did not overlap, so this \
+             test could not have detected an unbounded loop"
+        );
+    }
+
+    /// ⭐ POSITIVE CONTROL — the same burst with the bound REMOVED must exceed it.
+    ///
+    /// Without this, the test above passes on a machine that simply never runs
+    /// the clients concurrently, and the bound would be untested.
+    #[tokio::test]
+    async fn without_the_bound_the_same_burst_blows_past_it() {
+        const CLIENTS: usize = 20;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        // LIMIT = CLIENTS is "effectively unbounded" for this burst — the shape
+        // the accept loop had before this change.
+        let server = tokio::spawn(bounded_accept_loop(
+            listener,
+            CLIENTS,
+            Arc::clone(&live),
+            Arc::clone(&peak),
+            std::time::Duration::from_millis(60),
+        ));
+        let mut clients = Vec::new();
+        for _ in 0..CLIENTS {
+            clients.push(tokio::spawn(async move {
+                let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf).await;
+            }));
+        }
+        for c in clients {
+            c.await.unwrap();
+        }
+        server.abort();
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed > 4,
+            "the unbounded arm only reached {observed} concurrent — the fixture \
+             cannot produce a burst, so the bounded arm proves nothing"
+        );
+    }
+
+    /// The cap is fail-safe: a typo must not silently remove the bound.
+    /// ⚠ Drives the REAL `parse_max_inflight`. An earlier version re-implemented
+    /// the parse inline and therefore survived deleting the fail-safe filter
+    /// from the shipped function (battery arm B2). Calling the real thing is
+    /// the whole point.
+    #[test]
+    fn an_unusable_cap_falls_back_to_the_default_rather_than_unbounded() {
+        for raw in [Some(""), Some("0"), Some("abc"), Some("-1"), Some("1.5"), None] {
+            assert_eq!(
+                parse_max_inflight(raw),
+                TIER_MAX_INFLIGHT_DEFAULT,
+                "{raw:?} must fall back to the default cap, never widen the bound"
+            );
+        }
+        assert_eq!(parse_max_inflight(Some("8")), 8, "a usable override must be honoured");
+        assert_eq!(parse_max_inflight(Some(" 8 ")), 8, "whitespace must not defeat the override");
+        assert!(
+            TIER_MAX_INFLIGHT_DEFAULT > 0,
+            "the default must itself be a usable bound — 0 would wedge the service"
+        );
+    }
+
+    /// ⚠ Holds the shipped loop and the test double in agreement on the one
+    /// property that matters: the permit is taken BEFORE `accept`. Acquiring
+    /// after would accept everything and bound only how many run at once, which
+    /// leaves the connection and task count unbounded — the same failure.
+    #[test]
+    fn the_real_accept_loop_takes_its_permit_before_accepting() {
+        let src = include_str!("tier_service.rs");
+        let body = src
+            .split("pub async fn serve_tier(")
+            .nth(1)
+            .expect("serve_tier not found — this guard is anchored to a renamed fn");
+        let accept = body.find("listener.accept()").expect("no accept in serve_tier");
+        // ⚠ The AWAITED form specifically. `try_acquire_owned()` contains the
+        // substring `acquire_owned`, so an earlier version of this guard was
+        // satisfied by a non-blocking acquisition that silently drops the bound
+        // (battery arm B1): `try_` returns Err when saturated rather than
+        // waiting, which under this loop means falling through unbounded.
+        let acquire = body
+            .find(".acquire_owned().await")
+            .expect("serve_tier must AWAIT its permit; a non-blocking acquire is not backpressure");
+        assert!(
+            !body[..accept].contains("try_acquire"),
+            "serve_tier uses a non-blocking try_acquire before accept; that does \
+             not wait when saturated, so it bounds nothing"
+        );
+        assert!(
+            acquire < accept,
+            "serve_tier acquires its permit AFTER accept; backpressure must happen \
+             before the connection is taken off the backlog"
+        );
     }
 }
 
