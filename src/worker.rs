@@ -253,8 +253,33 @@ impl Worker {
 
     /// Run the worker.
     pub async fn run(&self) -> Result<()> {
-        // Register worker
-        self.register().await?;
+        // ⚠ Registration is NOT fatal (noetl/ai-meta#332, 2026-09-22).
+        //
+        // It used to be `self.register().await?`, which exited the process on a
+        // timeout. In production that turned a slow control-plane answer into a
+        // crash loop on `noetl-cmdbus-writer-0` — the pod that hosts BOTH buses
+        // — every ~2.5 minutes: the tier went deaf, the materializer replay
+        // crawled (61s for 15 records), the 30s registration timeout in
+        // `ControlPlaneClient::new` expired, the process exited 1, and the
+        // restart made the next round worse. Registration failing is a
+        // *degraded* condition, not a reason to stop hosting the buses that
+        // every other pod depends on.
+        //
+        // The heartbeat below re-asserts this worker's presence on its own
+        // cadence, so a failure here is recovered rather than fatal.
+        if let Err(e) = self.register().await {
+            crate::metrics::record_worker_registration(false);
+            tracing::error!(
+                error = %e,
+                worker_id = %self.config.worker_id,
+                pool_name = %self.config.pool_name,
+                "worker registration failed; CONTINUING in a degraded state — the \
+                 heartbeat will re-assert presence. Exiting here would stop the \
+                 buses this pod hosts for everyone else."
+            );
+        } else {
+            crate::metrics::record_worker_registration(true);
+        }
 
         // Start heartbeat task
         let heartbeat_handle = self.start_heartbeat();
