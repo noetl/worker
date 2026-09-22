@@ -700,10 +700,21 @@ fn read_execution_locked(
 /// Best-effort by design: a failed index build leaves the segment unindexed,
 /// which means "might contain" — correct, just slow. It must never fail an
 /// append or a read.
+/// Index builds are serialised behind this lock.
+///
+/// The backfill spawns one build per unindexed segment, and production has two
+/// (1.08 GB + 3.3 GB). Serialising bounds the work to one segment scan at a
+/// time rather than letting startup contend for CPU across all of them.
+static INDEX_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn spawn_index_build(segment: PathBuf, tier: StoreTier) {
     tokio::spawn(async move {
         let seg = segment.clone();
-        let res = tokio::task::spawn_blocking(move || build_segment_index(&seg)).await;
+        let res = tokio::task::spawn_blocking(move || {
+            let _serialised = INDEX_BUILD_LOCK.lock();
+            build_segment_index(&seg)
+        })
+        .await;
         match res {
             Ok(Ok(n)) => tracing::info!(
                 tier = tier.as_str(), segment = %segment.display(), executions = n,
@@ -802,33 +813,70 @@ fn load_segment_index(segment: &std::path::Path) -> Option<std::collections::Has
 ///
 /// Written to a temp file and renamed, so a reader never observes a partial
 /// index and mistake it for "this segment contains only these executions".
+/// Extract the execution id from one stored segment line.
+///
+/// The driver derives `EventLogRecordView::execution_id` as
+/// `execution_from_subject(record.subject)` (`ehdb-reference/src/eventlog.rs`),
+/// i.e. the trailing token after [`ehdb_reference::EVENT_LOG_SUBJECT_PREFIX`].
+/// This reads the same field off the stored line, so the index is keyed exactly
+/// as a lookup keys it. `streaming_index_equals_replay_index` is the guard on
+/// that claim — it builds both ways and asserts set equality.
+///
+/// Why a targeted scan rather than a full JSON parse: a stored payload is a
+/// **numeric byte array**, so it contains no quoted strings and cannot produce a
+/// false `"subject":"` match; parsing it as `Value` would allocate one `Value`
+/// per payload byte for no gain. Measured on the production segment, 82,906 of
+/// 82,906 lines carry the subject.
+fn execution_id_from_line(line: &str) -> Option<String> {
+    const KEY: &str = "\"subject\":\"";
+    let start = line.find(KEY)? + KEY.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    let subject = &rest[..end];
+    Some(
+        subject
+            .strip_prefix(&format!("{}.", ehdb_reference::EVENT_LOG_SUBJECT_PREFIX))
+            .unwrap_or(subject)
+            .to_string(),
+    )
+}
+
+/// Build `<segment>.idx` by STREAMING the segment, never replaying it.
+///
+/// ⚠ This must not go back to a `LocalReferenceEventLogDriver` replay. Replay
+/// holds the whole segment in the runtime cache, and RSS was measured at ~2.8x
+/// record bytes for this workload — production's two sealed segments are 1.08 GB
+/// and 3.3 GB, so a replay-based backfill peaks around 12 GB and OOM-kills the
+/// writer on startup, on every restart. Streaming is O(1) in the segment size:
+/// one line at a time, and only the distinct ids are retained (969 for the
+/// 1.08 GB production segment).
+///
+/// ⚠ Fail-safe direction: a line whose subject cannot be read ABORTS the build
+/// and writes no index. A missing index means "might contain" and the segment is
+/// opened — correct but slow. A *partial* index read as complete would silently
+/// skip a segment that holds the execution, which is a wrong answer.
 pub fn build_segment_index(segment: &std::path::Path) -> Result<usize, String> {
-    let d = LocalReferenceEventLogDriver::new(
-        segment.to_path_buf(),
-        DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
-        DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
-    );
+    use std::io::BufRead;
+    let f = std::fs::File::open(segment).map_err(|e| e.to_string())?;
+    let reader = std::io::BufReader::with_capacity(1 << 20, f);
     let mut ids: std::collections::BTreeSet<String> = Default::default();
-    let mut after: Option<u64> = None;
-    loop {
-        let out = d
-            .scan_global(&EventLogScanRequest {
-                after,
-                limit: MAX_SCAN_LIMIT,
-            })
-            .map_err(|e| e.to_string())?;
-        if out.records.is_empty() {
-            break;
+    for (n, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("line {}: {e}", n + 1))?;
+        if line.trim().is_empty() {
+            continue;
         }
-        for r in &out.records {
-            ids.insert(r.execution_id.clone());
-        }
-        after = out.records.last().map(|r| r.global_sequence);
-        if out.records.len() < MAX_SCAN_LIMIT {
-            break;
+        match execution_id_from_line(&line) {
+            Some(id) => {
+                ids.insert(id);
+            }
+            None => {
+                return Err(format!(
+                    "line {} carries no readable subject; refusing to write a partial index",
+                    n + 1
+                ))
+            }
         }
     }
-    ehdb_reference::forget_runtime(segment);
 
     let body: String = ids.iter().map(|i| format!("{i}\n")).collect();
     let final_path = segment_index_path(segment);
@@ -1192,6 +1240,89 @@ mod tests {
 
     /// ⭐ The index must actually SKIP something, or it is decorative and the
     /// equality test above would pass against an index nobody consults.
+    #[tokio::test]
+    async fn streaming_index_equals_replay_index() {
+        // The differential that keeps the streaming derivation honest: build the
+        // index by streaming, and independently derive the same set from the
+        // DRIVER's own `execution_id` (which is what a lookup compares against).
+        // If the two ever key differently, a read silently skips a segment that
+        // holds the execution — a wrong answer, not a slow one.
+        let cfg = seal_cfg("idx-diff");
+        for i in 0..40 {
+            let exec = if i % 3 == 0 { "exec-alpha" } else { "exec-beta" };
+            let _ = append_with_seal(
+                Some(&cfg), StoreTier::EventLog, exec,
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "z".repeat(120)), Some(2048),
+            ).await;
+        }
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert!(segs.len() >= 2, "need several segments, got {}", segs.len());
+
+        let mut checked = 0usize;
+        for sg in &segs {
+            let n = build_segment_index(sg).expect("index build");
+            let streamed = load_segment_index(sg).expect("index present");
+
+            // Independent derivation, via the driver.
+            let d = LocalReferenceEventLogDriver::new(
+                sg.clone(),
+                DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+                DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+            );
+            let out = d
+                .scan_global(&EventLogScanRequest { after: None, limit: MAX_SCAN_LIMIT })
+                .expect("scan");
+            ehdb_reference::forget_runtime(sg);
+            let replayed: std::collections::BTreeSet<String> =
+                out.records.iter().map(|r| r.execution_id.clone()).collect();
+
+            assert!(!replayed.is_empty(), "fixture segment held no records");
+            let streamed_set: std::collections::BTreeSet<String> =
+                streamed.iter().cloned().collect();
+            assert_eq!(
+                streamed_set, replayed,
+                "streaming index disagrees with the driver's own execution_id for {}",
+                sg.display()
+            );
+            assert_eq!(n, replayed.len());
+            checked += 1;
+        }
+        assert!(checked >= 2, "compared only {checked} segments");
+    }
+
+    #[tokio::test]
+    async fn a_line_with_no_subject_refuses_to_write_an_index() {
+        // Fail-safe: a partial index read as complete would skip a segment that
+        // holds the execution. No index at all means "might contain" -> opened.
+        let cfg = seal_cfg("idx-torn");
+        for i in 0..24 {
+            let _ = append_with_seal(
+                Some(&cfg), StoreTier::EventLog, "exec-torn",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "t".repeat(120)), Some(2048),
+            ).await;
+        }
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        let sg = segs.first().expect("a sealed segment").clone();
+        // Append a line that carries no subject at all.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&sg).unwrap();
+            writeln!(f, "{{\"sequence\":999,\"mutations\":[]}}").unwrap();
+        }
+        let err = build_segment_index(&sg).expect_err("must refuse a partial index");
+        assert!(
+            err.contains("no readable subject"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            load_segment_index(&sg).is_none(),
+            "a partial index was written anyway"
+        );
+        // And the segment is therefore still considered for the read.
+        let (kept, _) = segments_possibly_holding(&cfg, StoreTier::EventLog, "exec-torn");
+        assert!(kept.contains(&sg), "an unindexed segment must still be opened");
+    }
+
     #[tokio::test]
     async fn the_index_actually_rules_segments_out() {
         let cfg = seal_cfg("idx-skip");
