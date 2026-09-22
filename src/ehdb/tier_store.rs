@@ -331,6 +331,11 @@ fn maybe_seal(cfg: &TierStoreConfig, tier: StoreTier, max: Option<u64>) -> Optio
                 sealed = %sealed.display(),
                 "EHDB tier store sealed (noetl/ai-meta#332 writer OOM)"
             );
+            // ⚠ Indexed in the BACKGROUND, not here: building it replays the
+            // whole segment, and this runs under the store's write lock on the
+            // append path. Doing it inline would make the append that happens to
+            // trigger a seal pay a multi-GB scan.
+            spawn_index_build(sealed.clone(), tier);
             Some(sealed)
         }
         Err(e) => {
@@ -650,9 +655,23 @@ fn read_execution_locked(
     // last seal — turning a memory fix into a data-loss bug, which is strictly
     // worse than the OOM it was meant to cure. `sealed_segments` is empty on a
     // store that has never sealed, so this is exactly today's behaviour there.
-    let sealed = sealed_segments(cfg, tier);
+    // ⚠ The INDEX decides which sealed segments must be opened. Without it every
+    // read replays every sealed segment, which is what broke the tier read path
+    // after sealing (2259 "timed out after 2s" in production). A segment with no
+    // index is still opened — absence is "unknown", never "absent".
+    let (sealed, total_sealed) = segments_possibly_holding(cfg, tier, execution_id);
     if !sealed.is_empty() {
         return read_execution_across_segments(cfg, tier, execution_id, &sealed, &request);
+    }
+    if total_sealed > 0 {
+        // Every sealed segment was ruled out by its index; the active segment
+        // alone answers. This is the fast path the index exists to create.
+        tracing::debug!(
+            tier = tier.as_str(),
+            execution_id,
+            skipped = total_sealed,
+            "tier read skipped sealed segments via index"
+        );
     }
     match driver(cfg, tier).read_execution(&request) {
         Ok(out) => {
@@ -674,6 +693,170 @@ fn read_execution_locked(
         }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
     }
+}
+
+/// Build a segment's index off the request path.
+///
+/// Best-effort by design: a failed index build leaves the segment unindexed,
+/// which means "might contain" — correct, just slow. It must never fail an
+/// append or a read.
+fn spawn_index_build(segment: PathBuf, tier: StoreTier) {
+    tokio::spawn(async move {
+        let seg = segment.clone();
+        let res = tokio::task::spawn_blocking(move || build_segment_index(&seg)).await;
+        match res {
+            Ok(Ok(n)) => tracing::info!(
+                tier = tier.as_str(), segment = %segment.display(), executions = n,
+                "EHDB tier segment indexed"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                tier = tier.as_str(), segment = %segment.display(), error = %e,
+                "EHDB tier segment index build failed; reads will open this segment"
+            ),
+            Err(e) => tracing::warn!(
+                tier = tier.as_str(), segment = %segment.display(), error = %e,
+                "EHDB tier segment index task failed; reads will open this segment"
+            ),
+        }
+    });
+}
+
+/// Index any sealed segment that has none yet.
+///
+/// ⚠ Needed because segments sealed by an earlier build have no index, and
+/// production already has two of them (1.08 GB and 3.3 GB). Without a backfill
+/// the index would only ever help segments sealed in the future, leaving the
+/// exact segments that caused the regression unindexed forever.
+pub fn backfill_segment_indexes(cfg: &TierStoreConfig) {
+    for &tier in StoreTier::ALL.iter() {
+        for seg in sealed_segments(cfg, tier) {
+            if load_segment_index(&seg).is_none() {
+                tracing::info!(
+                    tier = tier.as_str(), segment = %seg.display(),
+                    "EHDB tier segment has no index; building it"
+                );
+                spawn_index_build(seg, tier);
+            }
+        }
+    }
+}
+
+/// The execution-id index beside a sealed segment: `<segment>.idx`.
+///
+/// ⚠⚠ WHY THIS EXISTS — a regression I introduced and measured.
+///
+/// Sealing bounded memory (2.9 GB -> 186 MB in production) but broke the tier's
+/// READ path. A merged read must consult every sealed segment, and
+/// `read_segment_then_release` forgets each one immediately, so **every** read
+/// re-replays the whole sealed file. Production's first sealed segment is
+/// 1.08 GB, which cannot be replayed inside the tier client's 2-second read
+/// timeout. Measured on prod logs, split at the seal:
+///
+/// ```text
+///   before the seal (22:00-22:30Z):     0 read failures
+///   after  the seal (22:35Z onward): 2259 read failures, all "timed out after 2s"
+/// ```
+///
+/// (I had previously called this failure pre-existing. That was wrong: I ran a
+/// 100-minute window and asserted it spanned the seal without checking the
+/// timestamps. It did not.)
+///
+/// The index makes a read skip segments that cannot contain the execution.
+/// That works because the tier mirrors an execution's events over the execution's
+/// lifetime, so an execution's records land in the segment active at the time —
+/// almost always exactly one.
+///
+/// Format: one execution id per line, sorted, newline-terminated. A sidecar, so
+/// **the segment's own bytes are untouched** and an older binary that ignores
+/// `.idx` files still reads the segment correctly.
+///
+/// ⚠ A MISSING index means "might contain" — the segment is opened. Absence must
+/// never be read as "does not contain", or a read would silently skip records
+/// that exist, which is the data-loss-shaped failure this whole change has been
+/// avoiding.
+fn segment_index_path(segment: &std::path::Path) -> PathBuf {
+    let mut s = segment.as_os_str().to_os_string();
+    s.push(".idx");
+    PathBuf::from(s)
+}
+
+/// Load a segment's index. `None` = no index = "might contain, must open".
+fn load_segment_index(segment: &std::path::Path) -> Option<std::collections::HashSet<String>> {
+    let raw = std::fs::read_to_string(segment_index_path(segment)).ok()?;
+    // An index that exists but is EMPTY is a real answer (a segment with no
+    // executions), so it is distinguished from a missing file by `Some`.
+    Some(
+        raw.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+    )
+}
+
+/// Build the index for a sealed segment by paging its records once.
+///
+/// One replay total: the runtime cache serves the pages after the first open,
+/// and the runtime is released at the end so the scan does not leave a
+/// multi-GB state resident — the point of sealing in the first place.
+///
+/// Written to a temp file and renamed, so a reader never observes a partial
+/// index and mistake it for "this segment contains only these executions".
+pub fn build_segment_index(segment: &std::path::Path) -> Result<usize, String> {
+    let d = LocalReferenceEventLogDriver::new(
+        segment.to_path_buf(),
+        DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
+        DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
+    );
+    let mut ids: std::collections::BTreeSet<String> = Default::default();
+    let mut after: Option<u64> = None;
+    loop {
+        let out = d
+            .scan_global(&EventLogScanRequest {
+                after,
+                limit: MAX_SCAN_LIMIT,
+            })
+            .map_err(|e| e.to_string())?;
+        if out.records.is_empty() {
+            break;
+        }
+        for r in &out.records {
+            ids.insert(r.execution_id.clone());
+        }
+        after = out.records.last().map(|r| r.global_sequence);
+        if out.records.len() < MAX_SCAN_LIMIT {
+            break;
+        }
+    }
+    ehdb_reference::forget_runtime(segment);
+
+    let body: String = ids.iter().map(|i| format!("{i}\n")).collect();
+    let final_path = segment_index_path(segment);
+    let tmp = final_path.with_extension("idx.tmp");
+    std::fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
+    Ok(ids.len())
+}
+
+/// Segments that could hold `execution_id`, oldest first.
+///
+/// A segment with no index is INCLUDED — absence of an index is "unknown", never
+/// "absent".
+fn segments_possibly_holding(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    execution_id: &str,
+) -> (Vec<PathBuf>, usize) {
+    let all = sealed_segments(cfg, tier);
+    let total = all.len();
+    let kept = all
+        .into_iter()
+        .filter(|s| match load_segment_index(s) {
+            Some(ids) => ids.contains(execution_id),
+            None => true,
+        })
+        .collect();
+    (kept, total)
 }
 
 /// Read a segment and RELEASE it, so a merge is bounded by one segment at a
@@ -953,6 +1136,165 @@ mod tests {
                 sp.display()
             );
         }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐⭐ THE ONE THAT MATTERS. An index must never make a read MISS records
+    /// that exist. Skipping a segment that does contain the execution is silent
+    /// data loss — strictly worse than the slow reads the index exists to cure.
+    #[tokio::test]
+    async fn an_indexed_read_returns_exactly_what_an_unindexed_read_returns() {
+        let cfg = seal_cfg("idx-equiv");
+        const N: usize = 36;
+        for i in 0..N {
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                // Two executions interleaved, so segments genuinely differ in
+                // which ids they hold — a fixture where every segment held every
+                // execution could not detect a wrong skip.
+                if i % 2 == 0 { "exec-even" } else { "exec-odd" },
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)),
+                Some(2048),
+            )
+            .await;
+        }
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert!(segs.len() >= 2, "need >=2 sealed segments, got {}", segs.len());
+
+        // UNINDEXED answer first — the reference.
+        for id in ["exec-even", "exec-odd"] {
+            let before = read_execution(Some(&cfg), StoreTier::EventLog, id).await;
+            let TierStoreOutcome::Ok(b) = before else { panic!("read failed: {before:?}") };
+            let bv: serde_json::Value = serde_json::from_str(&b).unwrap();
+
+            // Now index every sealed segment and read again.
+            for sg in &segs {
+                build_segment_index(sg).expect("index build");
+            }
+            let after = read_execution(Some(&cfg), StoreTier::EventLog, id).await;
+            let TierStoreOutcome::Ok(a) = after else { panic!("indexed read failed: {after:?}") };
+            let av: serde_json::Value = serde_json::from_str(&a).unwrap();
+
+            assert_eq!(
+                av["record_count"], bv["record_count"],
+                "indexing CHANGED the answer for {id}: {} -> {} — a skipped segment \
+                 that holds the execution is silent data loss",
+                bv["record_count"], av["record_count"]
+            );
+            assert!(
+                bv["record_count"].as_u64().unwrap() > 0,
+                "the fixture returned no records for {id}, so equality is vacuous"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐ The index must actually SKIP something, or it is decorative and the
+    /// equality test above would pass against an index nobody consults.
+    #[tokio::test]
+    async fn the_index_actually_rules_segments_out() {
+        let cfg = seal_cfg("idx-skip");
+        // Fill the early segments with one execution only...
+        for i in 0..24 {
+            let _ = append_with_seal(
+                Some(&cfg), StoreTier::EventLog, "exec-early",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)), Some(2048),
+            ).await;
+        }
+        // ...then a DIFFERENT one, which cannot appear in those early segments.
+        for i in 0..24 {
+            let _ = append_with_seal(
+                Some(&cfg), StoreTier::EventLog, "exec-late",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)), Some(2048),
+            ).await;
+        }
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert!(segs.len() >= 3, "need several segments, got {}", segs.len());
+        for sg in &segs {
+            build_segment_index(sg).expect("index build");
+        }
+        let (kept, total) = segments_possibly_holding(&cfg, StoreTier::EventLog, "exec-late");
+        assert_eq!(total, segs.len());
+        assert!(
+            kept.len() < total,
+            "the index ruled out NOTHING ({}/{} kept) — it is not being consulted",
+            kept.len(), total
+        );
+        // And the early execution must still find its own segments.
+        let (kept_early, _) = segments_possibly_holding(&cfg, StoreTier::EventLog, "exec-early");
+        assert!(!kept_early.is_empty(), "the index ruled out the segments that DO hold exec-early");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⚠ A MISSING index means "might contain", never "absent".
+    #[tokio::test]
+    async fn a_segment_without_an_index_is_always_opened() {
+        let cfg = seal_cfg("idx-missing");
+        for i in 0..24 {
+            let _ = append_with_seal(
+                Some(&cfg), StoreTier::EventLog, "exec-x",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)), Some(2048),
+            ).await;
+        }
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert!(!segs.is_empty());
+        // No indexes built at all.
+        let (kept, total) = segments_possibly_holding(&cfg, StoreTier::EventLog, "anything-at-all");
+        assert_eq!(
+            kept.len(), total,
+            "an unindexed segment was ruled out; absence of an index must mean \
+             UNKNOWN, or a read silently skips records that exist"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐ The index build must PAGE. `scan_global` is capped at
+    /// `MAX_SCAN_LIMIT` (1000), so a build that reads one page indexes only the
+    /// first 1000 records — and every execution appearing later is then
+    /// silently "not in this segment", which makes reads skip records that
+    /// exist.
+    ///
+    /// ⚠ The other index tests cannot catch this: their segments hold far fewer
+    /// than 1000 records, so paging never engages and the fixture cannot exhibit
+    /// the failure. This one deliberately builds a segment LARGER than a page.
+    #[tokio::test]
+    async fn the_index_build_pages_past_the_scan_limit() {
+        let cfg = seal_cfg("idx-paging");
+        // Seal OFF, so everything lands in ONE segment larger than a page.
+        const EARLY: usize = MAX_SCAN_LIMIT + 200;
+        for i in 0..EARLY {
+            let _ = append_with_seal(
+                Some(&cfg), StoreTier::EventLog, "exec-early",
+                &format!("{{\"i\":{i}}}"), None,
+            ).await;
+        }
+        // This one appears ONLY after the first page boundary.
+        for i in 0..5 {
+            let _ = append_with_seal(
+                Some(&cfg), StoreTier::EventLog, "exec-past-the-page",
+                &format!("{{\"i\":{i}}}"), None,
+            ).await;
+        }
+        // Make it a sealed segment by name, so the index path applies to it.
+        let active = cfg.path_for(StoreTier::EventLog);
+        let sealed = active.with_file_name("eventlog.jsonl.1");
+        std::fs::rename(&active, &sealed).unwrap();
+        ehdb_reference::forget_runtime(&active);
+
+        let n = build_segment_index(&sealed).expect("index build");
+        let ids = load_segment_index(&sealed).expect("index must exist");
+        assert!(
+            ids.contains("exec-early"),
+            "the index lost the execution on the FIRST page ({n} ids)"
+        );
+        assert!(
+            ids.contains("exec-past-the-page"),
+            "the index stopped at the first page: {} records were written but only \
+             {n} execution ids indexed, so everything past record {} is invisible \
+             and reads would skip it",
+            EARLY + 5, MAX_SCAN_LIMIT
+        );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
