@@ -1101,6 +1101,10 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
     let exec = flags
         .get("execution-id")
         .unwrap_or_else(|| "tier-load".to_string());
+    let tier = flags
+        .get("tier")
+        .and_then(|t| ehdb::store_tier::StoreTier::parse(&t))
+        .unwrap_or(ehdb::store_tier::StoreTier::EventLog);
 
     let cfg = match ehdb::tier_client::TierClientConfig::build(
         Some(&addr),
@@ -1114,6 +1118,28 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // `--read-only` performs ONE read instead of appending. That is the probe
+    // for the READ path's load cost: a cold store is replayed in full on first
+    // access, and that replay — not the append path — is what a memory
+    // attribution has to separate.
+    let read_only = flags.get("read-only").is_some();
+    if read_only {
+        let client = ehdb::tier_client::TierClient::new(cfg.clone());
+        let t = std::time::Instant::now();
+        let r = client.read_execution_tier(tier, &exec).await;
+        println!(
+            "{}",
+            serde_json::json!({
+                "suite":"tier-load","mode":"read","tier":tier.as_str(),
+                "seconds": (t.elapsed().as_secs_f64()*100.0).round()/100.0,
+                "ok": r.is_ok(),
+                "bytes": r.as_ref().map(|b| b.len()).unwrap_or(0),
+                "error": r.err().unwrap_or_default(),
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
 
     let filler = "z".repeat(pad);
     let per = records.div_ceil(concurrency);
@@ -1130,7 +1156,7 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
             for i in 0..per {
                 let t = std::time::Instant::now();
                 let r = client
-                    .append(&exec, &format!("{{\"c\":{c},\"i\":{i},\"pad\":\"{filler}\"}}"))
+                    .append_tier(tier, &exec, &format!("{{\"c\":{c},\"i\":{i},\"pad\":\"{filler}\"}}"))
                     .await;
                 let ms = t.elapsed().as_millis() as u64;
                 if ms > slowest_ms {

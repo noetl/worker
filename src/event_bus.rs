@@ -372,6 +372,14 @@ pub async fn spawn_event_writer_host(
                 .unwrap_or_else(|| "<none: data ops answer `unavailable`>".to_string()),
             "EHDB tier service listener up"
         );
+        // ⚠ Backfill indexes for segments sealed by an EARLIER build, which have
+        // none. Without this the index only ever helps future segments, leaving
+        // exactly the segments that caused the read regression unindexed —
+        // production already has two (1.08 GB and 3.3 GB). Best-effort and off
+        // the request path; an unindexed segment is merely slow, never wrong.
+        if let Some(c) = store.as_ref() {
+            crate::ehdb::tier_store::backfill_segment_indexes(c);
+        }
     }
 
     let coordinator = Arc::new(GroupCoordinator::new(
