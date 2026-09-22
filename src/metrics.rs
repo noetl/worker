@@ -106,6 +106,8 @@ pub struct WorkerMetrics {
     /// with nothing logged anywhere, for ~2.4 days.  That fix added the log
     /// line; this adds the signal (`agents/rules/observability.md` Principle 2).
     pub ehdb_claim_reconnect_total: IntCounterVec,
+    /// Outcome of the worker's control-plane registration.
+    pub worker_registration_total: IntCounterVec,
     /// Where the worker's bootstrap secret came from at startup
     /// (noetl/ai-meta#267 Tier 2), labelled by `var` and `source`
     /// (`file` / `env` / `file_unusable`).  Records the PROVENANCE, never the
@@ -770,6 +772,29 @@ impl WorkerMetrics {
                     .with_label_values(&[feed, reason])
                     .inc_by(0);
             }
+        }
+
+        let worker_registration_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_registration_total",
+                "Control-plane registration attempts by outcome. Registration is \
+                 NOT fatal (noetl/ai-meta#332): a failure here leaves the worker \
+                 running in a degraded state, so this counter is the only signal \
+                 that it happened.",
+            ),
+            &["outcome"],
+        )
+        .expect("worker_registration_total metric");
+        registry
+            .register(Box::new(worker_registration_total.clone()))
+            .expect("register worker_registration_total");
+        // ⚠ Pinned UNCONDITIONALLY at 0 for both values. An empty family is
+        // pruned at gather time, so without this a worker that has never failed
+        // registration and a build that predates the counter look identical.
+        for outcome in ["ok", "failed"] {
+            worker_registration_total
+                .with_label_values(&[outcome])
+                .inc_by(0);
         }
 
         let build_info = IntGaugeVec::new(
@@ -1856,6 +1881,7 @@ impl WorkerMetrics {
             event_emit_retries_total,
             event_emit_failed_total,
             ehdb_claim_reconnect_total,
+            worker_registration_total,
             secret_source_total,
             command_pickup_phase_seconds,
             build_info,
@@ -3757,4 +3783,15 @@ mod state_build_latency_tests {
             "need a multi-second bucket: a cold rebuild must not collapse into +Inf"
         );
     }
+}
+
+/// Record the outcome of the worker's control-plane registration.
+///
+/// Registration is deliberately non-fatal (see `Worker::run`), so this counter
+/// is the difference between "registered" and "silently running unregistered".
+pub fn record_worker_registration(ok: bool) {
+    WorkerMetrics::global()
+        .worker_registration_total
+        .with_label_values(&[if ok { "ok" } else { "failed" }])
+        .inc();
 }
