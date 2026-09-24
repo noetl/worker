@@ -134,13 +134,52 @@ async fn phase_concurrent_appends_produce_a_readable_log() {
         let client = client.clone();
         tasks.push(tokio::spawn(async move {
             let mut failures = Vec::new();
+            let mut sheds = 0usize;
             for n in 0..APPENDS_PER_CLIENT {
                 let exec = format!("exec-{c}-{n}");
-                match client.append(&exec, &payload_for(c, n)).await {
-                    Ok(body) if body.contains("\"appended\":true") => {}
-                    Ok(body) => failures.push(format!("{exec}: refused: {body}")),
-                    Err(e) => failures.push(format!("{exec}: transport: {e}")),
+                // ⚠⚠ A SHED IS NOT A TEAR. Since the accept-then-permit change
+                // a saturated tier deliberately answers "tier service busy" and
+                // tells the caller to retry, instead of queueing forever. This
+                // test predates that and counted any refusal as "the store tore
+                // under concurrency", so it passed only while the runner was
+                // fast enough that nothing exceeded the shed deadline — it went
+                // red on CI while passing 3/3 locally.
+                //
+                // Retrying keeps the property that actually matters: assertion
+                // (3) below still requires exactly TOTAL records, so a shed that
+                // never lands still fails loudly, at the right place. A refusal
+                // that is NOT a shed is still an immediate failure.
+                let mut attempt = 0;
+                loop {
+                    match client.append(&exec, &payload_for(c, n)).await {
+                        Ok(body) if body.contains("\"appended\":true") => break,
+                        Ok(body) if body.contains("tier service busy") => {
+                            sheds += 1;
+                            attempt += 1;
+                            if attempt > 20 {
+                                failures.push(format!(
+                                    "{exec}: shed {attempt} times and never landed: {body}"
+                                ));
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                50 * attempt.min(10) as u64,
+                            ))
+                            .await;
+                        }
+                        Ok(body) => {
+                            failures.push(format!("{exec}: refused (not a shed): {body}"));
+                            break;
+                        }
+                        Err(e) => {
+                            failures.push(format!("{exec}: transport: {e}"));
+                            break;
+                        }
+                    }
                 }
+            }
+            if sheds > 0 {
+                eprintln!("client {c}: {sheds} shed(s) retried — backpressure, not corruption");
             }
             failures
         }));
