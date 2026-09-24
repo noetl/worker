@@ -362,6 +362,41 @@ fn ensure_dir(cfg: &TierStoreConfig) -> Result<(), String> {
 /// Append one record. `execution_id` and `payload` are required; an empty
 /// payload is refused rather than stored, because an empty record is
 /// indistinguishable from a read miss later.
+/// Run a store operation on the BLOCKING pool instead of a runtime thread.
+///
+/// ⚠⚠ This exists because of a production outage on 2026-09-22. Every
+/// `*_locked` helper below is synchronous and CPU-bound — it replays JSONL
+/// segments into memory, and production's are 1.08 GB and 3.3 GB. They were
+/// called directly from the `async fn` wrappers, so the replay ran **on a tokio
+/// runtime thread**.
+///
+/// Tokio sizes its runtime to available parallelism and the writer's cpu limit
+/// is **2**, so there are **2 runtime threads**. A handful of concurrent tier
+/// requests therefore occupied every runtime thread, and nothing else on the
+/// runtime could run: the tier accept loop, its shed path, the metrics server,
+/// and the worker's own control-plane registration all stopped. Measured at the
+/// time: `tier-concurrency` failing with `timed out after 30s`, the process
+/// pegged at ~0.88 cores across two `tokio-rt-worker` threads, and
+/// `spawn_blocking` appearing **zero** times in the tier service.
+///
+/// The bound on concurrency (`NOETL_EHDB_TIER_MAX_INFLIGHT`) does not help here
+/// and made it worse when raised: more permits means more CPU-bound tasks on
+/// the same two threads. Concurrency limits share a runtime; they do not create
+/// one.
+///
+/// ⚠ The caller holds the store lock across this await deliberately. The guard
+/// lives in the async frame while the work runs on the blocking pool, so the
+/// critical section is unchanged — only the thread it burns is.
+async fn off_runtime<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("tier store task failed to join: {e}"))
+}
+
 pub async fn append(
     cfg: Option<&TierStoreConfig>,
     tier: StoreTier,
@@ -411,8 +446,18 @@ pub async fn append_with_seal(
     // ⚠ Under the WRITE lock, before the append: no reader or writer can be
     // mid-operation on the file being renamed. No-op unless a threshold is
     // configured AND the active segment is over it.
-    let _ = maybe_seal(cfg, tier, seal_max);
-    append_locked(cfg, tier, execution_id, payload)
+    let cfg = cfg.clone();
+    let execution_id = execution_id.to_string();
+    let payload = payload.to_string();
+    match off_runtime(move || {
+        let _ = maybe_seal(&cfg, tier, seal_max);
+        append_locked(&cfg, tier, &execution_id, &payload)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => TierStoreOutcome::Error(e),
+    }
 }
 
 /// Append N records under ONE store-write lock and ONE `fsync`
@@ -463,7 +508,13 @@ pub async fn append_batch(
     let lock = store_lock(cfg, tier);
     let _exclusive = lock.write().await;
     let _ = maybe_seal(cfg, tier, tier_seal_max_bytes());
-    append_batch_locked(cfg, tier, execution_id, payloads)
+    let cfg = cfg.clone();
+    let execution_id = execution_id.to_string();
+    let payloads: Vec<String> = payloads.to_vec();
+    match off_runtime(move || append_batch_locked(&cfg, tier, &execution_id, &payloads)).await {
+        Ok(v) => v,
+        Err(e) => vec![TierStoreOutcome::Error(e)],
+    }
 }
 
 fn append_batch_locked(
@@ -637,7 +688,12 @@ pub async fn read_execution(
     }
     let lock = store_lock(cfg, tier);
     let _shared = lock.read().await;
-    read_execution_locked(cfg, tier, execution_id)
+    let cfg = cfg.clone();
+    let execution_id = execution_id.to_string();
+    match off_runtime(move || read_execution_locked(&cfg, tier, &execution_id)).await {
+        Ok(v) => v,
+        Err(e) => TierStoreOutcome::Error(e),
+    }
 }
 
 fn read_execution_locked(
@@ -1074,7 +1130,11 @@ pub async fn scan(
     };
     let lock = store_lock(cfg, tier);
     let _shared = lock.read().await;
-    scan_locked(cfg, tier, after, limit)
+    let cfg = cfg.clone();
+    match off_runtime(move || scan_locked(&cfg, tier, after, limit)).await {
+        Ok(v) => v,
+        Err(e) => TierStoreOutcome::Error(e),
+    }
 }
 
 fn scan_locked(
@@ -1240,6 +1300,76 @@ mod tests {
 
     /// ⭐ The index must actually SKIP something, or it is decorative and the
     /// equality test above would pass against an index nobody consults.
+    /// Remove every sealed-segment index under a fixture store.
+    ///
+    /// ⚠ Needed because the seal builds indexes in the BACKGROUND. Two tests
+    /// here asserted "no index exists" and passed only while that build was
+    /// slow — a race, not a precondition. Moving the store work to the blocking
+    /// pool made the build finish promptly and both tests failed, correctly.
+    /// State the precondition instead of depending on losing a race.
+    fn drop_all_indexes(cfg: &TierStoreConfig) {
+        if let Ok(rd) = std::fs::read_dir(&cfg.dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("idx") {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+    }
+
+    /// ⚠⚠ Every store entry point must hand its CPU-bound work to the blocking
+    /// pool. Calling a `*_locked` helper directly from an `async fn` puts a
+    /// multi-hundred-MB JSONL replay on a tokio runtime thread, and the writer
+    /// has only TWO of those (cpu limit 2). That is what made the tier service,
+    /// its metrics server and the worker's own registration all stop responding
+    /// in production on 2026-09-22 while the process looked healthy.
+    ///
+    /// A concurrency cap does not help — it shares a runtime, it does not create
+    /// one — and raising it made the failure worse.
+    #[test]
+    fn every_store_entry_point_runs_its_work_off_the_runtime() {
+        let src = include_str!("tier_store.rs");
+        let mut checked = 0;
+        for (entry, locked) in [
+            ("pub async fn read_execution(", "read_execution_locked"),
+            ("pub async fn scan(", "scan_locked"),
+            ("pub async fn append_with_seal(", "append_locked"),
+            ("pub async fn append_batch(", "append_batch_locked"),
+        ] {
+            let body = src
+                .split(entry)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{entry} not found — guard anchored to a renamed fn"));
+            let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+            assert!(
+                body.len() > 120,
+                "extracted body for {entry} is implausibly small ({} bytes)",
+                body.len()
+            );
+            assert!(
+                body.contains(locked),
+                "{entry} no longer calls {locked}; this guard is measuring nothing"
+            );
+            assert!(
+                body.contains("off_runtime("),
+                "{entry} calls {locked} directly on the async runtime. A tier \
+                 replay there occupies one of only two runtime threads and \
+                 starves the accept loop, the shed path, the metrics server and \
+                 worker registration — the 2026-09-22 outage."
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "expected to check 4 entry points, checked {checked}");
+        // The helper must actually use the blocking pool, or the call above is
+        // decorative.
+        let h = src.split("async fn off_runtime").nth(1).expect("off_runtime not found");
+        assert!(
+            h[..h.find("\n}\n").unwrap_or(h.len())].contains("spawn_blocking"),
+            "off_runtime does not use spawn_blocking; it is not moving work off the runtime"
+        );
+    }
+
     #[tokio::test]
     async fn streaming_index_equals_replay_index() {
         // The differential that keeps the streaming derivation honest: build the
@@ -1303,6 +1433,11 @@ mod tests {
         }
         let segs = sealed_segments(&cfg, StoreTier::EventLog);
         let sg = segs.first().expect("a sealed segment").clone();
+        // ⚠ The seal already built an index in the background. Drop it, or this
+        // asserts against that valid index rather than the partial one under
+        // test.
+        drop_all_indexes(&cfg);
+        assert!(load_segment_index(&sg).is_none(), "precondition: no index yet");
         // Append a line that carries no subject at all.
         {
             use std::io::Write;
@@ -1370,7 +1505,12 @@ mod tests {
         }
         let segs = sealed_segments(&cfg, StoreTier::EventLog);
         assert!(!segs.is_empty());
-        // No indexes built at all.
+        // No indexes built at all — stated, not raced (see drop_all_indexes).
+        drop_all_indexes(&cfg);
+        assert!(
+            segs.iter().all(|g| load_segment_index(g).is_none()),
+            "fixture precondition failed: an index survived"
+        );
         let (kept, total) = segments_possibly_holding(&cfg, StoreTier::EventLog, "anything-at-all");
         assert_eq!(
             kept.len(), total,

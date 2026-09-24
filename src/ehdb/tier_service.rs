@@ -723,7 +723,74 @@ pub const TIER_MAX_INFLIGHT_DEFAULT: usize = 8;
 /// Resolve the in-flight cap. Unparsable or zero ⇒ the default, because a typo
 /// must not silently remove the bound this exists to impose.
 pub fn tier_max_inflight() -> usize {
-    parse_max_inflight(std::env::var(TIER_MAX_INFLIGHT_ENV).ok().as_deref())
+    let requested = parse_max_inflight(std::env::var(TIER_MAX_INFLIGHT_ENV).ok().as_deref());
+    let cap = runtime_headroom_cap();
+    if requested > cap {
+        tracing::warn!(
+            requested,
+            clamped_to = cap,
+            "EHDB tier: NOETL_EHDB_TIER_MAX_INFLIGHT exceeds what this runtime can \
+             absorb; clamping so the process keeps CPU headroom for everything else \
+             (noetl/ai-meta#351)"
+        );
+        return cap;
+    }
+    requested
+}
+
+/// The most concurrent tier operations this process can run while still leaving
+/// the rest of it able to make progress.
+///
+/// ⚠⚠ This exists because of a measured production stall. On 2026-09-23
+/// `noetl-cmdbus-writer-0` ran **two** `tokio-rt-worker` threads
+/// (`available_parallelism()` honours the cgroup quota, which was 2 cores) while
+/// `NOETL_EHDB_TIER_MAX_INFLIGHT` was **4**. Four concurrent tier operations
+/// therefore consumed the entire runtime and nothing else in the process ran —
+/// not the accept loop, not the shed path, not the metrics scrape, not the
+/// worker's own control-plane registration.
+///
+/// ⚠ Moving the work to the blocking pool (the commit this builds on) is
+/// necessary but **not sufficient**: the blocking pool does not create CPU.
+///
+/// Reserving one unit leaves the runtime a core to schedule on. It is a clamp,
+/// not a default, so an operator setting cannot re-open the failure — the
+/// production value could not be changed by env at the time it mattered, so the
+/// safety has to travel in the image.
+///
+/// ## What the gate measured — and what it did NOT
+///
+/// Gated in kind against a prod-shaped fixture: a **sealed 973 MiB** segment
+/// (`1,020,001,271` bytes) at `cpu=2`, under 8 sustained readers.
+/// `playbooks/351-tier-saturation/` in noetl/ai-meta.
+///
+/// ✅ **Process responsiveness — the production failure, fixed.** Scraping the
+/// worker's own `/metrics` from outside the pod:
+///
+/// | arm | idle (control) | under load |
+/// | :-- | :-- | :-- |
+/// | without the clamp | 34ms, 513 lines | **30024ms, 0 lines** |
+/// | with the clamp | 47ms, 513 lines | **19ms, 529 lines** |
+///
+/// Idle controls agree (513/513), so the arms are comparable; the 30s timeout
+/// reproduced across two runs. That is the stall that starved registration past
+/// its hardcoded 30s deadline.
+///
+/// ❌ **A cost-free tier READ under load still fails — on both arms.** An
+/// earlier draft of this comment implied the clamp fixes that. It does not:
+/// without the clamp the probe times out at 2s at every load level (1/2/4/8);
+/// with it the probe is **shed** in ~1s with a countable busy reply. A cap of 1
+/// buys runtime headroom and makes head-of-line blocking *inside* the tier
+/// strictly worse — one in-flight expensive read now blocks every cheap one.
+///
+/// So this clamp delivers **runtime headroom, not tier availability**. Tier
+/// availability under a large sealed segment is a separate problem
+/// (noetl/ai-meta#351).
+fn runtime_headroom_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1)
 }
 
 /// [`tier_max_inflight`] as a **pure function of the raw value**.
@@ -1136,6 +1203,31 @@ mod reconnect_burst_tests {
             !text.starts_with("err tier service busy"),
             "shed a request while a permit was free — the shed path is firing \
              unconditionally, which would make the saturation test vacuous"
+        );
+    }
+
+    /// ⚠⚠ The in-flight bound must never exceed what the runtime can absorb.
+    ///
+    /// Prod ran 4 concurrent tier ops against 2 runtime threads and the whole
+    /// process stopped responding. The clamp is in the image on purpose: the env
+    /// value could not be changed when it mattered.
+    #[test]
+    fn the_inflight_bound_reserves_runtime_headroom() {
+        let cap = runtime_headroom_cap();
+        let par = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        assert!(cap >= 1, "the cap must never be zero — that would wedge the service");
+        assert!(
+            cap < par || par == 1,
+            "cap {cap} leaves no headroom against {par} available; a tier op could \
+             occupy every thread the runtime has"
+        );
+        // ...and an oversized env value must be clamped, not honoured.
+        let requested = parse_max_inflight(Some("1024"));
+        assert_eq!(requested, 1024, "parse must report what was asked for");
+        assert!(
+            cap < requested,
+            "a 1024 request must be clamped by the headroom cap, or the clamp is \
+             decorative"
         );
     }
 
