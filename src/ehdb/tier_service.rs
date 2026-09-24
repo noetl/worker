@@ -750,16 +750,41 @@ pub fn tier_max_inflight() -> usize {
 /// worker's own control-plane registration.
 ///
 /// ⚠ Moving the work to the blocking pool (the commit this builds on) is
-/// necessary but **not sufficient**, and that is measured, not assumed: in kind,
-/// 8 concurrent reads of a 973 MiB segment at `cpu=2` still left a cost-free
-/// request on an *empty* tier unanswered, because the blocking pool does not
-/// create CPU. The same gate at 243 MiB served normally. So the bound has to
-/// reserve CPU, not just relocate the work.
+/// necessary but **not sufficient**: the blocking pool does not create CPU.
 ///
 /// Reserving one unit leaves the runtime a core to schedule on. It is a clamp,
 /// not a default, so an operator setting cannot re-open the failure — the
 /// production value could not be changed by env at the time it mattered, so the
 /// safety has to travel in the image.
+///
+/// ## What the gate measured — and what it did NOT
+///
+/// Gated in kind against a prod-shaped fixture: a **sealed 973 MiB** segment
+/// (`1,020,001,271` bytes) at `cpu=2`, under 8 sustained readers.
+/// `playbooks/351-tier-saturation/` in noetl/ai-meta.
+///
+/// ✅ **Process responsiveness — the production failure, fixed.** Scraping the
+/// worker's own `/metrics` from outside the pod:
+///
+/// | arm | idle (control) | under load |
+/// | :-- | :-- | :-- |
+/// | without the clamp | 34ms, 513 lines | **30024ms, 0 lines** |
+/// | with the clamp | 47ms, 513 lines | **19ms, 529 lines** |
+///
+/// Idle controls agree (513/513), so the arms are comparable; the 30s timeout
+/// reproduced across two runs. That is the stall that starved registration past
+/// its hardcoded 30s deadline.
+///
+/// ❌ **A cost-free tier READ under load still fails — on both arms.** An
+/// earlier draft of this comment implied the clamp fixes that. It does not:
+/// without the clamp the probe times out at 2s at every load level (1/2/4/8);
+/// with it the probe is **shed** in ~1s with a countable busy reply. A cap of 1
+/// buys runtime headroom and makes head-of-line blocking *inside* the tier
+/// strictly worse — one in-flight expensive read now blocks every cheap one.
+///
+/// So this clamp delivers **runtime headroom, not tier availability**. Tier
+/// availability under a large sealed segment is a separate problem
+/// (noetl/ai-meta#351).
 fn runtime_headroom_cap() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
