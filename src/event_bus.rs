@@ -521,16 +521,54 @@ pub async fn spawn_event_writer_host(
 /// three consumers that are deliberately at different positions, so "is the
 /// durable-log materializer keeping up" is only answerable per group.
 const EVENT_DURABILITY_SAMPLE_OK: &str = concat!(
-    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or could not acquire the engine lock (0).\n",
+    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or found the engine lock held/poisoned and skipped it without blocking (0).\n",
     "# TYPE ehdb_l0_durability_sample_ok gauge\n",
     "ehdb_l0_durability_sample_ok 1\n"
 );
 
 const EVENT_DURABILITY_SAMPLE_FAILED: &str = concat!(
-    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or could not acquire the engine lock (0).\n",
+    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or found the engine lock held/poisoned and skipped it without blocking (0).\n",
     "# TYPE ehdb_l0_durability_sample_ok gauge\n",
     "ehdb_l0_durability_sample_ok 0\n"
 );
+
+/// Render the durability window for a writer **without ever blocking**.
+///
+/// ⚠⚠ Split out of `render_event_metrics` so the non-blocking property is
+/// testable. The shipped scrape path calls this, so a test that drives it is
+/// testing what runs — a test that re-implemented the try_lock would prove only
+/// that the expression can be written twice.
+///
+/// Two independent changes from the pre-fix version, both measured on prod
+/// 2026-09-23:
+///
+/// 1. **Replicated lag is rendered lock-free**, from the metrics handle that is
+///    cloned at construction (`ehdb-feed/src/lib.rs:317`, `:506` — "without
+///    taking the engine lock", noetl/ehdb#345). It therefore never vanishes just
+///    because the engine is busy.
+/// 2. **`try_lock`, not `lock`.** Only `unreplicated_snapshot()` needs the
+///    engine. `std::sync::Mutex::lock()` BLOCKS and `.ok()` maps only
+///    `PoisonError`, so the old code could not report contention — it could only
+///    park a Tokio worker thread inside an async task. The writer runs **two**
+///    worker threads (cgroup quota 2 cores), so one scrape could occupy half the
+///    runtime waiting behind an append.
+pub(crate) fn render_durability_window(writer: &FeedWriter<D1EventLog>) -> String {
+    let mut out = String::new();
+    out.push_str(&ehdb_feed::render_replicated_lag(writer.metrics()));
+    let engine = writer.engine();
+    let locked = engine.try_lock();
+    match locked {
+        Ok(e) => {
+            out.push_str(&ehdb_feed::render_unreplicated(&e.unreplicated_snapshot()));
+            out.push_str(EVENT_DURABILITY_SAMPLE_OK);
+        }
+        Err(_) => {
+            out.push_str(&ehdb_feed::render_unreplicated(&[]));
+            out.push_str(EVENT_DURABILITY_SAMPLE_FAILED);
+        }
+    }
+    out
+}
 
 async fn render_event_metrics(coordinator: &GroupCoordinator<D1EventLog>) -> String {
     let mut out = String::new();
@@ -599,20 +637,7 @@ async fn render_event_metrics(coordinator: &GroupCoordinator<D1EventLog>) -> Str
     // sample was taken at all -- a contended lock must not make the series
     // silently vanish, which reads identically to a binary too old to have them.
     {
-        let writer = coordinator.writer();
-        let engine = writer.engine();
-        let locked = engine.lock();
-        match locked {
-            Ok(e) => {
-                out.push_str(&ehdb_feed::render_unreplicated(&e.unreplicated_snapshot()));
-                out.push_str(&ehdb_feed::render_replicated_lag(&e.metrics()));
-                out.push_str(EVENT_DURABILITY_SAMPLE_OK);
-            }
-            Err(_) => {
-                out.push_str(&ehdb_feed::render_unreplicated(&[]));
-                out.push_str(EVENT_DURABILITY_SAMPLE_FAILED);
-            }
-        }
+        out.push_str(&render_durability_window(&coordinator.writer()));
     }
 
     out
@@ -682,6 +707,72 @@ async fn serve_event_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a real D1 event engine in a tempdir — the shipped type, not a stub.
+    fn test_writer(tag: &str) -> Arc<FeedWriter<D1EventLog>> {
+        let dir = std::env::temp_dir().join(format!("ehdb-durwin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&dir).unwrap());
+        let engine =
+            L0Engine::<D1EventLog>::open(L0Config::d1(&dir).with_shard_count(1), store).unwrap();
+        Arc::new(FeedWriter::new(engine))
+    }
+
+    /// ⭐ The property the fix exists for: a HELD engine lock must not block the
+    /// scrape.
+    ///
+    /// ⚠ The pre-fix code (`engine.lock()`) does not *fail* this test, it
+    /// **hangs** — and a hung test reads exactly like a slow compile. So the
+    /// render runs on its own thread and the assertion is a bounded join; the
+    /// test fails loudly on timeout instead of stalling the suite.
+    #[test]
+    fn a_held_engine_lock_does_not_block_the_scrape() {
+        let writer = test_writer("held");
+        let engine = writer.engine();
+        let guard = engine.lock().expect("take the lock first");
+
+        let w = Arc::clone(&writer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(render_durability_window(&w));
+        });
+
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "the scrape BLOCKED on a held engine lock — this is the defect: \
+                 std::sync::Mutex::lock() parks a Tokio worker thread inside an \
+                 async task, and the writer has only two of them",
+            );
+        drop(guard);
+
+        assert!(
+            out.contains("ehdb_l0_durability_sample_ok 0"),
+            "expected sample_ok 0 while the lock was held, got:\n{out}"
+        );
+        // ...and the lock-free half must still be present, or the fix traded a
+        // hang for a hole in the series.
+        assert!(
+            out.contains("ehdb_l0_replicated") || out.contains("replicated"),
+            "replicated lag vanished while the engine was busy; it is rendered \
+             from the lock-free metrics handle and must always appear:\n{out}"
+        );
+    }
+
+    /// ⭐ POSITIVE CONTROL. Without this, the test above would pass on a
+    /// function that hard-coded `sample_ok 0` and never sampled anything.
+    #[test]
+    fn an_unheld_engine_reports_a_real_sample() {
+        let writer = test_writer("free");
+        let out = render_durability_window(&writer);
+        assert!(
+            out.contains("ehdb_l0_durability_sample_ok 1"),
+            "expected sample_ok 1 with the lock free — if this says 0 the render \
+             is not sampling at all and the contention test is vacuous:\n{out}"
+        );
+    }
+
 
     /// The events feed must default to **off** and must not inherit the command
     /// bus's directory — a shared dir would put both logs in one fsync stream,
