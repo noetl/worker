@@ -270,6 +270,7 @@ pub struct WorkerMetrics {
     /// stops being written, and that must not be one of the metrics you cannot
     /// see.
     pub materializer_drain_failed_total: IntCounter,
+    pub materializer_dead_lettered_total: IntCounter,
     /// Why a cold-rebuild replay loop stopped, by reason.
     ///
     /// Four different conditions `break` out of that loop identically, and only
@@ -1149,6 +1150,15 @@ impl WorkerMetrics {
             .register(Box::new(materializer_drain_failed_total.clone()))
             .expect("register materializer_drain_failed_total");
 
+        let materializer_dead_lettered_total = IntCounter::new(
+            "noetl_worker_materializer_dead_lettered_total",
+            "Events the server will never accept, parked so the ordered drain advances (noetl/ai-meta#249 shape).",
+        )
+        .expect("materializer_dead_lettered_total metric");
+        registry
+            .register(Box::new(materializer_dead_lettered_total.clone()))
+            .expect("register materializer_dead_lettered_total");
+
         let state_builder_replay_end_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_state_builder_replay_end_total",
@@ -1889,6 +1899,7 @@ impl WorkerMetrics {
             tool_result_error_total,
             materializer_ack_failed_total,
             materializer_drain_failed_total,
+            materializer_dead_lettered_total,
             state_builder_replay_end_total,
             materializer_cycle_duration_seconds,
             result_materializer_drained_total,
@@ -2273,7 +2284,12 @@ pub fn record_state_builder_replay_end(reason: &str) {
 }
 
 /// The stages at which a materializer ack can fail.
-pub const MATERIALIZER_ACK_STAGES: [&str; 3] = ["non_event_batch", "after_project", "per_handle"];
+pub const MATERIALIZER_ACK_STAGES: [&str; 4] = [
+    "non_event_batch",
+    "after_project",
+    "per_handle",
+    "after_dead_letter",
+];
 
 /// Record one materializer ack failure at `stage`.
 pub fn record_materializer_ack_failed(stage: &str) {
@@ -2322,6 +2338,17 @@ pub fn record_materializer_skipped(n: u64) {
 pub fn record_materializer_project_error() {
     WorkerMetrics::global()
         .materializer_project_errors_total
+        .inc();
+}
+
+/// One event parked to dead-letter: `events/project` rejected it with a
+/// deterministic constraint violation, so redelivering it can only fail again
+/// while it holds the head of the ordered drain.  Always paired with an ERROR
+/// log carrying the full payload — never a silent drop (the noetl/ai-meta#249
+/// discipline, applied to the event stream).
+pub fn record_materializer_dead_lettered() {
+    WorkerMetrics::global()
+        .materializer_dead_lettered_total
         .inc();
 }
 
@@ -3477,6 +3504,10 @@ mod tests {
                 "after_project",
             ),
             ("materializer ack reported per-handle errors", "per_handle"),
+            (
+                "materializer ack failed after dead-lettering",
+                "after_dead_letter",
+            ),
         ] {
             assert!(
                 src.contains(needle),
