@@ -271,6 +271,7 @@ pub struct WorkerMetrics {
     /// see.
     pub materializer_drain_failed_total: IntCounter,
     pub materializer_dead_lettered_total: IntCounter,
+    pub materializer_dead_letter_unconfirmed_total: IntCounter,
     /// Why a cold-rebuild replay loop stopped, by reason.
     ///
     /// Four different conditions `break` out of that loop identically, and only
@@ -750,7 +751,9 @@ impl WorkerMetrics {
             .expect("register secret_source_total");
         for var in crate::secrets::file_env::HYDRATED {
             for source in ["file", "env", "file_unusable"] {
-                secret_source_total.with_label_values(&[var, source]).reset();
+                secret_source_total
+                    .with_label_values(&[var, source])
+                    .reset();
             }
         }
 
@@ -1158,6 +1161,15 @@ impl WorkerMetrics {
         registry
             .register(Box::new(materializer_dead_lettered_total.clone()))
             .expect("register materializer_dead_lettered_total");
+
+        let materializer_dead_letter_unconfirmed_total = IntCounter::new(
+            "noetl_worker_materializer_dead_letter_unconfirmed_total",
+            "Dead-letter parks the sink would NOT confirm durable — the batch was deliberately NOT acked and the drain stays blocked. Alert on any nonzero value.",
+        )
+        .expect("materializer_dead_letter_unconfirmed_total metric");
+        registry
+            .register(Box::new(materializer_dead_letter_unconfirmed_total.clone()))
+            .expect("register materializer_dead_letter_unconfirmed_total");
 
         let state_builder_replay_end_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -1845,12 +1857,10 @@ impl WorkerMetrics {
             .register(Box::new(projector_errors_total.clone()))
             .expect("register projector_errors_total");
 
-        let projector_cycle_duration_seconds = Histogram::with_opts(
-            HistogramOpts::new(
-                "noetl_worker_projector_cycle_duration_seconds",
-                "Latency of one projector drain-advance-ack cycle.",
-            ),
-        )
+        let projector_cycle_duration_seconds = Histogram::with_opts(HistogramOpts::new(
+            "noetl_worker_projector_cycle_duration_seconds",
+            "Latency of one projector drain-advance-ack cycle.",
+        ))
         .expect("projector_cycle_duration_seconds metric");
         registry
             .register(Box::new(projector_cycle_duration_seconds.clone()))
@@ -1900,6 +1910,7 @@ impl WorkerMetrics {
             materializer_ack_failed_total,
             materializer_drain_failed_total,
             materializer_dead_lettered_total,
+            materializer_dead_letter_unconfirmed_total,
             state_builder_replay_end_total,
             materializer_cycle_duration_seconds,
             result_materializer_drained_total,
@@ -2234,7 +2245,6 @@ pub fn record_projector_error(reason: &str) {
         .inc();
 }
 
-
 /// Record one materializer drain→project→ack cycle (noetl/ai-meta#103).
 /// `drained` messages were pulled; `projected`/`duplicates` came back from
 /// events/project; `acked` handles were disposed. Call
@@ -2349,6 +2359,15 @@ pub fn record_materializer_project_error() {
 pub fn record_materializer_dead_lettered() {
     WorkerMetrics::global()
         .materializer_dead_lettered_total
+        .inc();
+}
+
+/// A dead-letter park the sink could not confirm durable.  The batch was NOT
+/// acked, so the poison still holds the head of the ordered drain — the safe
+/// outcome, but one that needs a human.  Any nonzero value is an alert.
+pub fn record_materializer_dead_letter_unconfirmed() {
+    WorkerMetrics::global()
+        .materializer_dead_letter_unconfirmed_total
         .inc();
 }
 
@@ -2867,9 +2886,7 @@ pub fn record_claim_loop_progress() {
 /// mistake idleness for a stall, which is the trap a naive "no claims recently"
 /// rule falls into.
 pub fn record_claim_loop_failure() {
-    let n = CLAIM_LOOP_CONSECUTIVE_FAILURES
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
+    let n = CLAIM_LOOP_CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     CLAIM_LOOP_LAST_FAILURE.store(unix_now(), std::sync::atomic::Ordering::Relaxed);
     if n >= claim_loop_failure_streak() {
         set_claim_loop_connected(false);
@@ -2877,8 +2894,7 @@ pub fn record_claim_loop_failure() {
 }
 
 /// Unix seconds of the most recent claim failure.
-static CLAIM_LOOP_LAST_FAILURE: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
+static CLAIM_LOOP_LAST_FAILURE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
