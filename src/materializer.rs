@@ -212,7 +212,7 @@ async fn run_loop(config: MaterializerConfig) -> Result<()> {
 /// matters here: the batch is acked ONLY after `events/project` returns 2xx, so
 /// How long a materializer HTTP call may take before it is abandoned.
 ///
-/// ⚠ `reqwest::Client::new()` has **no timeout at all**, and both drain loops
+/// ⚠ `test_http()` has **no timeout at all**, and both drain loops
 /// used one. A control-plane that accepts the connection and then stalls would
 /// park the loop forever: no completion, no error, no retry — the drain simply
 /// stops, and because it is a background task nothing reports it. Projections
@@ -251,6 +251,7 @@ async fn run_loop_ehdb(config: MaterializerConfig) -> Result<()> {
     .await?;
     let http = materializer_http()?;
     let project_url = format!("{}/api/internal/events/project", config.server_url);
+    let dead_letter_url = format!("{}/api/internal/events/dead-letter", config.server_url);
 
     tracing::info!(
         %claim_addr,
@@ -341,8 +342,42 @@ async fn run_loop_ehdb(config: MaterializerConfig) -> Result<()> {
                 );
             }
             Err(e) => {
-                // DO NOT ack — the batch redelivers after ack_wait. No row lost.
                 crate::metrics::record_materializer_project_error();
+                // A deterministic constraint rejection cannot be retried out of
+                // existence: it holds the head of the ordered drain for ever and
+                // every other execution's events queue behind it.  Isolate the
+                // offenders, land their healthy neighbours, park the offenders,
+                // then ack so the cursor advances.
+                let salvage = salvage_rejected_batch(
+                    &http,
+                    &project_url,
+                    &config.internal_token,
+                    &events,
+                    &e.to_string(),
+                )
+                .await;
+                // The ack is gated on a CONFIRMED durable row: acking removes the
+                // event from the stream, so the dead-letter row is its only
+                // remaining copy.  A park that cannot be confirmed leaves the batch
+                // in flight — the drain stays blocked, which is the right trade
+                // against dropping a durable event with nowhere to land.
+                if salvage.ackable
+                    && park_dead_lettered(
+                        &http,
+                        &dead_letter_url,
+                        &config.internal_token,
+                        &salvage.poison,
+                        &config.consumer,
+                    )
+                    .await
+                {
+                    if let Err(error) = source.ack(&sort_keys).await {
+                        crate::metrics::record_materializer_ack_failed("after_dead_letter");
+                        tracing::warn!(%error, "materializer ack failed after dead-lettering");
+                    }
+                    continue;
+                }
+                // DO NOT ack — the batch redelivers after ack_wait. No row lost.
                 tracing::warn!(
                     drained,
                     error = %e,
@@ -368,6 +403,7 @@ async fn run_loop_nats(config: MaterializerConfig) -> Result<()> {
         .map_err(|e| anyhow!("materializer build_source failed: {e}"))?;
     let http = materializer_http()?;
     let project_url = format!("{}/api/internal/events/project", config.server_url);
+    let dead_letter_url = format!("{}/api/internal/events/dead-letter", config.server_url);
 
     tracing::info!(
         stream = %config.stream,
@@ -472,9 +508,39 @@ async fn run_loop_nats(config: MaterializerConfig) -> Result<()> {
                 );
             }
             Err(e) => {
+                crate::metrics::record_materializer_project_error();
+                // See the EHDB drain above: a deterministic constraint rejection
+                // parks the ordered drain for ever unless it is isolated.
+                let salvage = salvage_rejected_batch(
+                    &http,
+                    &project_url,
+                    &config.internal_token,
+                    &events,
+                    &e.to_string(),
+                )
+                .await;
+                // Same durability gate as the EHDB drain above.
+                if salvage.ackable
+                    && park_dead_lettered(
+                        &http,
+                        &dead_letter_url,
+                        &config.internal_token,
+                        &salvage.poison,
+                        &config.consumer,
+                    )
+                    .await
+                {
+                    dispose(
+                        &*source,
+                        &outcome.ack_ids,
+                        AckDisposition::Ack,
+                        "dead-lettered batch",
+                    )
+                    .await;
+                    continue;
+                }
                 // DO NOT ack — the batch stays in-flight and redelivers after
                 // the consumer's ack-wait. No event is lost.
-                crate::metrics::record_materializer_project_error();
                 tracing::warn!(
                     drained,
                     error = %e,
@@ -550,6 +616,232 @@ fn distinct_execution_ids(events: &[serde_json::Value]) -> Vec<i64> {
 }
 
 /// POST one batch to `events/project`. Returns `(projected, duplicates)`.
+/// Is `NOETL_MATERIALIZER_DEAD_LETTER` on?
+///
+/// Default OFF, for the same reason poison-command dead-lettering is
+/// (noetl/ai-meta#249): enabling it changes DELIVERY GUARANTEES.  An event that
+/// would have been redelivered for ever is instead acked and parked.  That is
+/// the point — one un-insertable event holds the head of the ordered drain and
+/// every other execution's `command.completed` queues behind it — but it is a
+/// semantics change and must be a deliberate flip, not a side effect of a
+/// deploy.
+fn dead_letter_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_MATERIALIZER_DEAD_LETTER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Does this `events/project` error mean the server will NEVER accept this
+/// payload, however many times it is redelivered?
+///
+/// Deliberately narrow: only Postgres constraint rejections, which are a pure
+/// function of the row.  Everything else — connection resets, timeouts, 5xx
+/// without a constraint, pool exhaustion — is transient and MUST keep today's
+/// redelivery, because acking it would lose an event that a retry would have
+/// landed.
+///
+/// The case that motivated this: `noetl.event.catalog_id` is
+/// `NOT NULL REFERENCES noetl.catalog(catalog_id)` and there is no
+/// `catalog_id = 0` row, so an event emitted with a zero catalog_id is
+/// permanently un-insertable.  Five such `playbook.failed` events from
+/// 2026-09-24 were still looping three days later (120k project errors across
+/// two shards, 271s of projection lag on a 22s playbook).
+fn is_permanent_rejection(error: &str) -> bool {
+    const FATAL: &[&str] = &[
+        "violates foreign key constraint",
+        "violates check constraint",
+        "violates not-null constraint",
+        "violates unique constraint",
+        "invalid input syntax",
+        "value too long for type",
+        "numeric field overflow",
+    ];
+    FATAL.iter().any(|needle| error.contains(needle))
+}
+
+/// What a salvage attempt concluded about a rejected batch.
+#[derive(Debug, Default)]
+struct Salvage {
+    /// Events the server will never accept, each with the reason it gave.
+    poison: Vec<(serde_json::Value, String)>,
+    /// True only when every non-poison event in the batch is now durable, so
+    /// the batch's handles may be acked without losing anything.
+    ackable: bool,
+}
+
+/// Split a rejected batch into "will never land" and "landed on retry".
+///
+/// A batch is posted as one unit, so a single un-insertable event fails the
+/// whole batch and takes its healthy neighbours down with it.  On a permanent
+/// rejection we re-post each event ALONE: the healthy ones become durable, the
+/// poison ones name themselves.  Only then may the batch be acked.
+///
+/// Bails out (`ackable: false`, no poison reported) the moment a single-event
+/// post fails transiently — a flaky server mid-salvage must not be read as
+/// "this event is poison", and leaving the batch un-acked is always safe.
+async fn salvage_rejected_batch(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    events: &[serde_json::Value],
+    first_error: &str,
+) -> Salvage {
+    if !dead_letter_enabled() || !is_permanent_rejection(first_error) {
+        return Salvage::default();
+    }
+    let mut poison = Vec::new();
+    for event in events {
+        match project(http, url, token, std::slice::from_ref(event)).await {
+            Ok(_) => {}
+            Err(e) => {
+                let reason = e.to_string();
+                if is_permanent_rejection(&reason) {
+                    poison.push((event.clone(), reason));
+                } else {
+                    // Transient failure while isolating.  Everything stays
+                    // in-flight and redelivers; we conclude nothing.
+                    tracing::warn!(
+                        error = %reason,
+                        "materializer salvage aborted on a transient error; batch stays un-acked"
+                    );
+                    return Salvage::default();
+                }
+            }
+        }
+    }
+    Salvage {
+        poison,
+        ackable: true,
+    }
+}
+
+/// Park the poison in `noetl.event_dead_letter` and report whether EVERY event is
+/// confirmed durable, which is the only condition under which the caller may ack.
+///
+/// Acking removes the event from the durable stream, so the dead-letter row
+/// becomes its only remaining copy.  This is therefore a MOVE, not a delete, and
+/// the order is load-bearing: write, have the server read the row back after its
+/// commit, and only then ack.  A partial or unconfirmed result returns `false`
+/// and the caller leaves the batch in flight — the drain stays blocked, which is
+/// the correct trade against dropping a durable event with no landing spot.
+///
+/// The full payload is ALSO logged at ERROR, as a second independent record.
+async fn park_dead_lettered(
+    http: &reqwest::Client,
+    dead_letter_url: &str,
+    token: &str,
+    poison: &[(serde_json::Value, String)],
+    parked_by: &str,
+) -> bool {
+    if poison.is_empty() {
+        return true;
+    }
+    // Log first: if the POST or the process dies here, the payload is still on
+    // record, and nothing has been acked yet.
+    for (event, reason) in poison {
+        tracing::error!(
+            event_id = ?event.get("event_id"),
+            execution_id = ?event.get("execution_id"),
+            event_type = ?event.get("event_type"),
+            reason = %reason,
+            payload = %event,
+            "Poison event being parked to dead-letter: events/project rejected it with a \
+             deterministic constraint violation, so redelivery can only fail again while \
+             it holds the head of the ordered drain.  Full payload logged above; the \
+             stream message is acked ONLY once the durable row is confirmed."
+        );
+    }
+
+    let rows: Vec<serde_json::Value> = poison
+        .iter()
+        .map(|(event, reason)| {
+            serde_json::json!({
+                "execution_id": as_i64(event.get("execution_id")),
+                "event_id": as_i64(event.get("event_id")),
+                "catalog_id": as_i64(event.get("catalog_id")),
+                "event_type": event.get("event_type").and_then(|v| v.as_str()),
+                "node_name": event.get("node_name").and_then(|v| v.as_str()),
+                "reason": reason,
+                "payload": event,
+                "parked_by": parked_by,
+            })
+        })
+        .collect();
+
+    let resp = match http
+        .post(dead_letter_url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "events": rows }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::metrics::record_materializer_dead_letter_unconfirmed();
+            tracing::error!(
+                error = %e,
+                count = poison.len(),
+                "dead-letter POST failed — NOT acking.  The drain stays blocked, which is \
+                 correct: an un-ackable event must never be dropped without a landing spot."
+            );
+            return false;
+        }
+    };
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        crate::metrics::record_materializer_dead_letter_unconfirmed();
+        tracing::error!(
+            status = status.as_u16(),
+            body = %body,
+            count = poison.len(),
+            "dead-letter sink refused the rows — NOT acking."
+        );
+        return false;
+    }
+    // The sink reports per-event durability from a post-commit read-back.  Only a
+    // full confirmation lets the whole batch be acked; anything less and we leave
+    // it in flight rather than guess which message is safe to drop.
+    let confirmed = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("durable").and_then(|d| d.as_u64()))
+        .unwrap_or(0) as usize;
+    if confirmed != poison.len() {
+        crate::metrics::record_materializer_dead_letter_unconfirmed();
+        tracing::error!(
+            confirmed,
+            requested = poison.len(),
+            body = %body,
+            "dead-letter sink could not confirm every row durable — NOT acking."
+        );
+        return false;
+    }
+    for _ in poison {
+        crate::metrics::record_materializer_dead_lettered();
+    }
+    tracing::warn!(
+        parked = poison.len(),
+        "poison parked to noetl.event_dead_letter and confirmed durable; acking the \
+         stream messages so the ordered drain can advance"
+    );
+    true
+}
+
+/// Read a JSON field that may be a number or a numeric string (the stream shape
+/// uses both for snowflake ids, depending on producer).
+fn as_i64(v: Option<&serde_json::Value>) -> Option<i64> {
+    match v {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 async fn project(
     http: &reqwest::Client,
     url: &str,
@@ -655,6 +947,398 @@ pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A bounded HTTP client for these tests.
+    ///
+    /// `test_http()` has no timeout at all, and
+    /// `tests/http_clients_are_bounded.rs` rejects it on purpose. That guard is
+    /// right about test code too: `an_unconfirmed_park_must_never_permit_the_ack`
+    /// deliberately points at an unreachable port, and without a bound a hang
+    /// there would surface as a stuck CI job rather than a failed assertion.
+    fn test_http() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client builds")
+    }
+
+    // ---------------------------------------------------------------------
+    // Poison-batch escape (the 2026-09-27 prod stall).
+    //
+    // Five `playbook.failed` events emitted with `catalog_id = 0` on
+    // 2026-09-24 were STILL being redelivered three days later:
+    // `noetl.event.catalog_id` is `NOT NULL REFERENCES noetl.catalog(catalog_id)`
+    // and no `catalog_id = 0` row exists, so `events/project` returned 500 for
+    // every batch that carried one.  The materializer never acks a failed
+    // batch, so the head of the ordered drain never moved: 120,545 project
+    // errors against 24,888 successes across the two system shards, 271s of
+    // projection lag, and a 22s playbook taking 290s because the off-server
+    // drive could not read its own `command.completed` out of the WAL.
+    // ---------------------------------------------------------------------
+
+    /// The exact error Postgres/`events/project` returns for the poison shape.
+    const FK_500: &str = "events/project HTTP 500: {\"error\":\"Database error: error returned \
+from database: insert or update on table \\\"event_2026_q3\\\" violates foreign key constraint \
+\\\"event_catalog_id_fkey\\\"\",\"status\":500}";
+
+    #[test]
+    fn the_prod_fk_rejection_is_classified_permanent() {
+        assert!(
+            is_permanent_rejection(FK_500),
+            "the FK violation that stalled prod must be recognised as permanent"
+        );
+    }
+
+    /// Transient failures must keep today's redelivery — acking one would lose
+    /// an event that a retry would have landed.  This is the guard that keeps
+    /// the escape hatch from becoming a data-loss hatch.
+    #[test]
+    fn transient_failures_are_not_permanent() {
+        for transient in [
+            "events/project request failed: connection reset by peer",
+            "events/project HTTP 502: {\"error\":\"upstream unavailable\"}",
+            "events/project HTTP 500: {\"error\":\"Database error: pool timed out\"}",
+            "events/project HTTP 503: {}",
+            "events/project decode: expected value",
+        ] {
+            assert!(
+                !is_permanent_rejection(transient),
+                "{transient:?} is retryable and must NOT be dead-lettered"
+            );
+        }
+    }
+
+    fn event(event_id: u64, catalog_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "event_id": event_id.to_string(),
+            "execution_id": "360874172542361600",
+            "catalog_id": catalog_id.to_string(),
+            "event_type": "playbook.failed",
+        })
+    }
+
+    /// A stub `events/project` with the real server's batch semantics: the whole
+    /// batch is one transaction, so ONE event with `catalog_id == 0` fails all of
+    /// it.  Returns the bound address and the list of event_ids that landed.
+    async fn stub_project_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{routing::post, Json, Router};
+        let landed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = landed.clone();
+        let app = Router::new().route(
+            "/api/internal/events/project",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    let events = body
+                        .get("events")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    // One bad row fails the batch — exactly like the real INSERT.
+                    let poisoned = events.iter().any(|e| {
+                        e.get("catalog_id").and_then(|c| c.as_str()) == Some("0")
+                    });
+                    if poisoned {
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "Database error: error returned from database: insert \
+or update on table \"event_2026_q3\" violates foreign key constraint \"event_catalog_id_fkey\"",
+                                "status": 500
+                            })),
+                        );
+                    }
+                    let mut g = sink.lock().unwrap();
+                    for e in &events {
+                        if let Some(id) = e.get("event_id").and_then(|v| v.as_str()) {
+                            g.push(id.to_string());
+                        }
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(serde_json::json!({
+                            "projected": events.len(), "duplicates": 0
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/api/internal/events/project"), landed)
+    }
+
+    /// The whole defect and the whole fix, in one test.
+    ///
+    /// The batch is 1 poison event + 2 healthy ones.  The DEFECT-PLANTING
+    /// control is the first phase: with dead-lettering off (prod's state on
+    /// 2026-09-27) the batch is rejected, NOTHING is ackable, and the two
+    /// healthy events never land — that is the stalled drain, reproduced.  The
+    /// second phase flips the one flag and asserts the poison is named, the
+    /// healthy events become durable, and the batch may finally be acked.
+    #[tokio::test]
+    async fn a_poison_event_must_not_hold_the_drain_hostage() {
+        const FLAG: &str = "NOETL_MATERIALIZER_DEAD_LETTER";
+        let (url, landed) = stub_project_server().await;
+        let http = test_http();
+        let batch = vec![
+            event(1001, 717028015384821801),
+            event(1002, 0),
+            event(1003, 717028015384821801),
+        ];
+
+        // Sanity: the batch really is rejected, and rejected for the prod reason.
+        let err = project(&http, &url, "tok", &batch)
+            .await
+            .expect_err("a batch carrying catalog_id=0 must be rejected")
+            .to_string();
+        assert!(
+            is_permanent_rejection(&err),
+            "stub must reproduce the prod FK rejection, got: {err}"
+        );
+
+        // --- RED: the defect, as it ran on prod. ---
+        std::env::remove_var(FLAG);
+        let stuck = salvage_rejected_batch(&http, &url, "tok", &batch, &err).await;
+        assert!(
+            !stuck.ackable,
+            "with dead-lettering OFF the batch must stay un-acked (today's guarantee)"
+        );
+        assert!(stuck.poison.is_empty(), "nothing may be parked while OFF");
+        assert!(
+            landed.lock().unwrap().is_empty(),
+            "THE DEFECT: one poison event blocks its healthy neighbours too — \
+             nothing lands, and the batch redelivers for ever"
+        );
+
+        // --- GREEN: one deliberate flip. ---
+        std::env::set_var(FLAG, "true");
+        let salvaged = salvage_rejected_batch(&http, &url, "tok", &batch, &err).await;
+        std::env::remove_var(FLAG);
+
+        assert!(
+            salvaged.ackable,
+            "the batch must become ackable so the ordered drain can advance"
+        );
+        assert_eq!(salvaged.poison.len(), 1, "exactly one event is poison");
+        assert_eq!(
+            salvaged.poison[0].0.get("event_id").unwrap().as_str(),
+            Some("1002"),
+            "the parked event must be the catalog_id=0 one, not a neighbour"
+        );
+        assert!(
+            is_permanent_rejection(&salvaged.poison[0].1),
+            "the parked event must carry the server's reason"
+        );
+        let mut landed_ids = landed.lock().unwrap().clone();
+        landed_ids.sort();
+        assert_eq!(
+            landed_ids,
+            vec!["1001".to_string(), "1003".to_string()],
+            "both healthy events must be DURABLE before the batch is acked"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The durability gate (owner condition: verify the dead-letter row is
+    // durably written BEFORE the ack; if it cannot be confirmed, do NOT ack).
+    // ---------------------------------------------------------------------
+
+    /// Stub dead-letter sink. `durable_of` decides how many rows it will confirm,
+    /// mimicking the real endpoint's post-commit read-back count.
+    async fn stub_dead_letter(
+        mode: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use axum::{routing::post, Json, Router};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let app = Router::new().route(
+            "/api/internal/events/dead-letter",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    let rows = body
+                        .get("events")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    sink.lock().unwrap().extend(rows.iter().cloned());
+                    match mode {
+                        // Every row committed and read back.
+                        "all" => (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({"durable": rows.len(), "outcomes": []})),
+                        ),
+                        // Wrote nothing durably (e.g. the commit was rolled back).
+                        "none" => (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({"durable": 0, "outcomes": []})),
+                        ),
+                        // The dangerous middle: SOME rows landed.
+                        "partial" => (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({
+                                "durable": rows.len().saturating_sub(1), "outcomes": []
+                            })),
+                        ),
+                        // The sink itself is down.
+                        _ => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "sink down"})),
+                        ),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (
+            format!("http://{addr}/api/internal/events/dead-letter"),
+            seen,
+        )
+    }
+
+    /// A confirmed park permits the ack, and the row carries everything needed to
+    /// reconstruct the event — this is a MOVE, not a delete.
+    #[tokio::test]
+    async fn a_confirmed_park_permits_the_ack_and_preserves_the_event() {
+        let (url, seen) = stub_dead_letter("all").await;
+        let poison = vec![(event(4001, 0), FK_500.to_string())];
+        assert!(
+            park_dead_lettered(
+                &test_http(),
+                &url,
+                "tok",
+                &poison,
+                "test-consumer"
+            )
+            .await,
+            "a fully confirmed park must permit the ack"
+        );
+        let rows = seen.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.get("event_id").unwrap().as_i64(), Some(4001));
+        assert_eq!(r.get("catalog_id").unwrap().as_i64(), Some(0));
+        assert_eq!(
+            r.get("reason").unwrap().as_str().unwrap(),
+            FK_500,
+            "the row must carry the server's verbatim rejection"
+        );
+        assert_eq!(
+            r.get("payload").unwrap(),
+            &event(4001, 0),
+            "the row must carry the COMPLETE payload byte-for-byte, or the event \
+             is not reconstructable and the ack was a delete"
+        );
+        assert_eq!(
+            r.get("parked_by").unwrap().as_str(),
+            Some("test-consumer"),
+            "the row must record who parked it"
+        );
+    }
+
+    /// The hard line: nothing confirmed durable => NO ack, whatever the reason.
+    ///
+    /// Each arm is a distinct way the sink can fail to give a landing spot. All
+    /// three must refuse the ack, because an ack removes the only other copy.
+    #[tokio::test]
+    async fn an_unconfirmed_park_must_never_permit_the_ack() {
+        let poison = vec![
+            (event(4002, 0), FK_500.to_string()),
+            (event(4003, 0), FK_500.to_string()),
+        ];
+
+        for mode in ["none", "partial", "down"] {
+            let (url, _) = stub_dead_letter(mode).await;
+            assert!(
+                !park_dead_lettered(&test_http(), &url, "tok", &poison, "t").await,
+                "mode={mode}: an unconfirmed park MUST NOT permit the ack — the drain \
+                 staying blocked is correct, dropping a durable event is not"
+            );
+        }
+
+        // And an unreachable sink (nothing listening) is the same answer.
+        assert!(
+            !park_dead_lettered(
+                &test_http(),
+                "http://127.0.0.1:1/api/internal/events/dead-letter",
+                "tok",
+                &poison,
+                "t",
+            )
+            .await,
+            "an unreachable sink MUST NOT permit the ack"
+        );
+    }
+
+    /// Empty poison is vacuously safe — nothing to park, nothing to lose.
+    #[tokio::test]
+    async fn an_empty_park_is_permitted() {
+        assert!(
+            park_dead_lettered(
+                &test_http(),
+                "http://127.0.0.1:1/unused",
+                "tok",
+                &[],
+                "t"
+            )
+            .await,
+            "no poison means there is nothing to confirm"
+        );
+    }
+
+    /// A transient rejection mid-salvage must conclude nothing: no park, no ack.
+    #[tokio::test]
+    async fn a_transient_failure_never_parks_an_event() {
+        const FLAG: &str = "NOETL_MATERIALIZER_DEAD_LETTER";
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/api/internal/events/project",
+            post(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "upstream unavailable"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}/api/internal/events/project");
+
+        std::env::set_var(FLAG, "true");
+        // Enter salvage on a permanent first error, then hit a transient one.
+        let out = salvage_rejected_batch(
+            &test_http(),
+            &url,
+            "tok",
+            &[event(2001, 0)],
+            FK_500,
+        )
+        .await;
+        std::env::remove_var(FLAG);
+
+        assert!(
+            !out.ackable,
+            "a transient error mid-salvage must leave the batch in-flight"
+        );
+        assert!(
+            out.poison.is_empty(),
+            "a flaky server must never be read as 'this event is poison'"
+        );
+    }
     use super::*;
     use noetl_tools::tools::source::PolledMessage;
 
