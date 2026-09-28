@@ -129,7 +129,12 @@ impl TierClientConfig {
         )
     }
 
-    fn build(
+    /// Construct from raw strings.
+    ///
+    /// `pub` so `ehdb-selfcheck` (a separate binary crate) can point a client at an explicit
+    /// address without going through the process env — a load driver must be
+    /// able to name its target.
+    pub fn build(
         raw: Option<&str>,
         raw_timeout: Option<&str>,
         raw_append_timeout: Option<&str>,

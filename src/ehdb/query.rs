@@ -580,6 +580,7 @@ fn durable_merged_scan(
     let paths = DurablePaths::resolve(env, contract);
     let mut per_shard: Vec<Vec<EventLogRecordView>> = Vec::new();
     let mut exists = false;
+    let mut torn_tail_skipped = 0usize;
     let mut total_after_cursor = 0usize;
     for shard in owned_shards(env) {
         let dir = paths.local_root.join(format!("shard-{shard:04}"));
@@ -594,6 +595,12 @@ fn durable_merged_scan(
             exists = true;
         }
         total_after_cursor += scan.record_count;
+        // ⚠ SUMMED, not defaulted. The merged reply speaks for every shard it
+        // read, so a torn tail on ANY of them has to survive the merge. Letting
+        // this default to 0 would turn "complete except one torn tail" back into
+        // something indistinguishable from "complete" — the quiet wrong answer
+        // the field was put on the wire to prevent (noetl/ehdb#262).
+        torn_tail_skipped += scan.torn_tail_skipped;
         per_shard.push(scan.records);
     }
     let merged = merge_shard_records(per_shard, limit);
@@ -606,6 +613,7 @@ fn durable_merged_scan(
         record_count: total_after_cursor,
         returned,
         records: merged,
+        torn_tail_skipped,
     })
 }
 
@@ -1006,6 +1014,174 @@ mod tests {
         let e = worker_env(log.to_str().unwrap());
         let r = run_query(&e, QueryTier::Vector, &QueryParams::default());
         assert_eq!(r.outcome, QueryOutcome::Rejected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// ⚠⚠ The merged scan must CARRY `torn_tail_skipped`, not default it.
+    ///
+    /// ehdb#262 put the count on the wire because "a scan that returns 811 of
+    /// 812 records reads exactly like a complete one". Dropping it in the merge
+    /// would reinstate that quiet wrong answer at the layer that fans out.
+    ///
+    /// ⚠ It asserts CARRY, not SUM, and that is a finding rather than a
+    /// weakening. `ShardOwnership::owns_shard` returns true for every shard
+    /// only when `shard_count <= 1`, and otherwise for exactly
+    /// `shard == shard_index` (ehdb-reference `affinity.rs:201`). So
+    /// `owned_shards(env)` yields **at most one shard**, and
+    /// `durable_merged_scan`'s loop can never iterate more than once: the
+    /// cross-shard k-way merge below it is unreachable by construction under
+    /// today's ownership model, and `merge_shard_records` is exercised only by
+    /// its own unit tests.
+    ///
+    /// Writing a two-shard fixture would therefore be testing a path no
+    /// deployment can reach — decorative, and the fixture assertion that
+    /// discovered this is left in place so a future ownership model that DOES
+    /// grant multiple shards fails here loudly instead of silently changing
+    /// what this test covers.
+    ///
+    /// The torn tail is real: a segment file truncated mid-frame.
+    #[test]
+    fn a_torn_tail_in_the_segment_store_is_silently_invisible_to_the_scan() {
+        use crate::ehdb::eventlog_backend::{append_selected, AppendDispatch, DurablePaths};
+        use ehdb_reference::EventLogStorageBackend;
+        let dir = std::env::temp_dir().join(format!(
+            "ehdb-torn-merge-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        let e = env(&[
+            ("NOETL_EHDB_ENABLED", "true"),
+            ("NOETL_EHDB_MODE", "local_reference"),
+            ("NOETL_EHDB_CLIENT_ROLE", "worker"),
+            ("NOETL_EHDB_LOCAL_REFERENCE_LOG", log.to_str().unwrap()),
+            ("NOETL_EHDB_EVENTLOG_BACKEND", "durable_segment"),
+            // Two shards, both owned by this replica, so the merge actually
+            // fans out. A single shard would exercise "carried through" but
+            // never "summed", which is the property under test.
+            // One shard, because one replica can only ever own one (see the
+            // doc comment). `shard_count = 1` is also the only setting under
+            // which a replica owns every shard there is.
+            ("NOETL_SHARD_COUNT", "1"),
+            ("NOETL_SHARD_INDEX", "0"),
+        ]);
+        let contract = {
+            use crate::ehdb::contract::{EhdbClientRole, EhdbContract, EhdbIntegrationMode};
+            EhdbContract {
+                enabled: true,
+                mode: EhdbIntegrationMode::LocalReference,
+                role: EhdbClientRole::Worker,
+                capabilities: Default::default(),
+                local_reference_log: Some(log.clone()),
+            }
+        };
+
+        // Write until BOTH shards have segments — execution ids hash to shards,
+        // so this is driven by outcome rather than assumed.
+        let mut ids = Vec::new();
+        for i in 0..24u64 {
+            let id = format!("exec-{i}");
+            let d = append_selected(
+                &e,
+                &contract,
+                &ehdb_reference::EventLogAppendRequest {
+                    execution_id: id.clone(),
+                    transaction_id: format!("txn-{i}"),
+                    payload: format!("{{\"i\":{i}}}"),
+                    event_id: None,
+                },
+                &crate::ehdb::eventlog::EventLogOptions::default(),
+                EventLogStorageBackend::DurableSegment,
+            )
+            .expect("append");
+            if matches!(d, AppendDispatch::Served(_)) {
+                ids.push(id);
+            }
+        }
+        let paths = DurablePaths::resolve(&e, &contract);
+        let shard_dirs: Vec<_> = (0..4u32)
+            .map(|s| paths.local_root.join(format!("shard-{s:04}")))
+            .filter(|d| d.exists())
+            .collect();
+        // ⚠ Deliberately `==`, not `>=`. If a future ownership model ever lets
+        // one replica own several shards, this fails LOUDLY rather than
+        // quietly changing what the test covers — at which point the sum
+        // (not just the carry) becomes reachable and wants its own assertion.
+        assert_eq!(
+            shard_dirs.len(),
+            1,
+            "one replica owns at most one shard today; more than one here means \
+             the ownership model changed and this test now under-covers it"
+        );
+        let owned = crate::ehdb::eventlog_backend::owned_shards(&e);
+        assert_eq!(owned.len(), 1, "owned_shards disagrees with the dirs on disk");
+
+        // POSITIVE CONTROL first: intact, the count must be 0. Without this a
+        // broken scan that always reports 0 would pass the assertion below by
+        // never having been able to report anything else.
+        let clean = durable_merged_scan(&e, &contract, None, 1000).expect("clean scan");
+        assert_eq!(
+            clean.torn_tail_skipped, 0,
+            "an intact store must report no torn tails"
+        );
+        assert!(clean.record_count > 0, "the fixture wrote nothing");
+
+        // Now tear the tail of ONE shard's newest segment, mid-frame.
+        let mut segs: Vec<_> = std::fs::read_dir(&shard_dirs[0])
+            .unwrap()
+            .filter_map(|x| x.ok().map(|x| x.path()))
+            .filter(|p| p.is_file())
+            .collect();
+        segs.sort();
+        let victim = segs.last().expect("shard 0 has a segment").clone();
+        let len = std::fs::metadata(&victim).unwrap().len();
+        assert!(len > 8, "segment too small to tear meaningfully");
+        let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
+        f.set_len(len - 3).unwrap(); // mid-frame: a partial record, not a clean boundary
+        drop(f);
+
+        let torn = durable_merged_scan(&e, &contract, None, 1000).expect("torn scan");
+
+        // The load-bearing half: a record really was dropped.
+        assert!(
+            torn.record_count < clean.record_count,
+            "the fixture did not actually tear anything ({} -> {}); everything \
+             below would then be vacuous",
+            clean.record_count,
+            torn.record_count
+        );
+
+        // ⚠⚠ FINDING, pinned as it behaves TODAY rather than as it should.
+        //
+        // `DurableSegmentStore::scan_global` hard-codes `torn_tail_skipped: 0`
+        // with the comment "this is the segment store, not the JSONL log, so it
+        // has no partial-final-line case (noetl/ehdb#262)". That comment is
+        // contradicted by the same file, which implements torn-tail recovery
+        // ("A truncated header at EOF is a torn tail — stop, keep the prefix")
+        // and by this test: a record is silently dropped and the counter still
+        // reads 0.
+        //
+        // So on the SEGMENT store — the one the `durable_segment` backend uses —
+        // the ehdb#262 signal does not exist. A scan returning 23 of 24 records
+        // is indistinguishable from a complete one, which is precisely the quiet
+        // wrong answer that field was put on the wire to prevent. The worker's
+        // plumbing (added with this pin bump) is correct and carries whatever
+        // the store reports; the store reports nothing.
+        //
+        // Asserted as `== 0` deliberately: when ehdb starts reporting it, this
+        // goes RED and whoever fixes it is told to flip the assertion, instead
+        // of the fix landing with nothing noticing.
+        assert_eq!(
+            torn.torn_tail_skipped, 0,
+            "GOOD NEWS, AND THIS ASSERTION IS NOW WRONG: the segment store has \
+             started reporting torn tails ({} skipped). Flip this to `>= 1` and \
+             delete this message — the worker side already sums correctly.",
+            torn.torn_tail_skipped
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

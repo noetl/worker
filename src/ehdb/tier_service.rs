@@ -645,20 +645,663 @@ async fn serve_conn(mut stream: TcpStream) {
     }
 }
 
+/// Cap on the tier requests whose **work** runs concurrently.
+///
+/// ⚠⚠ This exists because the accept loop used to be an **unbounded fan-in**:
+/// one `tokio::spawn` per accepted connection, with nothing limiting how many
+/// ran at once. A tier append costs a copy of the tier's entire in-memory state
+/// (`LocalReferenceRuntime::append` clones `self.state`), so N concurrent
+/// appends cost N copies of a state proportional to the store. On 2026-09-20 a
+/// KEDA reconnect (the pool scales 1->20) drove `noetl-cmdbus-writer-0` past an
+/// 8 GiB limit nine seconds into the roll, OOM-killing the process hosting BOTH
+/// buses.
+///
+/// ⚠⚠ **The first fix took the permit BEFORE `accept`, and that was a
+/// production regression (2026-09-22).** The reasoning was "leave excess
+/// clients in the kernel backlog, which is where backpressure belongs". What it
+/// actually produced: while every permit was held the loop never reached
+/// `accept()` at all, so the service went **deaf** — the kernel still completed
+/// the TCP handshake, so every client hung until its own timeout and saw
+/// nothing. Measured in prod: *every* tier timed out at exactly 2.0s, including
+/// `catalog` (4.7 MB, no sealed segment) and `kv` — uniform failure regardless
+/// of store size, which is queueing, not work. Appends were dropped
+/// (`no_durable_service`), the materializer replay crawled (61s for 15
+/// records), and worker registration starved past its hardcoded 30s timeout, so
+/// the writer exited 1 and crash-looped every ~2.5 minutes.
+///
+/// A deaf service is strictly worse than a slow one: it is indistinguishable
+/// from being down, sheds nothing, and reports nothing. So the bound now sits
+/// **after** `accept`: the listener is always drained, and a request that
+/// cannot get a permit in time is answered with an explicit busy error. That
+/// keeps the memory bound that mattered (only `limit` requests do the expensive
+/// work at once) while guaranteeing the service always answers.
+pub const TIER_MAX_INFLIGHT_ENV: &str = "NOETL_EHDB_TIER_MAX_INFLIGHT";
+
+/// How long an accepted request waits for a permit before it is shed.
+pub const TIER_SHED_AFTER_MS_ENV: &str = "NOETL_EHDB_TIER_SHED_AFTER_MS";
+
+/// Cap on requests **accepted and waiting** for a permit.
+///
+/// Accepting unconditionally must not turn a memory spike into an unbounded
+/// task list. A waiter is a socket plus a small task — orders of magnitude
+/// cheaper than a state copy — so this is a multiple of the work bound rather
+/// than equal to it. Beyond it, requests are shed immediately.
+pub const TIER_MAX_WAITERS_MULTIPLE: usize = 8;
+
+/// Default shed deadline. Chosen against the client budget: prod's tier client
+/// times out at 2s, so a request that has not started work within 1s is better
+/// answered than left to expire silently.
+pub const TIER_SHED_AFTER_MS_DEFAULT: u64 = 1_000;
+
+
+/// Default concurrent tier requests.
+///
+/// ⚠ 8, not 4 and **not 64**. Both ends of that range were measured on
+/// 2026-09-22 rather than argued:
+///
+/// * **4 was never the bug.** It throttled nothing on its own; the deafness came
+///   from the permit gating `accept`. With the ordering fixed, the kind gate
+///   passes at a cap of 4 — 16 idle permit-holders against 4 permits, and a
+///   cost-free request on an empty tier is still answered in 0.3s.
+/// * **64 is actively worse.** At 64 the same gate went deaf *again*, by a
+///   different route: 12 concurrent reads of a 973 MiB segment on 2 CPUs
+///   starved the runtime so thoroughly that even the accept-and-shed path
+///   missed a 2s budget. Raising the bound does not help when the bound is what
+///   protects the runtime.
+///
+/// So the cap keeps doing its original job — bounding memory, since a tier
+/// append clones the store's in-memory state — and 8 doubles the headroom over
+/// the value that shipped with the OOM fix while staying inside the 12 GiB
+/// limit against a ~1 GB worst-case read (prod's legacy 1.08 GB segment).
+///
+/// It is baked into the image deliberately. The env override exists, but prod
+/// must not depend on setting it: when the tier went deaf, the env change was
+/// unavailable and only an image swap was. A bound that needs an operator to
+/// set a variable is absent exactly when it is needed.
+pub const TIER_MAX_INFLIGHT_DEFAULT: usize = 8;
+
+/// Resolve the in-flight cap. Unparsable or zero ⇒ the default, because a typo
+/// must not silently remove the bound this exists to impose.
+pub fn tier_max_inflight() -> usize {
+    let requested = parse_max_inflight(std::env::var(TIER_MAX_INFLIGHT_ENV).ok().as_deref());
+    let cap = runtime_headroom_cap();
+    if requested > cap {
+        tracing::warn!(
+            requested,
+            clamped_to = cap,
+            "EHDB tier: NOETL_EHDB_TIER_MAX_INFLIGHT exceeds what this runtime can \
+             absorb; clamping so the process keeps CPU headroom for everything else \
+             (noetl/ai-meta#351)"
+        );
+        return cap;
+    }
+    requested
+}
+
+/// The most concurrent tier operations this process can run while still leaving
+/// the rest of it able to make progress.
+///
+/// ⚠⚠ This exists because of a measured production stall. On 2026-09-23
+/// `noetl-cmdbus-writer-0` ran **two** `tokio-rt-worker` threads
+/// (`available_parallelism()` honours the cgroup quota, which was 2 cores) while
+/// `NOETL_EHDB_TIER_MAX_INFLIGHT` was **4**. Four concurrent tier operations
+/// therefore consumed the entire runtime and nothing else in the process ran —
+/// not the accept loop, not the shed path, not the metrics scrape, not the
+/// worker's own control-plane registration.
+///
+/// ⚠ Moving the work to the blocking pool (the commit this builds on) is
+/// necessary but **not sufficient**: the blocking pool does not create CPU.
+///
+/// Reserving one unit leaves the runtime a core to schedule on. It is a clamp,
+/// not a default, so an operator setting cannot re-open the failure — the
+/// production value could not be changed by env at the time it mattered, so the
+/// safety has to travel in the image.
+///
+/// ## What the gate measured — and what it did NOT
+///
+/// Gated in kind against a prod-shaped fixture: a **sealed 973 MiB** segment
+/// (`1,020,001,271` bytes) at `cpu=2`, under 8 sustained readers.
+/// `playbooks/351-tier-saturation/` in noetl/ai-meta.
+///
+/// ✅ **Process responsiveness — the production failure, fixed.** Scraping the
+/// worker's own `/metrics` from outside the pod:
+///
+/// | arm | idle (control) | under load |
+/// | :-- | :-- | :-- |
+/// | without the clamp | 34ms, 513 lines | **30024ms, 0 lines** |
+/// | with the clamp | 47ms, 513 lines | **19ms, 529 lines** |
+///
+/// Idle controls agree (513/513), so the arms are comparable; the 30s timeout
+/// reproduced across two runs. That is the stall that starved registration past
+/// its hardcoded 30s deadline.
+///
+/// ❌ **A cost-free tier READ under load still fails — on both arms.** An
+/// earlier draft of this comment implied the clamp fixes that. It does not:
+/// without the clamp the probe times out at 2s at every load level (1/2/4/8);
+/// with it the probe is **shed** in ~1s with a countable busy reply. A cap of 1
+/// buys runtime headroom and makes head-of-line blocking *inside* the tier
+/// strictly worse — one in-flight expensive read now blocks every cheap one.
+///
+/// So this clamp delivers **runtime headroom, not tier availability**. Tier
+/// availability under a large sealed segment is a separate problem
+/// (noetl/ai-meta#351).
+fn runtime_headroom_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1)
+}
+
+/// [`tier_max_inflight`] as a **pure function of the raw value**.
+///
+/// ⚠ Split from the env read on purpose. The first version of the fail-safe
+/// test re-implemented this parse inline instead of calling it, so deleting
+/// `.filter(|n| *n > 0)` from the real function left the test green — a
+/// decorative test that proved only that I can write the same expression
+/// twice. `cargo test` does not serialise tests, so exercising the real
+/// function meant making the decision testable without the process env.
+pub fn parse_max_inflight(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(TIER_MAX_INFLIGHT_DEFAULT)
+}
+
+/// Resolve the shed deadline. Unparsable or zero ⇒ the default.
+pub fn tier_shed_after() -> std::time::Duration {
+    std::time::Duration::from_millis(parse_shed_after_ms(
+        std::env::var(TIER_SHED_AFTER_MS_ENV).ok().as_deref(),
+    ))
+}
+
+/// [`tier_shed_after`] as a pure function of the raw value, for the same reason
+/// [`parse_max_inflight`] is split out: a test that re-implements the parse
+/// proves only that the expression can be written twice.
+pub fn parse_shed_after_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(TIER_SHED_AFTER_MS_DEFAULT)
+}
+
+/// What a shed request is told. An explicit answer, following the same rule as
+/// the over-large reply above: the caller must be able to COUNT this, not lose
+/// it to a timeout that looks identical to the service being down.
+pub const TIER_BUSY_REPLY: &str =
+    "err tier service busy: no in-flight permit within the shed deadline;      the request was ACCEPTED and REFUSED, not lost — retry or widen      NOETL_EHDB_TIER_MAX_INFLIGHT";
+
+/// Answer a request the service will not serve, then close **gracefully**.
+///
+/// ⚠ The shutdown is load-bearing. Writing the reply and dropping the stream
+/// races the FIN against the payload, and a shed reply that is lost on the wire
+/// is indistinguishable from the deaf failure this whole change exists to
+/// remove. The saturation test caught exactly that: it failed intermittently
+/// with "connection closed with no reply".
+async fn shed(mut stream: TcpStream, outcome: &str) {
+    record_conn(outcome, false, true);
+    if write_reply_frame(&mut stream, TIER_BUSY_REPLY.as_bytes())
+        .await
+        .is_ok()
+    {
+        use tokio::io::AsyncWriteExt;
+        let _ = stream.shutdown().await;
+    }
+}
+
 /// Accept loop. Runs until the task is dropped.
+///
+/// ⚠ The ordering here is load-bearing: **accept first, permit second.** See
+/// [`TIER_MAX_INFLIGHT_ENV`] for the production regression that the reverse
+/// ordering caused. `the_accept_loop_takes_its_permit_after_accepting` holds
+/// this shape against the source.
 pub async fn serve_tier(listener: TcpListener) {
+    serve_tier_with(listener, tier_max_inflight(), tier_shed_after()).await
+}
+
+/// [`serve_tier`] with the bounds injected.
+///
+/// ⚠ Split from the env read on purpose: the saturation tests must be able to
+/// drive a limit of 1 without `set_var`. `cargo test` does not serialise tests,
+/// and a leaked env var has already cost this module a silent cross-test
+/// failure once.
+pub async fn serve_tier_with(
+    listener: TcpListener,
+    limit: usize,
+    shed_after: std::time::Duration,
+) {
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
+    let waiters = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        limit.saturating_mul(TIER_MAX_WAITERS_MULTIPLE),
+    ));
+    tracing::info!(
+        max_inflight = limit,
+        max_waiters = limit.saturating_mul(TIER_MAX_WAITERS_MULTIPLE),
+        shed_after_ms = shed_after.as_millis() as u64,
+        "EHDB tier service: work bounded AFTER accept (noetl/ai-meta#332); the          listener is always drained so a saturated tier sheds instead of going deaf"
+    );
     loop {
-        match listener.accept().await {
-            Ok((stream, _peer)) => {
-                tokio::spawn(serve_conn(stream));
-            }
+        // Always accept. A saturated service must still answer.
+        let (stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
             Err(e) => {
                 record_conn("accept_error", false, true);
                 tracing::warn!(error = %e, "EHDB tier service: accept failed");
-                // Yield rather than spin if the listener is in a bad state.
                 tokio::task::yield_now().await;
+                continue;
+            }
+        };
+
+        // Bound how many accepted-but-unstarted requests exist, so accepting
+        // unconditionally cannot become an unbounded task list.
+        let waiter = match std::sync::Arc::clone(&waiters).try_acquire_owned() {
+            Ok(w) => w,
+            Err(_) => {
+                tokio::spawn(shed(stream, "shed_waiters_full"));
+                continue;
+            }
+        };
+
+        let permits = std::sync::Arc::clone(&permits);
+        tokio::spawn(async move {
+            let _waiter = waiter;
+            match tokio::time::timeout(shed_after, permits.acquire_owned()).await {
+                Ok(Ok(permit)) => {
+                    let _permit = permit;
+                    serve_conn(stream).await;
+                }
+                // The semaphore is never closed; if that changes, shed rather
+                // than silently reverting to unbounded work.
+                Ok(Err(_)) => shed(stream, "permit_source_closed").await,
+                Err(_) => shed(stream, "shed_busy").await,
+            }
+        });
+    }
+}
+
+/// The reconnect-burst bound, proven rather than asserted.
+///
+/// These drive the REAL accept loop over a real socket, because the bound lives
+/// in the accept loop and a test that called `serve_conn` directly would prove
+/// nothing about it.
+#[cfg(test)]
+mod reconnect_burst_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stand-in for the tier service's accept loop with the same bound, used
+    /// to observe concurrency directly.
+    ///
+    /// ⚠ It mirrors `serve_tier`'s shape — accept first, then a bounded permit
+    /// for the expensive work — and
+    /// `the_accept_loop_takes_its_permit_after_accepting` holds the shipped loop
+    /// to that ordering, so this cannot drift into testing a different algorithm
+    /// than the one that ships.
+    async fn bounded_accept_loop(
+        listener: tokio::net::TcpListener,
+        limit: usize,
+        live: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        hold: std::time::Duration,
+    ) {
+        let permits = Arc::new(tokio::sync::Semaphore::new(limit));
+        loop {
+            match listener.accept().await {
+                Ok((mut stream, _)) => {
+                    let live = Arc::clone(&live);
+                    let peak = Arc::clone(&peak);
+                    let permits = Arc::clone(&permits);
+                    tokio::spawn(async move {
+                        let permit = match permits.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        let _permit = permit;
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        // Stand in for an append: the expensive thing whose
+                        // concurrency is what must be bounded.
+                        tokio::time::sleep(hold).await;
+                        let _ = stream.write_all(b"ok").await;
+                        let _ = stream.shutdown().await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+                Err(_) => return,
             }
         }
+    }
+
+    /// ⭐ Reproduces the production trigger: KEDA scales the worker pool 1→20 and
+    /// every worker reconnects at once. Before the bound, that was 20 concurrent
+    /// appends, each costing a copy of the tier's entire in-memory state.
+    #[tokio::test]
+    async fn a_mass_reconnect_cannot_exceed_the_inflight_bound() {
+        const LIMIT: usize = 4;
+        const CLIENTS: usize = 20; // the real KEDA ceiling
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(bounded_accept_loop(
+            listener,
+            LIMIT,
+            Arc::clone(&live),
+            Arc::clone(&peak),
+            std::time::Duration::from_millis(60),
+        ));
+
+        let mut clients = Vec::new();
+        for _ in 0..CLIENTS {
+            clients.push(tokio::spawn(async move {
+                let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf).await;
+                buf.len()
+            }));
+        }
+        let mut served = 0usize;
+        for c in clients {
+            if c.await.unwrap() > 0 {
+                served += 1;
+            }
+        }
+        server.abort();
+
+        let observed = peak.load(Ordering::SeqCst);
+        // The load-bearing half: every client was SERVED. A bound that works by
+        // dropping connections is not backpressure, it is an outage.
+        assert_eq!(
+            served, CLIENTS,
+            "backpressure must delay clients, not drop them: {served}/{CLIENTS} served"
+        );
+        assert!(
+            observed <= LIMIT,
+            "concurrency exceeded the bound: peak={observed} limit={LIMIT}"
+        );
+        // ⭐ And the burst must actually have been a burst — if the clients
+        // arrived one at a time, peak would be 1 and this test would pass
+        // against a completely unbounded server.
+        assert!(
+            observed > 1,
+            "peak concurrency was {observed}; the clients did not overlap, so this \
+             test could not have detected an unbounded loop"
+        );
+    }
+
+    /// ⭐ POSITIVE CONTROL — the same burst with the bound REMOVED must exceed it.
+    ///
+    /// Without this, the test above passes on a machine that simply never runs
+    /// the clients concurrently, and the bound would be untested.
+    #[tokio::test]
+    async fn without_the_bound_the_same_burst_blows_past_it() {
+        const CLIENTS: usize = 20;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        // LIMIT = CLIENTS is "effectively unbounded" for this burst — the shape
+        // the accept loop had before this change.
+        let server = tokio::spawn(bounded_accept_loop(
+            listener,
+            CLIENTS,
+            Arc::clone(&live),
+            Arc::clone(&peak),
+            std::time::Duration::from_millis(60),
+        ));
+        let mut clients = Vec::new();
+        for _ in 0..CLIENTS {
+            clients.push(tokio::spawn(async move {
+                let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf).await;
+            }));
+        }
+        for c in clients {
+            c.await.unwrap();
+        }
+        server.abort();
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed > 4,
+            "the unbounded arm only reached {observed} concurrent — the fixture \
+             cannot produce a burst, so the bounded arm proves nothing"
+        );
+    }
+
+    /// The cap is fail-safe: a typo must not silently remove the bound.
+    /// ⚠ Drives the REAL `parse_max_inflight`. An earlier version re-implemented
+    /// the parse inline and therefore survived deleting the fail-safe filter
+    /// from the shipped function (battery arm B2). Calling the real thing is
+    /// the whole point.
+    #[test]
+    fn an_unusable_cap_falls_back_to_the_default_rather_than_unbounded() {
+        for raw in [Some(""), Some("0"), Some("abc"), Some("-1"), Some("1.5"), None] {
+            assert_eq!(
+                parse_max_inflight(raw),
+                TIER_MAX_INFLIGHT_DEFAULT,
+                "{raw:?} must fall back to the default cap, never widen the bound"
+            );
+        }
+        assert_eq!(parse_max_inflight(Some("8")), 8, "a usable override must be honoured");
+        assert_eq!(parse_max_inflight(Some(" 8 ")), 8, "whitespace must not defeat the override");
+        assert!(
+            TIER_MAX_INFLIGHT_DEFAULT > 0,
+            "the default must itself be a usable bound — 0 would wedge the service"
+        );
+    }
+
+    /// The shipped default must be safe on its own.
+    ///
+    /// ⚠ Prod could not set `NOETL_EHDB_TIER_MAX_INFLIGHT` when the tier went
+    /// deaf — the env change was unavailable, and only an image swap was. A
+    /// bound that depends on an operator setting a variable is a bound that is
+    /// absent exactly when it is needed, so the value baked into the image is
+    /// the one under test.
+    #[test]
+    fn the_shipped_default_does_not_depend_on_the_env_var() {
+        assert_eq!(
+            parse_max_inflight(None),
+            TIER_MAX_INFLIGHT_DEFAULT,
+            "an unset env var must fall back to the shipped default"
+        );
+        assert!(
+            TIER_MAX_INFLIGHT_DEFAULT >= 8,
+            "the shipped default is {TIER_MAX_INFLIGHT_DEFAULT}; prod must get more \
+             headroom than the value that shipped with the OOM fix, without needing \
+             an env change that was not available when the tier went deaf"
+        );
+        // ⚠ The upper half matters too: at 64 the saturation gate went deaf
+        // again, because concurrent reads of a large segment starved the very
+        // accept-and-shed path this change adds. A bound that does not bound is
+        // the failure wearing a different hat.
+        assert!(
+            TIER_MAX_INFLIGHT_DEFAULT <= 16,
+            "the shipped default is {TIER_MAX_INFLIGHT_DEFAULT}; measured, a cap \
+             this high lets concurrent large-segment reads starve the runtime and \
+             the service goes deaf by a different route"
+        );
+    }
+
+    /// ⭐ Reproduces the 2026-09-22 production regression directly.
+    ///
+    /// One client connects and sends NOTHING, so `serve_conn` sits in
+    /// `read_frame` holding its permit — exactly what a slow in-flight request
+    /// does. With the permit taken before `accept`, the loop then blocked
+    /// forever and the service went DEAF: the second client's handshake still
+    /// completed (so it looked connected) and it waited until its own timeout
+    /// with no answer. That is what prod showed — every tier timing out at
+    /// exactly 2.0s regardless of store size.
+    ///
+    /// Now the second client must get an explicit BUSY answer.
+    #[tokio::test]
+    async fn a_saturated_tier_answers_instead_of_going_deaf() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tier_with(
+            listener,
+            1,
+            std::time::Duration::from_millis(300),
+        ));
+
+        // Hold the only permit: connect and never send a frame.
+        let _hog = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        // A second client must be ACCEPTED and ANSWERED, not left to hang.
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        write_reply_frame(&mut c, b"health").await.unwrap();
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            read_frame(&mut c, MAX_FRAME_BYTES),
+        )
+        .await;
+
+        let got = got.expect(
+            "the tier went DEAF: a saturated service accepted nothing and answered \
+             nothing, which a caller cannot tell apart from the process being down",
+        );
+        let body = got.unwrap().expect("connection closed with no reply");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.starts_with("err tier service busy"),
+            "expected an explicit busy answer, got {text:?}"
+        );
+    }
+
+    /// ⭐ Positive control for the test above.
+    ///
+    /// Without this, `a_saturated_tier_answers_instead_of_going_deaf` would pass
+    /// on a service that answered "busy" to EVERYTHING — including when it had
+    /// capacity. Same fixture, same idle hog, one more permit: the second client
+    /// must now be genuinely SERVED.
+    #[tokio::test]
+    async fn with_capacity_the_same_request_is_served_not_shed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tier_with(
+            listener,
+            2,
+            std::time::Duration::from_millis(300),
+        ));
+
+        let _hog = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        write_reply_frame(&mut c, b"health").await.unwrap();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            read_frame(&mut c, MAX_FRAME_BYTES),
+        )
+        .await
+        .expect("timed out with capacity to spare")
+        .unwrap()
+        .expect("connection closed with no reply");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.starts_with("err tier service busy"),
+            "shed a request while a permit was free — the shed path is firing \
+             unconditionally, which would make the saturation test vacuous"
+        );
+    }
+
+    /// ⚠⚠ The in-flight bound must never exceed what the runtime can absorb.
+    ///
+    /// Prod ran 4 concurrent tier ops against 2 runtime threads and the whole
+    /// process stopped responding. The clamp is in the image on purpose: the env
+    /// value could not be changed when it mattered.
+    #[test]
+    fn the_inflight_bound_reserves_runtime_headroom() {
+        let cap = runtime_headroom_cap();
+        let par = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        assert!(cap >= 1, "the cap must never be zero — that would wedge the service");
+        assert!(
+            cap < par || par == 1,
+            "cap {cap} leaves no headroom against {par} available; a tier op could \
+             occupy every thread the runtime has"
+        );
+        // ...and an oversized env value must be clamped, not honoured.
+        let requested = parse_max_inflight(Some("1024"));
+        assert_eq!(requested, 1024, "parse must report what was asked for");
+        assert!(
+            cap < requested,
+            "a 1024 request must be clamped by the headroom cap, or the clamp is \
+             decorative"
+        );
+    }
+
+    /// ⚠ Holds the shipped loop to the ordering that the 2026-09-22 regression
+    /// taught us: **accept first, permit second.** The reverse made the service
+    /// go deaf under saturation — it never reached `accept()`, so every client
+    /// hung until its own timeout with nothing served and nothing recorded.
+    ///
+    /// The memory bound is unchanged and is asserted separately by
+    /// `a_mass_reconnect_cannot_exceed_the_inflight_bound`: this guard is only
+    /// about *where* the bound sits.
+    #[test]
+    fn the_accept_loop_takes_its_permit_after_accepting() {
+        let src = include_str!("tier_service.rs");
+        // ⚠ Anchored to serve_tier_with, which holds the real loop; serve_tier
+        // is a one-line delegate. This guard already caught that move once by
+        // failing rather than measuring an empty region — keep it that strict.
+        let body = src
+            .split("pub async fn serve_tier_with(")
+            .nth(1)
+            .expect("serve_tier_with not found — this guard is anchored to a renamed fn");
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.len() > 400,
+            "the extracted accept loop is implausibly small ({} bytes) — the \
+             anchor matched something that is not the loop",
+            body.len()
+        );
+        let accept = body
+            .find("listener.accept()")
+            .expect("no accept in serve_tier");
+        let acquire = body
+            .find("permits.acquire_owned()")
+            .expect("serve_tier must still acquire a work permit — the memory bound is not optional");
+        assert!(
+            accept < acquire,
+            "serve_tier acquires its permit BEFORE accept. That is the regression: \
+             while permits are held the loop never accepts, the kernel still \
+             completes the handshake, and every caller times out against a \
+             service that looks alive and serves nothing."
+        );
+        // ⚠ The positive half: it is not enough to accept first, the saturated
+        // path must ANSWER. A shed that silently drops the socket is the same
+        // failure the caller cannot distinguish from the service being down.
+        assert!(
+            body.contains("shed(stream"),
+            "serve_tier accepts but does not answer a shed request; an accepted \
+             connection that is dropped in silence is indistinguishable from a \
+             deaf service"
+        );
+        // ...and the shed path must actually WRITE something. Following the
+        // call keeps this honest: asserting only that `shed` is called would
+        // pass on a `shed` that silently dropped the socket.
+        let shed_body = src
+            .split("async fn shed(")
+            .nth(1)
+            .expect("shed() not found — the guard is anchored to a renamed fn");
+        let shed_body = &shed_body[..shed_body.find("\n}\n").unwrap_or(shed_body.len())];
+        assert!(
+            shed_body.contains("write_reply_frame") && shed_body.contains("TIER_BUSY_REPLY"),
+            "shed() does not write an answer; a shed request must be COUNTABLE by \
+             the caller, not lost to a timeout"
+        );
+        assert!(
+            shed_body.contains("shutdown()"),
+            "shed() does not close gracefully; dropping the stream races the FIN \
+             against the reply, and a lost shed reply reads exactly like the deaf \
+             failure"
+        );
+        assert!(
+            body.contains("timeout(shed_after"),
+            "serve_tier waits for a permit without a deadline; an unbounded wait \
+             after accept is the deaf failure again, one layer down"
+        );
     }
 }
 

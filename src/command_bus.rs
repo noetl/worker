@@ -390,15 +390,25 @@ pub async fn spawn_writer_host(
                 subjects: subjects.lock().map(|g| g.clone()).unwrap_or_default(),
             },
             move || {
-                integrity_engine
-                    .engine()
-                    .lock()
-                    .ok()
-                    .map(|e| e.metrics().snapshot())
+                // ⚠ LOCK-FREE. This used to take the engine lock purely to reach
+                // a metrics handle that is cloned at construction and needs no
+                // lock at all (`ehdb-feed/src/lib.rs:317`, `:506` — "without
+                // taking the engine lock", noetl/ehdb#345). Taking it parked a
+                // Tokio worker thread on a `std::sync::Mutex` inside an async
+                // task, and the writer runs only TWO worker threads (measured
+                // 2026-09-23: cgroup quota 2 cores), so a scrape could occupy
+                // half the runtime waiting on the append path.
+                Some(integrity_engine.metrics().snapshot())
             },
             move || {
                 let engine = durability_engine.engine();
-                let e = engine.lock().ok()?;
+                // ⚠ `try_lock`, not `lock`. `std::sync::Mutex::lock()` BLOCKS,
+                // and `.ok()` maps only `PoisonError` — so the old code could
+                // never report contention, it could only park a runtime thread
+                // until the append finished. `try_lock` fails fast, which is
+                // what `ehdb_l0_durability_sample_ok 0` has always claimed to
+                // mean.
+                let e = engine.try_lock().ok()?;
                 // Rendered under the lock: the gauges and the histogram must
                 // describe the same instant, or a shard could read "nothing
                 // pending" beside a latency sample for the record it just shed.
@@ -435,13 +445,13 @@ pub async fn spawn_writer_host(
 /// was contended look exactly like per-shard rows missing because the binary
 /// predates the metric.
 const DURABILITY_SAMPLE_OK: &str = concat!(
-    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or could not acquire the engine lock (0).\n",
+    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or found the engine lock held/poisoned and skipped it without blocking (0).\n",
     "# TYPE ehdb_l0_durability_sample_ok gauge\n",
     "ehdb_l0_durability_sample_ok 1\n"
 );
 
 const DURABILITY_SAMPLE_FAILED: &str = concat!(
-    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or could not acquire the engine lock (0).\n",
+    "# HELP ehdb_l0_durability_sample_ok Whether this scrape sampled the durability window (1) or found the engine lock held/poisoned and skipped it without blocking (0).\n",
     "# TYPE ehdb_l0_durability_sample_ok gauge\n",
     "ehdb_l0_durability_sample_ok 0\n"
 );
