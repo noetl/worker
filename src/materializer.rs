@@ -212,7 +212,7 @@ async fn run_loop(config: MaterializerConfig) -> Result<()> {
 /// matters here: the batch is acked ONLY after `events/project` returns 2xx, so
 /// How long a materializer HTTP call may take before it is abandoned.
 ///
-/// ⚠ `reqwest::Client::new()` has **no timeout at all**, and both drain loops
+/// ⚠ `test_http()` has **no timeout at all**, and both drain loops
 /// used one. A control-plane that accepts the connection and then stalls would
 /// park the loop forever: no completion, no error, no retry — the drain simply
 /// stops, and because it is a background task nothing reports it. Projections
@@ -948,6 +948,20 @@ pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
 
+    /// A bounded HTTP client for these tests.
+    ///
+    /// `test_http()` has no timeout at all, and
+    /// `tests/http_clients_are_bounded.rs` rejects it on purpose. That guard is
+    /// right about test code too: `an_unconfirmed_park_must_never_permit_the_ack`
+    /// deliberately points at an unreachable port, and without a bound a hang
+    /// there would surface as a stuck CI job rather than a failed assertion.
+    fn test_http() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client builds")
+    }
+
     // ---------------------------------------------------------------------
     // Poison-batch escape (the 2026-09-27 prod stall).
     //
@@ -1069,7 +1083,7 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
     async fn a_poison_event_must_not_hold_the_drain_hostage() {
         const FLAG: &str = "NOETL_MATERIALIZER_DEAD_LETTER";
         let (url, landed) = stub_project_server().await;
-        let http = reqwest::Client::new();
+        let http = test_http();
         let batch = vec![
             event(1001, 717028015384821801),
             event(1002, 0),
@@ -1201,7 +1215,7 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
         let poison = vec![(event(4001, 0), FK_500.to_string())];
         assert!(
             park_dead_lettered(
-                &reqwest::Client::new(),
+                &test_http(),
                 &url,
                 "tok",
                 &poison,
@@ -1247,7 +1261,7 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
         for mode in ["none", "partial", "down"] {
             let (url, _) = stub_dead_letter(mode).await;
             assert!(
-                !park_dead_lettered(&reqwest::Client::new(), &url, "tok", &poison, "t").await,
+                !park_dead_lettered(&test_http(), &url, "tok", &poison, "t").await,
                 "mode={mode}: an unconfirmed park MUST NOT permit the ack — the drain \
                  staying blocked is correct, dropping a durable event is not"
             );
@@ -1256,7 +1270,7 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
         // And an unreachable sink (nothing listening) is the same answer.
         assert!(
             !park_dead_lettered(
-                &reqwest::Client::new(),
+                &test_http(),
                 "http://127.0.0.1:1/api/internal/events/dead-letter",
                 "tok",
                 &poison,
@@ -1272,7 +1286,7 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
     async fn an_empty_park_is_permitted() {
         assert!(
             park_dead_lettered(
-                &reqwest::Client::new(),
+                &test_http(),
                 "http://127.0.0.1:1/unused",
                 "tok",
                 &[],
@@ -1307,7 +1321,7 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
         std::env::set_var(FLAG, "true");
         // Enter salvage on a permanent first error, then hit a transient one.
         let out = salvage_rejected_batch(
-            &reqwest::Client::new(),
+            &test_http(),
             &url,
             "tok",
             &[event(2001, 0)],
