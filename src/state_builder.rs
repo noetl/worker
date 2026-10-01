@@ -1965,14 +1965,26 @@ async fn finish_batch(
             }
         }
     }
-    let (indexed, bytes) = {
+    let (indexed, events, bytes) = {
         let mut idx = index.lock().await;
         for eid in batch.terminals {
             idx.evict(eid);
         }
-        (idx.execution_count(), idx.total_bytes())
+        (idx.execution_count(), idx.event_count(), idx.total_bytes())
     };
+    // ⚠ All THREE gauges, together. `index_events` was omitted here while
+    // `indexed_executions` and `index_bytes` were set, so after the terminal
+    // eviction above those two dropped to 0 while `index_events` kept whatever
+    // the other call site last wrote — a stale residency figure with no
+    // indication it was stale.
+    //
+    // Observed on prod: `indexed_executions 0`, `index_bytes 0`,
+    // `index_events 1` — zero executions holding one event. It is not a
+    // harmless inconsistency: it read as "156 events resident" during an
+    // investigation and was written into a wiki page and two issues as a live
+    // measurement before the contradiction was noticed (noetl/ai-meta#368).
     crate::metrics::set_state_builder_indexed_executions(indexed as i64);
+    crate::metrics::set_state_builder_index_events(events as i64);
     crate::metrics::set_state_builder_index_bytes(bytes as i64);
     if !*rehydrated && indexed > 0 {
         *rehydrated = true;
