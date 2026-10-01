@@ -3148,6 +3148,68 @@ const _: () = {
 };
 
 #[cfg(test)]
+mod index_gauge_tests {
+    /// The three index-residency gauges must be refreshed TOGETHER.
+    ///
+    /// `finish_batch` set `indexed_executions` and `index_bytes` but not
+    /// `index_events`, so after its terminal eviction the first two dropped to 0
+    /// while the third kept whatever the other call site last wrote. Prod showed
+    /// `indexed_executions 0, index_bytes 0, index_events 1` — zero executions
+    /// holding one event.
+    ///
+    /// ⚠ Not a cosmetic inconsistency. That stale figure read as "156 events
+    /// resident" during an investigation and was written into a wiki page and two
+    /// issues as a live measurement before the contradiction was spotted
+    /// (noetl/ai-meta#368). A gauge that is only sometimes refreshed is worse
+    /// than one that is absent: absent prompts a question, stale answers it
+    /// wrongly.
+    ///
+    /// Counted on the source rather than asserted at runtime, because the bug was
+    /// a MISSING CALL — and a test that exercises the setters cannot notice a
+    /// site that fails to call one.
+    #[test]
+    fn the_three_index_gauges_are_always_set_together() {
+        let src = include_str!("state_builder.rs");
+        // ⚠ Scans the WHOLE file. The first version used
+        // `split("#[cfg(test)]").next()` — the idiom the sibling guards in this
+        // repo use — and `state_builder.rs` carries an inline `#[cfg(test)]`
+        // attribute at line 908, well before the gauge sites at ~1919/1986. The
+        // guard therefore measured an empty region and tripped its own
+        // "premise is stale" self-check. That self-check is the only reason it
+        // did not pass vacuously, and it is why it is written that way.
+        //
+        // The same hazard applies to every guard using that idiom on a file with
+        // a mid-file `#[cfg(test)]` — including an inline attribute on a single
+        // item, not just a trailing test module.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let execs = code
+            .matches("set_state_builder_indexed_executions(")
+            .count();
+        let events = code.matches("set_state_builder_index_events(").count();
+        let bytes = code.matches("set_state_builder_index_bytes(").count();
+
+        assert!(
+            execs > 0,
+            "no index-gauge setters found in state_builder.rs — this guard's \
+             premise is stale; fix the guard rather than deleting it"
+        );
+        assert!(
+            execs == events && events == bytes,
+            "the index-residency gauges are set unequally: \
+             indexed_executions {execs}x, index_events {events}x, index_bytes \
+             {bytes}x. Any site that refreshes one must refresh all three, or the \
+             odd one out reports a stale residency that reads as a live \
+             measurement (noetl/ai-meta#368)."
+        );
+    }
+}
+
+#[cfg(test)]
 mod lock_wait_split_tests {
     /// ⚠ THE CALL-SITE GUARD. The recorder must be INVOKED, not merely exist.
     ///
