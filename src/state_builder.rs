@@ -1316,8 +1316,16 @@ pub async fn build_offserver_input(
 ) -> Option<Vec<u8>> {
     // noetl/ai-meta#156 — wall clock for the build, observed under the outcome label below.
     let build_started_at = std::time::Instant::now();
-    let (outcome, spine, resolved_trigger_type) = {
+    // ⚠ Timed separately from the build. `build_started_at.elapsed()` INCLUDES
+    // this wait, and for the `incomplete` outcome the wait is almost all of it:
+    // 49.1 ms mean on prod for a path whose work is a HashMap miss. The drain
+    // (`apply_indexed` / `finish_batch`) holds this same mutex while applying
+    // the very event the build is waiting for, so contention is causally tied to
+    // the outcome rather than incidental (noetl/ai-meta#369).
+    let (outcome, spine, resolved_trigger_type, index_lock_wait) = {
+        let lock_wait_started_at = std::time::Instant::now();
         let mut idx = index.lock().await;
+        let index_lock_wait = lock_wait_started_at.elapsed();
         // Build the spine rooted at the server's authoritative chain tip
         // (`expected_head`, the `ChainHeads` watermark = the last-arrived event)
         // when supplied — NOT the worker's max-id head.  Under a high-concurrency
@@ -1352,7 +1360,7 @@ pub async fn build_offserver_input(
                     .map(|s| s.to_string())
             })
         });
-        (outcome, spine, resolved_trigger_type)
+        (outcome, spine, resolved_trigger_type, index_lock_wait)
     };
     // Record the cache outcome (the same labels the shadow loop records) so the
     // authoritative path's hit/incremental/cold distribution is observable.
@@ -1371,6 +1379,13 @@ pub async fn build_offserver_input(
     crate::metrics::record_state_builder_build_duration(
         build_label,
         build_started_at.elapsed().as_secs_f64(),
+    );
+    // Paired with the line above, same label: `build_duration - lock_wait` is
+    // the work, and a build counted in one but not the other would make that
+    // subtraction meaningless.
+    crate::metrics::record_state_builder_index_lock_wait(
+        build_label,
+        index_lock_wait.as_secs_f64(),
     );
     match outcome {
         AdvanceOutcome::CacheHit => crate::metrics::record_state_builder_build("cache_hit"),
