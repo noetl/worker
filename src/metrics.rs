@@ -388,6 +388,21 @@ pub struct WorkerMetrics {
     /// per-hop drive-build floor is unmeasurable on prod, which is the reason
     /// #156 could quantify latency in kind but not in production.
     pub state_builder_build_duration_seconds: HistogramVec,
+    /// Seconds spent ACQUIRING the index mutex, by build outcome.
+    ///
+    /// ⚠ Exists because `state_builder_build_duration_seconds` includes this
+    /// wait, and for the `incomplete` outcome the wait dominates: 49.1 ms mean
+    /// on prod for a code path whose work is a HashMap miss
+    /// (noetl/ai-meta#369). Without the split, 87% of state-builder time reads
+    /// as "folding is expensive" when it is blocking on a mutex the WAL drain
+    /// holds while applying the very event the build is waiting for.
+    ///
+    /// A **counter of seconds**, not a histogram, so it can be pinned at zero —
+    /// observing `0.0` into a histogram would skew its mean. The denominator is
+    /// the already-pinned `state_builder_builds_total{outcome}`:
+    /// `lock_wait_seconds_total / builds_total` is the mean wait, and
+    /// `build_duration − lock_wait` is the work.
+    pub state_builder_index_lock_wait_seconds_total: CounterVec,
     /// Chain-walk depth (events on the spine) per cold rebuild — the analogue of
     /// the server's `noetl_state_build_chain_hops` (server#245), now off-server.
     pub state_builder_chain_hops: Histogram,
@@ -1567,7 +1582,10 @@ impl WorkerMetrics {
         let state_builder_build_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "noetl_worker_state_builder_build_duration_seconds",
-                "Off-server state build wall time by outcome (noetl/ai-meta#156).",
+                "Off-server state build wall time by outcome (noetl/ai-meta#156). \
+                 ⚠ INCLUDES time acquiring the index mutex — subtract \
+                 `index_lock_wait_seconds_total` for the work alone. For the \
+                 `incomplete` outcome the wait dominates (ai-meta#369).",
             )
             .buckets(vec![
                 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -1578,6 +1596,30 @@ impl WorkerMetrics {
         registry
             .register(Box::new(state_builder_build_duration_seconds.clone()))
             .expect("register state_builder_build_duration_seconds");
+
+        let state_builder_index_lock_wait_seconds_total = CounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_index_lock_wait_seconds_total",
+                "Seconds spent ACQUIRING the state-builder index mutex, by build \
+                 outcome. `build_duration_seconds` INCLUDES this; subtract to get \
+                 the work. Divide by `builds_total{outcome}` for the mean \
+                 (noetl/ai-meta#369).",
+            ),
+            &["outcome"],
+        )
+        .expect("state_builder_index_lock_wait_seconds_total metric");
+        registry
+            .register(Box::new(
+                state_builder_index_lock_wait_seconds_total.clone(),
+            ))
+            .expect("register state_builder_index_lock_wait_seconds_total");
+        // Pinned at 0 for the same reason as the counters below (ai-meta#238):
+        // an absent family reads identically to a zero one.
+        for outcome in STATE_BUILDER_BUILD_OUTCOMES {
+            state_builder_index_lock_wait_seconds_total
+                .with_label_values(&[outcome])
+                .inc_by(0.0);
+        }
 
         let state_builder_chain_hops = Histogram::with_opts(
             HistogramOpts::new(
@@ -1954,6 +1996,7 @@ impl WorkerMetrics {
             state_builder_event_scans_total,
             state_builder_builds_total,
             state_builder_build_duration_seconds,
+            state_builder_index_lock_wait_seconds_total,
             state_builder_chain_hops,
             state_builder_drive_builds_total,
             state_builder_drive_wait_total,
@@ -2691,6 +2734,20 @@ pub fn record_state_builder_build_duration(outcome: &str, secs: f64) {
         .observe(secs);
 }
 
+/// Seconds spent acquiring the index mutex for this build.
+///
+/// ⚠ Must be recorded on EVERY path that records
+/// [`record_state_builder_build_duration`], with the SAME outcome label — the
+/// two are a pair, and a build counted in one but not the other makes
+/// `build_duration − lock_wait` meaningless for that outcome. Guarded by
+/// `the_lock_wait_is_recorded_wherever_build_duration_is`.
+pub fn record_state_builder_index_lock_wait(outcome: &str, secs: f64) {
+    WorkerMetrics::global()
+        .state_builder_index_lock_wait_seconds_total
+        .with_label_values(&[outcome])
+        .inc_by(secs);
+}
+
 /// Record the chain-walk depth of one off-server cold rebuild.
 pub fn record_state_builder_chain_hops(hops: usize) {
     WorkerMetrics::global()
@@ -3089,6 +3146,97 @@ pub fn record_state_materializer_evicted(reason: &str, n: usize) {
 const _: () = {
     let _ = &CounterVec::new;
 };
+
+#[cfg(test)]
+mod lock_wait_split_tests {
+    /// ⚠ THE CALL-SITE GUARD. The recorder must be INVOKED, not merely exist.
+    ///
+    /// Three times in the related chain-certificate work a test proved a
+    /// mechanism worked while nothing called it (noetl/server#485 the skip,
+    /// #487 the rebuild evictor, #488 the series pin). Each time the unit tests
+    /// were green. So the pairing is asserted on the source: every site that
+    /// records a build duration must record a lock wait too, with the same
+    /// label — otherwise `build_duration − lock_wait` is meaningless for that
+    /// outcome, which is the entire point of the split.
+    #[test]
+    fn the_lock_wait_is_recorded_wherever_build_duration_is() {
+        let src = include_str!("state_builder.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let durations = code.matches("record_state_builder_build_duration(").count();
+        let waits = code
+            .matches("record_state_builder_index_lock_wait(")
+            .count();
+
+        assert!(
+            durations > 0,
+            "no build-duration recording found in state_builder.rs — this guard's \
+             premise is stale, fix the guard rather than deleting it"
+        );
+        assert_eq!(
+            durations, waits,
+            "state_builder.rs records build duration {durations} time(s) but lock \
+             wait {waits} time(s). They are a PAIR: a build counted in one and \
+             not the other makes `build_duration - lock_wait` meaningless for \
+             that outcome (noetl/ai-meta#369)."
+        );
+    }
+
+    /// The lock must be timed around the ACQUISITION, not around the build.
+    ///
+    /// If `lock_wait_started_at` were taken after the lock, the metric would
+    /// read ~0 always and the split would silently prove the opposite of the
+    /// truth — a far worse outcome than no metric at all.
+    #[test]
+    fn the_lock_wait_timer_brackets_the_acquisition() {
+        let src = include_str!("state_builder.rs");
+        let i = src
+            .find("let lock_wait_started_at")
+            .expect("lock-wait timer missing from state_builder.rs");
+        let j = src
+            .find("let mut idx = index.lock().await;")
+            .expect("index lock acquisition missing");
+        assert!(
+            i < j,
+            "the lock-wait timer must START BEFORE `index.lock().await`, or it \
+             measures nothing and reports ~0 wait — which would read as \
+             'contention is not the problem' regardless of the truth"
+        );
+        let after = &src[j..];
+        let k = after
+            .find("let index_lock_wait = lock_wait_started_at.elapsed();")
+            .expect("lock-wait timer is never read after the acquisition");
+        assert!(
+            k < 400,
+            "the lock-wait elapsed() must be taken immediately after the \
+             acquisition; {k} bytes later means it is picking up build work too"
+        );
+    }
+
+    /// The new series must be pinned, like its siblings.
+    #[test]
+    fn the_lock_wait_series_is_pinned_at_zero() {
+        let src = include_str!("metrics.rs");
+        let pin_block = src
+            .split("state_builder_index_lock_wait_seconds_total")
+            .any(|seg| {
+                seg.trim_start()
+                    .starts_with(".with_label_values(&[outcome])\n                .inc_by(0.0)")
+                    || seg.contains("inc_by(0.0)") && seg.len() < 200
+            });
+        assert!(
+            pin_block,
+            "`state_builder_index_lock_wait_seconds_total` must be pinned at 0.0 \
+             for every STATE_BUILDER_BUILD_OUTCOMES label. An unpinned family is \
+             pruned from /metrics until it fires, so `absent` reads identically \
+             to `zero` — and here those mean opposite things."
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
