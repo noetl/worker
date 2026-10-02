@@ -228,3 +228,9 @@ mod dependency_ranges {
         );
     }
 }
+
+// scratch RED control — clippy::len_zero is NOT on the allow-list, so this must
+// fail the gated clippy step. Reverted in the next commit.
+pub fn ci_red_control_len_zero(v: &[i32]) -> bool {
+    v.len() == 0
+}
