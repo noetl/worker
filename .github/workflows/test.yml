@@ -53,4 +53,28 @@ jobs:
         run: cargo test --all-targets --locked
 
       - name: clippy (visible, non-gating)
-        run: cargo clippy --all-targets --locked || true
+        # `|| true` was here, which made this step UNABLE to fail: it ran on every PR,
+        # appeared in every log, cost its full runtime, and could not report anything
+        # (noetl/ai-meta#374). `-D warnings` now gates, with the EXISTING backlog
+        # allow-listed by lint NAME so a NEW lint of any other kind fails the build.
+        #
+        # Measured on origin/main before this change: a bare `-D warnings` produced 15
+        # errors across 7 distinct lint kinds, so flipping it outright would have made
+        # this job red on arrival — a gate that is red the day it lands is one people
+        # learn to skip. Each -A below is tracked debt, not an opinion; deleting one
+        # should make the build fail until that lint is fixed. Sweep tracked in
+        # noetl/ai-meta#378.
+        #
+        # NOTE: `dead-code` here covers OVERSIZE_REFUSAL_OUTSTANDING and
+        # LAST_SERVE_STATE. Do not simply delete those to clear the lint — a dead
+        # static can be a shipped-but-unwired capability rather than garbage; establish
+        # which before removing (see #378).
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings \
+            -A clippy::assertions-on-constants \
+            -A clippy::cloned-ref-to-slice-refs \
+            -A clippy::map-identity \
+            -A clippy::ptr-arg \
+            -A clippy::unnecessary-filter-map \
+            -A dead-code \
+            -A duplicate-macro-attributes
