@@ -52,7 +52,7 @@ jobs:
       - name: test
         run: cargo test --all-targets --locked
 
-      - name: clippy (visible, non-gating)
+      - name: clippy (gating — see the allow-list below)
         # `|| true` was here, which made this step UNABLE to fail: it ran on every PR,
         # appeared in every log, cost its full runtime, and could not report anything
         # (noetl/ai-meta#374). `-D warnings` now gates, with the EXISTING backlog
