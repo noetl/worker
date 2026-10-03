@@ -1085,10 +1085,12 @@ mod reconnect_burst_tests {
         }
         assert_eq!(parse_max_inflight(Some("8")), 8, "a usable override must be honoured");
         assert_eq!(parse_max_inflight(Some(" 8 ")), 8, "whitespace must not defeat the override");
-        assert!(
-            TIER_MAX_INFLIGHT_DEFAULT > 0,
-            "the default must itself be a usable bound — 0 would wedge the service"
-        );
+        const {
+            assert!(
+                TIER_MAX_INFLIGHT_DEFAULT > 0,
+                "the default must itself be a usable bound — 0 would wedge the service"
+            );
+        }
     }
 
     /// The shipped default must be safe on its own.
@@ -1099,6 +1101,18 @@ mod reconnect_burst_tests {
     /// absent exactly when it is needed, so the value baked into the image is
     /// the one under test.
     #[test]
+    // `assertions_on_constants` is allowed on this FUNCTION rather than at the
+    // assertion, because an `#[allow]` placed directly on a macro invocation is
+    // SILENTLY IGNORED -- rustc reports "the built-in attribute `allow` will be
+    // ignored, since it's applied to the macro invocation `assert`". The first
+    // version of this change did exactly that and suppressed nothing.
+    //
+    // These assertions state relationships between shipped constants. Clippy's
+    // suggested `const { assert!(..) }` is used for the sibling assertions whose
+    // message is a plain string; it cannot be used here because the message
+    // interpolates the constants, and a const-block assert cannot format
+    // (E0080/E0015). Tried and rejected by the compiler, not assumed.
+    #[allow(clippy::assertions_on_constants)]
     fn the_shipped_default_does_not_depend_on_the_env_var() {
         assert_eq!(
             parse_max_inflight(None),
@@ -1751,10 +1765,12 @@ mod tests {
         // EVERY mutant read CAUGHT, which is the specific way two earlier
         // mutation batteries in this programme were thrown away.
         let _guard = metrics::test_guard();
-        assert!(
-            MAX_REPLY_BYTES > MAX_FRAME_BYTES,
-            "replies must be allowed to exceed requests, or #343 is not fixed"
-        );
+        const {
+            assert!(
+                MAX_REPLY_BYTES > MAX_FRAME_BYTES,
+                "replies must be allowed to exceed requests, or #343 is not fixed"
+            );
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_tier(listener));

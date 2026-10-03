@@ -1017,7 +1017,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
     /// ⚠⚠ The merged scan must CARRY `torn_tail_skipped`, not default it.
     ///
     /// ehdb#262 put the count on the wire because "a scan that returns 811 of
