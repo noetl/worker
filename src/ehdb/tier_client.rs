@@ -592,10 +592,12 @@ mod tests {
             Duration::from_millis(DEFAULT_APPEND_TIMEOUT_MS),
             "the append default must not silently inherit the read default"
         );
-        assert!(
-            DEFAULT_APPEND_TIMEOUT_MS > DEFAULT_TIMEOUT_MS,
-            "the whole point is that a write may wait longer than a read"
-        );
+        const {
+            assert!(
+                DEFAULT_APPEND_TIMEOUT_MS > DEFAULT_TIMEOUT_MS,
+                "the whole point is that a write may wait longer than a read"
+            );
+        }
 
         // Setting one must not move the other, in either direction.
         let c = cfg(&[(TIER_SERVICE_TIMEOUT_MS_ENV, "111")]);
@@ -630,6 +632,18 @@ mod tests {
     /// The append budget must stay under the SERVER's per-attempt POST timeout,
     /// or a slow append burns a whole retry instead of finishing inside one.
     #[test]
+    // `assertions_on_constants` is allowed on this FUNCTION rather than at the
+    // assertion, because an `#[allow]` placed directly on a macro invocation is
+    // SILENTLY IGNORED -- rustc reports "the built-in attribute `allow` will be
+    // ignored, since it's applied to the macro invocation `assert`". The first
+    // version of this change did exactly that and suppressed nothing.
+    //
+    // These assertions state relationships between shipped constants. Clippy's
+    // suggested `const { assert!(..) }` is used for the sibling assertions whose
+    // message is a plain string; it cannot be used here because the message
+    // interpolates the constants, and a const-block assert cannot format
+    // (E0080/E0015). Tried and rejected by the compiler, not assumed.
+    #[allow(clippy::assertions_on_constants)]
     fn the_append_budget_fits_inside_the_servers_attempt() {
         // ⚠ Serialised on the shared metrics state (noetl/ai-meta#343). This
         // test drives `serve_tier`/a probe, both of which record into the

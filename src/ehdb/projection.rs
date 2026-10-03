@@ -1225,6 +1225,10 @@ pub(crate) fn serve_service_append_with(
 ///
 /// Separate atomic from the event log's: the two tiers flip independently, and
 /// sharing one would make a projection demote silence an event-log promote.
+// Same shape as `eventlog::OVERSIZE_REFUSAL_OUTSTANDING`: read only from the
+// `#[cfg(not(test))]` arm of the accessor below, which `clippy --all-targets`
+// compiles out -- dead under the test cfg, live in production.
+#[cfg_attr(test, allow(dead_code))]
 static LAST_SERVE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[cfg(test)]

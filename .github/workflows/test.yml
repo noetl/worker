@@ -52,29 +52,29 @@ jobs:
       - name: test
         run: cargo test --all-targets --locked
 
-      - name: clippy (gating — see the allow-list below)
-        # `|| true` was here, which made this step UNABLE to fail: it ran on every PR,
-        # appeared in every log, cost its full runtime, and could not report anything
-        # (noetl/ai-meta#374). `-D warnings` now gates, with the EXISTING backlog
-        # allow-listed by lint NAME so a NEW lint of any other kind fails the build.
-        #
-        # Measured on origin/main before this change: a bare `-D warnings` produced 15
-        # errors across 7 distinct lint kinds, so flipping it outright would have made
-        # this job red on arrival — a gate that is red the day it lands is one people
-        # learn to skip. Each -A below is tracked debt, not an opinion; deleting one
-        # should make the build fail until that lint is fixed. Sweep tracked in
-        # noetl/ai-meta#378.
-        #
-        # NOTE: `dead-code` here covers OVERSIZE_REFUSAL_OUTSTANDING and
-        # LAST_SERVE_STATE. Do not simply delete those to clear the lint — a dead
-        # static can be a shipped-but-unwired capability rather than garbage; establish
-        # which before removing (see #378).
-        run: |
-          cargo clippy --all-targets --locked -- -D warnings \
-            -A clippy::assertions-on-constants \
-            -A clippy::cloned-ref-to-slice-refs \
-            -A clippy::map-identity \
-            -A clippy::ptr-arg \
-            -A clippy::unnecessary-filter-map \
-            -A dead-code \
-            -A duplicate-macro-attributes
+      # Gating with NO allow-list as of noetl/ai-meta#378.
+      #
+      # It previously carried 7 `-A` entries covering 13 lint instances. All 13 are
+      # now resolved at their sites, which is strictly better than a workflow-level
+      # flag: a repo-wide `-A dead-code` hides genuinely dead code everywhere to
+      # accommodate the one place it was wrong, and nothing ever revisits it.
+      #
+      # Two of the 13 kept an allow, scoped to the site and carrying its reason:
+      #
+      #   dead_code on OVERSIZE_REFUSAL_OUTSTANDING / LAST_SERVE_STATE -- these are
+      #   NOT dead. Each is read only from a `#[cfg(not(test))]` arm, and
+      #   `--all-targets` compiles the TEST cfg, so the reader is compiled out and
+      #   the static reads dead there while being live in every shipped build.
+      #   `#[cfg_attr(test, allow(dead_code))]`, verified by `cargo clippy --lib`
+      #   (non-test cfg) reporting neither.
+      #
+      #   assertions_on_constants on 3 of 6 sites -- clippy's fix is a `const`
+      #   block, which these three cannot take because their message interpolates
+      #   the constants (E0015: cannot call non-const formatting macro in
+      #   constants). Tried and rejected by the compiler, not assumed. The other
+      #   three moved to `const { assert!(..) }` and now fail at COMPILE time.
+      #
+      # If an `-A` is ever added back here, it needs a sentence saying why it cannot
+      # be fixed or scoped. An unexplained `-A` is how a gate quietly stops gating.
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings

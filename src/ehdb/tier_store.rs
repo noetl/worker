@@ -42,7 +42,7 @@
 //! them.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use ehdb_reference::{
@@ -979,12 +979,12 @@ fn segments_possibly_holding(
 /// every write, and evicting it would reintroduce a full replay per append —
 /// the exact cost the runtime cache exists to avoid.
 fn read_segment_then_release<T>(
-    path: &PathBuf,
+    path: &Path,
     is_sealed: bool,
     f: impl FnOnce(&LocalReferenceEventLogDriver) -> T,
 ) -> T {
     let d = LocalReferenceEventLogDriver::new(
-        path.clone(),
+        path.to_path_buf(),
         DEFAULT_LOCAL_REFERENCE_TENANT.to_string(),
         DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
     );
@@ -1079,7 +1079,7 @@ fn read_execution_across_segments(
         let sealed_seg = i < last; // the final entry is the ACTIVE segment
         match read_segment_then_release(path, sealed_seg, |d| d.read_execution(request)) {
             Ok(out) => {
-                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out).map(|v| v)
+                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out)
                 {
                     if let Some(serde_json::Value::Array(rs)) = o.remove("records") {
                         records.extend(rs);

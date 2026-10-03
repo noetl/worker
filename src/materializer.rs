@@ -1440,7 +1440,7 @@ mod t3_source_tests {
 
         // The NATS adapter path wraps the payload in a PolledMessage; the EHDB
         // adapter passes the payload directly.  Both must land on one envelope.
-        let (from_payload, skipped_p) = build_envelopes_from_payloads(&[payload.clone()]);
+        let (from_payload, skipped_p) = build_envelopes_from_payloads(std::slice::from_ref(&payload));
         assert_eq!(skipped_p, 0);
 
         // Same input, expressed as the string form NATS sometimes carries.

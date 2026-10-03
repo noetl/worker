@@ -1145,6 +1145,13 @@ fn serve_state_code(decision: &super::primary_serve::ServeDecision) -> u8 {
 /// ⚠ This changes what is LOGGED, not what the tier does with the data. Whether
 /// an over-cap event should be chunked, rejected at the producer, or dropped is
 /// a durability decision and is deliberately left alone.
+// NOT dead: read from the `#[cfg(not(test))]` arm of `oversize_flag()` below.
+// `clippy --all-targets` compiles the TEST cfg, which compiles that reader out, so
+// the static reads as dead there while being live in every shipped build.
+// Verified: `cargo clippy --lib` (non-test cfg) does not report it.
+// Scoped to `test` deliberately -- the workflow-level `-A dead-code` this replaces
+// hid genuinely dead code across the whole crate to accommodate this one shape.
+#[cfg_attr(test, allow(dead_code))]
 static OVERSIZE_REFUSAL_OUTSTANDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

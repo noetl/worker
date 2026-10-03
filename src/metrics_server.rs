@@ -741,9 +741,9 @@ async fn ehdb_tier_append_handler(
     let records: Vec<String> = match body.get("records").and_then(|v| v.as_array()) {
         Some(arr) => arr
             .iter()
-            .filter_map(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                other => Some(other.to_string()),
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
             })
             .collect(),
         None => {
