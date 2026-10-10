@@ -20,7 +20,23 @@ COPY --from=planner /app/recipe.json recipe.json
 # the DuckDB C++ engine behind that non-default feature — noetl/ai-meta#185).
 # Cook with the same feature set as the app build so the libduckdb-sys layer is
 # cached, not rebuilt in the app stage.
-RUN cargo chef cook --release --features duckdb-integration --recipe-path recipe.json
+# ⚠⚠ `--locked`. Without it the image's dependency graph is NOT the graph CI
+# tested: `noetl-tools = "~4.0"` floats, and on 2026-10-10 this build resolved
+# noetl-tools 4.0.6 (which needs async-nats 0.47) against a committed lock
+# saying 4.0.1 (async-nats 0.38). Two incompatible `Context` types, and
+# `release-worker` failed with E0308 in spool_runtime.rs after a 47-minute
+# build — on a commit whose `cargo test --locked` was green, because the test
+# job builds the lock and the image did not.
+#
+# This is the same class as worker#183, where a caret range silently dropped
+# DuckDB from the shipped binary: a floating range is a decision made later by
+# a resolver, and the resolver was not running where anyone was looking.
+# ⚠ The lock is copied explicitly rather than relying on cargo-chef carrying it
+# inside recipe.json: `--locked` fails outright without a Cargo.lock in /app,
+# and a cook stage that silently resolved fresh would reintroduce exactly the
+# drift above one layer earlier, where it is harder to see.
+COPY Cargo.lock Cargo.lock
+RUN cargo chef cook --release --locked --features duckdb-integration --recipe-path recipe.json
 
 # Build the application.  `ehdb-selfcheck` ships alongside the worker so the
 # in-process EHDB integration (noetl/ehdb#234) can be exercised inside the
@@ -29,7 +45,7 @@ RUN cargo chef cook --release --features duckdb-integration --recipe-path recipe
 COPY . .
 # `--features duckdb-integration`: ship the DuckDB engine (see the cook stage +
 # noetl/ai-meta#185).  The worker pool runs `duckdb` / `ducklake` steps.
-RUN cargo build --release --features duckdb-integration --bin noetl-worker --bin ehdb-selfcheck
+RUN cargo build --release --locked --features duckdb-integration --bin noetl-worker --bin ehdb-selfcheck
 
 # Runtime stage
 FROM alpine:3.22.2 AS runtime
