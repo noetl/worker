@@ -244,7 +244,28 @@ wasmtime = { version = "27", optional = true }
 # Requires noetl-executor >= 0.10.0 (noetl/cli#89), which is the first version
 # built against noetl-tools 4.x.  4.0.1 also carries noetl/tools#99 and #100,
 # which have been merged and undeployable behind this pin.
-noetl-tools = "~4.0"
+# ⚠⚠⚠ EXACT pin, not a range, and the reason is not tidiness.
+#
+# This crate pins `async-nats = "0.38"`. noetl-tools 4.0.6 depends on
+# async-nats 0.47, so ANY resolution that picks 4.0.6 puts two incompatible
+# `async_nats::jetstream::Context` types in one graph and `spool_runtime.rs`
+# fails to compile with E0308. The versions must agree, and a range cannot
+# express that requirement — it delegates the decision to whichever resolver
+# runs last.
+#
+# `~4.0` + a committed lock was not enough. `cargo chef cook` works from
+# `recipe.json`, a skeleton reconstruction of the manifests, and writes its own
+# Cargo.lock over whatever is in the build directory — so the image's cook stage
+# resolved 4.0.6 even with `--locked` passed and the real lock copied in. Two
+# release runs failed that way (v6.2.2, v6.2.3) after ~45-minute builds, on
+# commits whose `cargo test --locked` was green, because the test job used the
+# lock and the image never did.
+#
+# An exact pin removes the resolver from the decision entirely: there is no
+# other version to choose. Moving to 4.0.6 means moving to async-nats 0.47
+# here too, which is a real API migration on the legacy NATS spool path and
+# belongs in its own change.
+noetl-tools = "=4.0.1"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
