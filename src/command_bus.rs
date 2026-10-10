@@ -354,14 +354,27 @@ pub async fn spawn_writer_host(
         // stuck system-pool command would pin it high and hold the user pool at
         // maxReplicaCount forever (noetl/ai-meta#194, noetl/ai-meta#210).
         let subjects = Arc::new(std::sync::Mutex::new(Vec::<ehdb_feed::SubjectLag>::new()));
+        // Delivered-but-unacked depth, on the same sampler.
+        //
+        // ⚠⚠ This is sampled rather than left at 0 because `render_snapshot`
+        // publishes `inflight` unconditionally, and a literal 0 does not read
+        // as "unknown": per that metric's own HELP text, high lag with zero
+        // in-flight is the *stalled consumer* reading. Hardcoding it would make
+        // a healthy bus publish an outage signal on every scrape, and the one
+        // condition the field was added to distinguish would be the one it
+        // misreports. `ClaimCoordinator::inflight` exists for this
+        // (noetl/ehdb#402).
+        let inflight = Arc::new(AtomicU64::new(0));
         let sampler = gauge.clone();
         let committed_sampler = committed.clone();
         let subject_sampler = subjects.clone();
+        let inflight_sampler = inflight.clone();
         let coord = coordinator.clone();
         tokio::spawn(async move {
             loop {
                 sampler.store(coord.lag().await, Ordering::Relaxed);
                 committed_sampler.store(coord.committed_cursor().await, Ordering::Relaxed);
+                inflight_sampler.store(coord.inflight().await, Ordering::Relaxed);
                 let split = coord.subject_lags().await;
                 if let Ok(mut guard) = subject_sampler.lock() {
                     *guard = split;
@@ -371,6 +384,7 @@ pub async fn spawn_writer_host(
         });
         let shard = config.shard;
         let read = gauge.clone();
+        let read_inflight = inflight.clone();
         // Serve the lag snapshot, the resume facts, **and** the append-integrity
         // counters from one endpoint. Each answers a different question an
         // operator asks about this bus, and a writer that binds only one of them
@@ -386,6 +400,7 @@ pub async fn spawn_writer_host(
                     shard,
                     committed: committed.load(Ordering::Relaxed),
                     lag: read.load(Ordering::Relaxed),
+                    inflight: read_inflight.load(Ordering::Relaxed),
                 }],
                 subjects: subjects.lock().map(|g| g.clone()).unwrap_or_default(),
             },

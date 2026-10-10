@@ -220,3 +220,115 @@ async fn the_durability_window_is_on_the_deployed_scrape() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **The in-flight gauge carries a real sample, not a literal zero**
+/// (noetl/ehdb#402).
+///
+/// ⚠ Why this test is not redundant with "the family is present". `ShardLag`
+/// gained an `inflight` field that `render_snapshot` publishes unconditionally,
+/// and `ClaimCoordinator` had no accessor for the value — so the only thing a
+/// writer could compile was `inflight: 0`. On a drained bus that is
+/// indistinguishable from a correct reading: lag 0, inflight 0 is the honest
+/// "drained" row of the table.
+///
+/// The discriminating state is **lag high with inflight high** — a consumer
+/// that has claimed work and not acked it. A hardcoded zero reports that as
+/// *lag high, inflight 0*, which per the metric's own HELP text is the
+/// stalled-consumer reading: an outage signal on a healthy bus.
+///
+/// So this drives the real `spawn_writer_host` wiring, claims without acking,
+/// and asserts the scraped value is **non-zero**. Confirming the family exists
+/// would have passed against the defect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_inflight_gauge_reports_claimed_unacked_work_not_a_literal_zero() {
+    use ehdb_l0::EventRecord;
+
+    let dir = unique_dir("inflight");
+    let metrics = free_addr().await;
+    let claim = free_addr().await;
+
+    let mut cfg = config_at(&dir, metrics);
+    cfg.claim_bind = Some(claim);
+    let (writer, _shutdown) = spawn_writer_host(&cfg).await.unwrap();
+
+    // Commands on the shared subject, none claimed yet.
+    const N: u64 = 6;
+    for seq in 1..=N {
+        writer
+            .append(EventRecord::new(
+                seq,
+                format!("exec-{seq}"),
+                "t",
+                "command-payload",
+            ))
+            .unwrap();
+    }
+
+    // Claim three and DO NOT ack. The client is held open for the rest of the
+    // test: a departed connection releases its in-flight set by design, so
+    // dropping it here would quietly reset what we are measuring.
+    let mut client = ehdb_feed::ClaimClient::connect(claim, 1, "commands.shared.>")
+        .await
+        .expect("claim endpoint reachable");
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let c = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.claim_next::<EventRecord>(),
+        )
+        .await
+        .expect("claim did not time out")
+        .expect("claim succeeded");
+        held.push(c);
+    }
+
+    // The scraped value comes from an atomic a background sampler refreshes on
+    // a 2s cadence, so poll rather than sleeping once — a single fixed sleep
+    // makes this test flaky in exactly one direction (reading the pre-sample 0
+    // and calling it a pass is impossible here, but reading it and calling it a
+    // FAILURE is a false alarm).
+    let mut scraped = String::new();
+    let mut inflight: Option<u64> = None;
+    for _ in 0..40 {
+        scraped = scrape(metrics).await;
+        inflight = scraped
+            .lines()
+            .find_map(|l| l.strip_prefix("ehdb_feed_shard_inflight{shard=\"0\"} "))
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if inflight.unwrap_or(0) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    assert!(
+        scraped.contains("# TYPE ehdb_feed_shard_inflight gauge"),
+        "the in-flight family is missing from the deployed writer endpoint: {scraped}"
+    );
+    let inflight = inflight.expect("ehdb_feed_shard_inflight{shard=\"0\"} is present and numeric");
+    assert_eq!(
+        inflight, 3,
+        "three records are claimed and unacked, so the gauge must read 3 — a \
+         literal 0 here is the stalled-consumer reading on a healthy bus. \
+         scrape: {scraped}"
+    );
+
+    // ⭐ And the pair must disagree, which is the whole reason the field exists:
+    // `lag` counts undelivered PLUS unacked, so claiming without acking leaves
+    // it unchanged. If both read the same, one of them is not measuring what it
+    // claims.
+    let lag = scraped
+        .lines()
+        .find_map(|l| l.strip_prefix("ehdb_feed_shard_lag{shard=\"0\"} "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .expect("shard lag present");
+    assert_eq!(lag, N, "lag still counts all {N} — undelivered plus unacked");
+    assert_ne!(
+        lag, inflight,
+        "lag and inflight must be independent readings"
+    );
+
+    drop(client);
+    drop(held);
+    let _ = std::fs::remove_dir_all(&dir);
+}
