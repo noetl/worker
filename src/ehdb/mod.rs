@@ -90,6 +90,7 @@ use std::collections::HashMap;
 pub mod backends;
 pub mod contract;
 pub mod dataplane;
+pub mod election;
 pub mod eventlog;
 pub mod eventlog_backend;
 pub mod eventlog_gc;

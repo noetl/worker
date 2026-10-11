@@ -104,6 +104,33 @@ impl Worker {
             writer_shutdowns.push(shutdown);
         }
 
+        // noetl/ai-meta#460 C2 — the shard election's call site.
+        //
+        // Spawned only where this process HOSTS a writer, because the lease's
+        // unit of mutual exclusion is the ordinal that owns the volumes, not a
+        // worker that merely claims from it. A worker pod electing itself for a
+        // shard it does not write would mint tokens nobody can act on and make
+        // `ehdb_election_epoch` meaningless across the fleet.
+        //
+        // ⚠ One election per process, not per bus. A writer hosts two L0 engines
+        // (command bus and event bus) and the entrypoint derives both shards
+        // from the same StatefulSet ordinal; both are backed by the same pod's
+        // PVCs, so one lease per ordinal is the exclusion that matters.
+        //
+        // ⚠ A strict no-op unless NOETL_EHDB_ELECTION is set: no thread, no
+        // request, no ServiceAccount token read. And when the flag IS set but the
+        // environment cannot support it, the driver logs and returns false rather
+        // than failing the boot — the writer's restart behaviour is the riskiest
+        // part of enabling this, so a misconfiguration must degrade.
+        if cmdbus.host || eventbus.host {
+            let shard = if cmdbus.host {
+                cmdbus.shard
+            } else {
+                eventbus.shard
+            };
+            crate::ehdb::election::spawn(shard);
+        }
+
         // Select the command source by mode.  `ehdb` claims over the network from
         // the shard coordinator (competing across replicas) and creates NO NATS
         // subscriber (supports the NATS-deleted end state); every other mode is
