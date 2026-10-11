@@ -211,33 +211,21 @@ pub static FENCING_METRICS: std::sync::LazyLock<Arc<FencingMetrics>> =
 
 /// Whether a shard-lease election is running and issuing fencing tokens.
 ///
-/// ⚠⚠ **Always 0 today, and that is the point.** `ShardElection`
-/// (noetl/ehdb#331) is implemented, tested and merged — and has **no call sites
-/// anywhere**. Without it every writer's epoch is `0`, which has two
-/// consequences an operator cannot otherwise see:
+/// Delegates to [`crate::ehdb::election::render`], which owns the state.
 ///
-/// * single-writer-per-shard still rests entirely on `StatefulSet replicas: 1`,
-///   an orchestration preference rather than a mutual-exclusion primitive; and
-/// * fencing in `enforce` mode would be an **outage**, not a degradation,
-///   because the first writer to advance the marker fences every other one.
+/// ⚠ This used to hard-code `0` for both gauges, with a note explaining that
+/// `ShardElection` (noetl/ehdb#331) had no call sites anywhere and that a dead
+/// feature reporting nothing looks exactly like a live one with nothing to
+/// report. [`crate::ehdb::election`] is that call site, so the numbers are now
+/// real — and `0` has recovered its ordinary meaning: no election is running in
+/// this process, because the flag is off.
 ///
-/// A dead feature that reports nothing is indistinguishable from a live one that
-/// has nothing to report. This gauge makes the difference legible on the scrape
-/// instead of requiring someone to grep the source.
-///
-/// ⚠ It is deliberately **not** wired to a fake election. The Kubernetes
-/// `LeaseStore` adapter needs an HTTP/`kube` dependency decision; driving the
-/// in-memory store here would publish a token nothing else honours and a `1`
-/// that means nothing.
+/// ⚠⚠ A non-zero epoch here still does **not** mean writes are fenced. The
+/// election mints tokens in shadow; whether anything gates on them is C3, and
+/// `ehdb_election_token_valid` is the series fencing must consult (see the
+/// module note on why it is not `holds_lease`).
 pub fn render_election() -> String {
-    let mut out = String::new();
-    out.push_str("# HELP ehdb_election_active Whether a shard-lease election is running and issuing fencing tokens. 0 means single-writer rests on StatefulSet replicas:1 alone, and fencing enforce would be an outage.\n");
-    out.push_str("# TYPE ehdb_election_active gauge\n");
-    out.push_str("ehdb_election_active 0\n");
-    out.push_str("# HELP ehdb_election_epoch The fencing token this writer holds. 0 means no token has been issued.\n");
-    out.push_str("# TYPE ehdb_election_epoch gauge\n");
-    out.push_str("ehdb_election_epoch 0\n");
-    out
+    crate::ehdb::election::render()
 }
 
 /// The age-based seal trigger (noetl/ehdb#329), read from the process env.
@@ -1301,49 +1289,85 @@ mod election_visibility_tests {
     use super::*;
 
     #[test]
-    fn the_election_reports_itself_as_not_running() {
-        // ⚠⚠ This test is a placeholder that must FAIL when the election is
-        // actually wired — that is deliberate. If someone implements the K8s
-        // LeaseStore adapter and forgets to publish real state here, the scrape
-        // would keep asserting `0` while tokens were being issued, which is
-        // worse than no gauge: it would say fencing enforce is unsafe when it
-        // had become safe.
-        let text = render_election();
-        assert!(text.contains("ehdb_election_active 0\n"), "{text}");
-        assert!(text.contains("ehdb_election_epoch 0\n"), "{text}");
+    fn render_election_delegates_to_the_driver() {
+        // The two gauges used to be hard-coded string literals here. They are
+        // now computed from `crate::ehdb::election`'s state, so this asserts the
+        // delegation rather than the values.
+        assert_eq!(render_election(), crate::ehdb::election::render());
     }
 
     #[test]
-    fn the_election_is_still_unwired_in_this_build() {
-        // The guard that pairs with the gauge: if `ShardElection` ever gains a
-        // call site in this crate, `render_election` must stop hard-coding 0.
-        // Counts CODE, not prose.
-        let sources = [
-            include_str!("eventlog_backend.rs"),
-            include_str!("../command_bus.rs"),
-            include_str!("../event_bus.rs"),
-        ];
-        // ⚠⚠ Scan only the NON-TEST portion of each file. `include_str!` yields
-        // the whole file including this module, so the first two attempts both
-        // matched their own source: once on the bare name, and again on the very
-        // needle literals written to avoid that. A guard that counts itself is
-        // the same family as a counter that counts its own doc comment — and it
-        // took two turns to stop being self-referential.
+    fn the_flag_off_shape_still_reports_zero_and_carries_every_series() {
+        // ⚠ With no election running, `0` is the honest answer and must stay
+        // readable — but the *shape* must not change with the flag. A series
+        // that appears only once the election is enabled is indistinguishable
+        // from one this build does not have, which is the absent-is-not-zero
+        // trap that cost a 25-day scrape outage.
+        let text = render_election();
+        assert!(text.contains("ehdb_election_active 0\n"), "{text}");
+        assert!(text.contains("ehdb_election_epoch 0\n"), "{text}");
+        for series in [
+            "ehdb_election_holds_lease",
+            "ehdb_election_token_valid",
+            "ehdb_election_last_contact_age_seconds",
+            "ehdb_election_lease_duration_seconds",
+            "ehdb_election_renew_interval_seconds",
+        ] {
+            assert!(text.contains(series), "missing {series} in:\n{text}");
+        }
+        // ⚠ -1, not 0. Zero would claim contact just now.
+        assert!(
+            text.contains("ehdb_election_last_contact_age_seconds -1.000\n"),
+            "{text}"
+        );
+        for outcome in ["acquired", "renewed", "lost", "held_by_other"] {
+            assert!(
+                text.contains(&format!("ehdb_election_outcomes_total{{outcome=\"{outcome}\"}} 0")),
+                "outcome {outcome} not pinned in:\n{text}"
+            );
+        }
+        for reason in crate::ehdb::election::ERROR_REASONS {
+            assert!(
+                text.contains(&format!("ehdb_election_errors_total{{reason=\"{reason}\"}} 0")),
+                "reason {reason} not pinned in:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_election_now_has_a_call_site() {
+        // ⚠⚠ This REPLACES `the_election_is_still_unwired_in_this_build`, which
+        // asserted the opposite and whose failure message said to revisit it
+        // once a call site appeared. Deleting it was the point of this change —
+        // it is gone on purpose, not lost.
+        //
+        // The drift it guarded against has inverted: the risk now is that the
+        // wiring is removed or refactored away while the gauges keep reporting,
+        // so this asserts the call site EXISTS. Counts CODE, not prose, by the
+        // same split-at-#[cfg(test)] + skip-comment-lines technique, and with
+        // the same split needle so the guard cannot match its own source.
         let needle = concat!("Shard", "Election");
-        let wired = sources.iter().any(|src| {
+        let code = |src: &str| -> Vec<String> {
             src.split("#[cfg(test)]")
                 .next()
                 .unwrap_or("")
                 .lines()
                 .map(str::trim_start)
                 .filter(|l| !l.starts_with("//") && !l.starts_with('*'))
-                .any(|l| l.contains(needle))
-        });
+                .map(str::to_string)
+                .collect()
+        };
+        let driver = code(include_str!("election.rs"));
         assert!(
-            !wired,
-            "ShardElection now has a call site — render_election() must publish \
-             real state instead of a hard-coded 0, and noetl/ehdb#331's gate \
-             needs revisiting"
+            driver.iter().any(|l| l.contains(needle)),
+            "the election driver no longer constructs an election"
+        );
+        // And the driver must itself be reached from the writer's boot path,
+        // because a driver nothing spawns is the same defect one level up.
+        let worker = code(include_str!("../worker.rs"));
+        assert!(
+            worker.iter().any(|l| l.contains("election::spawn")),
+            "nothing in worker.rs spawns the election — the driver is inert"
         );
     }
 }
