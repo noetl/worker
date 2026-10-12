@@ -82,10 +82,7 @@ fn the_lock_is_tracked_and_not_dockerignored() {
     let ignore = include_str!("../.dockerignore");
     for pat in ["Cargo.lock", "*.lock", "/Cargo.lock"] {
         assert!(
-            !ignore
-                .lines()
-                .map(str::trim)
-                .any(|l| l == pat),
+            !ignore.lines().map(str::trim).any(|l| l == pat),
             ".dockerignore excludes {pat}, so the build context has no lock"
         );
     }

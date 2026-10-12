@@ -311,7 +311,11 @@ fn the_durable_append_is_additive_to_the_local_mirror() {
             CONTROL_PLANE_RS,
             "object::mirror_live_put(",
         ),
-        ("spool_runtime kv hook", SPOOL_RUNTIME_RS, "kv::mirror_live_put("),
+        (
+            "spool_runtime kv hook",
+            SPOOL_RUNTIME_RS,
+            "kv::mirror_live_put(",
+        ),
     ] {
         assert!(
             src.contains(local),

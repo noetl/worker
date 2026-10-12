@@ -272,13 +272,10 @@ async fn the_inflight_gauge_reports_claimed_unacked_work_not_a_literal_zero() {
         .expect("claim endpoint reachable");
     let mut held = Vec::new();
     for _ in 0..3 {
-        let c = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.claim_next::<EventRecord>(),
-        )
-        .await
-        .expect("claim did not time out")
-        .expect("claim succeeded");
+        let c = tokio::time::timeout(Duration::from_secs(5), client.claim_next::<EventRecord>())
+            .await
+            .expect("claim did not time out")
+            .expect("claim succeeded");
         held.push(c);
     }
 
@@ -322,7 +319,10 @@ async fn the_inflight_gauge_reports_claimed_unacked_work_not_a_literal_zero() {
         .find_map(|l| l.strip_prefix("ehdb_feed_shard_lag{shard=\"0\"} "))
         .and_then(|v| v.trim().parse::<u64>().ok())
         .expect("shard lag present");
-    assert_eq!(lag, N, "lag still counts all {N} — undelivered plus unacked");
+    assert_eq!(
+        lag, N,
+        "lag still counts all {N} — undelivered plus unacked"
+    );
     assert_ne!(
         lag, inflight,
         "lag and inflight must be independent readings"

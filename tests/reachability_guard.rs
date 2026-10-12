@@ -40,7 +40,10 @@ struct Expect {
 }
 
 const SOURCES: &[(&str, &str)] = &[
-    ("eventlog_backend", include_str!("../src/ehdb/eventlog_backend.rs")),
+    (
+        "eventlog_backend",
+        include_str!("../src/ehdb/eventlog_backend.rs"),
+    ),
     ("command_bus", include_str!("../src/command_bus.rs")),
     ("event_bus", include_str!("../src/event_bus.rs")),
     ("metrics_server", include_str!("../src/metrics_server.rs")),
@@ -259,8 +262,8 @@ fn the_domain_and_election_gauges_are_not_gated_on_the_observation_itself() {
         .find(|(n, _)| *n == "metrics_server")
         .map(|(_, s)| *s)
         .expect("metrics_server registered");
-    let gated_on_observation = production_lines(src)
-        .any(|l| l.contains("REPLICA_DOMAINS.get().is_some()"));
+    let gated_on_observation =
+        production_lines(src).any(|l| l.contains("REPLICA_DOMAINS.get().is_some()"));
     assert!(
         !gated_on_observation,
         "the replica-domain and election gauges must not be gated on \

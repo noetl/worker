@@ -247,7 +247,8 @@ pub fn tier_seal_max_bytes() -> Option<u64> {
 
 /// Pure parse, so the fail-safe direction is testable without the process env.
 pub fn parse_seal_max_bytes(raw: Option<&str>) -> Option<u64> {
-    raw.and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0)
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
 }
 
 /// Sealed segments of `tier`, oldest first.
@@ -316,7 +317,10 @@ fn maybe_seal(cfg: &TierStoreConfig, tier: StoreTier, max: Option<u64>) -> Optio
         + 1;
     let sealed = active.with_file_name(format!(
         "{}.{next}",
-        active.file_name().and_then(|s| s.to_str()).unwrap_or("tier")
+        active
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("tier")
     ));
     match std::fs::rename(&active, &sealed) {
         Ok(()) => {
@@ -414,7 +418,14 @@ pub async fn append(
     if payload.is_empty() {
         return TierStoreOutcome::Invalid("payload is empty".to_string());
     }
-    append_with_seal(Some(cfg), tier, execution_id, payload, tier_seal_max_bytes()).await
+    append_with_seal(
+        Some(cfg),
+        tier,
+        execution_id,
+        payload,
+        tier_seal_max_bytes(),
+    )
+    .await
 }
 
 /// [`append`] with the seal threshold injected.
@@ -1079,8 +1090,7 @@ fn read_execution_across_segments(
         let sealed_seg = i < last; // the final entry is the ACTIVE segment
         match read_segment_then_release(path, sealed_seg, |d| d.read_execution(request)) {
             Ok(out) => {
-                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out)
-                {
+                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out) {
                     if let Some(serde_json::Value::Array(rs)) = o.remove("records") {
                         records.extend(rs);
                     }
@@ -1155,9 +1165,9 @@ fn scan_locked(
         return scan_across_segments(cfg, tier, &sealed, after, limit);
     }
     match driver(cfg, tier).scan_global(&EventLogScanRequest { after, limit }) {
-        Ok(out) => TierStoreOutcome::Ok(
-            serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()),
-        ),
+        Ok(out) => {
+            TierStoreOutcome::Ok(serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()))
+        }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
     }
 }
@@ -1231,7 +1241,10 @@ mod tests {
         ehdb_reference::forget_runtime(&cfg.path_for(StoreTier::EventLog));
 
         let got = read_execution(Some(&cfg), StoreTier::EventLog, "exec-rel").await;
-        assert!(matches!(got, TierStoreOutcome::Ok(_)), "read failed: {got:?}");
+        assert!(
+            matches!(got, TierStoreOutcome::Ok(_)),
+            "read failed: {got:?}"
+        );
 
         // The ACTIVE segment stays cached on purpose — the append path uses it
         // on every write, and evicting it would reintroduce a full replay per
@@ -1268,12 +1281,18 @@ mod tests {
             .await;
         }
         let segs = sealed_segments(&cfg, StoreTier::EventLog);
-        assert!(segs.len() >= 2, "need >=2 sealed segments, got {}", segs.len());
+        assert!(
+            segs.len() >= 2,
+            "need >=2 sealed segments, got {}",
+            segs.len()
+        );
 
         // UNINDEXED answer first — the reference.
         for id in ["exec-even", "exec-odd"] {
             let before = read_execution(Some(&cfg), StoreTier::EventLog, id).await;
-            let TierStoreOutcome::Ok(b) = before else { panic!("read failed: {before:?}") };
+            let TierStoreOutcome::Ok(b) = before else {
+                panic!("read failed: {before:?}")
+            };
             let bv: serde_json::Value = serde_json::from_str(&b).unwrap();
 
             // Now index every sealed segment and read again.
@@ -1281,7 +1300,9 @@ mod tests {
                 build_segment_index(sg).expect("index build");
             }
             let after = read_execution(Some(&cfg), StoreTier::EventLog, id).await;
-            let TierStoreOutcome::Ok(a) = after else { panic!("indexed read failed: {after:?}") };
+            let TierStoreOutcome::Ok(a) = after else {
+                panic!("indexed read failed: {after:?}")
+            };
             let av: serde_json::Value = serde_json::from_str(&a).unwrap();
 
             assert_eq!(
@@ -1360,10 +1381,16 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 4, "expected to check 4 entry points, checked {checked}");
+        assert_eq!(
+            checked, 4,
+            "expected to check 4 entry points, checked {checked}"
+        );
         // The helper must actually use the blocking pool, or the call above is
         // decorative.
-        let h = src.split("async fn off_runtime").nth(1).expect("off_runtime not found");
+        let h = src
+            .split("async fn off_runtime")
+            .nth(1)
+            .expect("off_runtime not found");
         assert!(
             h[..h.find("\n}\n").unwrap_or(h.len())].contains("spawn_blocking"),
             "off_runtime does not use spawn_blocking; it is not moving work off the runtime"
@@ -1379,11 +1406,19 @@ mod tests {
         // holds the execution — a wrong answer, not a slow one.
         let cfg = seal_cfg("idx-diff");
         for i in 0..40 {
-            let exec = if i % 3 == 0 { "exec-alpha" } else { "exec-beta" };
+            let exec = if i % 3 == 0 {
+                "exec-alpha"
+            } else {
+                "exec-beta"
+            };
             let _ = append_with_seal(
-                Some(&cfg), StoreTier::EventLog, exec,
-                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "z".repeat(120)), Some(2048),
-            ).await;
+                Some(&cfg),
+                StoreTier::EventLog,
+                exec,
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "z".repeat(120)),
+                Some(2048),
+            )
+            .await;
         }
         let segs = sealed_segments(&cfg, StoreTier::EventLog);
         assert!(segs.len() >= 2, "need several segments, got {}", segs.len());
@@ -1400,7 +1435,10 @@ mod tests {
                 DEFAULT_LOCAL_REFERENCE_NAMESPACE.to_string(),
             );
             let out = d
-                .scan_global(&EventLogScanRequest { after: None, limit: MAX_SCAN_LIMIT })
+                .scan_global(&EventLogScanRequest {
+                    after: None,
+                    limit: MAX_SCAN_LIMIT,
+                })
                 .expect("scan");
             ehdb_reference::forget_runtime(sg);
             let replayed: std::collections::BTreeSet<String> =
@@ -1410,7 +1448,8 @@ mod tests {
             let streamed_set: std::collections::BTreeSet<String> =
                 streamed.iter().cloned().collect();
             assert_eq!(
-                streamed_set, replayed,
+                streamed_set,
+                replayed,
                 "streaming index disagrees with the driver's own execution_id for {}",
                 sg.display()
             );
@@ -1427,9 +1466,13 @@ mod tests {
         let cfg = seal_cfg("idx-torn");
         for i in 0..24 {
             let _ = append_with_seal(
-                Some(&cfg), StoreTier::EventLog, "exec-torn",
-                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "t".repeat(120)), Some(2048),
-            ).await;
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-torn",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "t".repeat(120)),
+                Some(2048),
+            )
+            .await;
         }
         let segs = sealed_segments(&cfg, StoreTier::EventLog);
         let sg = segs.first().expect("a sealed segment").clone();
@@ -1437,7 +1480,10 @@ mod tests {
         // asserts against that valid index rather than the partial one under
         // test.
         drop_all_indexes(&cfg);
-        assert!(load_segment_index(&sg).is_none(), "precondition: no index yet");
+        assert!(
+            load_segment_index(&sg).is_none(),
+            "precondition: no index yet"
+        );
         // Append a line that carries no subject at all.
         {
             use std::io::Write;
@@ -1455,7 +1501,10 @@ mod tests {
         );
         // And the segment is therefore still considered for the read.
         let (kept, _) = segments_possibly_holding(&cfg, StoreTier::EventLog, "exec-torn");
-        assert!(kept.contains(&sg), "an unindexed segment must still be opened");
+        assert!(
+            kept.contains(&sg),
+            "an unindexed segment must still be opened"
+        );
     }
 
     #[tokio::test]
@@ -1464,16 +1513,24 @@ mod tests {
         // Fill the early segments with one execution only...
         for i in 0..24 {
             let _ = append_with_seal(
-                Some(&cfg), StoreTier::EventLog, "exec-early",
-                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)), Some(2048),
-            ).await;
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-early",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)),
+                Some(2048),
+            )
+            .await;
         }
         // ...then a DIFFERENT one, which cannot appear in those early segments.
         for i in 0..24 {
             let _ = append_with_seal(
-                Some(&cfg), StoreTier::EventLog, "exec-late",
-                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)), Some(2048),
-            ).await;
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-late",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)),
+                Some(2048),
+            )
+            .await;
         }
         let segs = sealed_segments(&cfg, StoreTier::EventLog);
         assert!(segs.len() >= 3, "need several segments, got {}", segs.len());
@@ -1485,11 +1542,15 @@ mod tests {
         assert!(
             kept.len() < total,
             "the index ruled out NOTHING ({}/{} kept) — it is not being consulted",
-            kept.len(), total
+            kept.len(),
+            total
         );
         // And the early execution must still find its own segments.
         let (kept_early, _) = segments_possibly_holding(&cfg, StoreTier::EventLog, "exec-early");
-        assert!(!kept_early.is_empty(), "the index ruled out the segments that DO hold exec-early");
+        assert!(
+            !kept_early.is_empty(),
+            "the index ruled out the segments that DO hold exec-early"
+        );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
@@ -1499,9 +1560,13 @@ mod tests {
         let cfg = seal_cfg("idx-missing");
         for i in 0..24 {
             let _ = append_with_seal(
-                Some(&cfg), StoreTier::EventLog, "exec-x",
-                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)), Some(2048),
-            ).await;
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-x",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "k".repeat(120)),
+                Some(2048),
+            )
+            .await;
         }
         let segs = sealed_segments(&cfg, StoreTier::EventLog);
         assert!(!segs.is_empty());
@@ -1513,7 +1578,8 @@ mod tests {
         );
         let (kept, total) = segments_possibly_holding(&cfg, StoreTier::EventLog, "anything-at-all");
         assert_eq!(
-            kept.len(), total,
+            kept.len(),
+            total,
             "an unindexed segment was ruled out; absence of an index must mean \
              UNKNOWN, or a read silently skips records that exist"
         );
@@ -1536,16 +1602,24 @@ mod tests {
         const EARLY: usize = MAX_SCAN_LIMIT + 200;
         for i in 0..EARLY {
             let _ = append_with_seal(
-                Some(&cfg), StoreTier::EventLog, "exec-early",
-                &format!("{{\"i\":{i}}}"), None,
-            ).await;
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-early",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
         }
         // This one appears ONLY after the first page boundary.
         for i in 0..5 {
             let _ = append_with_seal(
-                Some(&cfg), StoreTier::EventLog, "exec-past-the-page",
-                &format!("{{\"i\":{i}}}"), None,
-            ).await;
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-past-the-page",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
         }
         // Make it a sealed segment by name, so the index path applies to it.
         let active = cfg.path_for(StoreTier::EventLog);
@@ -1564,7 +1638,8 @@ mod tests {
             "the index stopped at the first page: {} records were written but only \
              {n} execution ids indexed, so everything past record {} is invisible \
              and reads would skip it",
-            EARLY + 5, MAX_SCAN_LIMIT
+            EARLY + 5,
+            MAX_SCAN_LIMIT
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
@@ -1646,7 +1721,10 @@ mod tests {
                 Some(MAX),
             )
             .await;
-            assert!(matches!(out, TierStoreOutcome::Ok(_)), "append {i} failed: {out:?}");
+            assert!(
+                matches!(out, TierStoreOutcome::Ok(_)),
+                "append {i} failed: {out:?}"
+            );
         }
 
         let segs = sealed_segments(&cfg, StoreTier::EventLog);
@@ -1667,13 +1745,21 @@ mod tests {
 
         // NO LOSS, reader 1: read_execution.
         let got = read_execution(Some(&cfg), StoreTier::EventLog, "exec-seal").await;
-        let TierStoreOutcome::Ok(body) = got else { panic!("read failed: {got:?}") };
+        let TierStoreOutcome::Ok(body) = got else {
+            panic!("read failed: {got:?}")
+        };
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
-            v["record_count"].as_u64().unwrap() as usize, N,
-            "read_execution LOST records: {} of {N} (segments={})", v["record_count"], v["segments"]
+            v["record_count"].as_u64().unwrap() as usize,
+            N,
+            "read_execution LOST records: {} of {N} (segments={})",
+            v["record_count"],
+            v["segments"]
         );
-        assert!(v["segments"].as_u64().unwrap() > 1, "the read did not span segments");
+        assert!(
+            v["segments"].as_u64().unwrap() > 1,
+            "the read did not span segments"
+        );
 
         // ⚠ Sequences must be renumbered over the MERGE. Each segment's driver
         // numbers from 1 within its own file, so without renumbering the merged
@@ -1704,17 +1790,19 @@ mod tests {
 
         // NO LOSS, reader 2: scan. This is the one the first cut forgot.
         let sc = scan(Some(&cfg), StoreTier::EventLog, None, MAX_SCAN_LIMIT).await;
-        let TierStoreOutcome::Ok(sbody) = sc else { panic!("scan failed: {sc:?}") };
+        let TierStoreOutcome::Ok(sbody) = sc else {
+            panic!("scan failed: {sc:?}")
+        };
         let sv: serde_json::Value = serde_json::from_str(&sbody).unwrap();
         assert_eq!(
-            sv["record_count"].as_u64().unwrap() as usize, N,
+            sv["record_count"].as_u64().unwrap() as usize,
+            N,
             "scan LOST records: {} of {N} — a scan that returns only the active \
-             segment is silent data loss", sv["record_count"]
+             segment is silent data loss",
+            sv["record_count"]
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
-
-
 
     /// Every pre-#265 test addresses the event log, which is also the tier the
     /// wire default resolves to — so these keep asserting exactly what they
@@ -1733,9 +1821,18 @@ mod tests {
     async fn no_store_configured_is_unavailable_not_empty() {
         // The distinction that matters: a caller must be able to tell "no store
         // here" from "the store is empty".
-        assert_eq!(append(None, EL, "e1", "{}").await, TierStoreOutcome::Unavailable);
-        assert_eq!(read_execution(None, EL, "e1").await, TierStoreOutcome::Unavailable);
-        assert_eq!(scan(None, EL, None, 10).await, TierStoreOutcome::Unavailable);
+        assert_eq!(
+            append(None, EL, "e1", "{}").await,
+            TierStoreOutcome::Unavailable
+        );
+        assert_eq!(
+            read_execution(None, EL, "e1").await,
+            TierStoreOutcome::Unavailable
+        );
+        assert_eq!(
+            scan(None, EL, None, 10).await,
+            TierStoreOutcome::Unavailable
+        );
     }
 
     #[tokio::test]
@@ -1793,10 +1890,11 @@ mod tests {
             TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
             other => panic!("{other:?}"),
         };
-        let miss: serde_json::Value = match read_execution(Some(&cfg), EL, "no-such-execution").await {
-            TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
-            other => panic!("{other:?}"),
-        };
+        let miss: serde_json::Value =
+            match read_execution(Some(&cfg), EL, "no-such-execution").await {
+                TierStoreOutcome::Ok(b) => serde_json::from_str(&b).unwrap(),
+                other => panic!("{other:?}"),
+            };
         assert_eq!(hit["exists"], serde_json::Value::Bool(true));
         assert_eq!(hit["record_count"], 1);
         assert_eq!(
@@ -1865,7 +1963,13 @@ mod tests {
         // mirror rather than found by it.
         let cfg = tmp_cfg("isolation");
         append(Some(&cfg), EL, "exec-9", r#"{"marker":"EVENTLOG-ONLY"}"#).await;
-        append(Some(&cfg), PROJ, "exec-9", r#"{"marker":"PROJECTION-ONLY"}"#).await;
+        append(
+            Some(&cfg),
+            PROJ,
+            "exec-9",
+            r#"{"marker":"PROJECTION-ONLY"}"#,
+        )
+        .await;
 
         let el = match read_execution(Some(&cfg), EL, "exec-9").await {
             TierStoreOutcome::Ok(b) => b,
@@ -1877,8 +1981,14 @@ mod tests {
         };
         // POSITIVE control first: each tier must actually hold its own record,
         // or "did not see the other one" is satisfied by an empty store.
-        assert!(el.contains("EVENTLOG-ONLY"), "event-log tier lost its record: {el}");
-        assert!(proj.contains("PROJECTION-ONLY"), "projection tier lost its record: {proj}");
+        assert!(
+            el.contains("EVENTLOG-ONLY"),
+            "event-log tier lost its record: {el}"
+        );
+        assert!(
+            proj.contains("PROJECTION-ONLY"),
+            "projection tier lost its record: {proj}"
+        );
         assert!(
             !el.contains("PROJECTION-ONLY"),
             "the event-log tier can see projection records: {el}"
@@ -1925,7 +2035,13 @@ mod tests {
         for i in 0..n {
             let c = cfg.clone();
             set.spawn(async move {
-                append(Some(&c), PROJ, &format!("exec-{i}"), &format!(r#"{{"i":{i}}}"#)).await
+                append(
+                    Some(&c),
+                    PROJ,
+                    &format!("exec-{i}"),
+                    &format!(r#"{{"i":{i}}}"#),
+                )
+                .await
             });
         }
         let mut ok = 0;

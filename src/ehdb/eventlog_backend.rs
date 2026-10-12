@@ -257,7 +257,7 @@ pub const SEAL_MAX_AGE_ENV: &str = "NOETL_EHDB_SEAL_MAX_AGE_MS";
 /// spawned and the engine lock is never taken on a schedule. "Switched off" has
 /// to cost nothing, or it is not a real rollback.
 pub fn spawn_seal_age_sweep<D>(
-    engine: std::sync::Arc<std::sync::Mutex<ehdb_l0::L0Engine<D>>>,
+    engine: std::sync::Arc<ehdb_feed::fenced_engine::FencedEngine<D>>,
     label: &'static str,
     shard: u32,
 ) -> Option<tokio::task::JoinHandle<()>>
@@ -281,11 +281,23 @@ where
             // Hold the engine lock only for the sweep itself. `seal_aged_parts`
             // short-circuits when nothing has aged out, so the common case is a
             // cheap scan of the writer map.
-            let sealed = match engine.lock() {
+            // ⭐ Fenced (noetl/ai-meta#460). The age-seal sweep is a durable
+            // mutation and was never covered by the old fence, which decorated
+            // a backend this writer does not use. A superseded writer must not
+            // seal: sealing publishes a part and advances the manifest.
+            let sealed = match engine.write(ehdb_core::fence::MutationPath::SealAgedParts) {
                 Ok(mut e) => e.seal_aged_parts(),
-                // A poisoned lock means a writer thread panicked; the sweep is
-                // not the place to decide what that means.
-                Err(_) => continue,
+                Err(e) => {
+                    // ⚠ Distinct from a panic: this is the fence refusing a
+                    // superseded writer, which is the system working. Logged at
+                    // warn because a writer that keeps trying to seal while
+                    // fenced is worth seeing.
+                    tracing::warn!(
+                        %label, shard, error = %e,
+                        "age-seal sweep refused by the epoch fence — this writer is superseded"
+                    );
+                    continue;
+                }
             };
             match sealed {
                 Ok(n) if n > 0 => {
@@ -691,6 +703,54 @@ pub fn durable_shard_record_count(
     Ok(scan.record_count)
 }
 
+/// Build the engine fence for a writer host, from `NOETL_EHDB_FENCING`.
+///
+/// ⚠ Default **off**: no ledger, no checks, no counters, byte-identical to an
+/// unfenced writer. The ledger lives beside the log rather than inside it — it
+/// is metadata about who may write, not a record.
+///
+/// ⚠⚠ A fence without an election is **inert** by construction: no token is
+/// minted, so the fence holds epoch 0, which is `Fresh` against an empty ledger
+/// and never advances the marker. `register_fence` logs that explicitly, because
+/// the alternative is an operator reading a flat `epoch_advances` and guessing.
+pub(crate) fn build_engine_fence(
+    dir: &std::path::Path,
+    label: &str,
+    shard: u32,
+) -> std::sync::Arc<ehdb_core::fence::EpochFence> {
+    let mode = ehdb_core::fence::FenceMode::from_str_or_off(
+        &std::env::var("NOETL_EHDB_FENCING").unwrap_or_default(),
+    );
+    if !mode.is_active() {
+        return ehdb_core::fence::EpochFence::off();
+    }
+    let ledger = match ehdb_core::fence::FenceLedger::new(dir.join(".fence")) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            // ⚠ Not fatal. A fence that cannot open its ledger must not stop the
+            // writer booting — the writer hosts both buses, so refusing to start
+            // is a fleet-wide dispatch outage in exchange for an observability
+            // feature. Degrade to off, loudly.
+            tracing::error!(
+                %label, shard, error = %e,
+                "NOETL_EHDB_FENCING is set but the fence ledger could not be opened — \
+                 continuing UNFENCED. Durable mutations are not checked."
+            );
+            return ehdb_core::fence::EpochFence::off();
+        }
+    };
+    let fence =
+        ehdb_core::fence::EpochFence::new(mode, ledger, ehdb_core::fence::FenceMetrics::new());
+    tracing::info!(
+        %label, shard, mode = mode.as_str(),
+        "EHDB engine fence armed on the L0 chokepoint — every &mut on the engine \
+         is checked. Watch ehdb_engine_fence_epoch_advances_total: 0 beside a \
+         climbing writes_checked means the fence received no token and cannot refuse."
+    );
+    crate::ehdb::election::register_fence(label, std::sync::Arc::clone(&fence));
+    fence
+}
+
 #[cfg(test)]
 mod tests {
     // `DurableSegmentStore` / `EventLogScanRequest` come in via `super::*`
@@ -789,19 +849,18 @@ mod tests {
     #[test]
     fn ownership_selection_is_the_same_rule_the_affinity_config_uses() {
         for (index, count) in [
-            (0u32, 0u32),  // count 0 is normalised to 1 by both
+            (0u32, 0u32), // count 0 is normalised to 1 by both
             (0, 1),
             (0, 2),
             (1, 2),
-            (2, 2),        // out of range -> single owner
-            (3, 2),        // further out of range
+            (2, 2), // out of range -> single owner
+            (3, 2), // further out of range
             (0, 4),
             (3, 4),
-            (4, 4),        // boundary: index == count is out of range
+            (4, 4), // boundary: index == count is out of range
             (7, 8),
         ] {
-            let (want_index, want_count) =
-                crate::sharding::effective_shard_selection(index, count);
+            let (want_index, want_count) = crate::sharding::effective_shard_selection(index, count);
             let got = ownership_from_env(&env(&[
                 ("NOETL_SHARD_INDEX", &index.to_string()),
                 ("NOETL_SHARD_COUNT", &count.to_string()),
@@ -1045,7 +1104,10 @@ mod fencing_tests {
         // ⚠ The safety claim: an untouched deployment must not start wrapping
         // the shared store. Unset AND unrecognised both mean Off — the
         // fail-safe direction here is "change nothing", never "start refusing".
-        assert_eq!(FencingSetting::from_env(&env_with(None)), FencingSetting::Off);
+        assert_eq!(
+            FencingSetting::from_env(&env_with(None)),
+            FencingSetting::Off
+        );
         assert_eq!(FencingSetting::default(), FencingSetting::Off);
         for junk in ["", "  ", "on", "true", "enfroce", "shadw", "1"] {
             assert_eq!(
@@ -1084,7 +1146,10 @@ mod fencing_tests {
         // those apart is the entire purpose of the shadow period.
         let off = render_fencing(FencingSetting::Off);
         assert!(off.contains("ehdb_fencing_active 0\n"), "{off}");
-        assert!(off.contains("# TYPE ehdb_fencing_stale_observed_total counter"), "{off}");
+        assert!(
+            off.contains("# TYPE ehdb_fencing_stale_observed_total counter"),
+            "{off}"
+        );
         assert!(off.contains("ehdb_fencing_enforcing 0\n"), "{off}");
 
         let shadow = render_fencing(FencingSetting::Shadow);
@@ -1127,13 +1192,23 @@ mod fencing_tests {
             .with_mode(ehdb_fencing::FencingMode::Shadow)
             .with_metrics(std::sync::Arc::clone(&metrics));
 
-        let before = metrics.writes_checked.load(std::sync::atomic::Ordering::Relaxed);
+        let before = metrics
+            .writes_checked
+            .load(std::sync::atomic::Ordering::Relaxed);
         fenced.put_segment(0, 1, b"payload").unwrap();
-        let after = metrics.writes_checked.load(std::sync::atomic::Ordering::Relaxed);
+        let after = metrics
+            .writes_checked
+            .load(std::sync::atomic::Ordering::Relaxed);
 
-        assert_eq!(after, before + 1, "a write through the fenced store must be counted");
         assert_eq!(
-            metrics.stale_observed.load(std::sync::atomic::Ordering::Relaxed),
+            after,
+            before + 1,
+            "a write through the fenced store must be counted"
+        );
+        assert_eq!(
+            metrics
+                .stale_observed
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "with no election issuing tokens every epoch is 0, so nothing is stale"
         );
@@ -1205,10 +1280,15 @@ mod domain_observation_tests {
         // Before the stack is opened nothing has been computed, and the render
         // must say that rather than reporting a reassuring zero.
         let text = render_replica_domains();
-        assert!(text.contains("# TYPE ehdb_replica_domain_violations gauge"), "{text}");
+        assert!(
+            text.contains("# TYPE ehdb_replica_domain_violations gauge"),
+            "{text}"
+        );
         for kind in ["shared_domain", "nested_path", "undeclared"] {
             assert!(
-                text.contains(&format!("ehdb_replica_domain_violations{{kind=\"{kind}\"}}")),
+                text.contains(&format!(
+                    "ehdb_replica_domain_violations{{kind=\"{kind}\"}}"
+                )),
                 "label {kind} must be pinned, not absent: {text}"
             );
         }
@@ -1230,10 +1310,9 @@ mod domain_observation_tests {
         // Same device in a test env, so a shared-domain finding is expected and
         // correct; what must NOT appear is a nesting finding.
         assert!(
-            !obs.violations.iter().any(|v| matches!(
-                v,
-                ehdb_l0::DomainViolation::NestedPath { .. }
-            )),
+            !obs.violations
+                .iter()
+                .any(|v| matches!(v, ehdb_l0::DomainViolation::NestedPath { .. })),
             "sibling dirs are not nested: {obs:?}"
         );
         assert!(!obs.survives_node_loss);
@@ -1334,13 +1413,17 @@ mod election_visibility_tests {
         );
         for outcome in ["acquired", "renewed", "lost", "held_by_other"] {
             assert!(
-                text.contains(&format!("ehdb_election_outcomes_total{{outcome=\"{outcome}\"}} 0")),
+                text.contains(&format!(
+                    "ehdb_election_outcomes_total{{outcome=\"{outcome}\"}} 0"
+                )),
                 "outcome {outcome} not pinned in:\n{text}"
             );
         }
         for reason in crate::ehdb::election::ERROR_REASONS {
             assert!(
-                text.contains(&format!("ehdb_election_errors_total{{reason=\"{reason}\"}} 0")),
+                text.contains(&format!(
+                    "ehdb_election_errors_total{{reason=\"{reason}\"}} 0"
+                )),
                 "reason {reason} not pinned in:\n{text}"
             );
         }
@@ -1384,7 +1467,6 @@ mod election_visibility_tests {
     }
 }
 
-
 #[cfg(test)]
 mod seal_sweep_tests {
     use super::*;
@@ -1407,14 +1489,18 @@ mod seal_sweep_tests {
         out
     }
 
-    fn engine(dir: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<ehdb_l0::L0Engine<ehdb_l0::D1EventLog>>> {
+    fn engine(
+        dir: &std::path::Path,
+    ) -> std::sync::Arc<ehdb_feed::fenced_engine::FencedEngine<ehdb_l0::D1EventLog>> {
         let store: std::sync::Arc<dyn ehdb_l0::substrate::DurableSubstrate> =
             std::sync::Arc::new(ehdb_l0::LocalFsSubstrate::new(dir).unwrap());
         let cfg = ehdb_l0::L0Config::d1(dir)
             .with_shard_count(1)
             .with_seal_max_age(seal_max_age_from_env());
-        std::sync::Arc::new(std::sync::Mutex::new(
+        // Unfenced: these tests are about the age-seal trigger, not the fence.
+        std::sync::Arc::new(ehdb_feed::fenced_engine::FencedEngine::unfenced(
             ehdb_l0::L0Engine::<ehdb_l0::D1EventLog>::open(cfg, store).unwrap(),
+            0,
         ))
     }
 
@@ -1436,7 +1522,10 @@ mod seal_sweep_tests {
         let d = tmp("off");
         let e = with_age(None, || engine(&d));
         let h = with_age(None, || spawn_seal_age_sweep(e, "test", 0));
-        assert!(h.is_none(), "no sweep task may exist while the flag is unset");
+        assert!(
+            h.is_none(),
+            "no sweep task may exist while the flag is unset"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1459,10 +1548,16 @@ mod seal_sweep_tests {
         let d = tmp("idle");
         let e = with_age(Some("60"), || engine(&d));
         {
-            let mut g = e.lock().unwrap();
+            let mut g = e
+                .write(ehdb_core::fence::MutationPath::AppendRecord)
+                .unwrap();
             g.append_record(ehdb_l0::EventRecord::new(1, "exec-idle", "t1", "p1"))
                 .unwrap();
-            assert_eq!(g.metrics().snapshot().seals, 0, "nothing seals on one append");
+            assert_eq!(
+                g.metrics().snapshot().seals,
+                0,
+                "nothing seals on one append"
+            );
         }
         let h = with_age(Some("60"), || {
             std::env::set_var(SEAL_SWEEP_INTERVAL_MS_ENV, "20");
@@ -1475,13 +1570,13 @@ mod seal_sweep_tests {
         // No further appends. Only the sweep can seal this.
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            if e.lock().unwrap().metrics().snapshot().seals > 0 {
+            if e.read().metrics().snapshot().seals > 0 {
                 break;
             }
         }
         h.abort();
         assert!(
-            e.lock().unwrap().metrics().snapshot().seals > 0,
+            e.read().metrics().snapshot().seals > 0,
             "an IDLE shard must be sealed by the sweep -- this is the behaviour \
              the flag alone cannot produce"
         );
@@ -1495,13 +1590,15 @@ mod seal_sweep_tests {
         let d = tmp("idle-control");
         let e = with_age(Some("60"), || engine(&d));
         {
-            let mut g = e.lock().unwrap();
+            let mut g = e
+                .write(ehdb_core::fence::MutationPath::AppendRecord)
+                .unwrap();
             g.append_record(ehdb_l0::EventRecord::new(1, "exec-idle", "t1", "p1"))
                 .unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(
-            e.lock().unwrap().metrics().snapshot().seals,
+            e.read().metrics().snapshot().seals,
             0,
             "without the sweep an idle shard never seals -- if this fails, the \
              sweep is not what makes the difference"

@@ -202,6 +202,9 @@ async fn metrics_handler() -> impl IntoResponse {
         // that is `NOETL_EHDB_FENCING`, and `ehdb_election_token_valid` is the
         // series a fence must consult, not `holds_lease`.
         body.extend_from_slice(crate::ehdb::eventlog_backend::render_election().as_bytes());
+        // ⭐ The engine-chokepoint fence (noetl/ai-meta#460), per bus and per
+        // path. Empty when this process hosts no writer.
+        body.extend_from_slice(crate::ehdb::election::render_engine_fences().as_bytes());
     }
     (
         StatusCode::OK,

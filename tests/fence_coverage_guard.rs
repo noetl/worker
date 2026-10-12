@@ -187,7 +187,8 @@ fn no_unregistered_public_append_path_exists() {
             let t = line.trim();
             // Public append-shaped entry points. Narrow on purpose: `pub fn append…` is the
             // idiom all six registered paths share, and a wider net would flag helpers.
-            let is_append_fn = (t.starts_with("pub fn append") || t.starts_with("pub async fn append"))
+            let is_append_fn = (t.starts_with("pub fn append")
+                || t.starts_with("pub async fn append"))
                 && t.contains('(');
             if !is_append_fn {
                 continue;
@@ -208,7 +209,10 @@ fn no_unregistered_public_append_path_exists() {
     }
     // ⭐ The denominator. A pass over zero candidates is consistent with a broken scan, and
     // this guard's whole value is that it looked at something.
-    println!("  scanned {scanned} public append entry points across {} files", files.len());
+    println!(
+        "  scanned {scanned} public append entry points across {} files",
+        files.len()
+    );
     assert!(
         scanned >= REGISTERED_MUTATION_PATHS.len(),
         "the scan found {scanned} append entry points but {} are registered — the scan is \

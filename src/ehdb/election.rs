@@ -226,6 +226,132 @@ impl ElectionState {
 
 static STATE: OnceLock<Arc<ElectionState>> = OnceLock::new();
 
+/// The engine fences this process has built, which the election pushes its
+/// token into on every tick.
+///
+/// ⚠ Registered whether or not the election runs. A fence with no election
+/// never receives an epoch above 0, and 0 against an empty ledger reads `Fresh`
+/// and never advances the marker — so **fencing without election is inert**,
+/// which is the interlock, not an accident. The startup log says so rather than
+/// leaving an operator to infer it from a flat counter.
+type RegisteredFence = (String, Arc<ehdb_core::fence::EpochFence>);
+static FENCES: std::sync::Mutex<Vec<RegisteredFence>> = std::sync::Mutex::new(Vec::new());
+
+/// Register an engine fence to be fed this writer's token.
+pub fn register_fence(label: &str, fence: Arc<ehdb_core::fence::EpochFence>) {
+    let mode = fence.mode();
+    let entry = (label.to_string(), fence);
+    match FENCES.lock() {
+        Ok(mut g) => g.push(entry),
+        Err(p) => p.into_inner().push(entry),
+    }
+    if mode.is_active() && !election_enabled() {
+        tracing::warn!(
+            mode = mode.as_str(),
+            "NOETL_EHDB_FENCING is set but NOETL_EHDB_ELECTION is not, so no token \
+             is ever minted: the fence holds epoch 0, which is Fresh against an \
+             empty ledger and never advances the marker. The fence is INERT — \
+             ehdb_engine_fence_epoch_advances_total will stay 0 while \
+             writes_checked climbs. Enable the election first."
+        );
+    }
+}
+
+/// Push `epoch` to every registered fence.
+///
+/// ⚠ Called once per tick, so a fence's view of the token is at most one renew
+/// interval stale. That is deliberate and is why the published failover window
+/// is `lease + renew + 1`: a writer whose token has just become indefensible may
+/// still present it for up to one tick, and the bound already accounts for it.
+fn push_epoch_to_fences(epoch: u64) {
+    let g = match FENCES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    for (_, f) in g.iter() {
+        f.set_epoch(epoch);
+    }
+}
+
+/// The engine-fence block, one series set per registered bus.
+///
+/// ⚠⚠ Labelled by `bus`, because a writer hosts **two** L0 engines and two
+/// unlabelled fences would emit the same series name twice — a duplicate
+/// Prometheus series, where one silently wins and the other is lost. The two
+/// engines are separately fenced and must be separately readable; "the fence is
+/// covering appends" is not evidence about the event bus.
+///
+/// ⚠ Renders nothing when no fence is registered, which is the case on a worker
+/// that hosts no writer. There is no useful zero to publish for a component that
+/// does not exist in this process — unlike a *labelled value* on a component
+/// that does, which is pinned.
+pub fn render_engine_fences() -> String {
+    let g = match FENCES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if g.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("# HELP ehdb_engine_fence_active Whether the L0 engine chokepoint fence is armed for this bus: 0 off, 1 shadow, 2 enforce.\n");
+    out.push_str("# TYPE ehdb_engine_fence_active gauge\n");
+    for (bus, f) in g.iter() {
+        out.push_str(&format!(
+            "ehdb_engine_fence_active{{bus=\"{bus}\"}} {}\n",
+            match f.mode() {
+                ehdb_core::fence::FenceMode::Off => 0,
+                ehdb_core::fence::FenceMode::Shadow => 1,
+                ehdb_core::fence::FenceMode::Enforce => 2,
+            }
+        ));
+    }
+    out.push_str("# HELP ehdb_engine_fence_epoch The fencing token this bus's engine is checking against. 0 means no token was supplied.\n");
+    out.push_str("# TYPE ehdb_engine_fence_epoch gauge\n");
+    for (bus, f) in g.iter() {
+        out.push_str(&format!(
+            "ehdb_engine_fence_epoch{{bus=\"{bus}\"}} {}\n",
+            f.epoch()
+        ));
+    }
+    for (name, help) in [
+        ("writes_checked", "Durable mutations checked by the fence. ⚠ Read with epoch_advances: climbing here with 0 advances means the fence received no token and CANNOT refuse."),
+        ("stale_observed", "Superseded writes seen."),
+        ("stale_refused", "Superseded writes refused (enforce only)."),
+        ("epoch_advances", "⭐ Times the marker advanced. 0 beside a climbing writes_checked is an inert fence."),
+    ] {
+        out.push_str(&format!("# HELP ehdb_engine_fence_{name}_total {help}\n"));
+        out.push_str(&format!("# TYPE ehdb_engine_fence_{name}_total counter\n"));
+        for (bus, f) in g.iter() {
+            let m = f.metrics();
+            let v = match name {
+                "writes_checked" => m.writes_checked.load(Ordering::Relaxed),
+                "stale_observed" => m.stale_observed.load(Ordering::Relaxed),
+                "stale_refused" => m.stale_refused.load(Ordering::Relaxed),
+                _ => m.epoch_advances.load(Ordering::Relaxed),
+            };
+            out.push_str(&format!(
+                "ehdb_engine_fence_{name}_total{{bus=\"{bus}\"}} {v}\n"
+            ));
+        }
+    }
+    // ⚠ Per path AND per bus. Aggregate hides the partial-coverage failure this
+    // whole design exists to prevent: appends climbing while seal and retention
+    // stay unfenced would look complete in the total.
+    out.push_str("# HELP ehdb_engine_fence_checked_total Fence checks by durable-mutation path.\n");
+    out.push_str("# TYPE ehdb_engine_fence_checked_total counter\n");
+    for (bus, f) in g.iter() {
+        for path in ehdb_core::fence::MutationPath::ALL {
+            out.push_str(&format!(
+                "ehdb_engine_fence_checked_total{{bus=\"{bus}\",path=\"{}\"}} {}\n",
+                path.as_str(),
+                f.metrics().checked_for(path)
+            ));
+        }
+    }
+    out
+}
+
 /// The epoch to hand the fencing decorator, or `0` for "no token".
 ///
 /// ⚠⚠ **This function is the whole of C3's precondition.** Before it existed,
@@ -396,7 +522,12 @@ pub fn spawn(shard: u32) -> bool {
         let mut next_log_at: u64 = 1;
         let mut last_errors: u64 = 0;
         loop {
-            tick(&election, &st, clock.now_millis());
+            let now = clock.now_millis();
+            tick(&election, &st, now);
+            // ⭐ The token reaches the engine fence here, gated on
+            // `token_valid` — a writer that cannot defend its lease hands the
+            // fence 0 rather than a token it no longer owns.
+            push_epoch_to_fences(fence_epoch_from(Some(&st), now));
             let errs: u64 = st.errors.iter().map(|c| c.load(Ordering::Relaxed)).sum();
             if errs > last_errors {
                 // An election that cannot reach the API server would otherwise

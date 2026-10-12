@@ -341,7 +341,9 @@ async fn run_loop(config: ProjectorConfig) -> Result<()> {
 
     loop {
         let cycle_start = std::time::Instant::now();
-        let drained_batch = source.poll(config.batch as usize, config.poll_timeout).await;
+        let drained_batch = source
+            .poll(config.batch as usize, config.poll_timeout)
+            .await;
         let drained = drained_batch.len();
         if drained == 0 {
             if source.is_finished() {
@@ -550,10 +552,10 @@ mod tests {
     fn a_failed_execution_holds_only_its_own_events() {
         let advanced: BTreeSet<i64> = [7].into_iter().collect();
         let batch = vec![
-            (100, Some(7)),  // advanced
-            (101, Some(9)),  // failed
-            (102, Some(7)),  // advanced
-            (103, Some(9)),  // failed
+            (100, Some(7)), // advanced
+            (101, Some(9)), // failed
+            (102, Some(7)), // advanced
+            (103, Some(9)), // failed
         ];
         let (ack, held, unaddressable) = partition_acks(&batch, &advanced);
         assert_eq!(
@@ -617,7 +619,8 @@ mod tests {
         assert_eq!(failed_ids(&reply), vec![(9, "boom".to_string())]);
         assert!(!advance_fully_succeeded(&reply));
 
-        let clean = json!({"advanced": [{"execution_id": 1, "version": 2, "events": 3}], "failed": []});
+        let clean =
+            json!({"advanced": [{"execution_id": 1, "version": 2, "events": 3}], "failed": []});
         assert!(advance_fully_succeeded(&clean));
         assert_eq!(advanced_ids(&clean), [1].into_iter().collect());
         assert!(failed_ids(&clean).is_empty());

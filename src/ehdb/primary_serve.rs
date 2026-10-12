@@ -271,7 +271,10 @@ mod tests {
     #[test]
     fn divergence_demotes_rather_than_failing_or_serving_wrong_data() {
         let d = decide(true, true, false);
-        assert!(!d.served_by_ehdb(), "a diverged tier must NOT serve its answer");
+        assert!(
+            !d.served_by_ehdb(),
+            "a diverged tier must NOT serve its answer"
+        );
         assert!(d.degraded(), "divergence must mark the tier degraded");
         assert_eq!(
             d,
@@ -294,7 +297,10 @@ mod tests {
                 reason: DemoteReason::NoDurableService
             }
         );
-        assert!(d.degraded(), "asking for primary and not getting it is degraded");
+        assert!(
+            d.degraded(),
+            "asking for primary and not getting it is degraded"
+        );
     }
 
     #[test]

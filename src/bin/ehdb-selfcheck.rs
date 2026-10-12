@@ -1106,15 +1106,14 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
         .and_then(|t| ehdb::store_tier::StoreTier::parse(&t))
         .unwrap_or(ehdb::store_tier::StoreTier::EventLog);
 
-    let cfg = match ehdb::tier_client::TierClientConfig::build(
-        Some(&addr),
-        None,
-        None,
-    ) {
+    let cfg = match ehdb::tier_client::TierClientConfig::build(Some(&addr), None, None) {
         Some(c) => c,
         None => {
-            println!("{}", serde_json::json!({"suite":"tier-load","ok":false,
-                     "error":format!("unusable addr {addr}")}));
+            println!(
+                "{}",
+                serde_json::json!({"suite":"tier-load","ok":false,
+                     "error":format!("unusable addr {addr}")})
+            );
             return ExitCode::from(2);
         }
     };
@@ -1156,7 +1155,11 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
             for i in 0..per {
                 let t = std::time::Instant::now();
                 let r = client
-                    .append_tier(tier, &exec, &format!("{{\"c\":{c},\"i\":{i},\"pad\":\"{filler}\"}}"))
+                    .append_tier(
+                        tier,
+                        &exec,
+                        &format!("{{\"c\":{c},\"i\":{i},\"pad\":\"{filler}\"}}"),
+                    )
                     .await;
                 let ms = t.elapsed().as_millis() as u64;
                 if ms > slowest_ms {
@@ -2415,8 +2418,14 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
 fn run_tier_concurrency(flags: &Flags) -> ExitCode {
     use noetl_worker::ehdb::tier_client::{TierClient, TierClientConfig};
 
-    let clients: usize = flags.get("clients").and_then(|v| v.parse().ok()).unwrap_or(16);
-    let appends: usize = flags.get("appends").and_then(|v| v.parse().ok()).unwrap_or(12);
+    let clients: usize = flags
+        .get("clients")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let appends: usize = flags
+        .get("appends")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
     let total = clients * appends;
     let addr = match flags
         .get("addr")
@@ -2440,7 +2449,10 @@ fn run_tier_concurrency(flags: &Flags) -> ExitCode {
         .map(|d| d.as_millis())
         .unwrap_or(0);
 
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("tier-concurrency: cannot build runtime: {e}");
@@ -2538,7 +2550,9 @@ fn run_tier_concurrency(flags: &Flags) -> ExitCode {
     let mut unparseable = 0usize;
     let mut seqs = std::collections::BTreeSet::new();
     for r in &records {
-        let Some(p) = r["payload"].as_str() else { continue };
+        let Some(p) = r["payload"].as_str() else {
+            continue;
+        };
         match serde_json::from_str::<serde_json::Value>(p) {
             Ok(parsed) => {
                 if parsed["run"].as_u64() == Some(run as u64) {

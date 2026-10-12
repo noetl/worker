@@ -329,21 +329,19 @@ impl ControlPlaneClient {
         // Disarming here also disarms the tier-service append below it, which is
         // correct for the same reason and is why the two share this one gate.
         let mirror_source = crate::ehdb::mirror_source::MirrorSource::from_env(&process_env);
-        let ehdb_eventlog_hook = Arc::new(
-            match mirror_source {
-                crate::ehdb::mirror_source::MirrorSource::Server => {
-                    tracing::info!(
-                        "{}=server — the worker's event-log mirror is disarmed; the server's \
+        let ehdb_eventlog_hook = Arc::new(match mirror_source {
+            crate::ehdb::mirror_source::MirrorSource::Server => {
+                tracing::info!(
+                    "{}=server — the worker's event-log mirror is disarmed; the server's \
                          write chokepoint mirrors the full authoritative set (noetl/ai-meta#258)",
-                        crate::ehdb::mirror_source::MIRROR_SOURCE_ENV
-                    );
-                    None
-                }
-                crate::ehdb::mirror_source::MirrorSource::Worker => {
-                    crate::ehdb::eventlog::runtime_hook_env(&process_env)
-                }
-            },
-        );
+                    crate::ehdb::mirror_source::MIRROR_SOURCE_ENV
+                );
+                None
+            }
+            crate::ehdb::mirror_source::MirrorSource::Worker => {
+                crate::ehdb::eventlog::runtime_hook_env(&process_env)
+            }
+        });
         // Object-tier live-put hook (noetl/ehdb#234): `Some` only for a
         // data-plane role running `NOETL_EHDB_OBJECT=shadow` with EHDB enabled,
         // so `object_put` does zero work unless the shadow tier is armed.
@@ -532,11 +530,13 @@ impl ControlPlaneClient {
                 .json::<serde_json::Value>()
                 .await
                 .ok()
-                .and_then(|v| v.get("event_id").and_then(|id| match id {
-                    serde_json::Value::Number(n) => n.as_i64(),
-                    serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
-                    _ => None,
-                }))
+                .and_then(|v| {
+                    v.get("event_id").and_then(|id| match id {
+                        serde_json::Value::Number(n) => n.as_i64(),
+                        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+                        _ => None,
+                    })
+                })
         } else {
             None
         };
@@ -563,25 +563,25 @@ impl ControlPlaneClient {
                 // two stores the server's comparator may read would disagree
                 // about the record's identity (noetl/ai-meta#258).
                 let payload = mirrored.payload;
-                    // ai-meta#257 — GAP 2.  Option 2 says "the append IS the probe", but
-                    // nothing on the append path ever called the client: the only writers
-                    // of the verdict were the startup probe and the HTTP query handler.
-                    // A service that died AFTER startup would therefore never demote, and
-                    // the tier would keep claiming to serve from a dead store — arm D, one
-                    // restart later.
-                    //
-                    // Best-effort and isolated, exactly like the mirror above: the durable
-                    // append records a reachability verdict and its result is discarded.
-                    // The authoritative event path is never affected, and a failure
-                    // demotes rather than erroring the caller.  The cached negative keeps
-                    // an outage to one slow request instead of one per event.
-                    if let Some(client) = crate::ehdb::tier_client::TierClient::from_env() {
-                        if !crate::ehdb::reachability::is_cached_down() {
-                            let _ = client
-                                .append(&event.execution_id.to_string(), &payload)
-                                .await;
-                        }
+                // ai-meta#257 — GAP 2.  Option 2 says "the append IS the probe", but
+                // nothing on the append path ever called the client: the only writers
+                // of the verdict were the startup probe and the HTTP query handler.
+                // A service that died AFTER startup would therefore never demote, and
+                // the tier would keep claiming to serve from a dead store — arm D, one
+                // restart later.
+                //
+                // Best-effort and isolated, exactly like the mirror above: the durable
+                // append records a reachability verdict and its result is discarded.
+                // The authoritative event path is never affected, and a failure
+                // demotes rather than erroring the caller.  The cached negative keeps
+                // an outage to one slow request instead of one per event.
+                if let Some(client) = crate::ehdb::tier_client::TierClient::from_env() {
+                    if !crate::ehdb::reachability::is_cached_down() {
+                        let _ = client
+                            .append(&event.execution_id.to_string(), &payload)
+                            .await;
                     }
+                }
             }
         }
 

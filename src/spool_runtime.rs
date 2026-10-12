@@ -738,8 +738,8 @@ impl SpoolRuntime {
             // the object hook in `client/control_plane.rs` for why both: the
             // line above writes to the pod-local reference driver, which does
             // not survive a pod roll.
-            let _ = crate::ehdb::tier_shadow::mirror_kv(CIRCUIT_KV_BUCKET, &self.kv_key, &value)
-                .await;
+            let _ =
+                crate::ehdb::tier_shadow::mirror_kv(CIRCUIT_KV_BUCKET, &self.kv_key, &value).await;
         }
     }
 

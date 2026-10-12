@@ -2041,7 +2041,13 @@ mod tests {
 
     #[test]
     fn projection_primary_serves_when_all_three_conditions_hold() {
-        let s = serve_service_append_with(&serve_env("primary"), Ok(&ack_body(7, Some(7))), 6, 0.001, true);
+        let s = serve_service_append_with(
+            &serve_env("primary"),
+            Ok(&ack_body(7, Some(7))),
+            6,
+            0.001,
+            true,
+        );
         assert_eq!(s.outcome, ProjectionOutcome::ServedPrimary);
         assert!(s.decision.served_by_ehdb());
         assert!(!s.decision.degraded());
@@ -2056,12 +2062,19 @@ mod tests {
     fn projection_primary_without_a_reachable_service_does_not_claim_to_serve() {
         // The failure #257 exists to prevent, inherited unchanged: claiming
         // authority while answering from a pod-local fragment.
-        let s = serve_service_append_with(&serve_env("primary"), Ok(&ack_body(7, Some(7))), 6, 0.001, false);
+        let s = serve_service_append_with(
+            &serve_env("primary"),
+            Ok(&ack_body(7, Some(7))),
+            6,
+            0.001,
+            false,
+        );
         assert_eq!(s.outcome, ProjectionOutcome::PrimaryUnavailable);
         assert!(!s.decision.served_by_ehdb());
         assert!(s.decision.degraded());
         assert!(
-            s.detail.is_some_and(|d| d.contains("nothing authoritative to serve from")),
+            s.detail
+                .is_some_and(|d| d.contains("nothing authoritative to serve from")),
             "a demote must say why"
         );
     }
@@ -2069,9 +2082,18 @@ mod tests {
     #[test]
     fn projection_divergence_demotes_rather_than_failing_the_caller() {
         // count != sequence ⇒ the store lost or duplicated a record.
-        let s = serve_service_append_with(&serve_env("primary"), Ok(&ack_body(7, Some(3))), 6, 0.001, true);
+        let s = serve_service_append_with(
+            &serve_env("primary"),
+            Ok(&ack_body(7, Some(3))),
+            6,
+            0.001,
+            true,
+        );
         assert_eq!(s.outcome, ProjectionOutcome::PrimaryDivergence);
-        assert!(!s.decision.served_by_ehdb(), "a diverged tier must not serve");
+        assert!(
+            !s.decision.served_by_ehdb(),
+            "a diverged tier must not serve"
+        );
         assert!(s.decision.degraded());
         // The record DID land — the caller is not failed, the tier loses its
         // authority. That is the whole safety property.
@@ -2080,10 +2102,19 @@ mod tests {
 
     #[test]
     fn projection_shadow_materializes_and_never_serves() {
-        let s = serve_service_append_with(&serve_env("shadow"), Ok(&ack_body(7, Some(7))), 6, 0.001, true);
+        let s = serve_service_append_with(
+            &serve_env("shadow"),
+            Ok(&ack_body(7, Some(7))),
+            6,
+            0.001,
+            true,
+        );
         assert_eq!(s.outcome, ProjectionOutcome::Materialized);
         assert!(!s.decision.served_by_ehdb());
-        assert!(!s.decision.degraded(), "shadow is the normal state, not a degradation");
+        assert!(
+            !s.decision.degraded(),
+            "shadow is the normal state, not a degradation"
+        );
     }
 
     #[test]
@@ -2107,19 +2138,37 @@ mod tests {
         // The direction to be wrong in: a transport failure must show up as a
         // degraded outcome, not as the serve signal simply ceasing — an absent
         // series and a demoted one are the same bytes to a dashboard.
-        let s = serve_service_append_with(&serve_env("primary"), Err("connect refused"), 0, 0.05, false);
+        let s = serve_service_append_with(
+            &serve_env("primary"),
+            Err("connect refused"),
+            0,
+            0.05,
+            false,
+        );
         assert_eq!(s.outcome, ProjectionOutcome::Unavailable);
         assert!(s.outcome.degraded());
-        assert_eq!(s.sequence, None, "nothing landed, so no sequence may be claimed");
+        assert_eq!(
+            s.sequence, None,
+            "nothing landed, so no sequence may be claimed"
+        );
     }
 
     #[test]
     fn a_refused_record_is_not_a_degraded_tier() {
         // One poisoned payload must not be able to disable authoritative
         // serving for the whole tier.
-        let s = serve_service_append_with(&serve_env("primary"), Ok("invalid payload is empty"), 0, 0.0, true);
+        let s = serve_service_append_with(
+            &serve_env("primary"),
+            Ok("invalid payload is empty"),
+            0,
+            0.0,
+            true,
+        );
         assert_eq!(s.outcome, ProjectionOutcome::Rejected);
-        assert!(!s.outcome.degraded(), "a caller mistake is not a store failure");
+        assert!(
+            !s.outcome.degraded(),
+            "a caller mistake is not a store failure"
+        );
     }
 
     #[test]
@@ -2165,7 +2214,8 @@ mod tests {
             serve_service_append_with(&serve_env("primary"), Ok(&body_bad), 4, 0.0, true).outcome,
             serve_service_append_with(&serve_env("shadow"), Ok(&body_ok), 4, 0.0, true).outcome,
             serve_service_append_with(&serve_env("shadow"), Ok(&body_bad), 4, 0.0, true).outcome,
-            serve_service_append_with(&serve_env("primary"), Ok("invalid nope"), 0, 0.0, true).outcome,
+            serve_service_append_with(&serve_env("primary"), Ok("invalid nope"), 0, 0.0, true)
+                .outcome,
             serve_service_append_with(&serve_env("primary"), Err("gone"), 0, 0.0, false).outcome,
         ];
         // Positive control: the drive must actually reach the serving outcome,
@@ -2225,7 +2275,11 @@ mod tests {
         // A demote after a promote must still log. The transition state is
         // process-global, so the assertion is on the state it exposes.
         reset_serve_state();
-        assert_eq!(current_serve_state(), "unknown", "no decision yet is its own answer");
+        assert_eq!(
+            current_serve_state(),
+            "unknown",
+            "no decision yet is its own answer"
+        );
         let body = ack_body(5, Some(5));
         serve_service_append_with(&serve_env("primary"), Ok(&body), 4, 0.0, true);
         assert_eq!(current_serve_state(), "served_primary");

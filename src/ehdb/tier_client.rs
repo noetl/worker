@@ -785,7 +785,9 @@ mod tests {
     /// (`frame of 1174874 bytes exceeds the 1048576-byte cap`).
     #[tokio::test]
     async fn the_client_reads_back_a_reply_larger_than_the_request_cap() {
-        use super::super::tier_service::{read_frame, write_frame, MAX_FRAME_BYTES, MAX_REPLY_BYTES};
+        use super::super::tier_service::{
+            read_frame, write_frame, MAX_FRAME_BYTES, MAX_REPLY_BYTES,
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -815,7 +817,6 @@ mod tests {
             );
         assert_eq!(reply.len(), big);
     }
-
 
     /// END-TO-END, the PR-3 property: a record appended THROUGH THE CLIENT, over
     /// the real wire format, to a REAL listener backed by a REAL store, comes
