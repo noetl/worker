@@ -215,7 +215,54 @@ fn classify(err: &EhdbError) -> usize {
     }
 }
 
+impl ElectionState {
+    /// The token this writer last held. `0` means none was ever issued.
+    ///
+    /// ⚠ Not a licence to act on it — see [`ElectionState::token_valid`].
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+}
+
 static STATE: OnceLock<Arc<ElectionState>> = OnceLock::new();
+
+/// The epoch to hand the fencing decorator, or `0` for "no token".
+///
+/// ⚠⚠ **This function is the whole of C3's precondition.** Before it existed,
+/// `FencedSharedBackend::set_epoch` had exactly one definition and zero
+/// non-test callers, so `guard()` compared a hard `0` against the ledger. That
+/// has two failure modes and no success mode:
+///
+/// * with an empty ledger, `0` is never stale **and never advances the marker**,
+///   so `highest` stays 0 forever and nothing can ever be refused — an
+///   enforcing fence that cannot fire, reporting `writes_checked` climbing and
+///   `stale_observed 0`, which is exactly the reading an operator would accept
+///   as proof it works;
+/// * with any marker above 0, every write is stale and enforce refuses all of
+///   them.
+///
+/// ⭐ `ehdb_fencing_epoch_advances_total` is the series that tells those apart
+/// from a healthy fence. A C3 gate must require it to be non-zero.
+///
+/// ⚠ Reads [`ElectionState::token_valid`], **not** `holds_lease`. A writer
+/// partitioned from the API server still *believes* it holds the lease; what it
+/// has lost is the ability to defend that belief, and the lease it cannot renew
+/// is one another node is entitled to take. Handing the fence a token we can no
+/// longer defend is the split-brain this exists to prevent, so contact older
+/// than the lease duration degrades to `0` — which, once any real epoch has
+/// been minted, is refused under enforce.
+pub fn fence_epoch() -> u64 {
+    fence_epoch_from(state().map(|s| &**s), now_millis())
+}
+
+/// The decision, with the state and clock injected so it is testable without
+/// `STATE.set`, which would leak into every other test in the binary.
+pub fn fence_epoch_from(st: Option<&ElectionState>, now: u64) -> u64 {
+    match st {
+        Some(s) if s.token_valid(now) => s.epoch(),
+        _ => 0,
+    }
+}
 
 /// The live state, or `None` when no election is running in this process.
 pub fn state() -> Option<&'static Arc<ElectionState>> {
@@ -811,5 +858,74 @@ mod tests {
         let stale = render_from(Some(&st), 100_000 + LEASE * 1000 + 1);
         assert!(stale.contains("ehdb_election_holds_lease 1\n"), "{stale}");
         assert!(stale.contains("ehdb_election_token_valid 0\n"), "{stale}");
+    }
+
+    #[test]
+    fn fence_epoch_is_zero_without_an_election() {
+        // The flag-off case: no election, so no token, so nothing for the fence
+        // to accept. 0 is inert against an empty ledger and refused under
+        // enforce once any real epoch exists.
+        assert_eq!(fence_epoch_from(None, 1_000), 0);
+        // And through the real accessor, since no election runs in tests.
+        assert_eq!(fence_epoch(), 0);
+    }
+
+    #[test]
+    fn fence_epoch_follows_token_valid_not_holds_lease() {
+        let st = ElectionState::default();
+        st.lease_duration_secs.store(LEASE, Ordering::Relaxed);
+        st.holds.store(true, Ordering::Relaxed);
+        st.epoch.store(9, Ordering::Relaxed);
+
+        // Holder, but never contacted: no defensible token.
+        assert_eq!(fence_epoch_from(Some(&st), 1_000), 0);
+
+        st.note_contact(100_000);
+        assert_eq!(fence_epoch_from(Some(&st), 100_000), 9);
+        assert_eq!(fence_epoch_from(Some(&st), 100_000 + LEASE * 1000 - 1), 9);
+
+        // ⚠⚠ Contact older than the lease could survive: `holds_lease` is still
+        // 1 and the fence must NOT be told 9. A partitioned writer handing the
+        // fence a token it can no longer defend is the split-brain the epoch
+        // exists to catch.
+        assert_eq!(fence_epoch_from(Some(&st), 100_000 + LEASE * 1000), 0);
+        assert!(st.holds.load(Ordering::Relaxed), "holds_lease is still set");
+        assert_eq!(st.epoch(), 9, "and the epoch is still readable");
+    }
+
+    #[test]
+    fn the_fence_is_actually_told_the_epoch() {
+        // ⚠⚠ The guard for C3's precondition. `set_epoch` previously had ZERO
+        // non-test callers while the fencing decorator was constructed and
+        // reporting — so enforce would have been a fence that could not fire.
+        // Counts CODE, not prose; the needle is split so this cannot match its
+        // own source.
+        let needle = concat!("set_", "epoch");
+        let src = include_str!("eventlog_backend.rs");
+        assert!(
+            src.len() > 1000,
+            "eventlog_backend.rs read as {} bytes — the check would be vacuous",
+            src.len()
+        );
+        let code: Vec<&str> = src
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("")
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//") && !l.starts_with('*'))
+            .collect();
+        assert!(
+            !code.is_empty(),
+            "the non-test slice came out empty — a check computed from zero bytes"
+        );
+        assert!(
+            code.iter().any(|l| l.contains(needle)),
+            "nothing hands the fencing decorator an epoch, so guard() compares 0 \
+             against the ledger: with an empty ledger it can never refuse (0 \
+             never advances the marker) and with any marker it refuses \
+             everything. ehdb_fencing_epoch_advances_total is the series that \
+             tells an inert fence from a working one."
+        );
     }
 }

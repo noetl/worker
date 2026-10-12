@@ -517,11 +517,23 @@ pub fn build_durable_stack(
             let fenced = ehdb_fencing::FencedSharedBackend::new(plain, ledger)
                 .with_mode(mode)
                 .with_metrics(Arc::clone(&FENCING_METRICS));
-            // ⚠ No election yet (noetl/ehdb#331), so this writer holds no token
-            // and its epoch stays 0. Shadow therefore observes nothing —
-            // deliberately: the point of wiring it now is that `writes_checked`
-            // starts climbing, which is what makes a later zero on
-            // `stale_observed` mean anything at all.
+            // ⚠⚠ Hand the fence this writer's fencing token. Until this line
+            // existed, `set_epoch` had ZERO non-test callers, so `guard()`
+            // compared a hard-coded 0 against the ledger: with an empty ledger
+            // nothing could ever be stale (0 never advances the marker, so
+            // `highest` stays 0) and enforce was a fence that could not fire
+            // while reporting `writes_checked` climbing and `stale_observed 0`.
+            // The comment this replaces said "no election yet" and was correct
+            // when written; `crate::ehdb::election` is now that election.
+            //
+            // ⚠ The stack is rebuilt per operation (see FENCING_METRICS), so the
+            // token is re-read on every op rather than captured once — which is
+            // what makes a lease LOST between operations take effect.
+            //
+            // `fence_epoch()` yields 0 when no election runs or the token can no
+            // longer be defended; 0 is refused under enforce once any real epoch
+            // has been minted, and is inert while the ledger is empty.
+            fenced.set_epoch(crate::ehdb::election::fence_epoch());
             Arc::new(fenced)
         }
     };
