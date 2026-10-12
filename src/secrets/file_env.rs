@@ -285,7 +285,8 @@ mod tests {
         let bad = "async fn main() {\n let c = WorkerConfig::from_env();\n file_env::hydrate();\n}";
         let body = &bad[bad.find("async fn main").unwrap()..];
         assert!(
-            body.find("file_env::hydrate()").unwrap() > body.find("WorkerConfig::from_env").unwrap(),
+            body.find("file_env::hydrate()").unwrap()
+                > body.find("WorkerConfig::from_env").unwrap(),
             "fixture must represent the WRONG order"
         );
     }

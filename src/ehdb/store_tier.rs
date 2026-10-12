@@ -244,7 +244,10 @@ mod tests {
     fn absent_tier_is_the_event_log() {
         // The rolling-upgrade property: a pre-#265 frame carries no tier.
         assert_eq!(StoreTier::parse_or_default(None), Ok(StoreTier::EventLog));
-        assert_eq!(StoreTier::parse_or_default(Some("")), Ok(StoreTier::EventLog));
+        assert_eq!(
+            StoreTier::parse_or_default(Some("")),
+            Ok(StoreTier::EventLog)
+        );
         assert_eq!(
             StoreTier::parse_or_default(Some("   ")),
             Ok(StoreTier::EventLog)
@@ -257,7 +260,10 @@ mod tests {
         // treating `projction` as `eventlog` would append projection records
         // into the log that is primary in prod.
         let err = StoreTier::parse_or_default(Some("projction")).unwrap_err();
-        assert!(err.contains("projction"), "the error must name the value: {err}");
+        assert!(
+            err.contains("projction"),
+            "the error must name the value: {err}"
+        );
         assert!(
             err.contains("eventlog") && err.contains("projection"),
             "the error must name what IS accepted: {err}"
@@ -393,7 +399,9 @@ mod tests {
         }
         // Positive control, so this is membership-checking rather than reading
         // an empty list.
-        assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::EventLog.as_str()));
+        assert!(
+            super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::EventLog.as_str())
+        );
     }
 
     /// A refused KV/object append must not be reported as `appended` — the same
@@ -425,8 +433,11 @@ mod tests {
         );
         // The positive control: the two that ARE wired still are, so this test
         // is checking membership rather than an empty list.
-        assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::EventLog.as_str()));
-        assert!(super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::Projection.as_str()));
+        assert!(
+            super::super::primary_serve::SERVE_WIRED_TIERS.contains(&StoreTier::EventLog.as_str())
+        );
+        assert!(super::super::primary_serve::SERVE_WIRED_TIERS
+            .contains(&StoreTier::Projection.as_str()));
     }
 
     /// Every tier reads its OWN mirror-source variable.

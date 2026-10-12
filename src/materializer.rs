@@ -1214,14 +1214,7 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
         let (url, seen) = stub_dead_letter("all").await;
         let poison = vec![(event(4001, 0), FK_500.to_string())];
         assert!(
-            park_dead_lettered(
-                &test_http(),
-                &url,
-                "tok",
-                &poison,
-                "test-consumer"
-            )
-            .await,
+            park_dead_lettered(&test_http(), &url, "tok", &poison, "test-consumer").await,
             "a fully confirmed park must permit the ack"
         );
         let rows = seen.lock().unwrap().clone();
@@ -1285,14 +1278,7 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
     #[tokio::test]
     async fn an_empty_park_is_permitted() {
         assert!(
-            park_dead_lettered(
-                &test_http(),
-                "http://127.0.0.1:1/unused",
-                "tok",
-                &[],
-                "t"
-            )
-            .await,
+            park_dead_lettered(&test_http(), "http://127.0.0.1:1/unused", "tok", &[], "t").await,
             "no poison means there is nothing to confirm"
         );
     }
@@ -1320,14 +1306,8 @@ or update on table \"event_2026_q3\" violates foreign key constraint \"event_cat
 
         std::env::set_var(FLAG, "true");
         // Enter salvage on a permanent first error, then hit a transient one.
-        let out = salvage_rejected_batch(
-            &test_http(),
-            &url,
-            "tok",
-            &[event(2001, 0)],
-            FK_500,
-        )
-        .await;
+        let out =
+            salvage_rejected_batch(&test_http(), &url, "tok", &[event(2001, 0)], FK_500).await;
         std::env::remove_var(FLAG);
 
         assert!(
@@ -1440,7 +1420,8 @@ mod t3_source_tests {
 
         // The NATS adapter path wraps the payload in a PolledMessage; the EHDB
         // adapter passes the payload directly.  Both must land on one envelope.
-        let (from_payload, skipped_p) = build_envelopes_from_payloads(std::slice::from_ref(&payload));
+        let (from_payload, skipped_p) =
+            build_envelopes_from_payloads(std::slice::from_ref(&payload));
         assert_eq!(skipped_p, 0);
 
         // Same input, expressed as the string form NATS sometimes carries.

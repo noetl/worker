@@ -465,7 +465,10 @@ pub(crate) async fn encode_response_observed(req: &TierRequest) -> (Vec<u8>, Obs
 /// treated as "no more work".
 /// Shared with the client (`tier_client`) so both ends use ONE codec.  Two
 /// implementations of the same wire format is how a protocol drifts.
-pub(crate) async fn read_frame(stream: &mut TcpStream, cap: u32) -> std::io::Result<Option<Vec<u8>>> {
+pub(crate) async fn read_frame(
+    stream: &mut TcpStream,
+    cap: u32,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -492,8 +495,7 @@ pub(crate) async fn write_reply_frame(
     stream: &mut TcpStream,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    write_frame_capped(stream, payload, MAX_REPLY_BYTES, "reply")
-        .await
+    write_frame_capped(stream, payload, MAX_REPLY_BYTES, "reply").await
 }
 
 /// Write one length-framed **request** (client → service), bounded by
@@ -524,8 +526,7 @@ pub(crate) async fn write_request_frame(
     stream: &mut TcpStream,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    write_frame_capped(stream, payload, MAX_FRAME_BYTES, "request")
-        .await
+    write_frame_capped(stream, payload, MAX_FRAME_BYTES, "request").await
 }
 
 async fn write_frame_capped(
@@ -692,7 +693,6 @@ pub const TIER_MAX_WAITERS_MULTIPLE: usize = 8;
 /// times out at 2s, so a request that has not started work within 1s is better
 /// answered than left to expire silently.
 pub const TIER_SHED_AFTER_MS_DEFAULT: u64 = 1_000;
-
 
 /// Default concurrent tier requests.
 ///
@@ -863,11 +863,7 @@ pub async fn serve_tier(listener: TcpListener) {
 /// drive a limit of 1 without `set_var`. `cargo test` does not serialise tests,
 /// and a leaked env var has already cost this module a silent cross-test
 /// failure once.
-pub async fn serve_tier_with(
-    listener: TcpListener,
-    limit: usize,
-    shed_after: std::time::Duration,
-) {
+pub async fn serve_tier_with(listener: TcpListener, limit: usize, shed_after: std::time::Duration) {
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
     let waiters = std::sync::Arc::new(tokio::sync::Semaphore::new(
         limit.saturating_mul(TIER_MAX_WAITERS_MULTIPLE),
@@ -1076,15 +1072,30 @@ mod reconnect_burst_tests {
     /// the whole point.
     #[test]
     fn an_unusable_cap_falls_back_to_the_default_rather_than_unbounded() {
-        for raw in [Some(""), Some("0"), Some("abc"), Some("-1"), Some("1.5"), None] {
+        for raw in [
+            Some(""),
+            Some("0"),
+            Some("abc"),
+            Some("-1"),
+            Some("1.5"),
+            None,
+        ] {
             assert_eq!(
                 parse_max_inflight(raw),
                 TIER_MAX_INFLIGHT_DEFAULT,
                 "{raw:?} must fall back to the default cap, never widen the bound"
             );
         }
-        assert_eq!(parse_max_inflight(Some("8")), 8, "a usable override must be honoured");
-        assert_eq!(parse_max_inflight(Some(" 8 ")), 8, "whitespace must not defeat the override");
+        assert_eq!(
+            parse_max_inflight(Some("8")),
+            8,
+            "a usable override must be honoured"
+        );
+        assert_eq!(
+            parse_max_inflight(Some(" 8 ")),
+            8,
+            "whitespace must not defeat the override"
+        );
         const {
             assert!(
                 TIER_MAX_INFLIGHT_DEFAULT > 0,
@@ -1228,8 +1239,13 @@ mod reconnect_burst_tests {
     #[test]
     fn the_inflight_bound_reserves_runtime_headroom() {
         let cap = runtime_headroom_cap();
-        let par = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        assert!(cap >= 1, "the cap must never be zero — that would wedge the service");
+        let par = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert!(
+            cap >= 1,
+            "the cap must never be zero — that would wedge the service"
+        );
         assert!(
             cap < par || par == 1,
             "cap {cap} leaves no headroom against {par} available; a tier op could \
@@ -1273,9 +1289,9 @@ mod reconnect_burst_tests {
         let accept = body
             .find("listener.accept()")
             .expect("no accept in serve_tier");
-        let acquire = body
-            .find("permits.acquire_owned()")
-            .expect("serve_tier must still acquire a work permit — the memory bound is not optional");
+        let acquire = body.find("permits.acquire_owned()").expect(
+            "serve_tier must still acquire a work permit — the memory bound is not optional",
+        );
         assert!(
             accept < acquire,
             "serve_tier acquires its permit BEFORE accept. That is the regression: \
@@ -1403,7 +1419,10 @@ mod tests {
 
         let mut c = TcpStream::connect(addr).await.unwrap();
         write_frame(&mut c, b"health").await.unwrap();
-        let reply = read_frame(&mut c, MAX_REPLY_BYTES).await.unwrap().expect("a reply frame");
+        let reply = read_frame(&mut c, MAX_REPLY_BYTES)
+            .await
+            .unwrap()
+            .expect("a reply frame");
         let reply = String::from_utf8(reply).unwrap();
         assert!(reply.starts_with("ok tier-service v"), "got {reply}");
     }
@@ -1459,12 +1478,16 @@ mod tests {
 
         let mut c = TcpStream::connect(addr).await.unwrap();
         write_frame(&mut c, b"health").await.unwrap();
-        let _ = read_frame(&mut c, MAX_REPLY_BYTES).await.unwrap().expect("a reply frame");
+        let _ = read_frame(&mut c, MAX_REPLY_BYTES)
+            .await
+            .unwrap()
+            .expect("a reply frame");
 
         let text = metrics::render_lines().join("\n");
         // What this test performed must be counted AT LEAST once. See
         // `series_present` for why these are not exact-value assertions.
-        let health = "noetl_ehdb_dataplane_ops_total{operation=\"tier_service.health\",outcome=\"ok\"}";
+        let health =
+            "noetl_ehdb_dataplane_ops_total{operation=\"tier_service.health\",outcome=\"ok\"}";
         assert!(
             series_value(&text, health).unwrap_or(0) >= 1,
             "health must be counted:\n{text}"
@@ -1912,7 +1935,9 @@ mod tests {
         // than the property is worth.
         let src = include_str!("tier_service.rs");
         let code = src.split("\n#[cfg(test)]").next().unwrap_or(src);
-        let start = code.find("async fn serve_conn").expect("serve_conn not found");
+        let start = code
+            .find("async fn serve_conn")
+            .expect("serve_conn not found");
         let body = &code[start..];
         let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
         let body: String = body[..end]

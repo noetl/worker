@@ -1047,7 +1047,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "ehdb-torn-merge-{}-{:?}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1116,7 +1118,11 @@ mod tests {
              the ownership model changed and this test now under-covers it"
         );
         let owned = crate::ehdb::eventlog_backend::owned_shards(&e);
-        assert_eq!(owned.len(), 1, "owned_shards disagrees with the dirs on disk");
+        assert_eq!(
+            owned.len(),
+            1,
+            "owned_shards disagrees with the dirs on disk"
+        );
 
         // POSITIVE CONTROL first: intact, the count must be 0. Without this a
         // broken scan that always reports 0 would pass the assertion below by
@@ -1138,7 +1144,10 @@ mod tests {
         let victim = segs.last().expect("shard 0 has a segment").clone();
         let len = std::fs::metadata(&victim).unwrap().len();
         assert!(len > 8, "segment too small to tear meaningfully");
-        let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&victim)
+            .unwrap();
         f.set_len(len - 3).unwrap(); // mid-frame: a partial record, not a clean boundary
         drop(f);
 

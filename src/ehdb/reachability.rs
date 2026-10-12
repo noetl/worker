@@ -228,7 +228,10 @@ mod tests {
         // --- a transport failure demotes, and caches the negative ---
         record(OpVerdict::Unreachable);
         assert!(!is_reachable(), "an unreachable op must demote");
-        assert!(is_cached_down(), "the negative must be cached to skip repeat timeouts");
+        assert!(
+            is_cached_down(),
+            "the negative must be cached to skip repeat timeouts"
+        );
 
         // --- a success self-heals immediately ---
         record(OpVerdict::Reached);
@@ -306,7 +309,10 @@ mod tests {
 
         // Only the successful retry re-promotes.
         record(OpVerdict::Reached);
-        assert!(is_reachable(), "a real success re-promotes, with no operator action");
+        assert!(
+            is_reachable(),
+            "a real success re-promotes, with no operator action"
+        );
     }
 
     #[test]

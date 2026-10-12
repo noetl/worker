@@ -375,7 +375,13 @@ pub fn record_runtime_hook(tier: &str, outcome: &str) {
 /// `operation="tier_client.<op>"` label rather than a new family, so it renders
 /// through the same path and adds no registry surface.  Absent entirely until
 /// the client is configured, which is the inertness property PR 2 asserts.
-pub fn record_tier_client(op: &str, outcome: &str, ok: bool, degraded: bool, duration_seconds: f64) {
+pub fn record_tier_client(
+    op: &str,
+    outcome: &str,
+    ok: bool,
+    degraded: bool,
+    duration_seconds: f64,
+) {
     record_dataplane(
         &format!("tier_client.{op}"),
         outcome,
@@ -522,7 +528,8 @@ pub fn pin_tier_service_series(samples: &[(StoreTier, u64, u64)]) {
         s.tier_service_store_bytes.entry(tier.as_str()).or_insert(0);
     }
     for (tier, store_bytes, sequence) in samples {
-        s.tier_service_store_bytes.insert(tier.as_str(), *store_bytes);
+        s.tier_service_store_bytes
+            .insert(tier.as_str(), *store_bytes);
         s.tier_service_sequence.insert(tier.as_str(), *sequence);
     }
     for (op, outcome) in TIER_SERVICE_SERIES {
@@ -648,7 +655,8 @@ pub fn record_tier_service_append(tier: StoreTier, sequence: u64, store_bytes: u
     // reordered or concurrent append.
     let cur = s.tier_service_sequence.entry(tier.as_str()).or_insert(0);
     *cur = (*cur).max(sequence);
-    s.tier_service_store_bytes.insert(tier.as_str(), store_bytes);
+    s.tier_service_store_bytes
+        .insert(tier.as_str(), store_bytes);
 }
 
 /// Record how many records one tier-append request took through each path.
@@ -1269,8 +1277,14 @@ mod tests {
         reset();
         pin_tier_append_series();
         let text = render_lines().join("\n");
-        assert!(text.contains("noetl_ehdb_tier_append_records_total{path=\"batch\"} 0"), "{text}");
-        assert!(text.contains("noetl_ehdb_tier_append_records_total{path=\"single\"} 0"), "{text}");
+        assert!(
+            text.contains("noetl_ehdb_tier_append_records_total{path=\"batch\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("noetl_ehdb_tier_append_records_total{path=\"single\"} 0"),
+            "{text}"
+        );
     }
 
     /// The tests below drive the same process-global accumulator: they
@@ -1387,7 +1401,10 @@ mod tests {
             let want = format!(
                 "noetl_ehdb_dataplane_ops_total{{operation=\"tier_service.{op}\",outcome=\"{outcome}\"}} 0"
             );
-            assert!(text.contains(&want), "missing pinned series: {want}\n{text}");
+            assert!(
+                text.contains(&want),
+                "missing pinned series: {want}\n{text}"
+            );
         }
         for op in TIER_SERVICE_OPS {
             let want =
@@ -1514,8 +1531,9 @@ mod tests {
         assert_eq!(bucket("0.05"), 2, "cumulative: now includes the 30ms one");
         assert_eq!(bucket("1"), 2, "the 5s observation is above every bound");
         assert_eq!(bucket("+Inf"), 3, "+Inf must equal the total count");
-        assert!(text
-            .contains("noetl_ehdb_tier_service_duration_seconds_count{operation=\"scan\"} 3"));
+        assert!(
+            text.contains("noetl_ehdb_tier_service_duration_seconds_count{operation=\"scan\"} 3")
+        );
         reset();
     }
 
@@ -1535,12 +1553,30 @@ mod tests {
         record_tier_service_append(StoreTier::Projection, 2, 64);
         let text = render_lines().join("\n");
         for (needle, why) in [
-            (r#"noetl_ehdb_tier_service_store_appends_total{tier="eventlog"} 3"#, "event-log appends"),
-            (r#"noetl_ehdb_tier_service_store_sequence{tier="eventlog"} 9"#, "event-log tip, not rewound"),
-            (r#"noetl_ehdb_tier_service_store_bytes{tier="eventlog"} 950"#, "event-log size"),
-            (r#"noetl_ehdb_tier_service_store_appends_total{tier="projection"} 1"#, "projection appends"),
-            (r#"noetl_ehdb_tier_service_store_sequence{tier="projection"} 2"#, "projection tip"),
-            (r#"noetl_ehdb_tier_service_store_bytes{tier="projection"} 64"#, "projection size"),
+            (
+                r#"noetl_ehdb_tier_service_store_appends_total{tier="eventlog"} 3"#,
+                "event-log appends",
+            ),
+            (
+                r#"noetl_ehdb_tier_service_store_sequence{tier="eventlog"} 9"#,
+                "event-log tip, not rewound",
+            ),
+            (
+                r#"noetl_ehdb_tier_service_store_bytes{tier="eventlog"} 950"#,
+                "event-log size",
+            ),
+            (
+                r#"noetl_ehdb_tier_service_store_appends_total{tier="projection"} 1"#,
+                "projection appends",
+            ),
+            (
+                r#"noetl_ehdb_tier_service_store_sequence{tier="projection"} 2"#,
+                "projection tip",
+            ),
+            (
+                r#"noetl_ehdb_tier_service_store_bytes{tier="projection"} 64"#,
+                "projection size",
+            ),
         ] {
             assert!(text.contains(needle), "{why}: missing {needle} in\n{text}");
         }

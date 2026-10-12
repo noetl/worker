@@ -246,7 +246,9 @@ pub async fn spawn_writer_host(
         recovered_active_records = recovered_at_open,
         "EHDB command-bus engine opened (recovered_active_records>0 means an unsealed part was replayed after an unclean exit)"
     );
-    let writer = Arc::new(FeedWriter::new(engine));
+    let fence =
+        crate::ehdb::eventlog_backend::build_engine_fence(&dir, "command-bus", config.shard);
+    let writer = Arc::new(FeedWriter::new_fenced(engine, fence, config.shard));
     // noetl/ehdb#329 -- the timer that makes the age trigger reach an IDLE shard.
     // A no-op unless NOETL_EHDB_SEAL_MAX_AGE_MS is set: nothing is spawned at
     // all, so the engine lock is never taken on a schedule.
@@ -423,7 +425,9 @@ pub async fn spawn_writer_host(
                 // until the append finished. `try_lock` fails fast, which is
                 // what `ehdb_l0_durability_sample_ok 0` has always claimed to
                 // mean.
-                let e = engine.try_lock().ok()?;
+                // `try_read`, preserving the non-blocking contract above: a
+                // metrics handler must never park on the append lock.
+                let e = engine.try_read()?;
                 // Rendered under the lock: the gauges and the histogram must
                 // describe the same instant, or a shard could read "nothing
                 // pending" beside a latency sample for the record it just shed.

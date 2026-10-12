@@ -91,7 +91,10 @@ async fn start_service(dir: &std::path::Path) -> TierClient {
 
 fn tmp_dir(name: &str) -> std::path::PathBuf {
     let mut d = std::env::temp_dir();
-    d.push(format!("ehdb-tier-concurrency-{name}-{}", std::process::id()));
+    d.push(format!(
+        "ehdb-tier-concurrency-{name}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -196,7 +199,12 @@ async fn phase_concurrent_appends_produce_a_readable_log() {
         "{} of {TOTAL} concurrent appends failed — the store tore under \
          concurrency.  First few:\n{}",
         failures.len(),
-        failures.iter().take(5).cloned().collect::<Vec<_>>().join("\n")
+        failures
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 
     // (2) The whole log reads back.  A corrupt store answers `error ...` here.
@@ -267,7 +275,11 @@ async fn phase_concurrent_appends_produce_a_readable_log() {
             parsed["n"].as_u64().unwrap_or(u64::MAX),
         ));
     }
-    assert_eq!(seen.len(), TOTAL, "duplicate or mangled payloads round-tripped");
+    assert_eq!(
+        seen.len(),
+        TOTAL,
+        "duplicate or mangled payloads round-tripped"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -289,8 +301,12 @@ async fn phase_the_preserved_prod_artifact_is_refused() {
         return;
     };
     let src = std::path::Path::new(&src).join("eventlog.jsonl");
-    let corrupt = std::fs::read(&src)
-        .unwrap_or_else(|e| panic!("EHDB_TORN_FIXTURE is set but unreadable ({e}): {}", src.display()));
+    let corrupt = std::fs::read(&src).unwrap_or_else(|e| {
+        panic!(
+            "EHDB_TORN_FIXTURE is set but unreadable ({e}): {}",
+            src.display()
+        )
+    });
 
     // COPY it. The service writes into whatever directory it is pointed at, and
     // a preserved incident artifact must not be mutated by the thing examining it.
@@ -330,7 +346,9 @@ async fn phase_reads_never_observe_a_half_written_record() {
         let client = client.clone();
         tokio::spawn(async move {
             for n in 0..TOTAL {
-                let _ = client.append(&format!("exec-{n}"), &payload_for(0, n)).await;
+                let _ = client
+                    .append(&format!("exec-{n}"), &payload_for(0, n))
+                    .await;
             }
         })
     };
@@ -399,7 +417,11 @@ async fn phase_a_corrupt_store_is_refused_not_misread() {
     // prod reported.
     let path = dir.join("eventlog.jsonl");
     let text = std::fs::read_to_string(&path).expect("read seeded log");
-    let first = text.lines().next().expect("at least one record").to_string();
+    let first = text
+        .lines()
+        .next()
+        .expect("at least one record")
+        .to_string();
     let marker = "\"payload\":[";
     let array_at = first
         .find(marker)
@@ -410,7 +432,12 @@ async fn phase_a_corrupt_store_is_refused_not_misread() {
             .find(',')
             .expect("the payload array has more than one element")
         + 1;
-    let torn = format!("{}{}{}", &first[..at], r#"{"transaction_id":"#, &first[at..]);
+    let torn = format!(
+        "{}{}{}",
+        &first[..at],
+        r#"{"transaction_id":"#,
+        &first[at..]
+    );
     std::fs::write(&path, format!("{torn}\n{text}")).expect("write torn log");
 
     // The reader must refuse, with the message an operator can search for.
