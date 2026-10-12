@@ -38,6 +38,7 @@
 //! away", so neither write path retries — a 409 is returned to the caller as a
 //! lost race, which is what it is.
 
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use ehdb_reference::election::{LeaseRecord, LeaseStore};
@@ -94,6 +95,66 @@ impl KubeLeaseConfig {
             bearer_token,
             ca_pem,
         })
+    }
+}
+
+/// Local clock minus the API server's clock, in milliseconds.
+///
+/// ⚠⚠ **Recorded, never applied.** Nothing may use this to adjust lease
+/// arithmetic. A self-correcting clock would make two writers disagree about
+/// when a lease expires in a way neither could observe — which is the exact
+/// failure the fencing epoch exists to catch, reintroduced one layer down.
+static CLOCK_OFFSET_MILLIS: AtomicI64 = AtomicI64::new(0);
+/// ⭐ The discriminator. Without it, an offset of `0` would mean both "the
+/// clocks agree" and "no reading has ever been taken" — and the second is the
+/// reading an operator would act on wrongly.
+static CLOCK_OFFSET_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Parse an RFC 7231 HTTP-date to epoch millis.
+///
+/// Pure, so the parsing is tested without touching the process-global offset —
+/// a test that set it would make the renderer's output order-dependent.
+fn parse_http_date_millis(raw: &str) -> Option<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(raw) {
+        return Some(dt.timestamp_millis());
+    }
+    // ⚠ IMF-fixdate ends in a literal `GMT`, which strict RFC-2822 parsers
+    // reject as a zone. It is the form the Kubernetes API server actually
+    // sends, so it is not a fallback for exotic servers — it is the main case.
+    chrono::NaiveDateTime::parse_from_str(raw, "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()
+        .map(|n| n.and_utc().timestamp_millis())
+}
+
+/// Record `local_now − Date:` from a response.
+///
+/// ⚠ **Whole-second resolution.** RFC 7231 HTTP-date has no sub-second field, so
+/// this bounds skew to about ±1 s and cannot prove better. That is why the
+/// published failover window is `lease + renew + 1 s` rather than implying a
+/// precision this cannot support. A silent failure to parse leaves the gauge
+/// unobserved rather than recording a fabricated 0 — absence is the honest
+/// answer and `..._observed` says so.
+fn note_clock_offset(header: Option<&reqwest::header::HeaderValue>) {
+    let Some(raw) = header.and_then(|v| v.to_str().ok()) else {
+        return;
+    };
+    let Some(server_ms) = parse_http_date_millis(raw) else {
+        return;
+    };
+    let local_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    CLOCK_OFFSET_MILLIS.store(local_ms - server_ms, Ordering::Relaxed);
+    CLOCK_OFFSET_SEEN.store(true, Ordering::Relaxed);
+}
+
+/// The last measured offset, or `None` when no response has been parsed.
+pub fn clock_offset_millis() -> Option<i64> {
+    if CLOCK_OFFSET_SEEN.load(Ordering::Relaxed) {
+        Some(CLOCK_OFFSET_MILLIS.load(Ordering::Relaxed))
+    } else {
+        None
     }
 }
 
@@ -258,6 +319,12 @@ impl KubeLeaseStore {
                 .await
                 .map_err(|e| EhdbError::Storage(format!("k8s request failed: {e}")))?;
             let status = resp.status();
+            // ⭐ δ, free. Every renewal is already a round-trip to the API
+            // server, and its `Date` header is a reading of the SAME reference
+            // clock from every node — which is exactly the quantity the
+            // failover bound needs and the one thing about it that was never
+            // measured. It was being discarded.
+            note_clock_offset(resp.headers().get(reqwest::header::DATE));
             let text = resp
                 .text()
                 .await
@@ -374,5 +441,46 @@ impl LeaseStore for KubeLeaseStore {
             )));
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod clock_offset_tests {
+    use super::parse_http_date_millis;
+
+    #[test]
+    fn imf_fixdate_is_the_form_the_api_server_sends() {
+        // The canonical RFC 7231 example.
+        let ms = parse_http_date_millis("Sun, 06 Nov 1994 08:49:37 GMT")
+            .expect("IMF-fixdate must parse — this is what Kubernetes sends");
+        assert_eq!(ms, 784_111_777_000);
+    }
+
+    #[test]
+    fn an_rfc2822_numeric_zone_also_parses() {
+        let ms = parse_http_date_millis("Sun, 06 Nov 1994 08:49:37 +0000").unwrap();
+        assert_eq!(ms, 784_111_777_000);
+    }
+
+    #[test]
+    fn garbage_yields_none_rather_than_a_fabricated_zero() {
+        // ⚠⚠ The failure that matters. Returning 0 here would record an offset
+        // of `local_now - 0` — about 56 years — or, worse, a plausible-looking
+        // small number, and the gauge would be a fabrication rather than a
+        // measurement. None leaves it unobserved, which is the honest answer.
+        for bad in ["", "not a date", "Sun, 06 Nov 1994", "1994-11-06T08:49:37Z"] {
+            assert!(
+                parse_http_date_millis(bad).is_none(),
+                "{bad:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_is_whole_seconds_which_is_why_the_bound_adds_one() {
+        // Two dates one second apart are the finest distinction available.
+        let a = parse_http_date_millis("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        let b = parse_http_date_millis("Sun, 06 Nov 1994 08:49:38 GMT").unwrap();
+        assert_eq!(b - a, 1000, "HTTP-date carries no sub-second field");
     }
 }
