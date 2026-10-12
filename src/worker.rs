@@ -121,37 +121,28 @@ impl Worker {
         // writer), open the shard's command-log writer and spawn its ingest
         // (server publishes) + claim (replicas compete) + `/metrics` (lag) faces.
         let cmdbus = crate::command_bus::CommandBusConfig::from_env()?;
-        let mut writer_shutdowns = Vec::new();
-        if cmdbus.host && cmdbus.mode.hosts_relevant() {
-            let (_writer, shutdown) = crate::command_bus::spawn_writer_host(&cmdbus).await?;
-            writer_shutdowns.push(shutdown);
-        }
-
-        // noetl/ai-meta#212 L1 T3 — the events feed, the `noetl.events.>`
-        // fan-out's EHDB home. Independent of the command bus in every way that
-        // matters: its own flag, its own L0 engine + directory, its own ports.
-        // Events run roughly an order of magnitude hotter than commands, so
-        // sharing the command bus's engine would put that volume in front of
-        // command dispatch latency and re-open noetl/ai-meta#205.
-        // ai-meta#257 — GAP 1.  The reachability probe used to be spawned ONLY
-        // inside spawn_event_writer_host, which runs only where
-        // NOETL_EVENT_BUS_HOST is set — the writer.  On worker pods nothing ever
-        // contacted the tier service, so EVER_SUCCEEDED never flipped,
-        // is_reachable() was permanently false, and `primary` could never
-        // promote.  The PR-6 gate's arm B caught it.
-        //
-        // Spawned wherever a tier CLIENT is configured, which is where the
-        // verdict is read.  A strict no-op when unconfigured.
-        tokio::spawn(crate::ehdb::tier_client::probe_at_startup());
-
         let eventbus = crate::event_bus::EventBusConfig::from_env();
-        if eventbus.host {
-            let (_coordinator, shutdown) =
-                crate::event_bus::spawn_event_writer_host(&eventbus).await?;
-            writer_shutdowns.push(shutdown);
-        }
+        let mut writer_shutdowns = Vec::new();
 
         // noetl/ai-meta#460 C2 — the shard election's call site.
+        //
+        // ⚠⚠ Spawned HERE, before the writer hosts below, and the position is
+        // load-bearing. Measured on the prod writer while it sat after them, the
+        // election acquired its lease at **+332 s** after process start — the
+        // same lateness #355 fixed for `/metrics`, for the same reason: both sat
+        // behind two L0 engine opens.
+        //
+        // That is not merely a slow gauge. Under `NOETL_EHDB_FENCING=enforce`
+        // the fence would hold epoch 0 against a marker already at the live
+        // epoch for those 5.5 minutes, so EVERY durable mutation would be
+        // refused — on the one workload hosting both buses, i.e. fleet-wide
+        // dispatch. It turned a published ~21 s failover window
+        // (`lease + renew + 1`) into ~5.5 min of refused writes per restart, and
+        // it is why enforce was not armed.
+        //
+        // Both bus configs are pure env reads, so reading them up here costs
+        // nothing and lets the election start while the engines are still
+        // opening.
         //
         // Spawned only where this process HOSTS a writer, because the lease's
         // unit of mutual exclusion is the ordinal that owns the volumes, not a
@@ -176,6 +167,34 @@ impl Worker {
                 eventbus.shard
             };
             crate::ehdb::election::spawn(shard);
+        }
+
+        if cmdbus.host && cmdbus.mode.hosts_relevant() {
+            let (_writer, shutdown) = crate::command_bus::spawn_writer_host(&cmdbus).await?;
+            writer_shutdowns.push(shutdown);
+        }
+
+        // noetl/ai-meta#212 L1 T3 — the events feed, the `noetl.events.>`
+        // fan-out's EHDB home. Independent of the command bus in every way that
+        // matters: its own flag, its own L0 engine + directory, its own ports.
+        // Events run roughly an order of magnitude hotter than commands, so
+        // sharing the command bus's engine would put that volume in front of
+        // command dispatch latency and re-open noetl/ai-meta#205.
+        // ai-meta#257 — GAP 1.  The reachability probe used to be spawned ONLY
+        // inside spawn_event_writer_host, which runs only where
+        // NOETL_EVENT_BUS_HOST is set — the writer.  On worker pods nothing ever
+        // contacted the tier service, so EVER_SUCCEEDED never flipped,
+        // is_reachable() was permanently false, and `primary` could never
+        // promote.  The PR-6 gate's arm B caught it.
+        //
+        // Spawned wherever a tier CLIENT is configured, which is where the
+        // verdict is read.  A strict no-op when unconfigured.
+        tokio::spawn(crate::ehdb::tier_client::probe_at_startup());
+
+        if eventbus.host {
+            let (_coordinator, shutdown) =
+                crate::event_bus::spawn_event_writer_host(&eventbus).await?;
+            writer_shutdowns.push(shutdown);
         }
 
         // Select the command source by mode.  `ehdb` claims over the network from
@@ -1283,6 +1302,56 @@ mod startup_order_tests {
     ///
     /// Counts CODE positions, not prose, and refuses to run against a slice it
     /// could not find — a check computed from a failed search reads green.
+    /// ⚠⚠ The guard for the +332 s finding: the election must be spawned BEFORE
+    /// the writer hosts.
+    ///
+    /// Measured on prod with it after them, the election acquired at **+332 s**
+    /// after process start. Under enforce that is ~5.5 min of fleet-wide refused
+    /// dispatch per writer restart instead of the published ~21 s
+    /// `lease + renew + 1` window — a different availability trade than the one
+    /// that was approved, and the reason enforce was not armed.
+    ///
+    /// Like its sibling below, this regression is invisible at runtime: the
+    /// election still works, just late, and nothing fails.
+    #[test]
+    fn the_election_is_spawned_before_the_ehdb_writer_hosts() {
+        let src = include_str!("worker.rs");
+        let new_fn = src
+            .split("pub async fn new(config: WorkerConfig)")
+            .nth(1)
+            .expect("Worker::new not found — this guard would be vacuous");
+        let body: String = new_fn
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//") && !l.starts_with('*'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.len() > 500,
+            "the non-comment slice of Worker::new came out at {} bytes — \
+             a guard computed from an empty region reads green",
+            body.len()
+        );
+        let elect = body
+            .find(concat!("election::", "spawn"))
+            .expect("Worker::new no longer spawns the election at all");
+        for host in [
+            concat!("spawn_", "writer_host"),
+            concat!("spawn_event_", "writer_host"),
+        ] {
+            let at = body
+                .find(host)
+                .unwrap_or_else(|| panic!("{host} not found in Worker::new"));
+            assert!(
+                elect < at,
+                "the election is spawned AFTER {host}. The EHDB opens take minutes \
+                 on a real writer, so the writer would hold epoch 0 for that long \
+                 — measured at +332 s on prod — and under enforce every durable \
+                 mutation in that window is refused fleet-wide."
+            );
+        }
+    }
+
     #[test]
     fn metrics_binds_before_the_ehdb_writer_hosts() {
         let src = include_str!("worker.rs");

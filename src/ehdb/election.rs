@@ -240,6 +240,12 @@ static FENCES: std::sync::Mutex<Vec<RegisteredFence>> = std::sync::Mutex::new(Ve
 /// Register an engine fence to be fed this writer's token.
 pub fn register_fence(label: &str, fence: Arc<ehdb_core::fence::EpochFence>) {
     let mode = fence.mode();
+    // ⚠ Seed it immediately rather than waiting for the next tick. The election
+    // now starts BEFORE the writer hosts, so a fence registered during their
+    // (slow) open would otherwise hold epoch 0 for up to one renew interval
+    // after the token already exists — a small window, but an avoidable one, and
+    // under enforce every durable mutation in it would be refused.
+    fence.set_epoch(fence_epoch());
     let entry = (label.to_string(), fence);
     match FENCES.lock() {
         Ok(mut g) => g.push(entry),
