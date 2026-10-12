@@ -162,16 +162,13 @@ async fn metrics_handler() -> impl IntoResponse {
     // `ehdb_fencing_writes_checked_total` is climbing beside it. A zero with a
     // flat checked-counter means the decorator is unreached, which is the
     // failure this whole programme keeps finding.
-    let fencing = crate::ehdb::eventlog_backend::FencingSetting::from_env(
-        &crate::ehdb::process_env(),
-    );
+    let fencing =
+        crate::ehdb::eventlog_backend::FencingSetting::from_env(&crate::ehdb::process_env());
     let checked = crate::ehdb::eventlog_backend::FENCING_METRICS
         .writes_checked
         .load(std::sync::atomic::Ordering::Relaxed);
     if fencing != crate::ehdb::eventlog_backend::FencingSetting::Off || checked > 0 {
-        body.extend_from_slice(
-            crate::ehdb::eventlog_backend::render_fencing(fencing).as_bytes(),
-        );
+        body.extend_from_slice(crate::ehdb::eventlog_backend::render_fencing(fencing).as_bytes());
     }
     // Replica failure domains (noetl/ehdb#332).
     //
@@ -192,14 +189,18 @@ async fn metrics_handler() -> impl IntoResponse {
     // has not been opened, so G4's verify-before cannot be answered from this
     // process. Absence would have said the same thing silently.
     if !ehdb_lines.is_empty() {
-        body.extend_from_slice(
-            crate::ehdb::eventlog_backend::render_replica_domains().as_bytes(),
-        );
-        // ⚠⚠ Election state, alongside the domains — always 0 today.
-        // `ShardElection` (noetl/ehdb#331) has no call sites, so every writer's
-        // epoch is 0 and single-writer rests on `replicas: 1` alone. A dead
-        // feature that reports nothing looks exactly like a live one with
-        // nothing to report; this makes the difference readable on the scrape.
+        body.extend_from_slice(crate::ehdb::eventlog_backend::render_replica_domains().as_bytes());
+        // ⚠ Election state, alongside the domains.
+        //
+        // This comment used to say "always 0 today — `ShardElection`
+        // (noetl/ehdb#331) has no call sites". That stopped being true with
+        // noetl/worker#353: the driver in `ehdb::election` runs the election and
+        // `render_election` publishes real state. On prod the writer has held
+        // epoch 1 across 3,424 renewals with zero losses.
+        //
+        // ⚠⚠ A non-zero epoch here still does NOT mean writes are fenced —
+        // that is `NOETL_EHDB_FENCING`, and `ehdb_election_token_valid` is the
+        // series a fence must consult, not `holds_lease`.
         body.extend_from_slice(crate::ehdb::eventlog_backend::render_election().as_bytes());
     }
     (
@@ -490,17 +491,14 @@ fn current_serve_state_for(tier: crate::ehdb::store_tier::StoreTier) -> &'static
         // The catalog log is append-and-read only; it has no serve path and is
         // deliberately absent from SERVE_WIRED_TIERS. Reporting a serve state
         // for it would publish a label describing a decision nothing makes.
-        crate::ehdb::store_tier::StoreTier::Catalog => {
-            crate::ehdb::store_tier::CATALOG_SERVE_STATE
-        }
+        crate::ehdb::store_tier::StoreTier::Catalog => crate::ehdb::store_tier::CATALOG_SERVE_STATE,
         // KV and object have a durable store (noetl/ai-meta#348) and no
         // read-serve path. Their incumbents — NATS-KV and the external object
         // store — remain authoritative; giving the derived shadow copy a home
         // that survives a pod roll says nothing about serving from it, and a
         // label an operator could read as "serving" is the drift this codebase
         // keeps finding.
-        crate::ehdb::store_tier::StoreTier::Kv
-        | crate::ehdb::store_tier::StoreTier::Object => {
+        crate::ehdb::store_tier::StoreTier::Kv | crate::ehdb::store_tier::StoreTier::Object => {
             crate::ehdb::store_tier::NOT_WIRED_SERVE_STATE
         }
     }
@@ -561,13 +559,11 @@ async fn ehdb_service_tier_query(
             return refuse(reason.clone());
         }
         Resolution::Local | Resolution::DowngradedToLocal => {
-            return refuse(
-                format!(
-                    "the {} tier is served only by the writer-fronted tier service; \
+            return refuse(format!(
+                "the {} tier is served only by the writer-fronted tier service; \
                      set NOETL_EHDB_TIER_QUERY_SOURCE=service and NOETL_EHDB_TIER_SERVICE_ADDR",
-                    tier.as_str()
-                ),
-            );
+                tier.as_str()
+            ));
         }
     };
 
@@ -600,7 +596,12 @@ async fn ehdb_service_tier_query(
         Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
             Ok(v) => (
                 StatusCode::OK,
-                Json(stamp_source(v, source_label, source_addr.as_deref(), serve_state)),
+                Json(stamp_source(
+                    v,
+                    source_label,
+                    source_addr.as_deref(),
+                    serve_state,
+                )),
             ),
             // A non-JSON reply is one of the service's typed refusals. Surface it
             // as-is rather than as an empty 200, which would read as "no data".
@@ -858,8 +859,7 @@ async fn ehdb_tier_append_handler(
                 // `batch_results` is positional and the per-record serve
                 // decision below consumes it that way.
                 let chunks = chunk_for_frame(&records, batch_frame_budget());
-                let mut per_record: Vec<Result<String, String>> =
-                    Vec::with_capacity(records.len());
+                let mut per_record: Vec<Result<String, String>> = Vec::with_capacity(records.len());
                 for range in &chunks {
                     let slice = &records[range.clone()];
                     let raw = client
@@ -1323,7 +1323,6 @@ fn claim_loop_unhealthy_after() -> u64 {
         .unwrap_or(180)
 }
 
-
 /// Router state carrying the off-server WAL chain index (ai-meta#265 Phase 2).
 #[derive(Clone)]
 struct SpineState {
@@ -1397,11 +1396,12 @@ async fn state_spine_handler(
         crate::state_builder::AdvanceOutcome::ColdRebuild(_) => "cold_rebuild",
         crate::state_builder::AdvanceOutcome::Incomplete => "incomplete",
     };
-    let complete = !matches!(
-        outcome,
-        crate::state_builder::AdvanceOutcome::Incomplete
-    );
-    let events = if complete { spine.unwrap_or_default() } else { Vec::new() };
+    let complete = !matches!(outcome, crate::state_builder::AdvanceOutcome::Incomplete);
+    let events = if complete {
+        spine.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     (
         StatusCode::OK,
@@ -1549,7 +1549,6 @@ mod tests {
 #[cfg(test)]
 mod tier_append_batch_tests {
 
-
     use super::{batch_frame_budget, chunk_for_frame};
     use crate::ehdb::tier_service::MAX_FRAME_BYTES;
 
@@ -1640,7 +1639,10 @@ mod tier_append_batch_tests {
         );
         // Contiguity: chunk N must start where chunk N-1 ended.
         for w in chunks.windows(2) {
-            assert_eq!(w[0].end, w[1].start, "chunks are not contiguous: {chunks:?}");
+            assert_eq!(
+                w[0].end, w[1].start,
+                "chunks are not contiguous: {chunks:?}"
+            );
         }
     }
 
@@ -1773,7 +1775,10 @@ mod tier_append_batch_tests {
         }
         let chunks = chunk_for_frame(&records, batch_frame_budget());
         for c in &chunks {
-            let n = framed_request("execution-id-of-realistic-length-1234567890", &records[c.clone()]);
+            let n = framed_request(
+                "execution-id-of-realistic-length-1234567890",
+                &records[c.clone()],
+            );
             assert!(
                 n <= MAX_FRAME_BYTES as usize,
                 "a budget-saturating chunk frames to {n} bytes, over the \
@@ -1859,8 +1864,7 @@ mod tier_append_batch_tests {
              meaningless and would still compare equal"
         );
         assert_eq!(
-            store_calls,
-            recorded,
+            store_calls, recorded,
             "the tier-append handler makes {store_calls} store call(s) but has \
              {recorded} record_tier_append_path call(s). An uncounted path makes \
              the batch substrate unfalsifiable from /metrics, which is the state \
@@ -1985,7 +1989,9 @@ mod state_spine_tests {
             "the comment stripper ate the handler; this guard proves nothing"
         );
         assert!(
-            code.contains("let events = if complete { spine.unwrap_or_default() } else { Vec::new() };"),
+            code.contains(
+                "let events = if complete { spine.unwrap_or_default() } else { Vec::new() };"
+            ),
             "the spine route must serve an EMPTY event list when the build is \
              Incomplete. Serving the partial spine would let the server fold a \
              gapped history and digest it as if it were the execution's state."
@@ -2010,8 +2016,7 @@ mod state_spine_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            code.contains("StatusCode::SERVICE_UNAVAILABLE")
-                && code.contains("\"unavailable\""),
+            code.contains("StatusCode::SERVICE_UNAVAILABLE") && code.contains("\"unavailable\""),
             "a worker with no state-builder index must answer `unavailable`, \
              never an empty spine"
         );
