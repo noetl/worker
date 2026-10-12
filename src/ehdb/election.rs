@@ -439,7 +439,11 @@ fn now_millis() -> u64 {
 /// scrape's shape does not depend on the flag. A series that appears only when
 /// enabled cannot be distinguished from one this build does not have.
 pub fn render() -> String {
-    render_from(state().map(|s| &**s), now_millis())
+    render_from(
+        state().map(|s| &**s),
+        now_millis(),
+        super::lease_store::clock_offset_millis(),
+    )
 }
 
 /// The renderer, with the state and the clock injected.
@@ -448,7 +452,11 @@ pub fn render() -> String {
 /// an argument is what lets a test render a populated state without calling
 /// `STATE.set`, which would leak into every other test in the binary and make
 /// the flag-off shape test order-dependent.
-pub fn render_from(st: Option<&ElectionState>, now: u64) -> String {
+pub fn render_from(
+    st: Option<&ElectionState>,
+    now: u64,
+    clock_offset_millis: Option<i64>,
+) -> String {
     let (active, epoch, holds, valid, lease, renew, age) = match st {
         None => (0, 0, 0, 0, 0u64, 0u64, -1.0f64),
         Some(s) => {
@@ -517,6 +525,36 @@ pub fn render_from(st: Option<&ElectionState>, now: u64) -> String {
         ));
     }
 
+    // ⭐ δ — inter-node clock skew, measured from the API server's own `Date`
+    // header on every renewal (noetl/ai-meta#460). It bounds the divergence
+    // window: the predecessor stops asserting its token at `last_contact +
+    // lease` on ITS clock while the successor becomes eligible at the same
+    // instant on ITS clock, so the overlap is |offset_a − offset_b|.
+    //
+    // ⚠ Whole-second HTTP-date resolution, so this bounds δ to ~±1 s and no
+    // better — which is why the published window below adds 1 s rather than
+    // implying a precision it cannot support.
+    //
+    // ⚠⚠ `..._observed` is the discriminator: an offset of 0 otherwise means
+    // both "the clocks agree" and "nothing has ever been measured".
+    out.push_str("# HELP ehdb_election_clock_offset_seconds Local clock minus the API server's Date header. Recorded, never applied to lease arithmetic.\n");
+    out.push_str("# TYPE ehdb_election_clock_offset_seconds gauge\n");
+    out.push_str(&format!(
+        "ehdb_election_clock_offset_seconds {:.3}\n",
+        clock_offset_millis.unwrap_or(0) as f64 / 1000.0
+    ));
+    out.push_str("# HELP ehdb_election_clock_offset_observed Whether any Date header has been parsed. 0 means the offset above is a placeholder, not a reading.\n");
+    out.push_str("# TYPE ehdb_election_clock_offset_observed gauge\n");
+    out.push_str(&format!(
+        "ehdb_election_clock_offset_observed {}\n",
+        u8::from(clock_offset_millis.is_some())
+    ));
+    out.push_str("# HELP ehdb_election_failover_window_seconds Upper bound on how long a shard may be unelected after a writer is lost: lease + renew + 1s for whole-second clock resolution. FLP: bounded, never zero.\n");
+    out.push_str("# TYPE ehdb_election_failover_window_seconds gauge\n");
+    out.push_str(&format!(
+        "ehdb_election_failover_window_seconds {}\n",
+        lease.saturating_add(renew).saturating_add(1)
+    ));
     out.push_str("# HELP ehdb_election_errors_total Lease-store failures by reason. forbidden>0 means the ehdb-shard-election Role is not bound to this pod's ServiceAccount.\n");
     out.push_str("# TYPE ehdb_election_errors_total counter\n");
     for (i, reason) in ERROR_REASONS.iter().enumerate() {
@@ -838,7 +876,7 @@ mod tests {
         st.renewed_total.store(12, Ordering::Relaxed);
         st.errors[FORBIDDEN].store(2, Ordering::Relaxed);
 
-        let text = render_from(Some(&st), 102_500);
+        let text = render_from(Some(&st), 102_500, None);
         for want in [
             "ehdb_election_active 1\n",
             "ehdb_election_epoch 3\n",
@@ -855,7 +893,7 @@ mod tests {
         }
         // Stale contact flips token_valid while holds_lease stays 1 — the two
         // series exist precisely to be read apart.
-        let stale = render_from(Some(&st), 100_000 + LEASE * 1000 + 1);
+        let stale = render_from(Some(&st), 100_000 + LEASE * 1000 + 1, None);
         assert!(stale.contains("ehdb_election_holds_lease 1\n"), "{stale}");
         assert!(stale.contains("ehdb_election_token_valid 0\n"), "{stale}");
     }
@@ -927,5 +965,62 @@ mod tests {
              everything. ehdb_fencing_epoch_advances_total is the series that \
              tells an inert fence from a working one."
         );
+    }
+
+    #[test]
+    fn the_clock_offset_distinguishes_zero_from_never_measured() {
+        let st = ElectionState::default();
+        st.lease_duration_secs.store(LEASE, Ordering::Relaxed);
+        st.renew_interval_secs.store(5, Ordering::Relaxed);
+
+        // ⚠⚠ Never measured: the offset renders 0 — so the `observed` gauge is
+        // the only thing that can tell that apart from clocks that agree.
+        let never = render_from(Some(&st), 1_000, None);
+        assert!(
+            never.contains("ehdb_election_clock_offset_seconds 0.000\n"),
+            "{never}"
+        );
+        assert!(
+            never.contains("ehdb_election_clock_offset_observed 0\n"),
+            "{never}"
+        );
+
+        // Measured, and genuinely zero.
+        let zero = render_from(Some(&st), 1_000, Some(0));
+        assert!(
+            zero.contains("ehdb_election_clock_offset_seconds 0.000\n"),
+            "{zero}"
+        );
+        assert!(
+            zero.contains("ehdb_election_clock_offset_observed 1\n"),
+            "{zero}"
+        );
+
+        // Negative offsets are legitimate — the local clock can be behind.
+        let behind = render_from(Some(&st), 1_000, Some(-1_250));
+        assert!(
+            behind.contains("ehdb_election_clock_offset_seconds -1.250\n"),
+            "{behind}"
+        );
+        assert!(
+            behind.contains("ehdb_election_clock_offset_observed 1\n"),
+            "{behind}"
+        );
+    }
+
+    #[test]
+    fn the_published_failover_window_is_lease_plus_renew_plus_one() {
+        let st = ElectionState::default();
+        st.lease_duration_secs.store(15, Ordering::Relaxed);
+        st.renew_interval_secs.store(5, Ordering::Relaxed);
+        // ⚠ The +1 is the whole-second HTTP-date resolution of the δ
+        // measurement, not padding. FLP: bounded, never zero.
+        assert!(
+            render_from(Some(&st), 0, None).contains("ehdb_election_failover_window_seconds 21\n"),
+            "15 + 5 + 1 = 21"
+        );
+        // With no election at all the bound renders 1 rather than being absent,
+        // so the series shape does not depend on the flag.
+        assert!(render_from(None, 0, None).contains("ehdb_election_failover_window_seconds 1\n"));
     }
 }
