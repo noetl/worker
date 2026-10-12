@@ -56,6 +56,17 @@ pub struct Worker {
     /// `NOETL_STATE_BUILDER=offserver`.  Always constructed (cheap, empty); the
     /// drain loop spawns only when the builder is enabled.
     state_builder_index: crate::state_builder::SharedWalIndex,
+
+    /// The `/metrics` + `/healthz` + `/readyz` server, spawned in
+    /// [`Worker::new`] **before** the EHDB writer hosts.
+    ///
+    /// ⚠⚠ It used to be spawned in [`Worker::run`], which runs after `new()`
+    /// has opened both L0 engines. On the prod cmdbus-writer that put the bind
+    /// at **+313.7 s** after process start (noetl/ai-meta#469) — so the one
+    /// workload that hosts both buses was unobservable for the first five
+    /// minutes of every restart, which is exactly the window the interesting
+    /// failures live in.
+    metrics_handle: tokio::task::JoinHandle<()>,
 }
 
 impl Worker {
@@ -63,6 +74,42 @@ impl Worker {
     pub async fn new(config: WorkerConfig) -> Result<Self> {
         // Create HTTP client
         let client = ControlPlaneClient::new(&config.server_url);
+
+        // ⚠⚠ noetl/ai-meta#469 — bind `/metrics` FIRST, before the EHDB writer
+        // hosts below.
+        //
+        // Measured on the prod cmdbus-writer, this bind used to land at
+        // **+313.7 s** after process start, because it was spawned in `run()`
+        // and `new()` opens two L0 engines first (cmdbus ingest at +6.5 s, its
+        // lag endpoint at +75.0 s, the events feed at +75.2 s, the tier service
+        // at +79.4 s, the events `/metrics` at +310.9 s). For five minutes after
+        // every restart the writer that hosts BOTH buses served nothing on
+        // :9090 — so KEDA's `metrics-api` scaler got `connection refused` and
+        // then `context deadline exceeded while awaiting headers`, and any human
+        // probing it read an empty reply.
+        //
+        // ⚠ That window is not a cosmetic gap. It is precisely when a restart's
+        // interesting behaviour happens — recovery replay, seal-on-open, lease
+        // acquisition — and a scrape that cannot be taken then is the same
+        // defect class as ehdb#345, where the writer reported Ready with every
+        // listener bound while every POST returned 500.
+        //
+        // The index is constructed here rather than further down because the
+        // server takes it; it is cheap and empty either way.
+        let state_builder_index: crate::state_builder::SharedWalIndex =
+            crate::state_builder::SharedWalIndex::new(
+                crate::state_builder::WalEventIndex::with_order_policy(
+                    crate::state_builder::spine_order(),
+                    crate::state_builder::EvictionPolicy::from_env(),
+                ),
+            );
+        // Bind failures still fail the boot, exactly as before — the only thing
+        // that changed is when.
+        let metrics_handle = crate::metrics_server::spawn_with_index(
+            &config.metrics_bind,
+            Some(state_builder_index.clone()),
+        )
+        .await?;
 
         // noetl/ai-meta#194 L1 T4 — the command-bus transport. `NOETL_COMMAND_BUS`
         // is REQUIRED with no default since noetl/ai-meta#243: resolving it can
@@ -221,14 +268,6 @@ impl Worker {
         // + the slim-chain projection).  Every knob defaults to off (unbounded =
         // today's behaviour), so a worker carrying this code is behaviour-neutral
         // until an operator sets the env vars.
-        let state_builder_index: crate::state_builder::SharedWalIndex =
-            crate::state_builder::SharedWalIndex::new(
-                crate::state_builder::WalEventIndex::with_order_policy(
-                    crate::state_builder::spine_order(),
-                    crate::state_builder::EvictionPolicy::from_env(),
-                ),
-            );
-
         // Create executor.  Under `NOETL_STATE_BUILDER=offserver` it builds the
         // orchestrate drive's state from `state_builder_index` (the WAL spine)
         // instead of the server-built `run_state` payload.
@@ -254,6 +293,7 @@ impl Worker {
             executor,
             semaphore,
             state_builder_index,
+            metrics_handle,
         })
     }
 
@@ -311,17 +351,12 @@ impl Worker {
         // Start heartbeat task
         let heartbeat_handle = self.start_heartbeat();
 
-        // Start metrics HTTP server.  Bind failures are
-        // immediately surfaced; the server runs in the background
-        // for the worker's lifetime.  Per
+        // The metrics HTTP server is already up — it is spawned at the top of
+        // `Worker::new` so it binds before the EHDB opens rather than five
+        // minutes after them (noetl/ai-meta#469). Per
         // `agents/rules/observability.md` Principle 2.
-        // ai-meta#265 Phase 2: hand the WAL chain index to the metrics server so
-        // `/ehdb/state-spine` can serve the same spine the drive builds.
-        let metrics_handle = crate::metrics_server::spawn_with_index(
-            &self.config.metrics_bind,
-            Some(self.state_builder_index.clone()),
-        )
-        .await?;
+        // ai-meta#265 Phase 2: it carries the WAL chain index so
+        // `/ehdb/state-spine` serves the same spine the drive builds.
 
         // The NATS consumer-lag poller is gone with NATS (noetl/ai-meta#212).
         // It had already become a no-op on the EHDB bus — `nats_subscriber()`
@@ -482,7 +517,7 @@ impl Worker {
 
         // Stop heartbeat + metrics server + materializer
         heartbeat_handle.abort();
-        metrics_handle.abort();
+        self.metrics_handle.abort();
         if let Some(h) = materializer_handle {
             h.abort();
         }
@@ -1230,5 +1265,61 @@ mod tests {
         assert_eq!(processed, vec!["c1", "c2", "c3", "c4"]);
         // Every processed command acked exactly once (no duplicate acks).
         assert_eq!(acked, vec!["c1", "c2", "c3", "c4"]);
+    }
+}
+
+#[cfg(test)]
+mod startup_order_tests {
+    /// ⚠⚠ The guard for noetl/ai-meta#469: `/metrics` must bind BEFORE the EHDB
+    /// writer hosts.
+    ///
+    /// The regression this prevents is invisible at runtime — the endpoint still
+    /// works, just not for the first five minutes after a restart, and nothing
+    /// fails. On the prod cmdbus-writer that gap measured **+313.7 s**, long
+    /// enough that KEDA's scaler reported `connection refused` and then
+    /// `context deadline exceeded while awaiting headers`, and long enough that
+    /// three of my own probes read an empty reply and I filed it as a wedged
+    /// HTTP reactor.
+    ///
+    /// Counts CODE positions, not prose, and refuses to run against a slice it
+    /// could not find — a check computed from a failed search reads green.
+    #[test]
+    fn metrics_binds_before_the_ehdb_writer_hosts() {
+        let src = include_str!("worker.rs");
+        let new_fn = src
+            .split("pub async fn new(config: WorkerConfig)")
+            .nth(1)
+            .expect("Worker::new not found — this guard would be vacuous");
+        let body: String = new_fn
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//") && !l.starts_with('*'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.len() > 500,
+            "the non-comment slice of Worker::new came out at {} bytes — \
+             a guard computed from an empty region reads green",
+            body.len()
+        );
+
+        let metrics = body
+            .find(concat!("metrics_server::", "spawn_with_index"))
+            .expect("Worker::new no longer spawns the metrics server at all");
+        for host in [
+            concat!("spawn_", "writer_host"),
+            concat!("spawn_event_", "writer_host"),
+        ] {
+            let at = body
+                .find(host)
+                .unwrap_or_else(|| panic!("{host} not found in Worker::new"));
+            assert!(
+                metrics < at,
+                "the metrics server is spawned AFTER {host}. The EHDB opens take \
+                 minutes on a real writer, so /metrics would not bind until they \
+                 finish and the writer would be unobservable for exactly the \
+                 window a restart is interesting in (noetl/ai-meta#469)."
+            );
+        }
     }
 }
