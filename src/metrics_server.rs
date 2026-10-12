@@ -190,22 +190,30 @@ async fn metrics_handler() -> impl IntoResponse {
     // process. Absence would have said the same thing silently.
     if !ehdb_lines.is_empty() {
         body.extend_from_slice(crate::ehdb::eventlog_backend::render_replica_domains().as_bytes());
-        // ⚠ Election state, alongside the domains.
-        //
-        // This comment used to say "always 0 today — `ShardElection`
-        // (noetl/ehdb#331) has no call sites". That stopped being true with
-        // noetl/worker#353: the driver in `ehdb::election` runs the election and
-        // `render_election` publishes real state. On prod the writer has held
-        // epoch 1 across 3,424 renewals with zero losses.
-        //
-        // ⚠⚠ A non-zero epoch here still does NOT mean writes are fenced —
-        // that is `NOETL_EHDB_FENCING`, and `ehdb_election_token_valid` is the
-        // series a fence must consult, not `holds_lease`.
-        body.extend_from_slice(crate::ehdb::eventlog_backend::render_election().as_bytes());
-        // ⭐ The engine-chokepoint fence (noetl/ai-meta#460), per bus and per
-        // path. Empty when this process hosts no writer.
-        body.extend_from_slice(crate::ehdb::election::render_engine_fences().as_bytes());
     }
+    // ⚠⚠ Election + engine-fence state is UNGATED, deliberately.
+    //
+    // These used to sit inside the `!ehdb_lines.is_empty()` block above, and
+    // that made the C3 safety gate unreadable during exactly the window it
+    // exists to cover. `ehdb::metrics::render_lines()` is empty until the EHDB
+    // data-plane metrics populate, which on the prod writer happens after the
+    // buses bind — so a scrape taken 87 s after a restart returned 30 KB with
+    // `ehdb_election_*` and `ehdb_engine_fence_*` at **zero lines** while the
+    // older `ehdb_fencing_*` block was present (noetl/ai-meta#460).
+    //
+    // Absence there is indistinguishable from "the fence is not working", and
+    // `ehdb_engine_fence_epoch_advances_total` is the one series that tells an
+    // inert fence from a live one. Gating it behind unrelated state is the same
+    // absent-is-not-zero defect this programme keeps finding, one layer up from
+    // the metric itself.
+    //
+    // Both renderers already handle their own "nothing to report" case:
+    // `render_election` emits zeros with `last_contact_age_seconds -1`, and
+    // `render_engine_fences` reports `registered 0` when fencing is configured
+    // but no fence has been built yet — which is a *readable* pre-arm state
+    // rather than silence.
+    body.extend_from_slice(crate::ehdb::eventlog_backend::render_election().as_bytes());
+    body.extend_from_slice(crate::ehdb::election::render_engine_fences().as_bytes());
     (
         StatusCode::OK,
         [(

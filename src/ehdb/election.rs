@@ -296,10 +296,29 @@ pub fn render_engine_fences() -> String {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    if g.is_empty() {
+    // ⚠⚠ The pre-arm state must be READABLE, not silent.
+    //
+    // The fence is built inside `spawn_writer_host`, which on the prod writer
+    // runs ~24 s after process start. Returning an empty string until then made
+    // `epoch_advances` absent during exactly the post-restart window the C3 gate
+    // covers — and absent is indistinguishable from "the fence is not working".
+    //
+    // So: nothing at all only when fencing is unconfigured AND no fence exists
+    // (a worker that hosts no writer — there is no useful zero for a component
+    // not present in this process). When fencing IS configured, the block
+    // renders with `registered 0`, which says "writer, armed by config, fence
+    // not yet built" — a distinct and actionable reading.
+    let configured = ehdb_core::fence::FenceMode::from_str_or_off(
+        &std::env::var("NOETL_EHDB_FENCING").unwrap_or_default(),
+    )
+    .is_active();
+    if g.is_empty() && !configured {
         return String::new();
     }
     let mut out = String::new();
+    out.push_str("# HELP ehdb_engine_fence_registered Engine fences built in this process. ⚠ 0 with NOETL_EHDB_FENCING set means the writer is still starting and no fence is armed YET — distinct from the whole block being absent, which means this process hosts no writer.\n");
+    out.push_str("# TYPE ehdb_engine_fence_registered gauge\n");
+    out.push_str(&format!("ehdb_engine_fence_registered {}\n", g.len()));
     out.push_str("# HELP ehdb_engine_fence_active Whether the L0 engine chokepoint fence is armed for this bus: 0 off, 1 shadow, 2 enforce.\n");
     out.push_str("# TYPE ehdb_engine_fence_active gauge\n");
     for (bus, f) in g.iter() {
