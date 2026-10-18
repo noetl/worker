@@ -104,30 +104,36 @@ impl ServingLoop {
         Self::TierService,
     ];
 
-    /// The loops `/readyz` REQUIRES to be fresh.
+    /// The DEFAULT loops `/readyz` requires to be fresh.
     ///
-    /// Rationale, and it is a deliberate subset rather than "everything":
-    /// readiness answers *can this writer take work in and hand work out, on both
-    /// buses*. Those four faces are the dispatch path — if any is not making
-    /// progress the writer should leave rotation.
+    /// ⚠⚠ Two faces, not four, and the reason is a measurement rather than a
+    /// preference. Bind times on the prod writer, from pod start 2026-10-16
+    /// 17:04:01Z (restarts=0, so these are its real startup logs):
     ///
-    /// `TierService` is **excluded**: the storage tiers are default-off/shadow in
-    /// prod, so requiring it would make readiness depend on a surface that is
-    /// deliberately not serving. The lag faces (:9102, :9106), SSE (:9105), KV
-    /// (:9107) and WAL (:9108) are excluded for the same class of reason — they are
-    /// auxiliary, and taking dispatch out of rotation because a KEDA lag endpoint
-    /// degraded would turn a scaling problem into an outage.
+    /// | face | bound at |
+    /// | :-- | --: |
+    /// | `:9090` metrics — serves `/readyz` itself | 73.6 s |
+    /// | `:9100` command ingest | 74.6 s |
+    /// | `:9101` command claim | 74.6 s |
+    /// | `:9103` event ingest | 128.0 s |
+    /// | `:9110` tier service | 132.5 s |
+    /// | `:9104` event claim | **380.4 s** |
     ///
-    /// ⚠ Intersected with [`EXPECTED`] at evaluation time — a face this process
-    /// was never configured to host is skipped, not failed.
+    /// Today's `tcpSocket` on cmdbus-claim turns the pod Ready at ~75 s. A
+    /// NotReady pod is removed from EVERY Service that selects it, so requiring
+    /// a face that binds later does not merely delay that face — it makes the
+    /// faces that ARE up unreachable for the difference. Requiring event ingest
+    /// costs +53 s of fleet-wide bus unreachability per writer restart;
+    /// requiring event claim costs **+306 s**, which is the same arithmetic as
+    /// the C3 enforce trade that was rejected for being too expensive per
+    /// restart.
     ///
-    /// ⚠ PROPOSED, not settled — see the PR. The alternative is requiring all five.
-    pub const REQUIRED: [ServingLoop; 4] = [
-        Self::CommandIngest,
-        Self::CommandClaim,
-        Self::EventIngest,
-        Self::EventClaim,
-    ];
+    /// So the default is the two faces that are already up when the current
+    /// probe passes. That makes this change **purely additive**: identical Ready
+    /// timing to today, plus wedge detection on the dispatch path the existing
+    /// probe pretends to cover. Widening is one env var and is a cost decision,
+    /// not a code change — see [`required_loops`].
+    pub const DEFAULT_REQUIRED: [ServingLoop; 2] = [Self::CommandIngest, Self::CommandClaim];
 
     pub fn index(self) -> usize {
         match self {
@@ -150,8 +156,57 @@ impl ServingLoop {
     }
 
     pub fn is_required(self) -> bool {
-        Self::REQUIRED.contains(&self)
+        required_loops().contains(&self)
     }
+}
+
+/// The faces `/readyz` requires, from `NOETL_SERVING_REQUIRED` — a comma-separated
+/// list of loop names ([`ServingLoop::as_str`]), or `all`.
+///
+/// ⚠ Unparseable or unknown names fall back to [`ServingLoop::DEFAULT_REQUIRED`]
+/// and log once, rather than silently requiring nothing. A typo that quietly
+/// emptied the required set would make `/readyz` answer 200 unconditionally — a
+/// readiness probe that cannot fail, which is the defect class this whole module
+/// exists to remove.
+pub fn required_loops() -> Vec<ServingLoop> {
+    static RESOLVED: std::sync::OnceLock<Vec<ServingLoop>> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| parse_required(std::env::var("NOETL_SERVING_REQUIRED").ok().as_deref()))
+        .clone()
+}
+
+/// The parse, separated from the env read and the memoization so it is testable
+/// without either. `required_loops` is a `OnceLock`, so a test driving it through
+/// the environment would depend on which test initialised it first — and
+/// `cargo test` does not serialise tests.
+pub fn parse_required(raw: Option<&str>) -> Vec<ServingLoop> {
+    let raw = match raw {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return ServingLoop::DEFAULT_REQUIRED.to_vec(),
+    };
+    if raw.trim().eq_ignore_ascii_case("all") {
+        return ServingLoop::ALL.to_vec();
+    }
+    let mut out = Vec::new();
+    for name in raw.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        match ServingLoop::ALL.iter().find(|l| l.as_str() == name) {
+            Some(l) if !out.contains(l) => out.push(*l),
+            Some(_) => {}
+            None => {
+                tracing::warn!(
+                    name,
+                    raw,
+                    "NOETL_SERVING_REQUIRED names an unknown serving loop; falling \
+                     back to the default required set rather than requiring nothing"
+                );
+                return ServingLoop::DEFAULT_REQUIRED.to_vec();
+            }
+        }
+    }
+    if out.is_empty() {
+        return ServingLoop::DEFAULT_REQUIRED.to_vec();
+    }
+    out
 }
 
 /// `0` means "never bumped", which is distinct from any real packed value because
@@ -170,7 +225,7 @@ static BOUND: AtomicU64 = AtomicU64::new(0);
 /// One bit per loop: this process is CONFIGURED to host that face.
 ///
 /// ⚠⚠ Load-bearing, and the reason the predicate is not simply "all of
-/// [`ServingLoop::REQUIRED`] must be fresh".
+/// [`ServingLoop::DEFAULT_REQUIRED`] must be fresh".
 ///
 /// Only the writer host binds the bus faces. A user-pool or drive-pool worker
 /// binds none of them — so a predicate that required them unconditionally would
@@ -348,6 +403,9 @@ pub struct Snapshot {
     pub bound: u64,
     /// Bitset of faces this process is configured to host.
     pub expected: u64,
+    /// The faces this sample must judge — captured in the snapshot so the
+    /// predicate stays pure and a test can vary it without touching env.
+    pub required: Vec<ServingLoop>,
 }
 
 /// Sample the live state.
@@ -365,6 +423,7 @@ pub fn snapshot() -> Snapshot {
         ],
         bound: BOUND.load(Ordering::Acquire),
         expected: EXPECTED.load(Ordering::Acquire),
+        required: required_loops(),
     }
 }
 
@@ -378,7 +437,8 @@ pub fn evaluate(s: &Snapshot) -> Result<(), NotReady> {
     if !s.warm {
         return Err(NotReady::Warming);
     }
-    for which in ServingLoop::REQUIRED {
+    for which in &s.required {
+        let which = *which;
         let i = which.index();
         // Not configured on this process — not its job, so not its readiness.
         if s.expected & (1 << i) == 0 {
@@ -568,6 +628,7 @@ mod tests {
             beats,
             bound,
             expected: bound,
+            required: ServingLoop::DEFAULT_REQUIRED.to_vec(),
         }
     }
 
@@ -593,7 +654,7 @@ mod tests {
 
     #[test]
     fn unbound_required_listener_is_not_ready() {
-        for l in ServingLoop::REQUIRED {
+        for l in ServingLoop::DEFAULT_REQUIRED {
             let mut s = healthy(1_000_000);
             s.bound &= !(1 << l.index());
             assert_eq!(
@@ -607,7 +668,7 @@ mod tests {
 
     #[test]
     fn never_served_required_loop_is_not_ready() {
-        for l in ServingLoop::REQUIRED {
+        for l in ServingLoop::DEFAULT_REQUIRED {
             let mut s = healthy(1_000_000);
             s.beats[l.index()] = 0;
             assert_eq!(
@@ -623,7 +684,7 @@ mod tests {
     /// `tcpSocket` probe reads Ready) and the loop stopped making progress.
     #[test]
     fn stale_required_loop_is_not_ready_though_bound() {
-        for l in ServingLoop::REQUIRED {
+        for l in ServingLoop::DEFAULT_REQUIRED {
             let now = 1_000_000u64;
             let mut s = healthy(now);
             // Bound — a tcpSocket probe would still succeed here.
@@ -710,6 +771,7 @@ mod tests {
             beats: [0; 5],
             bound: 0,
             expected: 0,
+            required: ServingLoop::DEFAULT_REQUIRED.to_vec(),
         };
         assert_eq!(
             evaluate(&s),
@@ -734,6 +796,75 @@ mod tests {
         s.bound &= !(1 << l.index());
         assert!(s.expected & (1 << l.index()) != 0, "fixture must expect it");
         assert_eq!(evaluate(&s), Err(NotReady::Unbound(l)));
+    }
+
+    // ---- the configurable required set ----------------------------------
+
+    #[test]
+    fn parse_required_defaults_when_unset_or_blank() {
+        for raw in [None, Some(""), Some("   "), Some(",, ,")] {
+            assert_eq!(
+                parse_required(raw),
+                ServingLoop::DEFAULT_REQUIRED.to_vec(),
+                "{raw:?} must fall back to the default set"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_required_accepts_all_and_explicit_lists() {
+        assert_eq!(parse_required(Some("all")), ServingLoop::ALL.to_vec());
+        assert_eq!(parse_required(Some("ALL")), ServingLoop::ALL.to_vec());
+        assert_eq!(
+            parse_required(Some("command_claim, event_ingest")),
+            vec![ServingLoop::CommandClaim, ServingLoop::EventIngest]
+        );
+        // Duplicates collapse — a repeated name must not be judged twice.
+        assert_eq!(
+            parse_required(Some("event_claim,event_claim")),
+            vec![ServingLoop::EventClaim]
+        );
+    }
+
+    /// ⚠⚠ The dangerous failure mode, pinned: a typo must NOT empty the required
+    /// set. An empty set makes `evaluate` return Ok unconditionally — a readiness
+    /// probe that cannot fail, which is the exact defect class this module exists
+    /// to remove.
+    #[test]
+    fn parse_required_falls_back_rather_than_requiring_nothing() {
+        for raw in ["command_clam", "event_ingest,nonsense", "9101"] {
+            let got = parse_required(Some(raw));
+            assert_eq!(
+                got,
+                ServingLoop::DEFAULT_REQUIRED.to_vec(),
+                "{raw:?} must fall back, not empty the set"
+            );
+            assert!(!got.is_empty(), "the required set must never be empty");
+        }
+    }
+
+    /// Widening must actually bite — otherwise the env var is decorative.
+    #[test]
+    fn widening_required_catches_a_face_the_default_ignores() {
+        let now = 1_000_000u64;
+        let l = ServingLoop::EventClaim;
+
+        let mut lenient = healthy(now);
+        lenient.beats[l.index()] = 1; // ancient
+        assert_eq!(
+            evaluate(&lenient),
+            Ok(()),
+            "the default set must ignore a stale event_claim (it binds at ~380 s)"
+        );
+
+        let strict = Snapshot {
+            required: ServingLoop::ALL.to_vec(),
+            ..lenient
+        };
+        assert!(
+            matches!(evaluate(&strict), Err(NotReady::Stale { which, .. }) if which == l),
+            "NOETL_SERVING_REQUIRED=all must refuse the same snapshot"
+        );
     }
 
     // ---- the packed value ------------------------------------------------
@@ -815,8 +946,8 @@ mod tests {
 
     #[test]
     fn required_is_a_strict_subset_of_all() {
-        assert!(ServingLoop::REQUIRED.len() < ServingLoop::ALL.len());
-        for l in ServingLoop::REQUIRED {
+        assert!(ServingLoop::DEFAULT_REQUIRED.len() < ServingLoop::ALL.len());
+        for l in ServingLoop::DEFAULT_REQUIRED {
             assert!(ServingLoop::ALL.contains(&l));
             assert!(l.is_required());
         }
