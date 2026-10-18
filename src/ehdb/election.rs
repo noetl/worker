@@ -469,16 +469,29 @@ pub fn clamp_renew(lease_secs: u64, want_secs: u64) -> u64 {
     want_secs.min((lease_secs / 3).max(1)).max(1)
 }
 
-/// The per-process holder identity: `<hostname>#<uuid>`.
+/// The per-process holder identity: `<hostname>#<uuid>`, minted once per process.
 ///
 /// See the module note — the uuid is what makes a restarted writer a *different*
 /// holder on a StatefulSet's stable pod name.
-fn identity() -> String {
-    let host = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown-host".to_string());
-    format!("{host}#{}", uuid::Uuid::new_v4())
+///
+/// ⚠ **Memoized deliberately.** It has exactly one caller today ([`spawn`], once),
+/// so the `OnceLock` changes no behaviour — but it closes a latent hazard: an
+/// unmemoized mint returns a DIFFERENT holder identity on every call, so a second
+/// caller would have made this writer contend with itself and thrash its own
+/// lease. Memoizing also lets the serving heartbeats
+/// ([`crate::serving_heartbeat`], noetl/ai-meta#470) stamp themselves with the
+/// SAME identity the lease carries, so an operator correlating a stale heartbeat
+/// against the lease holder reads one string rather than two uuids for one
+/// process.
+pub(crate) fn identity() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let host = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown-host".to_string());
+        format!("{host}#{}", uuid::Uuid::new_v4())
+    })
 }
 
 /// Start the election for `shard`, if enabled. Returns whether it started.
@@ -512,7 +525,7 @@ pub fn spawn(shard: u32) -> bool {
     };
 
     let (lease_secs, renew_secs) = intervals();
-    let id = identity();
+    let id = identity().to_string();
     let st = Arc::new(ElectionState::default());
     st.shard.store(u64::from(shard), Ordering::Relaxed);
     st.lease_duration_secs.store(lease_secs, Ordering::Relaxed);

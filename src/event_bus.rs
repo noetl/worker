@@ -292,10 +292,17 @@ pub async fn spawn_event_writer_host(
     let stop_ingest = crate::graceful::StopSignal::new();
     let mut ingest_stop_handle = None;
     if let Some(addr) = config.ingest_bind {
+        // Configured — recorded BEFORE the bind so a face that fails to bind
+        // reads expected-but-unbound (a 503) rather than silently absent
+        // (a pass). noetl/ai-meta#470.
+        crate::serving_heartbeat::mark_expected(crate::serving_heartbeat::ServingLoop::EventIngest);
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(crate::graceful::until_stopped(
             stop_ingest.register("events ingest"),
-            ehdb_feed::serve_ingest(listener, writer.clone()),
+            crate::serving_heartbeat::beating(
+                crate::serving_heartbeat::ServingLoop::EventIngest,
+                ehdb_feed::serve_ingest(listener, writer.clone()),
+            ),
         ));
         ingest_stop_handle = Some(stop_ingest.clone());
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed ingest listener up");
@@ -320,6 +327,10 @@ pub async fn spawn_event_writer_host(
     // answers `unavailable`.  The log line says which, because the two states
     // look identical from outside and the difference is the whole capability.
     if let Some(tier_cfg) = crate::ehdb::tier_service::TierServiceConfig::from_env() {
+        // Configured — recorded BEFORE the bind so a face that fails to bind
+        // reads expected-but-unbound (a 503) rather than silently absent
+        // (a pass). noetl/ai-meta#470.
+        crate::serving_heartbeat::mark_expected(crate::serving_heartbeat::ServingLoop::TierService);
         let listener = TcpListener::bind(tier_cfg.bind).await?;
         let addr = tier_cfg.bind;
 
@@ -356,7 +367,10 @@ pub async fn spawn_event_writer_host(
         };
         crate::ehdb::metrics::pin_tier_service_series(&samples);
 
-        tokio::spawn(crate::ehdb::tier_service::serve_tier(listener));
+        tokio::spawn(crate::serving_heartbeat::beating(
+            crate::serving_heartbeat::ServingLoop::TierService,
+            crate::ehdb::tier_service::serve_tier(listener),
+        ));
         // The PR-1 text — "skeleton: health only, serves no tier data" — outlived
         // the build it described.  PR 3 gave the service a store, so the line
         // was telling an operator the opposite of what the process would do,
@@ -402,10 +416,17 @@ pub async fn spawn_event_writer_host(
     }
 
     if let Some(addr) = config.claim_bind {
+        // Configured — recorded BEFORE the bind so a face that fails to bind
+        // reads expected-but-unbound (a 503) rather than silently absent
+        // (a pass). noetl/ai-meta#470.
+        crate::serving_heartbeat::mark_expected(crate::serving_heartbeat::ServingLoop::EventClaim);
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(crate::graceful::supervised(
             "events group-claim",
-            ehdb_feed::serve_group_claims(listener, coordinator.clone()),
+            crate::serving_heartbeat::beating(
+                crate::serving_heartbeat::ServingLoop::EventClaim,
+                ehdb_feed::serve_group_claims(listener, coordinator.clone()),
+            ),
         ));
         tracing::info!(%addr, shard = config.shard, "EHDB events-feed group coordinator up");
     }
