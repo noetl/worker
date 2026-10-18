@@ -214,6 +214,13 @@ async fn metrics_handler() -> impl IntoResponse {
     // rather than silence.
     body.extend_from_slice(crate::ehdb::eventlog_backend::render_election().as_bytes());
     body.extend_from_slice(crate::ehdb::election::render_engine_fences().as_bytes());
+    // Serving heartbeats (noetl/ai-meta#470) — UNGATED, same reasoning as the
+    // election/fence block above and for a sharper reason: this is the series an
+    // external reader uses to tell a RESTART (instance_id changed, value reset)
+    // from a WEDGE (instance_id unchanged, value frozen). Gating it on EHDB
+    // activity would hide it during the bind window, which is precisely when a
+    // writer that never finishes binding needs to be visible.
+    body.extend_from_slice(crate::serving_heartbeat::render_prometheus().as_bytes());
     (
         StatusCode::OK,
         [(
@@ -1277,17 +1284,32 @@ async fn healthz_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// `GET /readyz` — readiness check (noetl/ai-meta#130 cold-start).  Returns 200
-/// once boot warmup has completed (the orchestrate drive plug-in is compiled +
-/// cached on the drive pool); 503 while still warming.  Kubernetes routes /
-/// completes a rollout only on 200, so the one-time warm latency is hidden from
-/// the first real request.  Liveness (`/healthz`) stays 200 throughout so a slow
-/// warm never trips a restart.
+/// `GET /readyz` — readiness check.  200 only when ALL THREE hold:
+///
+/// 1. boot warmup has completed (noetl/ai-meta#130 cold-start — the orchestrate
+///    drive plug-in is compiled + cached on the drive pool);
+/// 2. every required serving face has a bound listener;
+/// 3. every required serving loop ticked within the freshness threshold.
+///
+/// Otherwise 503, with a body naming which of the three failed and for which
+/// face, so an operator does not have to guess from a bare "warming".
+///
+/// ⚠ (2) and (3) are noetl/ai-meta#470. Warmup alone is a boolean that is set
+/// once and never falsified, so it cannot represent a face that WAS serving and
+/// stopped — which is exactly what happened in noetl/ai-meta#469: the writer
+/// accepted TCP and never answered, for over a day, across two pod generations,
+/// while the pod read `Ready` with zero restarts and zero ERROR lines. The
+/// freshness comparison happens HERE, in the process, because a Kubernetes probe
+/// is stateless: it cannot diff two scrapes, so it cannot notice a number that
+/// stopped moving. See [`crate::serving_heartbeat`].
+///
+/// ⚠ Readiness only. `livenessProbe` must stay `tcpSocket`: gating liveness on
+/// bus freshness would let a slow bind KILL the writer, and this writer has
+/// looped fatally on restart before. A `startupProbe` covers the bind window.
 async fn readyz_handler() -> impl IntoResponse {
-    if crate::metrics::worker_ready() {
-        (StatusCode::OK, "ready")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "warming")
+    match crate::serving_heartbeat::readiness() {
+        Ok(()) => (StatusCode::OK, "ready".to_string()),
+        Err(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason.to_string()),
     }
 }
 

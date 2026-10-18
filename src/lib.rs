@@ -35,6 +35,7 @@ pub mod result_producer_stage;
 pub mod result_resolver;
 pub mod scrub;
 pub mod secrets;
+pub mod serving_heartbeat;
 pub mod sharding;
 pub mod snowflake;
 pub mod spool_runtime;

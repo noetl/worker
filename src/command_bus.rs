@@ -265,12 +265,21 @@ pub async fn spawn_writer_host(
     let stop_ingest = crate::graceful::StopSignal::new();
     let mut ingest_stop_handle = None;
     if let Some(addr) = config.ingest_bind {
+        // Configured — recorded BEFORE the bind so a face that fails to bind
+        // reads expected-but-unbound (a 503) rather than silently absent
+        // (a pass). noetl/ai-meta#470.
+        crate::serving_heartbeat::mark_expected(
+            crate::serving_heartbeat::ServingLoop::CommandIngest,
+        );
         let listener = TcpListener::bind(addr).await?;
         // Register before spawning, so the shutdown barrier counts this face
         // whether or not its task has been polled yet.
         tokio::spawn(crate::graceful::until_stopped(
             stop_ingest.register("command-bus ingest"),
-            ehdb_feed::serve_ingest(listener, writer.clone()),
+            crate::serving_heartbeat::beating(
+                crate::serving_heartbeat::ServingLoop::CommandIngest,
+                ehdb_feed::serve_ingest(listener, writer.clone()),
+            ),
         ));
         ingest_stop_handle = Some(stop_ingest.clone());
         tracing::info!(%addr, shard = config.shard, "EHDB command-bus ingest listener up");
@@ -327,10 +336,19 @@ pub async fn spawn_writer_host(
     };
 
     if let Some(addr) = config.claim_bind {
+        // Configured — recorded BEFORE the bind so a face that fails to bind
+        // reads expected-but-unbound (a 503) rather than silently absent
+        // (a pass). noetl/ai-meta#470.
+        crate::serving_heartbeat::mark_expected(
+            crate::serving_heartbeat::ServingLoop::CommandClaim,
+        );
         let listener = TcpListener::bind(addr).await?;
         tokio::spawn(crate::graceful::supervised(
             "command-bus claim",
-            ehdb_feed::serve_claims(listener, coordinator.clone()),
+            crate::serving_heartbeat::beating(
+                crate::serving_heartbeat::ServingLoop::CommandClaim,
+                ehdb_feed::serve_claims(listener, coordinator.clone()),
+            ),
         ));
         tracing::info!(%addr, shard = config.shard, "EHDB command-bus claim coordinator up");
     }
