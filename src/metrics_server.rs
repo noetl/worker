@@ -1284,17 +1284,23 @@ async fn healthz_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// `GET /readyz` — readiness check.  200 only when ALL THREE hold:
+/// `GET /readyz` — readiness check, answered for this process's ROLE
+/// (noetl/ai-meta#480).
 ///
-/// 1. boot warmup has completed (noetl/ai-meta#130 cold-start — the orchestrate
-///    drive plug-in is compiled + cached on the drive pool);
-/// 2. every required serving face has a bound listener;
-/// 3. every required serving loop ticked within the freshness threshold.
+/// **Bus host** (hosts at least one required bus face) — 200 when every required
+/// face it hosts is bound AND ticked within the freshness threshold. Boot warmup
+/// is deliberately NOT consulted: on prod it takes 300–435 s while the
+/// command-bus faces bind at 6.6 s, so gating the Service endpoint on it would
+/// stop dispatch for minutes on every restart.
+///
+/// **Pool** (hosts no bus face) — unchanged noetl/ai-meta#130 behaviour: 200 once
+/// boot warmup has completed, which hides the one-time orchestrate compile from
+/// the first real request.
 ///
 /// Otherwise 503, with a body naming which of the three failed and for which
 /// face, so an operator does not have to guess from a bare "warming".
 ///
-/// ⚠ (2) and (3) are noetl/ai-meta#470. Warmup alone is a boolean that is set
+/// ⚠ The bus-host branch is noetl/ai-meta#470 + #480. Warmup alone is a boolean that is set
 /// once and never falsified, so it cannot represent a face that WAS serving and
 /// stopped — which is exactly what happened in noetl/ai-meta#469: the writer
 /// accepted TCP and never answered, for over a day, across two pod generations,
