@@ -408,6 +408,36 @@ pub struct Snapshot {
     pub required: Vec<ServingLoop>,
 }
 
+/// Which role's readiness `/readyz` is answering for this process
+/// (noetl/ai-meta#480).
+///
+/// ⚠⚠ The distinction is load-bearing and was found the expensive way: on prod,
+/// the writer's boot warmup takes **300–435 s** (measured as `noetl_worker_ready`
+/// 0→1 across two restarts), while its command-bus faces bind at **6.6 s**. A
+/// readiness answer that waited for warmup would hold the writer out of every
+/// Service that selects it for 5–7 minutes per restart — and that pod hosts both
+/// buses, so it is minutes of stopped dispatch each time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// This process hosts bus faces. The Service endpoint exists so OTHER
+    /// workers can reach those faces, so readiness means **the bus serves**.
+    BusHost,
+    /// This process hosts no bus faces — an ordinary worker/drive pool. Readiness
+    /// keeps its original noetl/ai-meta#130 meaning: boot warmup has completed,
+    /// which hides the one-time orchestrate compile from the first real request.
+    Pool,
+}
+
+impl Role {
+    pub const ALL: [Role; 2] = [Self::BusHost, Self::Pool];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BusHost => "bus_host",
+            Self::Pool => "pool",
+        }
+    }
+}
+
 /// Sample the live state.
 pub fn snapshot() -> Snapshot {
     Snapshot {
@@ -427,6 +457,20 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+/// The role this sample describes: [`Role::BusHost`] when the process is
+/// configured to host at least one REQUIRED bus face, else [`Role::Pool`].
+///
+/// Derived from `expected` rather than from a flag, so it cannot drift from what
+/// the process actually wired up.
+pub fn role_of(s: &Snapshot) -> Role {
+    for which in &s.required {
+        if s.expected & (1 << which.index()) != 0 {
+            return Role::BusHost;
+        }
+    }
+    Role::Pool
+}
+
 /// The readiness predicate: warmup done, every REQUIRED listener bound, and every
 /// REQUIRED loop fresh.
 ///
@@ -434,33 +478,58 @@ pub fn snapshot() -> Snapshot {
 /// stateless — it cannot compare two scrapes, so it cannot notice that a number
 /// stopped moving. The process does the comparison and answers with a status code.
 pub fn evaluate(s: &Snapshot) -> Result<(), NotReady> {
-    if !s.warm {
-        return Err(NotReady::Warming);
+    match role_of(s) {
+        // ⭐ A bus host answers for its BUS. Boot warmup is deliberately NOT
+        // consulted here (noetl/ai-meta#480).
+        //
+        // Warmup is the worker-POOL role's concern — the one-time Cranelift
+        // compile of `system/orchestrate`. On prod it takes 300–435 s while the
+        // command-bus faces bind at 6.6 s, so gating the Service endpoint on it
+        // would stop dispatch for minutes on every restart.
+        //
+        // ⚠ Dropping it here starves nothing, and that is a property of the
+        // code rather than a hope: `worker.rs` awaits the warmup BEFORE
+        // `process_commands` starts claiming, and registers the pool with the
+        // server only after that. So the pool role is protected by in-process
+        // sequencing and late registration — never by this endpoint. At the time
+        // of writing `metrics::worker_ready()` has exactly one reader, which is
+        // this module.
+        Role::BusHost => {
+            for which in &s.required {
+                let which = *which;
+                let i = which.index();
+                // Not configured on this process — not its job, not its readiness.
+                if s.expected & (1 << i) == 0 {
+                    continue;
+                }
+                if s.bound & (1 << i) == 0 {
+                    return Err(NotReady::Unbound(which));
+                }
+                let packed = s.beats[i];
+                if packed == 0 {
+                    return Err(NotReady::NeverServed(which));
+                }
+                let age = s.now_ms.saturating_sub(packed >> SEQ_BITS);
+                if age > s.threshold_ms {
+                    return Err(NotReady::Stale {
+                        which,
+                        age_ms: age,
+                        threshold_ms: s.threshold_ms,
+                    });
+                }
+            }
+            Ok(())
+        }
+        // Unchanged noetl/ai-meta#130 behaviour for a pool that hosts no bus
+        // face: readiness is boot warmup, and nothing else. Any bus faces it
+        // somehow had would be non-required ones, which never gated readiness.
+        Role::Pool => {
+            if !s.warm {
+                return Err(NotReady::Warming);
+            }
+            Ok(())
+        }
     }
-    for which in &s.required {
-        let which = *which;
-        let i = which.index();
-        // Not configured on this process — not its job, so not its readiness.
-        if s.expected & (1 << i) == 0 {
-            continue;
-        }
-        if s.bound & (1 << i) == 0 {
-            return Err(NotReady::Unbound(which));
-        }
-        let packed = s.beats[i];
-        if packed == 0 {
-            return Err(NotReady::NeverServed(which));
-        }
-        let age = s.now_ms.saturating_sub(packed >> SEQ_BITS);
-        if age > s.threshold_ms {
-            return Err(NotReady::Stale {
-                which,
-                age_ms: age,
-                threshold_ms: s.threshold_ms,
-            });
-        }
-    }
-    Ok(())
 }
 
 /// [`evaluate`] against the live sample — what `/readyz` answers.
@@ -530,6 +599,11 @@ pub fn render_prometheus() -> String {
             u8::from(is_expected(l))
         ));
     }
+    // ⚠ Both role values pinned, so an operator can read WHICH predicate this
+    // process is answering with. Without it, `serving_ready 1` on a warming pool
+    // and `serving_ready 1` on a serving bus host are the same two bytes, and
+    // noetl/ai-meta#480 is precisely about those meaning different things.
+    out.push_str(&render_role(role_of(&snapshot())));
     out.push_str(
         "# HELP noetl_worker_serving_ready 1 when the readiness predicate holds \
          (what /readyz answers).\n# TYPE noetl_worker_serving_ready gauge\n",
@@ -538,6 +612,27 @@ pub fn render_prometheus() -> String {
         "noetl_worker_serving_ready {}\n",
         u8::from(readiness().is_ok())
     ));
+    out
+}
+
+/// The role gauge, pure over the role so a test can drive both values.
+///
+/// ⚠ Extracted rather than inlined because a mutation run showed the inline
+/// version was unverified: hardcoding it to always report `bus_host` survived
+/// the whole suite.
+pub fn render_role(role: Role) -> String {
+    let mut out = String::from(
+        "# HELP noetl_worker_serving_role 1 for the role whose readiness this \
+         process answers with (noetl/ai-meta#480).\n\
+         # TYPE noetl_worker_serving_role gauge\n",
+    );
+    for r in Role::ALL {
+        out.push_str(&format!(
+            "noetl_worker_serving_role{{role=\"{}\"}} {}\n",
+            r.as_str(),
+            u8::from(r == role)
+        ));
+    }
     out
 }
 
@@ -612,7 +707,11 @@ where
 mod tests {
     use super::*;
 
-    /// A snapshot where everything required is bound and just ticked.
+    /// A BUS-HOST snapshot: everything required is bound and just ticked.
+    ///
+    /// ⚠ `warm: false` deliberately. A bus host must answer ready WITHOUT boot
+    /// warmup (noetl/ai-meta#480) — baking `warm: true` into the fixture would
+    /// make every case below pass even if the warmup gate came back.
     fn healthy(now_ms: u64) -> Snapshot {
         let packed = now_ms << SEQ_BITS;
         let mut bound = 0u64;
@@ -622,7 +721,7 @@ mod tests {
             beats[l.index()] = packed;
         }
         Snapshot {
-            warm: true,
+            warm: false,
             now_ms,
             threshold_ms: DEFAULT_FRESHNESS_MS,
             beats,
@@ -645,11 +744,82 @@ mod tests {
 
     // ---- the three refusal paths ----------------------------------------
 
+    /// ⭐⭐ The noetl/ai-meta#480 case, and the reason this PR exists.
+    ///
+    /// Prod measurement: the writer's boot warmup takes 300–435 s while its
+    /// command-bus faces bind at 6.6 s. If warmup gated this answer, the writer
+    /// would leave every Service that selects it for 5–7 minutes per restart,
+    /// and that pod hosts BOTH buses.
     #[test]
-    fn not_warm_is_not_ready() {
-        let mut s = healthy(1_000_000);
-        s.warm = false;
-        assert_eq!(evaluate(&s), Err(NotReady::Warming));
+    fn bus_host_is_ready_while_the_worker_pool_is_still_warming() {
+        let s = healthy(1_000_000);
+        assert_eq!(role_of(&s), Role::BusHost);
+        assert!(!s.warm, "fixture must represent a still-warming process");
+        assert_eq!(
+            evaluate(&s),
+            Ok(()),
+            "a serving bus must be ready even though boot warmup has not finished"
+        );
+        // And warmth must not be what carries it either way.
+        let warm = Snapshot { warm: true, ..s };
+        assert_eq!(evaluate(&warm), Ok(()));
+    }
+
+    /// The other half of the split: a process with NO bus face keeps the
+    /// original noetl/ai-meta#130 contract exactly.
+    #[test]
+    fn pool_without_bus_faces_still_gates_on_warmup() {
+        let base = Snapshot {
+            warm: false,
+            now_ms: 1_000_000,
+            threshold_ms: DEFAULT_FRESHNESS_MS,
+            beats: [0; 5],
+            bound: 0,
+            expected: 0,
+            required: ServingLoop::DEFAULT_REQUIRED.to_vec(),
+        };
+        assert_eq!(role_of(&base), Role::Pool);
+        assert_eq!(
+            evaluate(&base),
+            Err(NotReady::Warming),
+            "a pool must still refuse while warming"
+        );
+        assert_eq!(
+            evaluate(&Snapshot { warm: true, ..base }),
+            Ok(()),
+            "and be ready once warm"
+        );
+    }
+
+    /// ⚠ The role is derived from what the process HOSTS, not from a flag, so it
+    /// cannot drift from reality. Hosting a non-required face only does not make
+    /// a process a bus host — otherwise a tier-service-only process would stop
+    /// gating on warmup for no reason.
+    #[test]
+    fn role_is_derived_from_required_faces_only() {
+        let now = 1_000_000u64;
+        let mut only_tier = Snapshot {
+            warm: false,
+            now_ms: now,
+            threshold_ms: DEFAULT_FRESHNESS_MS,
+            beats: [0; 5],
+            bound: 0,
+            expected: 0,
+            required: ServingLoop::DEFAULT_REQUIRED.to_vec(),
+        };
+        let t = ServingLoop::TierService.index();
+        only_tier.expected |= 1 << t;
+        only_tier.bound |= 1 << t;
+        only_tier.beats[t] = now << SEQ_BITS;
+        assert_eq!(role_of(&only_tier), Role::Pool);
+        assert_eq!(evaluate(&only_tier), Err(NotReady::Warming));
+
+        let mut with_cmd = only_tier.clone();
+        let c = ServingLoop::CommandIngest.index();
+        with_cmd.expected |= 1 << c;
+        with_cmd.bound |= 1 << c;
+        with_cmd.beats[c] = now << SEQ_BITS;
+        assert_eq!(role_of(&with_cmd), Role::BusHost);
     }
 
     #[test]
@@ -796,6 +966,111 @@ mod tests {
         s.bound &= !(1 << l.index());
         assert!(s.expected & (1 << l.index()) != 0, "fixture must expect it");
         assert_eq!(evaluate(&s), Err(NotReady::Unbound(l)));
+    }
+
+    /// ⭐ The user-specified case: `event_claim` binds at ~430 s on prod and is
+    /// NOT required, so a bus host must be ready long before it appears.
+    #[test]
+    fn unbound_event_claim_does_not_block_readiness() {
+        let now = 1_000_000u64;
+        let mut s = healthy(now);
+        for l in [
+            ServingLoop::EventClaim,
+            ServingLoop::EventIngest,
+            ServingLoop::TierService,
+        ] {
+            let i = l.index();
+            s.bound &= !(1 << i);
+            s.expected &= !(1 << i);
+            s.beats[i] = 0;
+        }
+        assert_eq!(role_of(&s), Role::BusHost);
+        assert!(
+            !ServingLoop::DEFAULT_REQUIRED.contains(&ServingLoop::EventClaim),
+            "fixture assumes event_claim is not required"
+        );
+        assert_eq!(
+            evaluate(&s),
+            Ok(()),
+            "only the command faces are required; the slow-binding ones must not gate"
+        );
+    }
+
+    /// ⭐ And the converse, so the loosened predicate still bites: a required bus
+    /// that goes stale (wedged) or was never bound must refuse.
+    #[test]
+    fn required_bus_stale_or_dead_still_refuses_on_a_bus_host() {
+        let now = 1_000_000u64;
+        for l in ServingLoop::DEFAULT_REQUIRED {
+            let mut stale = healthy(now);
+            stale.beats[l.index()] = (now - DEFAULT_FRESHNESS_MS - 1) << SEQ_BITS;
+            assert!(
+                matches!(evaluate(&stale), Err(NotReady::Stale { which, .. }) if which == l),
+                "a wedged {} must refuse",
+                l.as_str()
+            );
+
+            let mut dead = healthy(now);
+            dead.bound &= !(1 << l.index());
+            assert_eq!(evaluate(&dead), Err(NotReady::Unbound(l)));
+        }
+    }
+
+    /// ⚠ Closes a mutation gap: removing the expected-intersection INSIDE the
+    /// bus-host branch survived the suite, because no case had a bus host that
+    /// hosts one required face and not the other. A process configured to bind
+    /// only the ingest face must not be refused for the claim face it never had.
+    #[test]
+    fn bus_host_ignores_a_required_face_it_does_not_host() {
+        let now = 1_000_000u64;
+        let mut s = healthy(now);
+        let missing = ServingLoop::CommandClaim;
+        let i = missing.index();
+        s.expected &= !(1 << i);
+        s.bound &= !(1 << i);
+        s.beats[i] = 0;
+        assert_eq!(role_of(&s), Role::BusHost, "it still hosts command_ingest");
+        assert_eq!(
+            evaluate(&s),
+            Ok(()),
+            "a required face this process does not host must be skipped, not failed"
+        );
+        // ...but once it IS hosted, being unbound refuses again.
+        let mut hosted = s.clone();
+        hosted.expected |= 1 << i;
+        assert_eq!(evaluate(&hosted), Err(NotReady::Unbound(missing)));
+    }
+
+    /// ⚠ Closes the other mutation gap: nothing asserted the role gauge's VALUE,
+    /// so hardcoding it to `bus_host` survived.
+    #[test]
+    fn role_gauge_reports_the_actual_role() {
+        for (role, other) in [(Role::BusHost, Role::Pool), (Role::Pool, Role::BusHost)] {
+            let body = render_role(role);
+            assert!(
+                body.contains(&format!(
+                    "noetl_worker_serving_role{{role=\"{}\"}} 1",
+                    role.as_str()
+                )),
+                "{} must read 1, got:\n{body}",
+                role.as_str()
+            );
+            assert!(
+                body.contains(&format!(
+                    "noetl_worker_serving_role{{role=\"{}\"}} 0",
+                    other.as_str()
+                )),
+                "{} must read 0, got:\n{body}",
+                other.as_str()
+            );
+        }
+        // Both values pinned every time, so absence means "build lacks it".
+        assert_eq!(
+            render_role(Role::Pool)
+                .matches("noetl_worker_serving_role{")
+                .count(),
+            Role::ALL.len()
+        );
     }
 
     // ---- the configurable required set ----------------------------------
