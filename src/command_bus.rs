@@ -354,107 +354,132 @@ pub async fn spawn_writer_host(
     }
 
     if let Some(addr) = config.metrics_bind {
-        // Seed the reported subject label set from the existing log **before** the
-        // endpoint is up, so the very first scrape after a restart already carries
-        // a line for every pool this shard has ever routed to. Without it a
-        // freshly-restarted writer reports an empty subject set until each pool's
-        // next command arrives — and to KEDA a `valueLocation` that matches no
-        // line is a *scaler error*, not a backlog of 0 (noetl/ai-meta#194).
-        coordinator.seed_subjects().await;
-
-        // The scaler provider is sync; publish the async lag into an atomic that a
-        // background sampler refreshes.
-        let gauge = Arc::new(AtomicU64::new(0));
-        // The committed cursor rides the same sampler: it is the value a restart
-        // resumes from, so an operator watching a restart can see it advance
-        // (noetl/ai-meta#208) instead of the hardcoded 0 reported before.
-        let committed = Arc::new(AtomicU64::new(0));
-        // The per-pool split — the value the user pool's ScaledObject actually
-        // triggers on. Whole-shard lag mixes the pools that share this shard, so a
-        // stuck system-pool command would pin it high and hold the user pool at
-        // maxReplicaCount forever (noetl/ai-meta#194, noetl/ai-meta#210).
-        let subjects = Arc::new(std::sync::Mutex::new(Vec::<ehdb_feed::SubjectLag>::new()));
-        // Delivered-but-unacked depth, on the same sampler.
+        // ⚠⚠ Spawned, NOT awaited (noetl/ai-meta#482).
         //
-        // ⚠⚠ This is sampled rather than left at 0 because `render_snapshot`
-        // publishes `inflight` unconditionally, and a literal 0 does not read
-        // as "unknown": per that metric's own HELP text, high lag with zero
-        // in-flight is the *stalled consumer* reading. Hardcoding it would make
-        // a healthy bus publish an outage signal on every scrape, and the one
-        // condition the field was added to distinguish would be the one it
-        // misreports. `ClaimCoordinator::inflight` exists for this
-        // (noetl/ehdb#402).
-        let inflight = Arc::new(AtomicU64::new(0));
-        let sampler = gauge.clone();
-        let committed_sampler = committed.clone();
-        let subject_sampler = subjects.clone();
-        let inflight_sampler = inflight.clone();
-        let coord = coordinator.clone();
-        tokio::spawn(async move {
-            loop {
-                sampler.store(coord.lag().await, Ordering::Relaxed);
-                committed_sampler.store(coord.committed_cursor().await, Ordering::Relaxed);
-                inflight_sampler.store(coord.inflight().await, Ordering::Relaxed);
-                let split = coord.subject_lags().await;
-                if let Ok(mut guard) = subject_sampler.lock() {
-                    *guard = split;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
+        // The seed below reads the retained partition from sequence 0 to
+        // enumerate subjects. On the prod command bus that takes ~63.5 s, and
+        // awaiting it here blocked EVERYTHING after this point — including the
+        // entire event-bus host, whose own faces then bound 63.5 s later than
+        // they needed to. The event bus is documented as "independent of the
+        // command bus in every way that matters: its own flag, its own L0
+        // engine + directory, its own ports", so there was never an ordering
+        // reason for it to wait on this.
+        //
+        // What is PRESERVED: the seed still completes BEFORE this endpoint
+        // binds, so KEDA never scrapes an empty subject set — the
+        // noetl/ai-meta#194 contract that put the seed ahead of the bind in the
+        // first place. :9102 is unavailable for the same ~63.5 s it already was,
+        // so there is no regression on this face; the change is that nothing
+        // else waits for it.
+        //
+        // Deliberately NOT full concurrency of the two hosts: that would overlap
+        // two L0 engine opens and raise peak memory on a writer with documented
+        // OOMs (noetl/ai-meta#332). Only this face moves.
+        let coordinator = coordinator.clone();
+        let writer = writer.clone();
         let shard = config.shard;
-        let read = gauge.clone();
-        let read_inflight = inflight.clone();
-        // Serve the lag snapshot, the resume facts, **and** the append-integrity
-        // counters from one endpoint. Each answers a different question an
-        // operator asks about this bus, and a writer that binds only one of them
-        // drops the others silently (noetl/ai-meta#208 follow-up).
-        let resume_reports = coordinator.resume_report().into_iter().collect::<Vec<_>>();
-        let integrity_engine = writer.clone();
-        let durability_engine = writer.clone();
-        tokio::spawn(serve_writer_metrics(
-            addr,
-            resume_reports,
-            move || ehdb_feed::LagSnapshot {
-                shards: vec![ShardLag {
-                    shard,
-                    committed: committed.load(Ordering::Relaxed),
-                    lag: read.load(Ordering::Relaxed),
-                    inflight: read_inflight.load(Ordering::Relaxed),
-                }],
-                subjects: subjects.lock().map(|g| g.clone()).unwrap_or_default(),
-            },
-            move || {
-                // ⚠ LOCK-FREE. This used to take the engine lock purely to reach
-                // a metrics handle that is cloned at construction and needs no
-                // lock at all (`ehdb-feed/src/lib.rs:317`, `:506` — "without
-                // taking the engine lock", noetl/ehdb#345). Taking it parked a
-                // Tokio worker thread on a `std::sync::Mutex` inside an async
-                // task, and the writer runs only TWO worker threads (measured
-                // 2026-09-23: cgroup quota 2 cores), so a scrape could occupy
-                // half the runtime waiting on the append path.
-                Some(integrity_engine.metrics().snapshot())
-            },
-            move || {
-                let engine = durability_engine.engine();
-                // ⚠ `try_lock`, not `lock`. `std::sync::Mutex::lock()` BLOCKS,
-                // and `.ok()` maps only `PoisonError` — so the old code could
-                // never report contention, it could only park a runtime thread
-                // until the append finished. `try_lock` fails fast, which is
-                // what `ehdb_l0_durability_sample_ok 0` has always claimed to
-                // mean.
-                // `try_read`, preserving the non-blocking contract above: a
-                // metrics handler must never park on the append lock.
-                let e = engine.try_read()?;
-                // Rendered under the lock: the gauges and the histogram must
-                // describe the same instant, or a shard could read "nothing
-                // pending" beside a latency sample for the record it just shed.
-                let mut out = ehdb_feed::render_unreplicated(&e.unreplicated_snapshot());
-                out.push_str(&ehdb_feed::render_replicated_lag(&e.metrics()));
-                Some(out)
-            },
-        ));
-        tracing::info!(%addr, "EHDB command-bus /metrics lag + resume + integrity + durability-window endpoint up");
+        tokio::spawn(async move {
+            // Seed the reported subject label set from the existing log **before** the
+            // endpoint is up, so the very first scrape after a restart already carries
+            // a line for every pool this shard has ever routed to. Without it a
+            // freshly-restarted writer reports an empty subject set until each pool's
+            // next command arrives — and to KEDA a `valueLocation` that matches no
+            // line is a *scaler error*, not a backlog of 0 (noetl/ai-meta#194).
+            coordinator.seed_subjects().await;
+
+            // The scaler provider is sync; publish the async lag into an atomic that a
+            // background sampler refreshes.
+            let gauge = Arc::new(AtomicU64::new(0));
+            // The committed cursor rides the same sampler: it is the value a restart
+            // resumes from, so an operator watching a restart can see it advance
+            // (noetl/ai-meta#208) instead of the hardcoded 0 reported before.
+            let committed = Arc::new(AtomicU64::new(0));
+            // The per-pool split — the value the user pool's ScaledObject actually
+            // triggers on. Whole-shard lag mixes the pools that share this shard, so a
+            // stuck system-pool command would pin it high and hold the user pool at
+            // maxReplicaCount forever (noetl/ai-meta#194, noetl/ai-meta#210).
+            let subjects = Arc::new(std::sync::Mutex::new(Vec::<ehdb_feed::SubjectLag>::new()));
+            // Delivered-but-unacked depth, on the same sampler.
+            //
+            // ⚠⚠ This is sampled rather than left at 0 because `render_snapshot`
+            // publishes `inflight` unconditionally, and a literal 0 does not read
+            // as "unknown": per that metric's own HELP text, high lag with zero
+            // in-flight is the *stalled consumer* reading. Hardcoding it would make
+            // a healthy bus publish an outage signal on every scrape, and the one
+            // condition the field was added to distinguish would be the one it
+            // misreports. `ClaimCoordinator::inflight` exists for this
+            // (noetl/ehdb#402).
+            let inflight = Arc::new(AtomicU64::new(0));
+            let sampler = gauge.clone();
+            let committed_sampler = committed.clone();
+            let subject_sampler = subjects.clone();
+            let inflight_sampler = inflight.clone();
+            let coord = coordinator.clone();
+            tokio::spawn(async move {
+                loop {
+                    sampler.store(coord.lag().await, Ordering::Relaxed);
+                    committed_sampler.store(coord.committed_cursor().await, Ordering::Relaxed);
+                    inflight_sampler.store(coord.inflight().await, Ordering::Relaxed);
+                    let split = coord.subject_lags().await;
+                    if let Ok(mut guard) = subject_sampler.lock() {
+                        *guard = split;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            });
+            let read = gauge.clone();
+            let read_inflight = inflight.clone();
+            // Serve the lag snapshot, the resume facts, **and** the append-integrity
+            // counters from one endpoint. Each answers a different question an
+            // operator asks about this bus, and a writer that binds only one of them
+            // drops the others silently (noetl/ai-meta#208 follow-up).
+            let resume_reports = coordinator.resume_report().into_iter().collect::<Vec<_>>();
+            let integrity_engine = writer.clone();
+            let durability_engine = writer.clone();
+            tokio::spawn(serve_writer_metrics(
+                addr,
+                resume_reports,
+                move || ehdb_feed::LagSnapshot {
+                    shards: vec![ShardLag {
+                        shard,
+                        committed: committed.load(Ordering::Relaxed),
+                        lag: read.load(Ordering::Relaxed),
+                        inflight: read_inflight.load(Ordering::Relaxed),
+                    }],
+                    subjects: subjects.lock().map(|g| g.clone()).unwrap_or_default(),
+                },
+                move || {
+                    // ⚠ LOCK-FREE. This used to take the engine lock purely to reach
+                    // a metrics handle that is cloned at construction and needs no
+                    // lock at all (`ehdb-feed/src/lib.rs:317`, `:506` — "without
+                    // taking the engine lock", noetl/ehdb#345). Taking it parked a
+                    // Tokio worker thread on a `std::sync::Mutex` inside an async
+                    // task, and the writer runs only TWO worker threads (measured
+                    // 2026-09-23: cgroup quota 2 cores), so a scrape could occupy
+                    // half the runtime waiting on the append path.
+                    Some(integrity_engine.metrics().snapshot())
+                },
+                move || {
+                    let engine = durability_engine.engine();
+                    // ⚠ `try_lock`, not `lock`. `std::sync::Mutex::lock()` BLOCKS,
+                    // and `.ok()` maps only `PoisonError` — so the old code could
+                    // never report contention, it could only park a runtime thread
+                    // until the append finished. `try_lock` fails fast, which is
+                    // what `ehdb_l0_durability_sample_ok 0` has always claimed to
+                    // mean.
+                    // `try_read`, preserving the non-blocking contract above: a
+                    // metrics handler must never park on the append lock.
+                    let e = engine.try_read()?;
+                    // Rendered under the lock: the gauges and the histogram must
+                    // describe the same instant, or a shard could read "nothing
+                    // pending" beside a latency sample for the record it just shed.
+                    let mut out = ehdb_feed::render_unreplicated(&e.unreplicated_snapshot());
+                    out.push_str(&ehdb_feed::render_replicated_lag(&e.metrics()));
+                    Some(out)
+                },
+            ));
+            tracing::info!(%addr, "EHDB command-bus /metrics lag + resume + integrity + durability-window endpoint up");
+        });
     }
 
     Ok((writer, shutdown))
