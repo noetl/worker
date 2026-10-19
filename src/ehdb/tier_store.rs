@@ -167,6 +167,12 @@ impl DedupRing {
         }
     }
 
+    /// ⚠ `#[cfg(test)]`: the production path never asks "is this present" on its
+    /// own — `insert` answers both questions in one lock. This exists so the
+    /// ring's eviction order is assertable, which is what the mutation battery
+    /// needs. Gated rather than `allow(dead_code)` so it cannot quietly become a
+    /// second, drifting way to read the ring.
+    #[cfg(test)]
     pub(crate) fn contains(&self, id: &str) -> bool {
         self.seen.contains(id)
     }
@@ -200,6 +206,9 @@ impl DedupRing {
         true
     }
 
+    /// ⚠ `#[cfg(test)]`, same reason as [`contains`]: the bound is asserted by
+    /// tests, not consulted at runtime.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.order.len()
     }
