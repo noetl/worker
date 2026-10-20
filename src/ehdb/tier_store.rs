@@ -698,20 +698,54 @@ pub async fn read_execution(
         return TierStoreOutcome::Invalid("execution_id is empty".to_string());
     }
     let lock = store_lock(cfg, tier);
-    let _shared = lock.read().await;
-    let cfg = cfg.clone();
-    let execution_id = execution_id.to_string();
-    match off_runtime(move || read_execution_locked(&cfg, tier, &execution_id)).await {
-        Ok(v) => v,
+    let shared = lock.read().await;
+    let locked_phase = {
+        let cfg = cfg.clone();
+        let execution_id = execution_id.to_string();
+        off_runtime(move || read_execution_locked(&cfg, tier, &execution_id)).await
+    };
+    // ⚠⚠ Released BEFORE the sealed segments are read. A sealed segment is
+    // immutable — it is created by a rename under the WRITE lock and never
+    // written again — so reading it needs no lock. Holding the shared guard
+    // across its replay (256 MiB on prod) queued every append behind the read,
+    // because tokio's RwLock is write-preferring: on 2026-10-20 a live chat
+    // turn's mirror append was shed behind comparator reads of a freshly sealed
+    // segment (noetl/ai-meta#490). The sealed LIST and the active segment were
+    // both taken under the guard, so the answer is the store as of that instant;
+    // a seal after release renames a file this read already holds the contents
+    // of, and adds a segment it correctly does not consult.
+    drop(shared);
+    match locked_phase {
         Err(e) => TierStoreOutcome::Error(e),
+        Ok(LockedRead::Complete(outcome)) => outcome,
+        Ok(LockedRead::NeedsSealed { sealed, active }) => {
+            let cfg = cfg.clone();
+            let execution_id = execution_id.to_string();
+            match off_runtime(move || {
+                read_execution_across_segments(&cfg, tier, &execution_id, &sealed, active)
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => TierStoreOutcome::Error(e),
+            }
+        }
     }
 }
 
-fn read_execution_locked(
-    cfg: &TierStoreConfig,
-    tier: StoreTier,
-    execution_id: &str,
-) -> TierStoreOutcome {
+/// What the locked phase of a read produced.
+enum LockedRead {
+    /// No sealed segment can hold the execution; the active segment answered.
+    Complete(TierStoreOutcome),
+    /// These sealed segments must be merged in front of the active segment's
+    /// records, which were already read under the lock.
+    NeedsSealed {
+        sealed: Vec<PathBuf>,
+        active: Result<Vec<serde_json::Value>, String>,
+    },
+}
+
+fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &str) -> LockedRead {
     let request = EventLogReadExecutionRequest {
         execution_id: execution_id.to_string(),
         after: None,
@@ -728,7 +762,13 @@ fn read_execution_locked(
     // index is still opened — absence is "unknown", never "absent".
     let (sealed, total_sealed) = segments_possibly_holding(cfg, tier, execution_id);
     if !sealed.is_empty() {
-        return read_execution_across_segments(cfg, tier, execution_id, &sealed, &request);
+        // Only the ACTIVE segment is read here; the sealed ones are read by the
+        // caller after it releases the lock.
+        let active =
+            read_segment_then_release(&cfg.path_for(tier), false, |d| d.read_execution(&request))
+                .map_err(|e| e.to_string())
+                .map(|out| records_of(&out));
+        return LockedRead::NeedsSealed { sealed, active };
     }
     if total_sealed > 0 {
         // Every sealed segment was ruled out by its index; the active segment
@@ -740,7 +780,7 @@ fn read_execution_locked(
             "tier read skipped sealed segments via index"
         );
     }
-    match driver(cfg, tier).read_execution(&request) {
+    LockedRead::Complete(match driver(cfg, tier).read_execution(&request) {
         Ok(out) => {
             let mut v = serde_json::to_value(&out).unwrap_or(serde_json::Value::Null);
             // ⚠ The driver reports `exists: true` for an execution it holds NO
@@ -759,7 +799,7 @@ fn read_execution_locked(
             TierStoreOutcome::Ok(serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()))
         }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
-    }
+    })
 }
 
 /// Build a segment's index off the request path.
@@ -1068,6 +1108,17 @@ fn scan_across_segments(
     TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
+/// The `records` array of a driver read, as JSON values.
+fn records_of<T: serde::Serialize>(out: &T) -> Vec<serde_json::Value> {
+    match serde_json::to_value(out) {
+        Ok(serde_json::Value::Object(mut o)) => match o.remove("records") {
+            Some(serde_json::Value::Array(rs)) => rs,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 /// Read one execution across sealed segments + the active one, oldest first.
 ///
 /// ⚠ `global_sequence` is **renumbered** over the merged result. Each segment's
@@ -1080,22 +1131,19 @@ fn read_execution_across_segments(
     tier: StoreTier,
     execution_id: &str,
     sealed: &[PathBuf],
-    request: &EventLogReadExecutionRequest,
+    active: Result<Vec<serde_json::Value>, String>,
 ) -> TierStoreOutcome {
+    #[cfg(test)]
+    tests::probe_sealed_phase(cfg, tier);
+    let request = EventLogReadExecutionRequest {
+        execution_id: execution_id.to_string(),
+        after: None,
+        limit: MAX_SCAN_LIMIT,
+    };
     let mut records: Vec<serde_json::Value> = Vec::new();
-    let mut paths: Vec<PathBuf> = sealed.to_vec();
-    paths.push(cfg.path_for(tier));
-    let last = paths.len() - 1;
-    for (i, path) in paths.iter().enumerate() {
-        let sealed_seg = i < last; // the final entry is the ACTIVE segment
-        match read_segment_then_release(path, sealed_seg, |d| d.read_execution(request)) {
-            Ok(out) => {
-                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out) {
-                    if let Some(serde_json::Value::Array(rs)) = o.remove("records") {
-                        records.extend(rs);
-                    }
-                }
-            }
+    for path in sealed {
+        match read_segment_then_release(path, true, |d| d.read_execution(&request)) {
+            Ok(out) => records.extend(records_of(&out)),
             // A segment that cannot be read is NOT silently skipped: a partial
             // answer presented as complete is the failure this whole change is
             // trying not to cause.
@@ -1105,6 +1153,16 @@ fn read_execution_across_segments(
                     path.display()
                 ))
             }
+        }
+    }
+    // The active segment's records were read under the lock and go LAST.
+    match active {
+        Ok(rs) => records.extend(rs),
+        Err(e) => {
+            return TierStoreOutcome::Error(format!(
+                "tier segment {} unreadable: {e}",
+                cfg.path_for(tier).display()
+            ))
         }
     }
     for (i, r) in records.iter_mut().enumerate() {
@@ -1189,6 +1247,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         TierStoreConfig { dir: d }
+    }
+
+    /// Sealed-phase probes, keyed by store dir: `0` not reached, `1` the store
+    /// lock was free when the sealed segments were read, `2` it was held.
+    /// Keyed so a parallel test's reads cannot answer for this one.
+    fn sealed_probes() -> &'static StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicU8>>> {
+        static P: OnceLock<StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicU8>>>> =
+            OnceLock::new();
+        P.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    pub(super) fn probe_sealed_phase(cfg: &TierStoreConfig, tier: StoreTier) {
+        let probe = sealed_probes().lock().unwrap().get(&cfg.dir).cloned();
+        if let Some(p) = probe {
+            let free = store_lock(cfg, tier).try_write().is_ok();
+            p.store(
+                if free { 1 } else { 2 },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+
+    /// ⭐⭐ The sealed segments are read with the store lock RELEASED.
+    ///
+    /// noetl/ai-meta#490: a read held the shared guard across a 256 MiB sealed
+    /// replay, so appends (write guard) queued behind it and a live mirror
+    /// append was shed. The probe runs at the start of the sealed phase and
+    /// tries the WRITE lock — what an append needs.
+    #[tokio::test]
+    async fn sealed_segments_are_read_without_the_store_lock() {
+        let cfg = seal_cfg("unlocked");
+        const N: usize = 30;
+        for i in 0..N {
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-unl",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "u".repeat(120)),
+                Some(2048),
+            )
+            .await;
+        }
+        assert!(
+            !sealed_segments(&cfg, StoreTier::EventLog).is_empty(),
+            "fixture never sealed; the sealed phase would not run"
+        );
+        let probe = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        sealed_probes()
+            .lock()
+            .unwrap()
+            .insert(cfg.dir.clone(), probe.clone());
+
+        let got = read_execution(Some(&cfg), StoreTier::EventLog, "exec-unl").await;
+        sealed_probes().lock().unwrap().remove(&cfg.dir);
+
+        let TierStoreOutcome::Ok(body) = got else {
+            panic!("read failed: {got:?}");
+        };
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["record_count"], N,
+            "the split read lost or duplicated records"
+        );
+        // Oldest first across the split: sealed records, then the active ones.
+        let order: Vec<u64> = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let p = r["payload"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| r["payload"].to_string());
+                serde_json::from_str::<serde_json::Value>(&p).unwrap()["i"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(order, (0..N as u64).collect::<Vec<_>>());
+        match probe.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => {}
+            0 => panic!("the sealed phase never ran — this test measured nothing"),
+            _ => panic!("the store lock was HELD while sealed segments were read"),
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
     /// ⭐⭐ A merge must be bounded by ONE segment at a time, not by their sum.
