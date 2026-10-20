@@ -1283,6 +1283,9 @@ fn serve_state_code(decision: &super::primary_serve::ServeDecision) -> u8 {
         ServeDecision::ServedByIncumbent {
             reason: DemoteReason::ParityDiverged,
         } => 4,
+        ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::AppendRefused,
+        } => 5,
     }
 }
 
@@ -1349,6 +1352,10 @@ pub fn current_serve_state() -> &'static str {
         .outcome_label(),
         4 => ServeDecision::ServedByIncumbent {
             reason: DemoteReason::ParityDiverged,
+        }
+        .outcome_label(),
+        5 => ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::AppendRefused,
         }
         .outcome_label(),
         _ => "unknown",

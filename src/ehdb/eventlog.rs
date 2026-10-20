@@ -1051,7 +1051,19 @@ pub(crate) fn serve_service_append_with(
         },
     };
 
-    let decision = super::primary_serve::decide(is_primary, durable_service_reachable, parity_held);
+    // A record that never landed has no parity verdict — `parity_held` is false
+    // above only because there is nothing to compare. Letting that reach
+    // `decide` reported a load shed as `parity_diverged`, a correctness signal
+    // for what is an availability one. Reachability still wins: an unreachable
+    // service stays `no_durable_service`.
+    let decision = match landed_outcome {
+        Some(_) if is_primary && durable_service_reachable => {
+            super::primary_serve::ServeDecision::ServedByIncumbent {
+                reason: super::primary_serve::DemoteReason::AppendRefused,
+            }
+        }
+        _ => super::primary_serve::decide(is_primary, durable_service_reachable, parity_held),
+    };
 
     // The SAME mapping `mirror_event` uses.  `landed_outcome` short-circuits it
     // for the records that are not in the store at all: claiming a parity verdict
@@ -1125,6 +1137,9 @@ fn serve_state_code(decision: &super::primary_serve::ServeDecision) -> u8 {
         ServeDecision::ServedByIncumbent {
             reason: DemoteReason::ParityDiverged,
         } => 4,
+        ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::AppendRefused,
+        } => 5,
     }
 }
 
@@ -1135,8 +1150,9 @@ fn serve_state_code(decision: &super::primary_serve::ServeDecision) -> u8 {
 /// missing an event**, so the promotion line below must not claim the tier
 /// "answered authoritatively".
 ///
-/// The observed failure: a refused append demotes to `parity_diverged`, the next
-/// successful op promotes back to `served_primary`, and the pair repeats every
+/// The observed failure: a refused append demotes (then to `parity_diverged`,
+/// now `append_refused`), the next successful op promotes back to
+/// `served_primary`, and the pair repeats every
 /// few seconds — so a reader sampling either side gets a different answer about
 /// whether the tier is authoritative, and the INFO line (the one visible at
 /// default level) says it is, milliseconds after the WARN saying an append was
@@ -1288,6 +1304,10 @@ pub fn current_serve_state() -> &'static str {
         .outcome_label(),
         4 => ServeDecision::ServedByIncumbent {
             reason: DemoteReason::ParityDiverged,
+        }
+        .outcome_label(),
+        5 => ServeDecision::ServedByIncumbent {
+            reason: DemoteReason::AppendRefused,
         }
         .outcome_label(),
         _ => "unknown",
@@ -1881,6 +1901,45 @@ mod tests {
         let s2 = serve_service_append_with(&e, Ok(&flat), 6, 0.001, true);
         assert_eq!(s2.outcome, EventLogOutcome::PrimaryDivergence);
         assert!(s2.detail.is_some_and(|d| d.contains("ordering divergence")));
+    }
+
+    #[test]
+    fn a_shed_append_is_refused_not_diverged() {
+        // The 2026-10-20 05:36:38Z prod line, verbatim: the writer shed the
+        // append under load. Nothing landed, so there is no parity to have
+        // diverged — the label must say the record was refused.
+        let e = worker_env("/tmp/svc-shed.jsonl", "primary");
+        let shed = "err tier service busy: no in-flight permit within the shed deadline; \
+                    the request was ACCEPTED and REFUSED, not lost — retry or widen \
+                    NOETL_EHDB_TIER_MAX_INFLIGHT";
+        let s = serve_service_append_with(&e, Ok(shed), 6, 0.001, true);
+        assert_eq!(s.outcome, EventLogOutcome::Unavailable);
+        assert!(!s.decision.served_by_ehdb());
+        assert!(s.decision.degraded(), "a refused append still demotes");
+        assert_eq!(s.decision.outcome_label(), "append_refused");
+
+        // Transport failure and a typed `invalid` refusal: same — not landed.
+        let t = serve_service_append_with(&e, Err("timed out after 2s"), 6, 0.001, true);
+        assert_eq!(t.decision.outcome_label(), "append_refused");
+        let i = serve_service_append_with(&e, Ok("invalid: empty payload"), 6, 0.001, true);
+        assert_eq!(i.outcome, EventLogOutcome::Rejected);
+        assert_eq!(i.decision.outcome_label(), "append_refused");
+    }
+
+    #[test]
+    fn a_refused_append_on_an_unreachable_service_stays_no_durable_service() {
+        // Reachability is the coarser fact and keeps precedence.
+        let e = worker_env("/tmp/svc-shed-unreach.jsonl", "primary");
+        let s = serve_service_append_with(&e, Err("connection refused"), 6, 0.001, false);
+        assert_eq!(s.decision.outcome_label(), "no_durable_service");
+    }
+
+    #[test]
+    fn a_refused_append_in_shadow_is_not_primary() {
+        // Not asking for primary is not degraded, refused append or not.
+        let e = worker_env("/tmp/svc-shed-shadow.jsonl", "shadow");
+        let s = serve_service_append_with(&e, Err("timed out after 2s"), 6, 0.001, true);
+        assert_eq!(s.decision.outcome_label(), "not_primary");
     }
 
     #[test]
