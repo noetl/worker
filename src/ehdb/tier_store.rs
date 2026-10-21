@@ -895,11 +895,18 @@ pub async fn read_execution(
     match locked_phase {
         Err(e) => TierStoreOutcome::Error(e),
         Ok(LockedRead::Complete(outcome)) => outcome,
-        Ok(LockedRead::NeedsSealed { sealed, active }) => {
+        Ok(LockedRead::NeedsSealed {
+            sealed,
+            active,
+            lease,
+        }) => {
             let cfg = cfg.clone();
             let execution_id = execution_id.to_string();
             match off_runtime(move || {
-                read_execution_across_segments(&cfg, tier, &execution_id, &sealed, active)
+                let out =
+                    read_execution_across_segments(&cfg, tier, &execution_id, &sealed, active);
+                drop(lease);
+                out
             })
             .await
             {
@@ -919,6 +926,9 @@ enum LockedRead {
     NeedsSealed {
         sealed: Vec<PathBuf>,
         active: Result<Vec<serde_json::Value>, String>,
+        /// Held until the unlocked sealed read finishes, so a prune cannot
+        /// unlink a segment this read has already named (noetl/ai-meta#491).
+        lease: SegmentLease,
     },
 }
 
@@ -945,7 +955,16 @@ fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &
             read_segment_then_release(&cfg.path_for(tier), false, |d| d.read_execution(&request))
                 .map_err(|e| e.to_string())
                 .map(|out| records_of(&out));
-        return LockedRead::NeedsSealed { sealed, active };
+        // ⚠ Leased HERE, under the shared lock, in the same instant the sealed
+        // list was snapshot. The prune takes the WRITE lock and skips a leased
+        // segment, so the two cannot interleave: a segment is either leased
+        // before the prune looks, or gone before any reader can name it.
+        let lease = SegmentLease::acquire(&sealed);
+        return LockedRead::NeedsSealed {
+            sealed,
+            active,
+            lease,
+        };
     }
     if total_sealed > 0 {
         // Every sealed segment was ruled out by its index; the active segment
@@ -1583,6 +1602,318 @@ fn scan_locked(
     }
 }
 
+// ===========================================================================
+// Segment leases + the retention planner (noetl/ai-meta#491).
+// ===========================================================================
+
+/// Per-segment read refcounts: a sealed segment a read has named and not yet
+/// finished with. The prune skips any segment with a non-zero count.
+fn lease_counts() -> &'static StdMutex<HashMap<PathBuf, usize>> {
+    static L: OnceLock<StdMutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    L.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// A read's hold on the sealed segments it is about to read.
+///
+/// ⚠ Why a lease rather than holding the files open: the replay fallback hands
+/// `LocalReferenceEventLogDriver` a PATH and the driver opens it lazily, so a
+/// file handle held here would protect only the offset path. A refcount checked
+/// by the prune under the write lock protects both.
+///
+/// Released on drop, so a panic or an early return cannot strand a lease.
+pub(crate) struct SegmentLease(Vec<PathBuf>);
+
+impl SegmentLease {
+    /// Take a lease on `segments`. Call under the store's shared lock.
+    pub(crate) fn acquire(segments: &[PathBuf]) -> Self {
+        let mut g = lease_counts().lock().unwrap_or_else(|e| e.into_inner());
+        for s in segments {
+            *g.entry(s.clone()).or_insert(0) += 1;
+        }
+        Self(segments.to_vec())
+    }
+}
+
+impl Drop for SegmentLease {
+    fn drop(&mut self) {
+        let mut g = lease_counts().lock().unwrap_or_else(|e| e.into_inner());
+        for s in &self.0 {
+            if let Some(n) = g.get_mut(s) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    g.remove(s);
+                }
+            }
+        }
+    }
+}
+
+/// How many reads currently hold `segment`.
+pub(crate) fn lease_count(segment: &Path) -> usize {
+    lease_counts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(segment)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `NOETL_EHDB_TIER_PRUNE_MODE`. Default `off`.
+pub const TIER_PRUNE_MODE_ENV: &str = "NOETL_EHDB_TIER_PRUNE_MODE";
+/// `NOETL_EHDB_TIER_RETENTION_HOURS`. Default 168.
+pub const TIER_RETENTION_HOURS_ENV: &str = "NOETL_EHDB_TIER_RETENTION_HOURS";
+/// Default retention: 7 days, 7x the longest live reader window (repair sweep,
+/// 180 min). See the #491 reader table.
+pub const TIER_RETENTION_HOURS_DEFAULT: u64 = 168;
+/// Below this the live readers (comparator 1 h, repair sweep 3 h) could lose
+/// records they still read; refused, not clamped.
+pub const TIER_RETENTION_HOURS_MIN: u64 = 24;
+
+/// What the retention pass is allowed to do.
+///
+/// ⚠ There is deliberately NO deleting mode in this build. Deleting waits on
+/// owner decisions (archive-before-delete, the window, rollout order —
+/// noetl/ai-meta#491), and on a reviewed dry-run pass. `on` is recognised only
+/// so that asking for it is refused out loud instead of read as a typo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneMode {
+    Off,
+    DryRun,
+}
+
+/// Parse the mode. Anything but `dry_run` is `Off`; `on` is refused loudly.
+pub fn parse_prune_mode(raw: Option<&str>) -> PruneMode {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("dry_run") | Some("dry-run") | Some("dryrun") => PruneMode::DryRun,
+        Some("on") | Some("true") | Some("enabled") => {
+            tracing::error!(
+                env = TIER_PRUNE_MODE_ENV,
+                "tier prune mode `on` is NOT available in this build: deleting \
+                 waits on the noetl/ai-meta#491 decisions and a reviewed dry run. \
+                 Treated as `off`."
+            );
+            PruneMode::Off
+        }
+        _ => PruneMode::Off,
+    }
+}
+
+/// Parse the retention window. `None` = refused (below the minimum, or
+/// unparsable); the caller must then not run the pass at all.
+pub fn parse_retention_hours(raw: Option<&str>) -> Option<u64> {
+    let h = match raw {
+        None => TIER_RETENTION_HOURS_DEFAULT,
+        Some(v) => v.trim().parse::<u64>().ok()?,
+    };
+    (h >= TIER_RETENTION_HOURS_MIN).then_some(h)
+}
+
+/// The tiers retention may ever touch. Catalog needs full history (its fold
+/// reads from sequence 1); kv/object parity reads the oldest records. Code, not
+/// configuration, so no env value can widen it.
+pub const PRUNABLE_TIERS: &[StoreTier] = &[StoreTier::EventLog, StoreTier::Projection];
+
+/// One sealed segment's verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PruneVerdict {
+    /// Every rule held; a deleting build would remove it.
+    WouldPrune,
+    /// Kept, and why.
+    Keep(&'static str),
+    /// Not considered: an older segment of the same tier was kept, and pruning
+    /// is strictly oldest-first.
+    BehindAKeptSegment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneDecision {
+    pub segment: PathBuf,
+    pub bytes: u64,
+    pub verdict: PruneVerdict,
+}
+
+/// Execution ids appearing anywhere in the ACTIVE segment, by streaming it.
+/// `None` = a line whose subject cannot be read: treat as unknown, prune nothing.
+fn active_execution_ids(path: &Path) -> Option<std::collections::HashSet<String>> {
+    use std::io::BufRead;
+    let mut out = std::collections::HashSet::new();
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(out),
+        Err(_) => return None,
+    };
+    for line in std::io::BufReader::with_capacity(1 << 20, f).lines() {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.insert(execution_id_from_line(&line)?);
+    }
+    Some(out)
+}
+
+/// Plan a retention pass for one tier. Reads only; changes nothing.
+///
+/// A sealed segment is `WouldPrune` only if ALL hold:
+/// 1. the tier is in [`PRUNABLE_TIERS`];
+/// 2. it is older than `retention` (its mtime is its seal time: a sealed file
+///    is never written again, and `rename` preserves mtime);
+/// 3. it has an `.idx` (unknown contents are kept);
+/// 4. none of its executions appears in a segment sealed WITHIN `retention`,
+///    nor in the active segment — an execution still writing pins every segment
+///    it touches;
+/// 5. no read currently holds a lease on it;
+/// 6. every OLDER segment of the tier is also `WouldPrune` (oldest-first).
+pub fn plan_tier_prune(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    retention: std::time::Duration,
+    now: std::time::SystemTime,
+) -> Vec<PruneDecision> {
+    let segs = sealed_segments(cfg, tier);
+    let bytes = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    if !PRUNABLE_TIERS.contains(&tier) {
+        return segs
+            .into_iter()
+            .map(|s| PruneDecision {
+                bytes: bytes(&s),
+                segment: s,
+                verdict: PruneVerdict::Keep("tier is never pruned"),
+            })
+            .collect();
+    }
+    let age = |p: &Path| -> Option<std::time::Duration> {
+        let m = std::fs::metadata(p).ok()?.modified().ok()?;
+        now.duration_since(m).ok()
+    };
+    let is_old = |p: &Path| age(p).is_some_and(|a| a >= retention);
+
+    // Execution ids still "hot": in any recently sealed segment or the active one.
+    let mut hot: Option<std::collections::HashSet<String>> =
+        active_execution_ids(&cfg.path_for(tier));
+    for s in segs.iter().filter(|s| !is_old(s)) {
+        match (hot.as_mut(), load_segment_index(s)) {
+            (Some(h), Some(ids)) => h.extend(ids),
+            // A recent segment with no index: its ids are unknown, so nothing
+            // older can be proven unpinned.
+            _ => hot = None,
+        }
+    }
+
+    let mut out = Vec::with_capacity(segs.len());
+    let mut stopped = false;
+    for s in segs {
+        let verdict = if stopped {
+            PruneVerdict::BehindAKeptSegment
+        } else if !is_old(&s) {
+            PruneVerdict::Keep("younger than the retention window")
+        } else {
+            match (load_segment_index(&s), hot.as_ref()) {
+                (None, _) => PruneVerdict::Keep("no .idx: contents unknown"),
+                (_, None) => PruneVerdict::Keep(
+                    "hot set unknown (unreadable active line or unindexed recent segment)",
+                ),
+                (Some(ids), Some(h)) if ids.iter().any(|id| h.contains(id)) => {
+                    PruneVerdict::Keep("pinned: an execution in it is still writing")
+                }
+                _ if lease_count(&s) > 0 => PruneVerdict::Keep("leased by a read in flight"),
+                _ => PruneVerdict::WouldPrune,
+            }
+        };
+        if !matches!(verdict, PruneVerdict::WouldPrune) {
+            stopped = true;
+        }
+        out.push(PruneDecision {
+            bytes: bytes(&s),
+            segment: s,
+            verdict,
+        });
+    }
+    out
+}
+
+/// `NOETL_EHDB_TIER_PRUNE_INTERVAL_SECS`. Default 3600; floor 60.
+pub const TIER_PRUNE_INTERVAL_SECS_ENV: &str = "NOETL_EHDB_TIER_PRUNE_INTERVAL_SECS";
+
+/// Start the retention pass if configured. A no-op unless
+/// `NOETL_EHDB_TIER_PRUNE_MODE=dry_run` and the retention window is valid, so
+/// shipping this changes nothing on a writer that does not opt in.
+pub fn spawn_retention_pass(cfg: &TierStoreConfig) {
+    let mode = parse_prune_mode(std::env::var(TIER_PRUNE_MODE_ENV).ok().as_deref());
+    if mode == PruneMode::Off {
+        return;
+    }
+    let raw = std::env::var(TIER_RETENTION_HOURS_ENV).ok();
+    let Some(hours) = parse_retention_hours(raw.as_deref()) else {
+        tracing::error!(
+            env = TIER_RETENTION_HOURS_ENV,
+            value = raw.as_deref().unwrap_or(""),
+            min = TIER_RETENTION_HOURS_MIN,
+            "EHDB tier retention window refused (unparsable or below the minimum); \
+             the retention pass will NOT run"
+        );
+        return;
+    };
+    let interval = std::env::var(TIER_PRUNE_INTERVAL_SECS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(3600)
+        .max(60);
+    let retention = std::time::Duration::from_secs(hours * 3600);
+    let cfg = cfg.clone();
+    tracing::info!(
+        retention_hours = hours,
+        interval_secs = interval,
+        "EHDB tier retention: DRY RUN enabled — logs what would be pruned, deletes nothing"
+    );
+    tokio::spawn(async move {
+        loop {
+            let c = cfg.clone();
+            // Streaming the active segment and reading indexes is file I/O: off
+            // the runtime, like every other store entry point.
+            let _ = tokio::task::spawn_blocking(move || run_prune_dry_run(&c, retention)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// Log a dry-run pass over every tier. Deletes nothing.
+pub fn run_prune_dry_run(cfg: &TierStoreConfig, retention: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    for &tier in StoreTier::ALL.iter() {
+        let plan = plan_tier_prune(cfg, tier, retention, now);
+        if plan.is_empty() {
+            continue;
+        }
+        let (mut n, mut b) = (0usize, 0u64);
+        for d in &plan {
+            let verdict = match &d.verdict {
+                PruneVerdict::WouldPrune => {
+                    n += 1;
+                    b += d.bytes;
+                    "would_prune".to_string()
+                }
+                PruneVerdict::Keep(why) => format!("keep: {why}"),
+                PruneVerdict::BehindAKeptSegment => "keep: behind a kept segment".to_string(),
+            };
+            tracing::info!(
+                tier = tier.as_str(),
+                segment = %d.segment.display(),
+                bytes = d.bytes,
+                verdict,
+                "EHDB tier retention DRY RUN (nothing deleted)"
+            );
+        }
+        tracing::info!(
+            tier = tier.as_str(),
+            would_prune_segments = n,
+            would_prune_bytes = b,
+            retention_hours = retention.as_secs() / 3600,
+            "EHDB tier retention DRY RUN summary (nothing deleted; noetl/ai-meta#491)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1620,6 +1951,244 @@ mod tests {
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
+        let lease_probe = lease_probes().lock().unwrap().get(&cfg.dir).cloned();
+        if let Some(p) = lease_probe {
+            let leased = sealed_segments(cfg, tier)
+                .iter()
+                .map(|s| lease_count(s))
+                .min()
+                .unwrap_or(0);
+            p.store(leased, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Lease probes, keyed by store dir: the MINIMUM lease count over the
+    /// store's sealed segments, observed at the start of the sealed phase.
+    fn lease_probes() -> &'static StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicUsize>>> {
+        static P: OnceLock<StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicUsize>>>> =
+            OnceLock::new();
+        P.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    // ---- noetl/ai-meta#491: leases + the retention planner ----
+
+    /// Seal the active segment by hand, exactly as `maybe_seal` does (a rename),
+    /// so a test controls which executions land in which segment.
+    fn seal_now(cfg: &TierStoreConfig, tier: StoreTier) -> PathBuf {
+        let active = cfg.path_for(tier);
+        let n = sealed_segments(cfg, tier).len() + 1;
+        let sealed = active.with_file_name(format!(
+            "{}.{n}",
+            active.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::rename(&active, &sealed).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        build_segment_index(&sealed).unwrap();
+        sealed
+    }
+
+    async fn put(cfg: &TierStoreConfig, tier: StoreTier, exec: &str, n: usize) {
+        for i in 0..n {
+            let _ = append(Some(cfg), tier, exec, &format!("{{\"i\":{i}}}")).await;
+        }
+    }
+
+    fn age(path: &Path, hours: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    const R: std::time::Duration = std::time::Duration::from_secs(168 * 3600);
+
+    fn verdicts(cfg: &TierStoreConfig, tier: StoreTier) -> Vec<PruneVerdict> {
+        plan_tier_prune(cfg, tier, R, std::time::SystemTime::now())
+            .into_iter()
+            .map(|d| d.verdict)
+            .collect()
+    }
+
+    /// ⭐ The rules, one case each. Segment 1 old+finished, 2 old+finished,
+    /// 3 recent; exec-live writes in the ACTIVE segment.
+    #[tokio::test]
+    async fn an_old_finished_segment_would_prune_and_a_recent_one_is_kept() {
+        let cfg = seal_cfg("prune-basic");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 5).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 5).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-c", 5).await;
+        let _s3 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-live", 2).await;
+        age(&s1, 400);
+        age(&s2, 300);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![
+                PruneVerdict::WouldPrune,
+                PruneVerdict::WouldPrune,
+                PruneVerdict::Keep("younger than the retention window"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// An execution still writing — in the active segment or a recent one —
+    /// pins every old segment it touches, and oldest-first stops behind it.
+    #[tokio::test]
+    async fn a_long_runner_pins_its_old_segment_and_everything_behind_it() {
+        let cfg = seal_cfg("prune-pin");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-long", 3).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 3).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-long", 1).await; // still writing, in the ACTIVE segment
+        age(&s1, 400);
+        age(&s2, 300);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![
+                PruneVerdict::Keep("pinned: an execution in it is still writing"),
+                PruneVerdict::BehindAKeptSegment,
+            ]
+        );
+
+        // Pinned by a RECENT sealed segment too, not only the active one.
+        let cfg2 = seal_cfg("prune-pin2");
+        put(&cfg2, t, "exec-long", 3).await;
+        let a = seal_now(&cfg2, t);
+        put(&cfg2, t, "exec-long", 1).await;
+        let _recent = seal_now(&cfg2, t);
+        age(&a, 400);
+        assert_eq!(
+            verdicts(&cfg2, t)[0],
+            PruneVerdict::Keep("pinned: an execution in it is still writing")
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+        let _ = std::fs::remove_dir_all(&cfg2.dir);
+    }
+
+    #[tokio::test]
+    async fn an_unindexed_segment_is_kept() {
+        let cfg = seal_cfg("prune-noidx");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        std::fs::remove_file(segment_index_path(&s1)).unwrap();
+        age(&s1, 400);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![PruneVerdict::Keep("no .idx: contents unknown")]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn the_catalog_tier_is_never_pruned_however_old() {
+        let cfg = seal_cfg("prune-catalog");
+        let t = StoreTier::Catalog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        age(&s1, 10_000);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![PruneVerdict::Keep("tier is never pruned")]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn a_leased_segment_is_kept() {
+        let cfg = seal_cfg("prune-leased");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        age(&s1, 400);
+        let lease = SegmentLease::acquire(std::slice::from_ref(&s1));
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![PruneVerdict::Keep("leased by a read in flight")]
+        );
+        drop(lease);
+        assert_eq!(verdicts(&cfg, t), vec![PruneVerdict::WouldPrune]);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// The read path actually takes the lease for the sealed phase, and releases it.
+    #[tokio::test]
+    async fn a_sealed_read_holds_a_lease_and_releases_it() {
+        let cfg = seal_cfg("lease-read");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-a", 2).await;
+        let probe = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        lease_probes()
+            .lock()
+            .unwrap()
+            .insert(cfg.dir.clone(), probe.clone());
+        let got = read_execution(Some(&cfg), t, "exec-a").await;
+        lease_probes().lock().unwrap().remove(&cfg.dir);
+        assert!(matches!(got, TierStoreOutcome::Ok(_)), "{got:?}");
+        let seen = probe.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(
+            seen,
+            usize::MAX,
+            "the sealed phase never ran — measured nothing"
+        );
+        assert!(
+            seen >= 1,
+            "the sealed segment was NOT leased during the read"
+        );
+        assert_eq!(lease_count(&s1), 0, "the lease outlived the read");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// Dry run is a dry run: every file survives a pass that finds work.
+    #[tokio::test]
+    async fn a_dry_run_deletes_nothing() {
+        let cfg = seal_cfg("prune-dry");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        age(&s1, 400);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![PruneVerdict::WouldPrune],
+            "precondition"
+        );
+        let before: Vec<_> = std::fs::read_dir(&cfg.dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        run_prune_dry_run(&cfg, R);
+        for p in &before {
+            assert!(p.exists(), "dry run removed {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[test]
+    fn mode_on_is_refused_and_retention_below_the_floor_is_refused() {
+        assert_eq!(parse_prune_mode(None), PruneMode::Off);
+        assert_eq!(parse_prune_mode(Some("dry_run")), PruneMode::DryRun);
+        assert_eq!(
+            parse_prune_mode(Some("on")),
+            PruneMode::Off,
+            "no deleting mode in this build"
+        );
+        assert_eq!(parse_prune_mode(Some("bogus")), PruneMode::Off);
+        assert_eq!(parse_retention_hours(None), Some(168));
+        assert_eq!(parse_retention_hours(Some("24")), Some(24));
+        assert_eq!(parse_retention_hours(Some("23")), None);
+        assert_eq!(parse_retention_hours(Some("nope")), None);
     }
 
     /// ⭐⭐ The sealed segments are read with the store lock RELEASED.
