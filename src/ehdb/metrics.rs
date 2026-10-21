@@ -143,6 +143,8 @@ struct EhdbMetricsState {
     /// nothing reads `0` rather than being absent — the pruned-family trap that
     /// made the prod gateway serve an empty `/metrics`.
     tier_service_appends: BTreeMap<&'static str, u64>,
+    /// Appends refused by the seal-straddling dedup window (noetl/ai-meta#472).
+    tier_dedup_hits: BTreeMap<&'static str, u64>,
     /// Highest `global_sequence` each store has reported. Sampled at pin time
     /// from the store file too, so it is meaningful before the first append.
     tier_service_sequence: BTreeMap<&'static str, u64>,
@@ -524,6 +526,10 @@ pub fn pin_tier_service_series(samples: &[(StoreTier, u64, u64)]) {
     // absent is indistinguishable from "this build has no such tier".
     for tier in StoreTier::ALL {
         s.tier_service_appends.entry(tier.as_str()).or_insert(0);
+        // ⚠ Pinned at 0 like its neighbour: absent would be indistinguishable from
+        // a binary too old to have the window at all, which is the question an
+        // operator asks first when duplicates reappear (noetl/ai-meta#472).
+        s.tier_dedup_hits.entry(tier.as_str()).or_insert(0);
         s.tier_service_sequence.entry(tier.as_str()).or_insert(0);
         s.tier_service_store_bytes.entry(tier.as_str()).or_insert(0);
     }
@@ -657,6 +663,18 @@ pub fn record_tier_service_append(tier: StoreTier, sequence: u64, store_bytes: u
     *cur = (*cur).max(sequence);
     s.tier_service_store_bytes
         .insert(tier.as_str(), store_bytes);
+}
+
+/// Record that the seal-straddling dedup window refused an append
+/// (noetl/ai-meta#472).
+///
+/// A rising value is the window DOING ITS JOB — it is the count of duplicate
+/// records that would otherwise have landed in the tier. A permanent 0 with
+/// duplicates still appearing in the cross-store comparator means the window is
+/// too small for the retry span, not that it is unnecessary.
+pub fn record_tier_dedup_hit(tier: StoreTier) {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    *s.tier_dedup_hits.entry(tier.as_str()).or_insert(0) += 1;
 }
 
 /// Record how many records one tier-append request took through each path.
@@ -1059,6 +1077,16 @@ pub fn render_lines() -> Vec<String> {
         for (tier, v) in &s.tier_service_appends {
             lines.push(format!(
                 "noetl_ehdb_tier_service_store_appends_total{{tier=\"{tier}\"}} {v}"
+            ));
+        }
+        lines.push(
+            "# HELP noetl_ehdb_tier_dedup_hits_total Appends refused by the seal-straddling event_id dedup window; a rising value is duplicates prevented (noetl/ai-meta#472)"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_ehdb_tier_dedup_hits_total counter".to_string());
+        for (tier, v) in &s.tier_dedup_hits {
+            lines.push(format!(
+                "noetl_ehdb_tier_dedup_hits_total{{tier=\"{tier}\"}} {v}"
             ));
         }
         lines.push(
