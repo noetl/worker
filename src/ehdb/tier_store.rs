@@ -1025,7 +1025,7 @@ fn spawn_index_build(segment: PathBuf, tier: StoreTier) {
 pub fn backfill_segment_indexes(cfg: &TierStoreConfig) {
     for &tier in StoreTier::ALL.iter() {
         for seg in sealed_segments(cfg, tier) {
-            if load_segment_index(&seg).is_none() {
+            if load_segment_index(&seg).is_none() || !segment_offset_index_path(&seg).exists() {
                 tracing::info!(
                     tier = tier.as_str(), segment = %seg.display(),
                     "EHDB tier segment has no index; building it"
@@ -1142,32 +1142,202 @@ fn execution_id_from_line(line: &str) -> Option<String> {
 pub fn build_segment_index(segment: &std::path::Path) -> Result<usize, String> {
     use std::io::BufRead;
     let f = std::fs::File::open(segment).map_err(|e| e.to_string())?;
-    let reader = std::io::BufReader::with_capacity(1 << 20, f);
-    let mut ids: std::collections::BTreeSet<String> = Default::default();
-    for (n, line) in reader.lines().enumerate() {
-        let line = line.map_err(|e| format!("line {}: {e}", n + 1))?;
-        if line.trim().is_empty() {
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, f);
+    // execution_id -> (offset, length) of each of its lines, in file order.
+    let mut ids: std::collections::BTreeMap<String, Vec<(u64, u64)>> = Default::default();
+    let mut line = String::new();
+    let mut offset = 0u64;
+    let mut n = 0usize;
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("line {}: {e}", n + 1))?;
+        if read == 0 {
+            break;
+        }
+        n += 1;
+        let start = offset;
+        offset += read as u64;
+        let body = line.strip_suffix('\n').unwrap_or(&line);
+        if body.trim().is_empty() {
             continue;
         }
-        match execution_id_from_line(&line) {
-            Some(id) => {
-                ids.insert(id);
-            }
+        match execution_id_from_line(body) {
+            Some(id) => ids.entry(id).or_default().push((start, body.len() as u64)),
             None => {
                 return Err(format!(
-                    "line {} carries no readable subject; refusing to write a partial index",
-                    n + 1
+                    "line {n} carries no readable subject; refusing to write a partial index"
                 ))
             }
         }
     }
 
-    let body: String = ids.iter().map(|i| format!("{i}\n")).collect();
+    let body: String = ids.keys().map(|i| format!("{i}\n")).collect();
     let final_path = segment_index_path(segment);
     let tmp = final_path.with_extension("idx.tmp");
     std::fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
+
+    // Best-effort: without it a read replays the segment, which is slow and
+    // correct. It must never fail the `.idx` that rules segments out.
+    if let Err(e) = write_offset_index(segment, offset, &ids) {
+        tracing::warn!(
+            segment = %segment.display(), error = %e,
+            "EHDB tier segment offset index not written; reads will replay this segment"
+        );
+    }
     Ok(ids.len())
+}
+
+/// The per-execution line offsets beside a sealed segment: `<segment>.offidx`.
+///
+/// ⚠⚠ WHY — noetl/ai-meta#490. `.idx` decides WHICH sealed segments to open,
+/// but opening one replays the whole file: 256 MiB per read on prod, far past
+/// the tier client's 2 s timeout, and the abandoned replay keeps its in-flight
+/// permit until it finishes. On 2026-10-20 that shed a live chat turn's mirror
+/// append. With this sidecar a sealed read costs this execution's lines.
+///
+/// ⚠ A SEPARATE file, not a new `.idx` format. An older binary reads every
+/// `.idx` line as an execution id; handing it offsets after a rollback would
+/// make it rule out segments that hold the execution — a wrong answer. It
+/// ignores `.offidx` entirely.
+///
+/// Format: a header `ehdb-offidx v1 <segment byte length>`, then one line per
+/// execution: `<execution_id>\t<offset>:<length> <offset>:<length> …`. The
+/// recorded length is checked on every read; a mismatch means the sidecar does
+/// not describe this file and the read replays instead.
+fn segment_offset_index_path(segment: &std::path::Path) -> PathBuf {
+    let mut s = segment.as_os_str().to_os_string();
+    s.push(".offidx");
+    PathBuf::from(s)
+}
+
+const OFFSET_INDEX_HEADER: &str = "ehdb-offidx v1";
+
+fn write_offset_index(
+    segment: &std::path::Path,
+    segment_len: u64,
+    ids: &std::collections::BTreeMap<String, Vec<(u64, u64)>>,
+) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let mut body = format!("{OFFSET_INDEX_HEADER} {segment_len}\n");
+    for (id, spans) in ids {
+        body.push_str(id);
+        body.push('\t');
+        for (i, (off, len)) in spans.iter().enumerate() {
+            if i > 0 {
+                body.push(' ');
+            }
+            let _ = write!(body, "{off}:{len}");
+        }
+        body.push('\n');
+    }
+    let final_path = segment_offset_index_path(segment);
+    let tmp = final_path.with_extension("offidx.tmp");
+    std::fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())
+}
+
+/// This execution's line spans in `segment`, if the offset index can vouch for
+/// them. `None` = no usable index (missing, unparsable, or written for a file
+/// of a different length) — the caller must replay.
+fn load_offset_spans(segment: &std::path::Path, execution_id: &str) -> Option<Vec<(u64, u64)>> {
+    let raw = std::fs::read_to_string(segment_offset_index_path(segment)).ok()?;
+    let mut lines = raw.lines();
+    let recorded: u64 = lines
+        .next()?
+        .strip_prefix(OFFSET_INDEX_HEADER)?
+        .trim()
+        .parse()
+        .ok()?;
+    if std::fs::metadata(segment).ok()?.len() != recorded {
+        return None;
+    }
+    let prefix = format!("{execution_id}\t");
+    for l in lines {
+        if let Some(rest) = l.strip_prefix(&prefix) {
+            return rest
+                .split(' ')
+                .map(|span| {
+                    let (o, n) = span.split_once(':')?;
+                    Some((o.parse().ok()?, n.parse().ok()?))
+                })
+                .collect();
+        }
+    }
+    // The header is valid and the execution is absent: this segment holds none
+    // of its records. That is an answer, not "unknown".
+    Some(Vec::new())
+}
+
+/// Read one execution's records from a SEALED segment by seeking to its lines.
+///
+/// Builds the same `EventLogRecordView` the driver projects — `global_sequence`
+/// from the `Publish` mutation's sequence, the execution from the subject, the
+/// payload bytes as lossy UTF-8 — so the result is indistinguishable from a
+/// replay (`an_offset_read_equals_a_replay_read` holds it to that).
+///
+/// ⚠ Fail-safe: ANY surprise returns `None` and the caller replays — a line
+/// that does not parse, a span past the end, a line whose `Publish` is not this
+/// execution's, a foreign tenant/namespace/stream. The offset path may only
+/// ever be faster than the replay, never different from it.
+fn read_sealed_by_offsets(
+    segment: &std::path::Path,
+    execution_id: &str,
+) -> Option<Vec<serde_json::Value>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let spans = load_offset_spans(segment, execution_id)?;
+    let subject = format!(
+        "{}.{execution_id}",
+        ehdb_reference::EVENT_LOG_SUBJECT_PREFIX
+    );
+    let mut f = std::fs::File::open(segment).ok()?;
+    let mut views: Vec<ehdb_reference::EventLogRecordView> = Vec::new();
+    let mut buf = Vec::new();
+    for (off, len) in spans {
+        buf.resize(usize::try_from(len).ok()?, 0);
+        f.seek(SeekFrom::Start(off)).ok()?;
+        f.read_exact(&mut buf).ok()?;
+        let line: serde_json::Value = serde_json::from_slice(&buf).ok()?;
+        if line.get("tenant")?.as_str()? != DEFAULT_LOCAL_REFERENCE_TENANT
+            || line.get("namespace")?.as_str()? != DEFAULT_LOCAL_REFERENCE_NAMESPACE
+        {
+            return None;
+        }
+        let transaction_id = line.get("transaction_id")?.as_str()?;
+        let before = views.len();
+        for m in line.get("mutations")?.as_array()? {
+            let Some(p) = m.get("Stream").and_then(|s| s.get("Publish")) else {
+                continue;
+            };
+            if p.get("stream")?.as_str()? != ehdb_reference::EVENT_LOG_STREAM
+                || p.get("subject")?.as_str()? != subject
+            {
+                return None;
+            }
+            let payload: Vec<u8> = p
+                .get("payload")?
+                .as_array()?
+                .iter()
+                .map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()))
+                .collect::<Option<_>>()?;
+            views.push(ehdb_reference::EventLogRecordView {
+                global_sequence: p.get("sequence")?.as_u64()?,
+                execution_id: execution_id.to_string(),
+                transaction_id: transaction_id.to_string(),
+                byte_len: payload.len(),
+                payload: String::from_utf8_lossy(&payload).into_owned(),
+            });
+        }
+        // The index said this line is the execution's; a line with no Publish
+        // of it means the index and the file disagree.
+        if views.len() == before {
+            return None;
+        }
+    }
+    views.sort_by_key(|v| v.global_sequence);
+    views.iter().map(|v| serde_json::to_value(v).ok()).collect()
 }
 
 /// Segments that could hold `execution_id`, oldest first.
@@ -1319,6 +1489,12 @@ fn read_execution_across_segments(
     };
     let mut records: Vec<serde_json::Value> = Vec::new();
     for path in sealed {
+        // A sealed segment with a usable offset index answers from just this
+        // execution's lines; anything else replays the segment as before.
+        if let Some(rs) = read_sealed_by_offsets(path, execution_id) {
+            records.extend(rs);
+            continue;
+        }
         match read_segment_then_release(path, true, |d| d.read_execution(&request)) {
             Ok(out) => records.extend(records_of(&out)),
             // A segment that cannot be read is NOT silently skipped: a partial
@@ -1508,6 +1684,238 @@ mod tests {
             0 => panic!("the sealed phase never ran — this test measured nothing"),
             _ => panic!("the store lock was HELD while sealed segments were read"),
         }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// Fixture: three executions interleaved across several sealed segments,
+    /// every segment indexed. Returns the store and its sealed segments.
+    async fn offidx_fixture(tag: &str) -> (TierStoreConfig, Vec<PathBuf>) {
+        let cfg = seal_cfg(tag);
+        for i in 0..60 {
+            let exec = ["exec-a", "exec-b", "exec-c"][i % 3];
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                exec,
+                &format!(
+                    "{{\"i\":{i},\"q\":\"\\\"x\\\"\",\"pad\":\"{}\"}}",
+                    "o".repeat(100)
+                ),
+                Some(2048),
+            )
+            .await;
+        }
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert!(segs.len() >= 3, "need several segments, got {}", segs.len());
+        for sg in &segs {
+            build_segment_index(sg).expect("index build");
+            assert!(
+                segment_offset_index_path(sg).exists(),
+                "no offset index written"
+            );
+        }
+        (cfg, segs)
+    }
+
+    /// One segment's records for one execution, by full replay.
+    fn replayed(sg: &Path, exec: &str) -> Vec<serde_json::Value> {
+        let req = EventLogReadExecutionRequest {
+            execution_id: exec.to_string(),
+            after: None,
+            limit: MAX_SCAN_LIMIT,
+        };
+        let out = read_segment_then_release(sg, true, |d| d.read_execution(&req)).expect("replay");
+        let v = serde_json::to_value(&out).unwrap();
+        v["records"].as_array().unwrap().clone()
+    }
+
+    /// ⭐⭐ The offset path is indistinguishable from the replay it replaces.
+    #[tokio::test]
+    async fn an_offset_read_equals_a_replay_read() {
+        let (cfg, segs) = offidx_fixture("off-eq").await;
+        let mut nonempty = 0;
+        for sg in &segs {
+            for exec in ["exec-a", "exec-b", "exec-c", "exec-absent"] {
+                let fast = read_sealed_by_offsets(sg, exec).expect("index should be usable");
+                assert_eq!(fast, replayed(sg, exec), "{exec} in {}", sg.display());
+                nonempty += usize::from(!fast.is_empty());
+            }
+        }
+        assert!(nonempty >= 3, "compared only empty answers ({nonempty})");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐⭐ A sealed read touches only the execution's own lines.
+    ///
+    /// Proven by damage: another execution's line in the middle of the segment
+    /// is overwritten in place (same length, so offsets hold). A replay must
+    /// now FAIL — a torn middle fails the whole open — so a read that still
+    /// succeeds did not replay. Deleting the offset index then makes the same
+    /// read fail, which shows the fallback really is the replay.
+    #[tokio::test]
+    async fn a_sealed_read_does_not_replay_the_segment() {
+        let (cfg, segs) = offidx_fixture("off-noreplay").await;
+        let before = read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await;
+        let TierStoreOutcome::Ok(before) = before else {
+            panic!("baseline read failed: {before:?}")
+        };
+
+        let sg = &segs[0];
+        let spans = load_offset_spans(sg, "exec-b").expect("spans");
+        let (off, len) = spans[spans.len() / 2];
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(sg).unwrap();
+            f.seek(SeekFrom::Start(off)).unwrap();
+            f.write_all(&vec![b'#'; len as usize]).unwrap();
+        }
+        ehdb_reference::forget_runtime(sg);
+
+        let after = read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await;
+        assert!(
+            matches!(&after, TierStoreOutcome::Ok(b) if *b == before),
+            "the offset read changed or failed after damage it should never touch: {after:?}"
+        );
+
+        std::fs::remove_file(segment_offset_index_path(sg)).unwrap();
+        ehdb_reference::forget_runtime(sg);
+        let replay = read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await;
+        assert!(
+            matches!(replay, TierStoreOutcome::Error(_)),
+            "without the offset index the damaged segment must be REPLAYED (and fail): {replay:?}"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// An offset index that does not describe the file is not used.
+    #[tokio::test]
+    async fn a_stale_or_wrong_offset_index_falls_back_to_replay() {
+        let (cfg, segs) = offidx_fixture("off-stale").await;
+        let sg = &segs[0];
+        let want = replayed(sg, "exec-a");
+
+        // Length mismatch: the header no longer vouches for the file.
+        let len = std::fs::metadata(sg).unwrap().len();
+        let idx = segment_offset_index_path(sg);
+        let raw = std::fs::read_to_string(&idx).unwrap();
+        std::fs::write(
+            &idx,
+            raw.replacen(&len.to_string(), &(len + 1).to_string(), 1),
+        )
+        .unwrap();
+        assert!(
+            read_sealed_by_offsets(sg, "exec-a").is_none(),
+            "stale length was trusted"
+        );
+
+        // Spans that point at ANOTHER execution's lines.
+        let b = load_offset_spans_unchecked(&raw, "exec-b");
+        let swapped: String = raw
+            .lines()
+            .map(|l| match l.strip_prefix("exec-a\t") {
+                Some(_) => format!("exec-a\t{b}\n"),
+                None => format!("{l}\n"),
+            })
+            .collect();
+        std::fs::write(&idx, swapped).unwrap();
+        assert!(
+            read_sealed_by_offsets(sg, "exec-a").is_none(),
+            "foreign lines were served"
+        );
+
+        // Either way the public read still returns the right records.
+        let got = read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await;
+        assert!(matches!(got, TierStoreOutcome::Ok(_)), "{got:?}");
+        assert!(!want.is_empty());
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    fn load_offset_spans_unchecked(raw: &str, exec: &str) -> String {
+        raw.lines()
+            .find_map(|l| l.strip_prefix(&format!("{exec}\t")))
+            .expect("exec in index")
+            .to_string()
+    }
+
+    /// Measurement, not a gate: one sealed segment of `NOETL_OFFIDX_BENCH_MB`
+    /// (default 64) MiB, ~1 KiB events over 500 executions; time a replay read
+    /// against an offset read of the same execution. Run with
+    /// `cargo test --release --lib offset_read_cost -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn offset_read_cost_vs_replay() {
+        let mb: u64 = std::env::var("NOETL_OFFIDX_BENCH_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let cfg = seal_cfg("off-bench");
+        let active = cfg.path_for(StoreTier::EventLog);
+        let pad = "b".repeat(1000);
+        // Batched, as prod writes them (NOETL_EHDB_TIER_APPEND_BATCH=true): one
+        // line per batch of one execution's events, 500 executions interleaved.
+        let mut i = 0u64;
+        while std::fs::metadata(&active).map(|m| m.len()).unwrap_or(0) < mb << 20 {
+            let exec = format!("exec-{}", (i / 10) % 500);
+            let batch: Vec<String> = (0..10)
+                .map(|k| format!("{{\"i\":{},\"pad\":\"{pad}\"}}", i + k))
+                .collect();
+            let _ = append_batch(Some(&cfg), StoreTier::EventLog, &exec, &batch).await;
+            i += 10;
+        }
+        // Seal exactly as `maybe_seal` does: a rename, nothing else.
+        let sg = active.with_file_name(format!(
+            "{}.1",
+            active.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::rename(&active, &sg).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        build_segment_index(&sg).unwrap();
+        let bytes = std::fs::metadata(&sg).unwrap().len();
+
+        ehdb_reference::forget_runtime(&sg);
+        let t = std::time::Instant::now();
+        let slow = replayed(&sg, "exec-7");
+        let replay = t.elapsed();
+        let t = std::time::Instant::now();
+        let fast = read_sealed_by_offsets(&sg, "exec-7").unwrap();
+        let offset = t.elapsed();
+        assert_eq!(fast, slow);
+        eprintln!(
+            "segment {:.1} MiB, {i} events: replay {replay:?}, offset {offset:?} ({} records)",
+            bytes as f64 / 1048576.0,
+            fast.len()
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// Segments indexed by an older build have `.idx` and no `.offidx`; the
+    /// backfill must give them one, and `.idx` must keep its old format.
+    #[tokio::test]
+    async fn the_backfill_adds_an_offset_index_and_leaves_idx_alone() {
+        let (cfg, segs) = offidx_fixture("off-backfill").await;
+        let idx_before = std::fs::read_to_string(segment_index_path(&segs[0])).unwrap();
+        assert!(
+            idx_before
+                .lines()
+                .all(|l| !l.contains('\t') && !l.contains(':')),
+            ".idx format changed — an older binary would misread it: {idx_before:?}"
+        );
+        for sg in &segs {
+            std::fs::remove_file(segment_offset_index_path(sg)).unwrap();
+        }
+        backfill_segment_indexes(&cfg);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !segs.iter().all(|sg| segment_offset_index_path(sg).exists()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backfill never wrote .offidx"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(segment_index_path(&segs[0])).unwrap(),
+            idx_before
+        );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
