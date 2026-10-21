@@ -847,18 +847,36 @@ pub(crate) fn store_bytes(cfg: &TierStoreConfig, tier: StoreTier) -> u64 {
 /// Without this, a writer that restarts in front of a populated store reports
 /// `sequence 0` until the next append — which reads exactly like an empty store,
 /// on the component being promoted to authoritative.
+///
+/// ⚠ Pages to the END. This used to read one `MAX_SCAN_LIMIT` page and take its
+/// max, so a store holding more than 1000 records reported the 1000th record's
+/// sequence after every restart — a confident wrong number, not a zero, on the
+/// gauge meant to show the store is populated (noted on noetl/worker#368).
 pub(crate) fn startup_sequence(cfg: &TierStoreConfig, tier: StoreTier) -> u64 {
-    match driver(cfg, tier).scan_global(&EventLogScanRequest {
-        after: None,
-        limit: MAX_SCAN_LIMIT,
-    }) {
-        Ok(out) => out
-            .records
-            .iter()
-            .map(|r| r.global_sequence)
-            .max()
-            .unwrap_or(0),
-        Err(_) => 0,
+    let d = driver(cfg, tier);
+    let mut highest = 0u64;
+    let mut after: Option<u64> = None;
+    loop {
+        let page = match d.scan_global(&EventLogScanRequest {
+            after,
+            limit: MAX_SCAN_LIMIT,
+        }) {
+            Ok(out) => out.records,
+            Err(_) => return highest,
+        };
+        let Some(last) = page.iter().map(|r| r.global_sequence).max() else {
+            return highest;
+        };
+        // A page that does not move past what we already have means the cursor
+        // is not advancing; stop rather than spin at startup forever.
+        if last <= highest {
+            return highest;
+        }
+        highest = last;
+        if page.len() < MAX_SCAN_LIMIT {
+            return highest;
+        }
+        after = Some(last);
     }
 }
 
@@ -1916,6 +1934,21 @@ mod tests {
             std::fs::read_to_string(segment_index_path(&segs[0])).unwrap(),
             idx_before
         );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// The restart gauge reads the store's TRUE highest sequence, not the
+    /// highest within the first scan page.
+    #[tokio::test]
+    async fn startup_sequence_reads_past_the_first_page() {
+        let cfg = seal_cfg("startseq");
+        const N: usize = MAX_SCAN_LIMIT + 250;
+        let payloads: Vec<String> = (0..N).map(|i| format!("{{\"i\":{i}}}")).collect();
+        for chunk in payloads.chunks(100) {
+            let _ = append_batch(Some(&cfg), StoreTier::EventLog, "exec-many", chunk).await;
+        }
+        ehdb_reference::forget_runtime(&cfg.path_for(StoreTier::EventLog));
+        assert_eq!(startup_sequence(&cfg, StoreTier::EventLog), N as u64);
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
