@@ -115,6 +115,134 @@ pub enum TierStoreOutcome {
     Error(String),
 }
 
+/// Recently-appended `event_id`s, per tier — the seal-straddling dedup window
+/// (noetl/ai-meta#472).
+///
+/// ⚠⚠ **Why a ring and not the driver's dedup.** The driver already rejects a
+/// duplicate `event_id`, but it does so by replaying the log it has open, and
+/// that is the **active** segment only: sealing is `std::fs::rename(active,
+/// sealed)`, so every seal moves the previous records out of the driver's view
+/// and the dedup window closes. Reads enumerate sealed segments; the append path
+/// does not. A redelivery of an `event_id` that landed before a seal therefore
+/// found nothing and appended a second copy — the mechanism behind the
+/// `duplicate_event` divergence (+2 over 30 h, with the id SETS staying equal,
+/// which is exactly what a second copy of a present id looks like).
+///
+/// ⚠ Deliberately NOT the alternatives, each rejected on a measured cost:
+///
+/// * **Search sealed segments on append.** Prod holds segments of 1.08 GB and
+///   3.3 GB; a streaming search is seconds, on the write path of a
+///   `primary`-serving tier. The file's own note at `event_id_from_payload` says
+///   that path was kept free of per-record work on purpose.
+/// * **An `event_id` index per sealed segment.** The existing `.idx` is a set of
+///   `execution_id`s — a read-pruning filter — so this would be a new structure
+///   with one entry per record, ~1M entries resident on a writer with documented
+///   OOMs (noetl/ai-meta#332).
+///
+/// ⚠⚠ **What this does and does not guarantee.** It covers the window a retry
+/// actually spans: `MAX_RETRIES=7` with 500 ms doubling plus per-attempt
+/// timeouts is ~80 s, and the ring holds the last `NOETL_EHDB_TIER_DEDUP_WINDOW`
+/// ids (default 10,000). A redelivery older than that window still gets through,
+/// so this is **not** a total guarantee — the read-side dedup in
+/// `ehdb_projection_fold::events_from_tier` remains the backstop. It is a
+/// bounded fix for the observed mechanism, not a proof of uniqueness.
+static RECENT_EVENT_IDS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<StoreTier, DedupRing>>,
+> = std::sync::OnceLock::new();
+
+/// Bounded FIFO set: O(1) contains, O(1) insert, fixed memory.
+#[derive(Default)]
+pub(crate) struct DedupRing {
+    seen: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl DedupRing {
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// ⚠ `#[cfg(test)]`: the production path never asks "is this present" on its
+    /// own — `insert` answers both questions in one lock. This exists so the
+    /// ring's eviction order is assertable, which is what the mutation battery
+    /// needs. Gated rather than `allow(dead_code)` so it cannot quietly become a
+    /// second, drifting way to read the ring.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.seen.contains(id)
+    }
+
+    /// Insert `id`, evicting the oldest when at capacity. Returns false when the
+    /// id was already present (i.e. this is a duplicate).
+    pub(crate) fn insert(&mut self, id: &str) -> bool {
+        if self.seen.contains(id) {
+            return false;
+        }
+        // ⚠⚠ A capacity of 0 disables the ring entirely — and this guard is
+        // LOAD-BEARING, not tidiness.
+        //
+        // Without it the eviction loop below is `while self.order.len() >= 0`,
+        // which is **always true for a usize**, while `pop_front()` on an empty
+        // deque returns `None` and never decrements. That is an INFINITE LOOP, on
+        // the append path, the moment someone sets the rollback value.
+        //
+        // Found by mutation: deleting this block did not fail the suite, it HUNG
+        // it — which on a Rust repo reads as a slow compile rather than a defect.
+        if self.cap == 0 {
+            return true;
+        }
+        while self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        self.order.push_back(id.to_string());
+        self.seen.insert(id.to_string());
+        true
+    }
+
+    /// ⚠ `#[cfg(test)]`, same reason as [`contains`]: the bound is asserted by
+    /// tests, not consulted at runtime.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// Size of the seal-straddling dedup window, in `event_id`s per tier.
+///
+/// `0` disables it, restoring the pre-fix behaviour exactly — the no-redeploy
+/// rollback.
+pub const TIER_DEDUP_WINDOW_ENV: &str = "NOETL_EHDB_TIER_DEDUP_WINDOW";
+
+fn dedup_window() -> usize {
+    std::env::var(TIER_DEDUP_WINDOW_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(10_000)
+}
+
+/// Claim `event_id` for `tier`. `false` means it was appended recently, so the
+/// caller must NOT append again.
+fn claim_event_id(tier: StoreTier, event_id: &str) -> bool {
+    let map = RECENT_EVENT_IDS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        // A poisoned lock must not turn into a dropped append: fail OPEN, which
+        // degrades to the previous behaviour rather than losing a record.
+        Err(e) => e.into_inner(),
+    };
+    guard
+        .entry(tier)
+        .or_insert_with(|| DedupRing::with_capacity(dedup_window()))
+        .insert(event_id)
+}
+
 /// Per-store lock serialising access to one event-log file.
 ///
 /// **This is the fix for the P0 the serve-ready soak found.** Until the mirror
@@ -550,6 +678,37 @@ fn append_batch_locked(
         })
         .collect();
 
+    // Seal-straddling dedup (noetl/ai-meta#472), same reasoning as the single
+    // path. A request whose id was claimed recently is dropped from the batch
+    // rather than sent, so the driver never sees it.
+    let mut deduped = 0usize;
+    let requests: Vec<EventLogAppendRequest> = requests
+        .into_iter()
+        .filter(|r| match r.event_id.as_deref() {
+            Some(id) if !claim_event_id(tier, id) => {
+                deduped += 1;
+                super::metrics::record_tier_dedup_hit(tier);
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    if requests.is_empty() {
+        return payloads
+            .iter()
+            .map(|_| {
+                TierStoreOutcome::Ok(
+                    serde_json::json!({
+                        "action": "eventlog-append-batch",
+                        "deduplicated": true,
+                        "deduped": deduped,
+                        "window": "recent-event-ids",
+                    })
+                    .to_string(),
+                )
+            })
+            .collect();
+    }
     match driver(cfg, tier).append_batch(&requests) {
         Ok(outs) => {
             // Record store state once for the batch — the same signal the
@@ -616,6 +775,24 @@ fn append_locked(
         // Deploy A: inert.  Deploy B populates this from the payload's event_id.
         event_id: event_id_from_payload(payload),
     };
+    // Seal-straddling dedup (noetl/ai-meta#472). The driver's own dedup sees the
+    // ACTIVE segment only, so a redelivery whose original landed before a seal
+    // would append a second copy. Checked HERE, before the driver, because this
+    // is the only place that sees appends across seals.
+    if let Some(id) = request.event_id.as_deref() {
+        if !claim_event_id(tier, id) {
+            super::metrics::record_tier_dedup_hit(tier);
+            return TierStoreOutcome::Ok(
+                serde_json::json!({
+                    "action": "eventlog-append",
+                    "execution_id": request.execution_id,
+                    "deduplicated": true,
+                    "window": "recent-event-ids",
+                })
+                .to_string(),
+            );
+        }
+    }
     match driver(cfg, tier).append(&request) {
         Ok(out) => {
             // The store's own state, recorded on the write path (ai-meta#260).
@@ -2089,5 +2266,77 @@ mod tests {
             "a projection append must not move the event log's tip"
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+}
+
+#[cfg(test)]
+mod dedup_window_tests {
+    use super::*;
+
+    /// The ring's contract: bounded memory, O(1) membership, FIFO eviction.
+    #[test]
+    fn the_ring_is_bounded_and_evicts_oldest_first() {
+        let mut r = DedupRing::with_capacity(3);
+        for id in ["a", "b", "c"] {
+            assert!(r.insert(id), "{id} is new");
+        }
+        assert_eq!(r.len(), 3);
+        assert!(r.contains("a"));
+
+        // Fourth insert evicts "a", the oldest.
+        assert!(r.insert("d"));
+        assert_eq!(r.len(), 3, "capacity must hold");
+        assert!(!r.contains("a"), "oldest must be evicted");
+        assert!(r.contains("b") && r.contains("c") && r.contains("d"));
+
+        // ⚠ The whole point: "a" is now accepted AGAIN. The window is finite, so
+        // a redelivery older than it still gets through — stated as a test, not
+        // only in prose, so nobody reads this as a uniqueness guarantee.
+        assert!(
+            r.insert("a"),
+            "an id older than the window is NOT deduplicated"
+        );
+    }
+
+    #[test]
+    fn a_repeat_inside_the_window_is_refused() {
+        let mut r = DedupRing::with_capacity(10);
+        assert!(r.insert("e1"));
+        assert!(!r.insert("e1"), "the second insert must be refused");
+        assert!(!r.insert("e1"), "and stay refused");
+        assert_eq!(r.len(), 1, "a refused insert must not grow the ring");
+    }
+
+    /// ⚠ Capacity 0 is the no-redeploy rollback and must mean OFF, not "a window
+    /// of one". A naive eviction loop would evict the id it just inserted and
+    /// then accept everything — which looks like off but costs the work.
+    #[test]
+    fn capacity_zero_disables_the_window_entirely() {
+        let mut r = DedupRing::with_capacity(0);
+        assert!(r.insert("e1"));
+        assert!(
+            r.insert("e1"),
+            "with the window off, nothing is deduplicated"
+        );
+        assert_eq!(r.len(), 0, "and nothing is retained");
+    }
+
+    #[test]
+    fn the_window_size_comes_from_the_env_and_defaults_to_10k() {
+        // Default when unset or unparseable.
+        assert_eq!(dedup_window(), 10_000);
+    }
+
+    /// Distinct ids must not collide — the ring keys on the full id.
+    #[test]
+    fn distinct_ids_are_independent() {
+        let mut r = DedupRing::with_capacity(100);
+        for i in 0..50u64 {
+            assert!(r.insert(&format!("event-{i}")), "event-{i} is new");
+        }
+        for i in 0..50u64 {
+            assert!(!r.insert(&format!("event-{i}")), "event-{i} repeats");
+        }
+        assert_eq!(r.len(), 50);
     }
 }
