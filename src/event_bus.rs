@@ -394,6 +394,8 @@ pub async fn spawn_event_writer_host(
         // the request path; an unindexed segment is merely slow, never wrong.
         if let Some(c) = store.as_ref() {
             crate::ehdb::tier_store::backfill_segment_indexes(c);
+            // noetl/ai-meta#491 — opt-in, dry-run only in this build.
+            crate::ehdb::tier_store::spawn_retention_pass(c);
         }
     }
 
