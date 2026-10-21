@@ -895,11 +895,22 @@ pub async fn read_execution(
     match locked_phase {
         Err(e) => TierStoreOutcome::Error(e),
         Ok(LockedRead::Complete(outcome)) => outcome,
-        Ok(LockedRead::NeedsSealed { sealed, active }) => {
+        Ok(LockedRead::NeedsSealed {
+            sealed,
+            active,
+            active_torn,
+        }) => {
             let cfg = cfg.clone();
             let execution_id = execution_id.to_string();
             match off_runtime(move || {
-                read_execution_across_segments(&cfg, tier, &execution_id, &sealed, active)
+                read_execution_across_segments(
+                    &cfg,
+                    tier,
+                    &execution_id,
+                    &sealed,
+                    active,
+                    active_torn,
+                )
             })
             .await
             {
@@ -908,6 +919,29 @@ pub async fn read_execution(
             }
         }
     }
+}
+
+/// Sealed segments that end mid-line: a torn tail (noetl/ehdb#262).
+///
+/// ⚠ A sealed segment is immutable, so its last byte answers this for good,
+/// and it answers it for EVERY sealed segment, not only the ones a read
+/// replays. The torn line is unparseable, so its execution is unknowable:
+/// neither the index nor the offset index can say which reads it belongs to,
+/// and a read that skipped the segment via either one could be missing it.
+/// Every JSONL line the store writes ends in `\n`, so any other last byte is a
+/// write cut short.
+fn sealed_torn_tails(cfg: &TierStoreConfig, tier: StoreTier) -> usize {
+    use std::io::{Read, Seek, SeekFrom};
+    sealed_segments(cfg, tier)
+        .iter()
+        .filter(|path| {
+            let Ok(mut f) = std::fs::File::open(path) else {
+                return false;
+            };
+            let mut last = [0u8; 1];
+            f.seek(SeekFrom::End(-1)).is_ok() && f.read_exact(&mut last).is_ok() && last[0] != b'\n'
+        })
+        .count()
 }
 
 /// What the locked phase of a read produced.
@@ -919,6 +953,8 @@ enum LockedRead {
     NeedsSealed {
         sealed: Vec<PathBuf>,
         active: Result<Vec<serde_json::Value>, String>,
+        /// The active segment's own torn-tail count, from the driver.
+        active_torn: usize,
     },
 }
 
@@ -943,9 +979,14 @@ fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &
         // caller after it releases the lock.
         let active =
             read_segment_then_release(&cfg.path_for(tier), false, |d| d.read_execution(&request))
-                .map_err(|e| e.to_string())
-                .map(|out| records_of(&out));
-        return LockedRead::NeedsSealed { sealed, active };
+                .map_err(|e| e.to_string());
+        let active_torn = active.as_ref().map_or(0, |out| out.torn_tail_skipped);
+        let active = active.map(|out| records_of(&out));
+        return LockedRead::NeedsSealed {
+            sealed,
+            active,
+            active_torn,
+        };
     }
     if total_sealed > 0 {
         // Every sealed segment was ruled out by its index; the active segment
@@ -972,6 +1013,15 @@ fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &
                     .and_then(|c| c.as_u64())
                     .unwrap_or(0);
                 obj.insert("exists".to_string(), serde_json::Value::Bool(n > 0));
+                // The driver saw the active segment only; sealed segments the
+                // index ruled out can still hold a torn tail.
+                let torn = out.torn_tail_skipped + sealed_torn_tails(cfg, tier);
+                if torn > 0 {
+                    obj.insert(
+                        "torn_tail_skipped".to_string(),
+                        serde_json::Value::from(torn),
+                    );
+                }
             }
             TierStoreOutcome::Ok(serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()))
         }
@@ -1479,6 +1529,7 @@ fn read_execution_across_segments(
     execution_id: &str,
     sealed: &[PathBuf],
     active: Result<Vec<serde_json::Value>, String>,
+    active_torn: usize,
 ) -> TierStoreOutcome {
     #[cfg(test)]
     tests::probe_sealed_phase(cfg, tier);
@@ -1527,7 +1578,7 @@ fn read_execution_across_segments(
         }
     }
     let n = records.len();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "action": "eventlog-read-execution",
         "execution_id": execution_id,
         "exists": n > 0,
@@ -1536,6 +1587,13 @@ fn read_execution_across_segments(
         "records": records,
         "segments": sealed.len() + 1,
     });
+    // noetl/ehdb#262: the merge used to drop every segment's torn-tail count,
+    // so a torn write read exactly like a complete log. Absent when zero,
+    // matching the driver.
+    let torn = active_torn + sealed_torn_tails(cfg, tier);
+    if torn > 0 {
+        body["torn_tail_skipped"] = serde_json::Value::from(torn);
+    }
     TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
@@ -1783,6 +1841,127 @@ mod tests {
         assert!(
             matches!(replay, TierStoreOutcome::Error(_)),
             "without the offset index the damaged segment must be REPLAYED (and fail): {replay:?}"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// One sealed segment holding `exec-a`, an active one holding `exec-b`,
+    /// and the sealed segment torn (a write cut short) when `tear` is set.
+    ///
+    /// ⚠ The index is built BEFORE the tear: `build_segment_index` refuses a
+    /// torn segment outright, so a torn segment in practice is unindexed and
+    /// always replayed. Indexes that predate the damage are the case where a
+    /// read can step around the segment, which is what this exercises.
+    async fn torn_sealed_fixture(tag: &str, tear: bool, index: bool) -> (TierStoreConfig, PathBuf) {
+        let cfg = seal_cfg(tag);
+        for i in 0..6 {
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-a",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+        let active = cfg.path_for(StoreTier::EventLog);
+        let sealed = active.with_file_name("eventlog.jsonl.1");
+        std::fs::rename(&active, &sealed).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        for i in 0..3 {
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-b",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+        if index {
+            build_segment_index(&sealed).expect("index build");
+            assert!(
+                load_offset_spans(&sealed, "exec-a").is_some(),
+                "offset index unusable"
+            );
+        }
+        if tear {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&sealed)
+                .unwrap();
+            std::io::Write::write_all(&mut f, b"{\"torn").unwrap();
+        }
+        ehdb_reference::forget_runtime(&sealed);
+        (cfg, sealed)
+    }
+
+    fn torn_of(out: &TierStoreOutcome) -> (u64, Option<u64>) {
+        let TierStoreOutcome::Ok(b) = out else {
+            panic!("read failed: {out:?}")
+        };
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        (
+            v["record_count"].as_u64().unwrap(),
+            v["torn_tail_skipped"].as_u64(),
+        )
+    }
+
+    /// noetl/ehdb#262: a torn tail in a SEALED segment stays visible on a
+    /// per-execution read, whichever path the read takes through that segment —
+    /// replayed, answered from the offset index, or ruled out by the index.
+    #[tokio::test]
+    async fn a_torn_sealed_segment_is_reported_by_every_read_path() {
+        // Clean control: no field at all, on any path.
+        let (cfg, _) = torn_sealed_fixture("torn-clean", false, true).await;
+        for exec in ["exec-a", "exec-b"] {
+            let (n, torn) = torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, exec).await);
+            assert!(n > 0, "{exec}: control read returned nothing");
+            assert_eq!(torn, None, "{exec}: a clean store reported a torn tail");
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+
+        // Replayed: no index, so the sealed segment is opened by the driver.
+        let (cfg, _) = torn_sealed_fixture("torn-replay", true, false).await;
+        assert_eq!(
+            torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await),
+            (6, Some(1)),
+            "replay path dropped the sealed segment's torn tail"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+
+        // Offset index: the segment is never replayed, so the driver never
+        // sees the tear.
+        let (cfg, _) = torn_sealed_fixture("torn-offset", true, true).await;
+        assert_eq!(
+            torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await),
+            (6, Some(1)),
+            "offset-index path dropped the sealed segment's torn tail"
+        );
+        // Ruled out by the index: only the active segment is read, but the torn
+        // line's execution is unknowable, so this read may be missing it too.
+        assert_eq!(
+            torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, "exec-b").await),
+            (3, Some(1)),
+            "index-ruled-out path dropped the sealed segment's torn tail"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+
+        // The ACTIVE segment torn, on a read that also merges a sealed one: the
+        // driver's own count must survive the merge.
+        let (cfg, _) = torn_sealed_fixture("torn-active", false, false).await;
+        let active = cfg.path_for(StoreTier::EventLog);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{\"torn").unwrap();
+        drop(f);
+        ehdb_reference::forget_runtime(&active);
+        assert_eq!(
+            torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await),
+            (6, Some(1)),
+            "the merged read dropped the active segment's torn tail"
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
