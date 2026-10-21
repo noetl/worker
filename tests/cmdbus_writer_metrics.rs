@@ -332,3 +332,80 @@ async fn the_inflight_gauge_reports_claimed_unacked_work_not_a_literal_zero() {
     drop(held);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#482 — the subject seed must not block the rest of startup.
+// ---------------------------------------------------------------------------
+
+/// ⭐ `spawn_writer_host` must RETURN before the subject seed finishes.
+///
+/// The seed reads the retained partition from sequence 0 to enumerate subjects.
+/// On the prod command bus that is ~63.5 s, and awaiting it inside
+/// `spawn_writer_host` delayed everything after the call — including the whole
+/// event-bus host, which then bound its faces 63.5 s later than it needed to.
+///
+/// This pins the fix: the host returns promptly, and the metrics face binds
+/// later, on its own. ⚠ What it must NOT change is the ordering the seed exists
+/// for — `a_restarted_writer_reports_every_subject_it_has_ever_routed`
+/// (above) still requires the seeded label set to be present once the endpoint
+/// answers, which is the noetl/ai-meta#194 contract.
+#[tokio::test]
+async fn the_host_returns_without_waiting_for_the_subject_seed() {
+    let dir = unique_dir("seed-nonblocking");
+    let metrics = free_addr().await;
+
+    // Enough commands that the seed has real work: it replays every record.
+    {
+        let (writer, shutdown) = spawn_writer_host(&config_at(&dir, free_addr().await))
+            .await
+            .unwrap();
+        for i in 0..4_000u64 {
+            writer
+                .append(ehdb_l0::EventRecord::new(
+                    i + 1,
+                    format!("exec-{i}"),
+                    "command.issued",
+                    format!("{{\"pool\":\"pool-{}\"}}", i % 3),
+                ))
+                .unwrap();
+        }
+        shutdown.run().await;
+    }
+
+    // Reopen with the metrics face configured: the seed now has 4k records.
+    let t0 = std::time::Instant::now();
+    let (_writer, shutdown) = spawn_writer_host(&config_at(&dir, metrics)).await.unwrap();
+    let returned_in = t0.elapsed();
+
+    // The face is reachable only after the seed, so time that separately.
+    let body = scrape(metrics).await;
+    let total = t0.elapsed();
+
+    eprintln!(
+        "  host returned in {:?}; metrics face answered at {:?}",
+        returned_in, total
+    );
+
+    // ⚠ The denominator: if the seed were instant this test would be vacuous,
+    // so assert it actually cost something before asserting the host beat it.
+    assert!(
+        body.contains("ehdb_feed_subject_lag"),
+        "the seeded label set must still be present when the face answers — the \
+         #194 contract this change must not break. body:\n{body}"
+    );
+    // ⚠ Quantitative, not just ordered. `returned_in < total` is satisfied by a
+    // microsecond even when the host blocks on the seed, so it would pass
+    // against the very regression this test exists to catch. Requiring the host
+    // to return in a small FRACTION of the time the face takes is what makes a
+    // blocking revert fail: if the seed were awaited inline, the two would be
+    // within noise of each other.
+    assert!(
+        returned_in * 5 < total,
+        "the host must return in well under the time the seed costs — a blocking \
+         revert would put these within noise. returned_in={returned_in:?} \
+         total={total:?} (need returned_in*5 < total)"
+    );
+
+    shutdown.run().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
