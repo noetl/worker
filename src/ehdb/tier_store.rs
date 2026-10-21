@@ -128,6 +128,134 @@ pub enum TierStoreOutcome {
     Error(String),
 }
 
+/// Recently-appended `event_id`s, per tier — the seal-straddling dedup window
+/// (noetl/ai-meta#472).
+///
+/// ⚠⚠ **Why a ring and not the driver's dedup.** The driver already rejects a
+/// duplicate `event_id`, but it does so by replaying the log it has open, and
+/// that is the **active** segment only: sealing is `std::fs::rename(active,
+/// sealed)`, so every seal moves the previous records out of the driver's view
+/// and the dedup window closes. Reads enumerate sealed segments; the append path
+/// does not. A redelivery of an `event_id` that landed before a seal therefore
+/// found nothing and appended a second copy — the mechanism behind the
+/// `duplicate_event` divergence (+2 over 30 h, with the id SETS staying equal,
+/// which is exactly what a second copy of a present id looks like).
+///
+/// ⚠ Deliberately NOT the alternatives, each rejected on a measured cost:
+///
+/// * **Search sealed segments on append.** Prod holds segments of 1.08 GB and
+///   3.3 GB; a streaming search is seconds, on the write path of a
+///   `primary`-serving tier. The file's own note at `event_id_from_payload` says
+///   that path was kept free of per-record work on purpose.
+/// * **An `event_id` index per sealed segment.** The existing `.idx` is a set of
+///   `execution_id`s — a read-pruning filter — so this would be a new structure
+///   with one entry per record, ~1M entries resident on a writer with documented
+///   OOMs (noetl/ai-meta#332).
+///
+/// ⚠⚠ **What this does and does not guarantee.** It covers the window a retry
+/// actually spans: `MAX_RETRIES=7` with 500 ms doubling plus per-attempt
+/// timeouts is ~80 s, and the ring holds the last `NOETL_EHDB_TIER_DEDUP_WINDOW`
+/// ids (default 10,000). A redelivery older than that window still gets through,
+/// so this is **not** a total guarantee — the read-side dedup in
+/// `ehdb_projection_fold::events_from_tier` remains the backstop. It is a
+/// bounded fix for the observed mechanism, not a proof of uniqueness.
+static RECENT_EVENT_IDS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<StoreTier, DedupRing>>,
+> = std::sync::OnceLock::new();
+
+/// Bounded FIFO set: O(1) contains, O(1) insert, fixed memory.
+#[derive(Default)]
+pub(crate) struct DedupRing {
+    seen: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl DedupRing {
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// ⚠ `#[cfg(test)]`: the production path never asks "is this present" on its
+    /// own — `insert` answers both questions in one lock. This exists so the
+    /// ring's eviction order is assertable, which is what the mutation battery
+    /// needs. Gated rather than `allow(dead_code)` so it cannot quietly become a
+    /// second, drifting way to read the ring.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.seen.contains(id)
+    }
+
+    /// Insert `id`, evicting the oldest when at capacity. Returns false when the
+    /// id was already present (i.e. this is a duplicate).
+    pub(crate) fn insert(&mut self, id: &str) -> bool {
+        if self.seen.contains(id) {
+            return false;
+        }
+        // ⚠⚠ A capacity of 0 disables the ring entirely — and this guard is
+        // LOAD-BEARING, not tidiness.
+        //
+        // Without it the eviction loop below is `while self.order.len() >= 0`,
+        // which is **always true for a usize**, while `pop_front()` on an empty
+        // deque returns `None` and never decrements. That is an INFINITE LOOP, on
+        // the append path, the moment someone sets the rollback value.
+        //
+        // Found by mutation: deleting this block did not fail the suite, it HUNG
+        // it — which on a Rust repo reads as a slow compile rather than a defect.
+        if self.cap == 0 {
+            return true;
+        }
+        while self.order.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        self.order.push_back(id.to_string());
+        self.seen.insert(id.to_string());
+        true
+    }
+
+    /// ⚠ `#[cfg(test)]`, same reason as [`contains`]: the bound is asserted by
+    /// tests, not consulted at runtime.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// Size of the seal-straddling dedup window, in `event_id`s per tier.
+///
+/// `0` disables it, restoring the pre-fix behaviour exactly — the no-redeploy
+/// rollback.
+pub const TIER_DEDUP_WINDOW_ENV: &str = "NOETL_EHDB_TIER_DEDUP_WINDOW";
+
+fn dedup_window() -> usize {
+    std::env::var(TIER_DEDUP_WINDOW_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(10_000)
+}
+
+/// Claim `event_id` for `tier`. `false` means it was appended recently, so the
+/// caller must NOT append again.
+fn claim_event_id(tier: StoreTier, event_id: &str) -> bool {
+    let map = RECENT_EVENT_IDS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        // A poisoned lock must not turn into a dropped append: fail OPEN, which
+        // degrades to the previous behaviour rather than losing a record.
+        Err(e) => e.into_inner(),
+    };
+    guard
+        .entry(tier)
+        .or_insert_with(|| DedupRing::with_capacity(dedup_window()))
+        .insert(event_id)
+}
+
 /// Per-store lock serialising access to one event-log file.
 ///
 /// **This is the fix for the P0 the serve-ready soak found.** Until the mirror
@@ -563,6 +691,37 @@ fn append_batch_locked(
         })
         .collect();
 
+    // Seal-straddling dedup (noetl/ai-meta#472), same reasoning as the single
+    // path. A request whose id was claimed recently is dropped from the batch
+    // rather than sent, so the driver never sees it.
+    let mut deduped = 0usize;
+    let requests: Vec<EventLogAppendRequest> = requests
+        .into_iter()
+        .filter(|r| match r.event_id.as_deref() {
+            Some(id) if !claim_event_id(tier, id) => {
+                deduped += 1;
+                super::metrics::record_tier_dedup_hit(tier);
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    if requests.is_empty() {
+        return payloads
+            .iter()
+            .map(|_| {
+                TierStoreOutcome::Ok(
+                    serde_json::json!({
+                        "action": "eventlog-append-batch",
+                        "deduplicated": true,
+                        "deduped": deduped,
+                        "window": "recent-event-ids",
+                    })
+                    .to_string(),
+                )
+            })
+            .collect();
+    }
     match driver(cfg, tier).append_batch(&requests) {
         Ok(outs) => {
             // Record store state once for the batch — the same signal the
@@ -629,6 +788,24 @@ fn append_locked(
         // Deploy A: inert.  Deploy B populates this from the payload's event_id.
         event_id: event_id_from_payload(payload),
     };
+    // Seal-straddling dedup (noetl/ai-meta#472). The driver's own dedup sees the
+    // ACTIVE segment only, so a redelivery whose original landed before a seal
+    // would append a second copy. Checked HERE, before the driver, because this
+    // is the only place that sees appends across seals.
+    if let Some(id) = request.event_id.as_deref() {
+        if !claim_event_id(tier, id) {
+            super::metrics::record_tier_dedup_hit(tier);
+            return TierStoreOutcome::Ok(
+                serde_json::json!({
+                    "action": "eventlog-append",
+                    "execution_id": request.execution_id,
+                    "deduplicated": true,
+                    "window": "recent-event-ids",
+                })
+                .to_string(),
+            );
+        }
+    }
     match driver(cfg, tier).append(&request) {
         Ok(out) => {
             // The store's own state, recorded on the write path (ai-meta#260).
@@ -711,20 +888,54 @@ pub async fn read_execution(
         return TierStoreOutcome::Invalid("execution_id is empty".to_string());
     }
     let lock = store_lock(cfg, tier);
-    let _shared = lock.read().await;
-    let cfg = cfg.clone();
-    let execution_id = execution_id.to_string();
-    match off_runtime(move || read_execution_locked(&cfg, tier, &execution_id)).await {
-        Ok(v) => v,
+    let shared = lock.read().await;
+    let locked_phase = {
+        let cfg = cfg.clone();
+        let execution_id = execution_id.to_string();
+        off_runtime(move || read_execution_locked(&cfg, tier, &execution_id)).await
+    };
+    // ⚠⚠ Released BEFORE the sealed segments are read. A sealed segment is
+    // immutable — it is created by a rename under the WRITE lock and never
+    // written again — so reading it needs no lock. Holding the shared guard
+    // across its replay (256 MiB on prod) queued every append behind the read,
+    // because tokio's RwLock is write-preferring: on 2026-10-20 a live chat
+    // turn's mirror append was shed behind comparator reads of a freshly sealed
+    // segment (noetl/ai-meta#490). The sealed LIST and the active segment were
+    // both taken under the guard, so the answer is the store as of that instant;
+    // a seal after release renames a file this read already holds the contents
+    // of, and adds a segment it correctly does not consult.
+    drop(shared);
+    match locked_phase {
         Err(e) => TierStoreOutcome::Error(e),
+        Ok(LockedRead::Complete(outcome)) => outcome,
+        Ok(LockedRead::NeedsSealed { sealed, active }) => {
+            let cfg = cfg.clone();
+            let execution_id = execution_id.to_string();
+            match off_runtime(move || {
+                read_execution_across_segments(&cfg, tier, &execution_id, &sealed, active)
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => TierStoreOutcome::Error(e),
+            }
+        }
     }
 }
 
-fn read_execution_locked(
-    cfg: &TierStoreConfig,
-    tier: StoreTier,
-    execution_id: &str,
-) -> TierStoreOutcome {
+/// What the locked phase of a read produced.
+enum LockedRead {
+    /// No sealed segment can hold the execution; the active segment answered.
+    Complete(TierStoreOutcome),
+    /// These sealed segments must be merged in front of the active segment's
+    /// records, which were already read under the lock.
+    NeedsSealed {
+        sealed: Vec<PathBuf>,
+        active: Result<Vec<serde_json::Value>, String>,
+    },
+}
+
+fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &str) -> LockedRead {
     let request = EventLogReadExecutionRequest {
         execution_id: execution_id.to_string(),
         after: None,
@@ -741,7 +952,13 @@ fn read_execution_locked(
     // index is still opened — absence is "unknown", never "absent".
     let (sealed, total_sealed) = segments_possibly_holding(cfg, tier, execution_id);
     if !sealed.is_empty() {
-        return read_execution_across_segments(cfg, tier, execution_id, &sealed, &request);
+        // Only the ACTIVE segment is read here; the sealed ones are read by the
+        // caller after it releases the lock.
+        let active =
+            read_segment_then_release(&cfg.path_for(tier), false, |d| d.read_execution(&request))
+                .map_err(|e| e.to_string())
+                .map(|out| records_of(&out));
+        return LockedRead::NeedsSealed { sealed, active };
     }
     if total_sealed > 0 {
         // Every sealed segment was ruled out by its index; the active segment
@@ -753,7 +970,7 @@ fn read_execution_locked(
             "tier read skipped sealed segments via index"
         );
     }
-    match driver(cfg, tier).read_execution(&request) {
+    LockedRead::Complete(match driver(cfg, tier).read_execution(&request) {
         Ok(out) => {
             let mut v = serde_json::to_value(&out).unwrap_or(serde_json::Value::Null);
             // ⚠ The driver reports `exists: true` for an execution it holds NO
@@ -772,7 +989,7 @@ fn read_execution_locked(
             TierStoreOutcome::Ok(serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()))
         }
         Err(e) => TierStoreOutcome::Error(e.to_string()),
-    }
+    })
 }
 
 /// Build a segment's index off the request path.
@@ -821,7 +1038,7 @@ fn spawn_index_build(segment: PathBuf, tier: StoreTier) {
 pub fn backfill_segment_indexes(cfg: &TierStoreConfig) {
     for &tier in StoreTier::ALL.iter() {
         for seg in sealed_segments(cfg, tier) {
-            if load_segment_index(&seg).is_none() {
+            if load_segment_index(&seg).is_none() || !segment_offset_index_path(&seg).exists() {
                 tracing::info!(
                     tier = tier.as_str(), segment = %seg.display(),
                     "EHDB tier segment has no index; building it"
@@ -938,32 +1155,202 @@ fn execution_id_from_line(line: &str) -> Option<String> {
 pub fn build_segment_index(segment: &std::path::Path) -> Result<usize, String> {
     use std::io::BufRead;
     let f = std::fs::File::open(segment).map_err(|e| e.to_string())?;
-    let reader = std::io::BufReader::with_capacity(1 << 20, f);
-    let mut ids: std::collections::BTreeSet<String> = Default::default();
-    for (n, line) in reader.lines().enumerate() {
-        let line = line.map_err(|e| format!("line {}: {e}", n + 1))?;
-        if line.trim().is_empty() {
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, f);
+    // execution_id -> (offset, length) of each of its lines, in file order.
+    let mut ids: std::collections::BTreeMap<String, Vec<(u64, u64)>> = Default::default();
+    let mut line = String::new();
+    let mut offset = 0u64;
+    let mut n = 0usize;
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("line {}: {e}", n + 1))?;
+        if read == 0 {
+            break;
+        }
+        n += 1;
+        let start = offset;
+        offset += read as u64;
+        let body = line.strip_suffix('\n').unwrap_or(&line);
+        if body.trim().is_empty() {
             continue;
         }
-        match execution_id_from_line(&line) {
-            Some(id) => {
-                ids.insert(id);
-            }
+        match execution_id_from_line(body) {
+            Some(id) => ids.entry(id).or_default().push((start, body.len() as u64)),
             None => {
                 return Err(format!(
-                    "line {} carries no readable subject; refusing to write a partial index",
-                    n + 1
+                    "line {n} carries no readable subject; refusing to write a partial index"
                 ))
             }
         }
     }
 
-    let body: String = ids.iter().map(|i| format!("{i}\n")).collect();
+    let body: String = ids.keys().map(|i| format!("{i}\n")).collect();
     let final_path = segment_index_path(segment);
     let tmp = final_path.with_extension("idx.tmp");
     std::fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())?;
+
+    // Best-effort: without it a read replays the segment, which is slow and
+    // correct. It must never fail the `.idx` that rules segments out.
+    if let Err(e) = write_offset_index(segment, offset, &ids) {
+        tracing::warn!(
+            segment = %segment.display(), error = %e,
+            "EHDB tier segment offset index not written; reads will replay this segment"
+        );
+    }
     Ok(ids.len())
+}
+
+/// The per-execution line offsets beside a sealed segment: `<segment>.offidx`.
+///
+/// ⚠⚠ WHY — noetl/ai-meta#490. `.idx` decides WHICH sealed segments to open,
+/// but opening one replays the whole file: 256 MiB per read on prod, far past
+/// the tier client's 2 s timeout, and the abandoned replay keeps its in-flight
+/// permit until it finishes. On 2026-10-20 that shed a live chat turn's mirror
+/// append. With this sidecar a sealed read costs this execution's lines.
+///
+/// ⚠ A SEPARATE file, not a new `.idx` format. An older binary reads every
+/// `.idx` line as an execution id; handing it offsets after a rollback would
+/// make it rule out segments that hold the execution — a wrong answer. It
+/// ignores `.offidx` entirely.
+///
+/// Format: a header `ehdb-offidx v1 <segment byte length>`, then one line per
+/// execution: `<execution_id>\t<offset>:<length> <offset>:<length> …`. The
+/// recorded length is checked on every read; a mismatch means the sidecar does
+/// not describe this file and the read replays instead.
+fn segment_offset_index_path(segment: &std::path::Path) -> PathBuf {
+    let mut s = segment.as_os_str().to_os_string();
+    s.push(".offidx");
+    PathBuf::from(s)
+}
+
+const OFFSET_INDEX_HEADER: &str = "ehdb-offidx v1";
+
+fn write_offset_index(
+    segment: &std::path::Path,
+    segment_len: u64,
+    ids: &std::collections::BTreeMap<String, Vec<(u64, u64)>>,
+) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let mut body = format!("{OFFSET_INDEX_HEADER} {segment_len}\n");
+    for (id, spans) in ids {
+        body.push_str(id);
+        body.push('\t');
+        for (i, (off, len)) in spans.iter().enumerate() {
+            if i > 0 {
+                body.push(' ');
+            }
+            let _ = write!(body, "{off}:{len}");
+        }
+        body.push('\n');
+    }
+    let final_path = segment_offset_index_path(segment);
+    let tmp = final_path.with_extension("offidx.tmp");
+    std::fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &final_path).map_err(|e| e.to_string())
+}
+
+/// This execution's line spans in `segment`, if the offset index can vouch for
+/// them. `None` = no usable index (missing, unparsable, or written for a file
+/// of a different length) — the caller must replay.
+fn load_offset_spans(segment: &std::path::Path, execution_id: &str) -> Option<Vec<(u64, u64)>> {
+    let raw = std::fs::read_to_string(segment_offset_index_path(segment)).ok()?;
+    let mut lines = raw.lines();
+    let recorded: u64 = lines
+        .next()?
+        .strip_prefix(OFFSET_INDEX_HEADER)?
+        .trim()
+        .parse()
+        .ok()?;
+    if std::fs::metadata(segment).ok()?.len() != recorded {
+        return None;
+    }
+    let prefix = format!("{execution_id}\t");
+    for l in lines {
+        if let Some(rest) = l.strip_prefix(&prefix) {
+            return rest
+                .split(' ')
+                .map(|span| {
+                    let (o, n) = span.split_once(':')?;
+                    Some((o.parse().ok()?, n.parse().ok()?))
+                })
+                .collect();
+        }
+    }
+    // The header is valid and the execution is absent: this segment holds none
+    // of its records. That is an answer, not "unknown".
+    Some(Vec::new())
+}
+
+/// Read one execution's records from a SEALED segment by seeking to its lines.
+///
+/// Builds the same `EventLogRecordView` the driver projects — `global_sequence`
+/// from the `Publish` mutation's sequence, the execution from the subject, the
+/// payload bytes as lossy UTF-8 — so the result is indistinguishable from a
+/// replay (`an_offset_read_equals_a_replay_read` holds it to that).
+///
+/// ⚠ Fail-safe: ANY surprise returns `None` and the caller replays — a line
+/// that does not parse, a span past the end, a line whose `Publish` is not this
+/// execution's, a foreign tenant/namespace/stream. The offset path may only
+/// ever be faster than the replay, never different from it.
+fn read_sealed_by_offsets(
+    segment: &std::path::Path,
+    execution_id: &str,
+) -> Option<Vec<serde_json::Value>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let spans = load_offset_spans(segment, execution_id)?;
+    let subject = format!(
+        "{}.{execution_id}",
+        ehdb_reference::EVENT_LOG_SUBJECT_PREFIX
+    );
+    let mut f = std::fs::File::open(segment).ok()?;
+    let mut views: Vec<ehdb_reference::EventLogRecordView> = Vec::new();
+    let mut buf = Vec::new();
+    for (off, len) in spans {
+        buf.resize(usize::try_from(len).ok()?, 0);
+        f.seek(SeekFrom::Start(off)).ok()?;
+        f.read_exact(&mut buf).ok()?;
+        let line: serde_json::Value = serde_json::from_slice(&buf).ok()?;
+        if line.get("tenant")?.as_str()? != DEFAULT_LOCAL_REFERENCE_TENANT
+            || line.get("namespace")?.as_str()? != DEFAULT_LOCAL_REFERENCE_NAMESPACE
+        {
+            return None;
+        }
+        let transaction_id = line.get("transaction_id")?.as_str()?;
+        let before = views.len();
+        for m in line.get("mutations")?.as_array()? {
+            let Some(p) = m.get("Stream").and_then(|s| s.get("Publish")) else {
+                continue;
+            };
+            if p.get("stream")?.as_str()? != ehdb_reference::EVENT_LOG_STREAM
+                || p.get("subject")?.as_str()? != subject
+            {
+                return None;
+            }
+            let payload: Vec<u8> = p
+                .get("payload")?
+                .as_array()?
+                .iter()
+                .map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()))
+                .collect::<Option<_>>()?;
+            views.push(ehdb_reference::EventLogRecordView {
+                global_sequence: p.get("sequence")?.as_u64()?,
+                execution_id: execution_id.to_string(),
+                transaction_id: transaction_id.to_string(),
+                byte_len: payload.len(),
+                payload: String::from_utf8_lossy(&payload).into_owned(),
+            });
+        }
+        // The index said this line is the execution's; a line with no Publish
+        // of it means the index and the file disagree.
+        if views.len() == before {
+            return None;
+        }
+    }
+    views.sort_by_key(|v| v.global_sequence);
+    views.iter().map(|v| serde_json::to_value(v).ok()).collect()
 }
 
 /// Segments that could hold `execution_id`, oldest first.
@@ -1081,6 +1468,17 @@ fn scan_across_segments(
     TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
+/// The `records` array of a driver read, as JSON values.
+fn records_of<T: serde::Serialize>(out: &T) -> Vec<serde_json::Value> {
+    match serde_json::to_value(out) {
+        Ok(serde_json::Value::Object(mut o)) => match o.remove("records") {
+            Some(serde_json::Value::Array(rs)) => rs,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 /// Read one execution across sealed segments + the active one, oldest first.
 ///
 /// ⚠ `global_sequence` is **renumbered** over the merged result. Each segment's
@@ -1093,22 +1491,28 @@ fn read_execution_across_segments(
     tier: StoreTier,
     execution_id: &str,
     sealed: &[PathBuf],
-    request: &EventLogReadExecutionRequest,
+    active: Result<Vec<serde_json::Value>, String>,
 ) -> TierStoreOutcome {
+    #[cfg(test)]
+    tests::probe_sealed_phase(cfg, tier);
+    let request = EventLogReadExecutionRequest {
+        execution_id: execution_id.to_string(),
+        after: None,
+        // noetl/ai-meta#492: the sealed replay builds its own request, so it
+        // needs the same uncapped limit as the locked phase, or a sealed segment
+        // holding >1000 of one execution's records is cut here instead.
+        limit: READ_EXECUTION_LIMIT,
+    };
     let mut records: Vec<serde_json::Value> = Vec::new();
-    let mut paths: Vec<PathBuf> = sealed.to_vec();
-    paths.push(cfg.path_for(tier));
-    let last = paths.len() - 1;
-    for (i, path) in paths.iter().enumerate() {
-        let sealed_seg = i < last; // the final entry is the ACTIVE segment
-        match read_segment_then_release(path, sealed_seg, |d| d.read_execution(request)) {
-            Ok(out) => {
-                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out) {
-                    if let Some(serde_json::Value::Array(rs)) = o.remove("records") {
-                        records.extend(rs);
-                    }
-                }
-            }
+    for path in sealed {
+        // A sealed segment with a usable offset index answers from just this
+        // execution's lines; anything else replays the segment as before.
+        if let Some(rs) = read_sealed_by_offsets(path, execution_id) {
+            records.extend(rs);
+            continue;
+        }
+        match read_segment_then_release(path, true, |d| d.read_execution(&request)) {
+            Ok(out) => records.extend(records_of(&out)),
             // A segment that cannot be read is NOT silently skipped: a partial
             // answer presented as complete is the failure this whole change is
             // trying not to cause.
@@ -1118,6 +1522,16 @@ fn read_execution_across_segments(
                     path.display()
                 ))
             }
+        }
+    }
+    // The active segment's records were read under the lock and go LAST.
+    match active {
+        Ok(rs) => records.extend(rs),
+        Err(e) => {
+            return TierStoreOutcome::Error(format!(
+                "tier segment {} unreadable: {e}",
+                cfg.path_for(tier).display()
+            ))
         }
     }
     for (i, r) in records.iter_mut().enumerate() {
@@ -1255,6 +1669,323 @@ mod tests {
             panic!("merged read failed")
         };
         assert_eq!(read_count(&b), (N, N), "merged read truncated");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// Sealed-phase probes, keyed by store dir: `0` not reached, `1` the store
+    /// lock was free when the sealed segments were read, `2` it was held.
+    /// Keyed so a parallel test's reads cannot answer for this one.
+    fn sealed_probes() -> &'static StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicU8>>> {
+        static P: OnceLock<StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicU8>>>> =
+            OnceLock::new();
+        P.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    pub(super) fn probe_sealed_phase(cfg: &TierStoreConfig, tier: StoreTier) {
+        let probe = sealed_probes().lock().unwrap().get(&cfg.dir).cloned();
+        if let Some(p) = probe {
+            let free = store_lock(cfg, tier).try_write().is_ok();
+            p.store(
+                if free { 1 } else { 2 },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+
+    /// ⭐⭐ The sealed segments are read with the store lock RELEASED.
+    ///
+    /// noetl/ai-meta#490: a read held the shared guard across a 256 MiB sealed
+    /// replay, so appends (write guard) queued behind it and a live mirror
+    /// append was shed. The probe runs at the start of the sealed phase and
+    /// tries the WRITE lock — what an append needs.
+    #[tokio::test]
+    async fn sealed_segments_are_read_without_the_store_lock() {
+        let cfg = seal_cfg("unlocked");
+        const N: usize = 30;
+        for i in 0..N {
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-unl",
+                &format!("{{\"i\":{i},\"pad\":\"{}\"}}", "u".repeat(120)),
+                Some(2048),
+            )
+            .await;
+        }
+        assert!(
+            !sealed_segments(&cfg, StoreTier::EventLog).is_empty(),
+            "fixture never sealed; the sealed phase would not run"
+        );
+        let probe = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        sealed_probes()
+            .lock()
+            .unwrap()
+            .insert(cfg.dir.clone(), probe.clone());
+
+        let got = read_execution(Some(&cfg), StoreTier::EventLog, "exec-unl").await;
+        sealed_probes().lock().unwrap().remove(&cfg.dir);
+
+        let TierStoreOutcome::Ok(body) = got else {
+            panic!("read failed: {got:?}");
+        };
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["record_count"], N,
+            "the split read lost or duplicated records"
+        );
+        // Oldest first across the split: sealed records, then the active ones.
+        let order: Vec<u64> = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let p = r["payload"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| r["payload"].to_string());
+                serde_json::from_str::<serde_json::Value>(&p).unwrap()["i"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(order, (0..N as u64).collect::<Vec<_>>());
+        match probe.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => {}
+            0 => panic!("the sealed phase never ran — this test measured nothing"),
+            _ => panic!("the store lock was HELD while sealed segments were read"),
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// Fixture: three executions interleaved across several sealed segments,
+    /// every segment indexed. Returns the store and its sealed segments.
+    async fn offidx_fixture(tag: &str) -> (TierStoreConfig, Vec<PathBuf>) {
+        let cfg = seal_cfg(tag);
+        for i in 0..60 {
+            let exec = ["exec-a", "exec-b", "exec-c"][i % 3];
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                exec,
+                &format!(
+                    "{{\"i\":{i},\"q\":\"\\\"x\\\"\",\"pad\":\"{}\"}}",
+                    "o".repeat(100)
+                ),
+                Some(2048),
+            )
+            .await;
+        }
+        let segs = sealed_segments(&cfg, StoreTier::EventLog);
+        assert!(segs.len() >= 3, "need several segments, got {}", segs.len());
+        for sg in &segs {
+            build_segment_index(sg).expect("index build");
+            assert!(
+                segment_offset_index_path(sg).exists(),
+                "no offset index written"
+            );
+        }
+        (cfg, segs)
+    }
+
+    /// One segment's records for one execution, by full replay.
+    fn replayed(sg: &Path, exec: &str) -> Vec<serde_json::Value> {
+        let req = EventLogReadExecutionRequest {
+            execution_id: exec.to_string(),
+            after: None,
+            limit: MAX_SCAN_LIMIT,
+        };
+        let out = read_segment_then_release(sg, true, |d| d.read_execution(&req)).expect("replay");
+        let v = serde_json::to_value(&out).unwrap();
+        v["records"].as_array().unwrap().clone()
+    }
+
+    /// ⭐⭐ The offset path is indistinguishable from the replay it replaces.
+    #[tokio::test]
+    async fn an_offset_read_equals_a_replay_read() {
+        let (cfg, segs) = offidx_fixture("off-eq").await;
+        let mut nonempty = 0;
+        for sg in &segs {
+            for exec in ["exec-a", "exec-b", "exec-c", "exec-absent"] {
+                let fast = read_sealed_by_offsets(sg, exec).expect("index should be usable");
+                assert_eq!(fast, replayed(sg, exec), "{exec} in {}", sg.display());
+                nonempty += usize::from(!fast.is_empty());
+            }
+        }
+        assert!(nonempty >= 3, "compared only empty answers ({nonempty})");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐⭐ A sealed read touches only the execution's own lines.
+    ///
+    /// Proven by damage: another execution's line in the middle of the segment
+    /// is overwritten in place (same length, so offsets hold). A replay must
+    /// now FAIL — a torn middle fails the whole open — so a read that still
+    /// succeeds did not replay. Deleting the offset index then makes the same
+    /// read fail, which shows the fallback really is the replay.
+    #[tokio::test]
+    async fn a_sealed_read_does_not_replay_the_segment() {
+        let (cfg, segs) = offidx_fixture("off-noreplay").await;
+        let before = read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await;
+        let TierStoreOutcome::Ok(before) = before else {
+            panic!("baseline read failed: {before:?}")
+        };
+
+        let sg = &segs[0];
+        let spans = load_offset_spans(sg, "exec-b").expect("spans");
+        let (off, len) = spans[spans.len() / 2];
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(sg).unwrap();
+            f.seek(SeekFrom::Start(off)).unwrap();
+            f.write_all(&vec![b'#'; len as usize]).unwrap();
+        }
+        ehdb_reference::forget_runtime(sg);
+
+        let after = read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await;
+        assert!(
+            matches!(&after, TierStoreOutcome::Ok(b) if *b == before),
+            "the offset read changed or failed after damage it should never touch: {after:?}"
+        );
+
+        std::fs::remove_file(segment_offset_index_path(sg)).unwrap();
+        ehdb_reference::forget_runtime(sg);
+        let replay = read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await;
+        assert!(
+            matches!(replay, TierStoreOutcome::Error(_)),
+            "without the offset index the damaged segment must be REPLAYED (and fail): {replay:?}"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// An offset index that does not describe the file is not used.
+    #[tokio::test]
+    async fn a_stale_or_wrong_offset_index_falls_back_to_replay() {
+        let (cfg, segs) = offidx_fixture("off-stale").await;
+        let sg = &segs[0];
+        let want = replayed(sg, "exec-a");
+
+        // Length mismatch: the header no longer vouches for the file.
+        let len = std::fs::metadata(sg).unwrap().len();
+        let idx = segment_offset_index_path(sg);
+        let raw = std::fs::read_to_string(&idx).unwrap();
+        std::fs::write(
+            &idx,
+            raw.replacen(&len.to_string(), &(len + 1).to_string(), 1),
+        )
+        .unwrap();
+        assert!(
+            read_sealed_by_offsets(sg, "exec-a").is_none(),
+            "stale length was trusted"
+        );
+
+        // Spans that point at ANOTHER execution's lines.
+        let b = load_offset_spans_unchecked(&raw, "exec-b");
+        let swapped: String = raw
+            .lines()
+            .map(|l| match l.strip_prefix("exec-a\t") {
+                Some(_) => format!("exec-a\t{b}\n"),
+                None => format!("{l}\n"),
+            })
+            .collect();
+        std::fs::write(&idx, swapped).unwrap();
+        assert!(
+            read_sealed_by_offsets(sg, "exec-a").is_none(),
+            "foreign lines were served"
+        );
+
+        // Either way the public read still returns the right records.
+        let got = read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await;
+        assert!(matches!(got, TierStoreOutcome::Ok(_)), "{got:?}");
+        assert!(!want.is_empty());
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    fn load_offset_spans_unchecked(raw: &str, exec: &str) -> String {
+        raw.lines()
+            .find_map(|l| l.strip_prefix(&format!("{exec}\t")))
+            .expect("exec in index")
+            .to_string()
+    }
+
+    /// Measurement, not a gate: one sealed segment of `NOETL_OFFIDX_BENCH_MB`
+    /// (default 64) MiB, ~1 KiB events over 500 executions; time a replay read
+    /// against an offset read of the same execution. Run with
+    /// `cargo test --release --lib offset_read_cost -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn offset_read_cost_vs_replay() {
+        let mb: u64 = std::env::var("NOETL_OFFIDX_BENCH_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let cfg = seal_cfg("off-bench");
+        let active = cfg.path_for(StoreTier::EventLog);
+        let pad = "b".repeat(1000);
+        // Batched, as prod writes them (NOETL_EHDB_TIER_APPEND_BATCH=true): one
+        // line per batch of one execution's events, 500 executions interleaved.
+        let mut i = 0u64;
+        while std::fs::metadata(&active).map(|m| m.len()).unwrap_or(0) < mb << 20 {
+            let exec = format!("exec-{}", (i / 10) % 500);
+            let batch: Vec<String> = (0..10)
+                .map(|k| format!("{{\"i\":{},\"pad\":\"{pad}\"}}", i + k))
+                .collect();
+            let _ = append_batch(Some(&cfg), StoreTier::EventLog, &exec, &batch).await;
+            i += 10;
+        }
+        // Seal exactly as `maybe_seal` does: a rename, nothing else.
+        let sg = active.with_file_name(format!(
+            "{}.1",
+            active.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::rename(&active, &sg).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        build_segment_index(&sg).unwrap();
+        let bytes = std::fs::metadata(&sg).unwrap().len();
+
+        ehdb_reference::forget_runtime(&sg);
+        let t = std::time::Instant::now();
+        let slow = replayed(&sg, "exec-7");
+        let replay = t.elapsed();
+        let t = std::time::Instant::now();
+        let fast = read_sealed_by_offsets(&sg, "exec-7").unwrap();
+        let offset = t.elapsed();
+        assert_eq!(fast, slow);
+        eprintln!(
+            "segment {:.1} MiB, {i} events: replay {replay:?}, offset {offset:?} ({} records)",
+            bytes as f64 / 1048576.0,
+            fast.len()
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// Segments indexed by an older build have `.idx` and no `.offidx`; the
+    /// backfill must give them one, and `.idx` must keep its old format.
+    #[tokio::test]
+    async fn the_backfill_adds_an_offset_index_and_leaves_idx_alone() {
+        let (cfg, segs) = offidx_fixture("off-backfill").await;
+        let idx_before = std::fs::read_to_string(segment_index_path(&segs[0])).unwrap();
+        assert!(
+            idx_before
+                .lines()
+                .all(|l| !l.contains('\t') && !l.contains(':')),
+            ".idx format changed — an older binary would misread it: {idx_before:?}"
+        );
+        for sg in &segs {
+            std::fs::remove_file(segment_offset_index_path(sg)).unwrap();
+        }
+        backfill_segment_indexes(&cfg);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !segs.iter().all(|sg| segment_offset_index_path(sg).exists()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backfill never wrote .offidx"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(segment_index_path(&segs[0])).unwrap(),
+            idx_before
+        );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
@@ -2156,5 +2887,77 @@ mod tests {
             "a projection append must not move the event log's tip"
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+}
+
+#[cfg(test)]
+mod dedup_window_tests {
+    use super::*;
+
+    /// The ring's contract: bounded memory, O(1) membership, FIFO eviction.
+    #[test]
+    fn the_ring_is_bounded_and_evicts_oldest_first() {
+        let mut r = DedupRing::with_capacity(3);
+        for id in ["a", "b", "c"] {
+            assert!(r.insert(id), "{id} is new");
+        }
+        assert_eq!(r.len(), 3);
+        assert!(r.contains("a"));
+
+        // Fourth insert evicts "a", the oldest.
+        assert!(r.insert("d"));
+        assert_eq!(r.len(), 3, "capacity must hold");
+        assert!(!r.contains("a"), "oldest must be evicted");
+        assert!(r.contains("b") && r.contains("c") && r.contains("d"));
+
+        // ⚠ The whole point: "a" is now accepted AGAIN. The window is finite, so
+        // a redelivery older than it still gets through — stated as a test, not
+        // only in prose, so nobody reads this as a uniqueness guarantee.
+        assert!(
+            r.insert("a"),
+            "an id older than the window is NOT deduplicated"
+        );
+    }
+
+    #[test]
+    fn a_repeat_inside_the_window_is_refused() {
+        let mut r = DedupRing::with_capacity(10);
+        assert!(r.insert("e1"));
+        assert!(!r.insert("e1"), "the second insert must be refused");
+        assert!(!r.insert("e1"), "and stay refused");
+        assert_eq!(r.len(), 1, "a refused insert must not grow the ring");
+    }
+
+    /// ⚠ Capacity 0 is the no-redeploy rollback and must mean OFF, not "a window
+    /// of one". A naive eviction loop would evict the id it just inserted and
+    /// then accept everything — which looks like off but costs the work.
+    #[test]
+    fn capacity_zero_disables_the_window_entirely() {
+        let mut r = DedupRing::with_capacity(0);
+        assert!(r.insert("e1"));
+        assert!(
+            r.insert("e1"),
+            "with the window off, nothing is deduplicated"
+        );
+        assert_eq!(r.len(), 0, "and nothing is retained");
+    }
+
+    #[test]
+    fn the_window_size_comes_from_the_env_and_defaults_to_10k() {
+        // Default when unset or unparseable.
+        assert_eq!(dedup_window(), 10_000);
+    }
+
+    /// Distinct ids must not collide — the ring keys on the full id.
+    #[test]
+    fn distinct_ids_are_independent() {
+        let mut r = DedupRing::with_capacity(100);
+        for i in 0..50u64 {
+            assert!(r.insert(&format!("event-{i}")), "event-{i} is new");
+        }
+        for i in 0..50u64 {
+            assert!(!r.insert(&format!("event-{i}")), "event-{i} repeats");
+        }
+        assert_eq!(r.len(), 50);
     }
 }
