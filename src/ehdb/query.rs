@@ -1041,7 +1041,7 @@ mod tests {
     ///
     /// The torn tail is real: a segment file truncated mid-frame.
     #[test]
-    fn a_torn_tail_in_the_segment_store_is_silently_invisible_to_the_scan() {
+    fn a_torn_tail_in_the_segment_store_is_reported_by_the_scan() {
         use crate::ehdb::eventlog_backend::{append_selected, AppendDispatch, DurablePaths};
         use ehdb_reference::EventLogStorageBackend;
         let dir = std::env::temp_dir().join(format!(
@@ -1162,32 +1162,18 @@ mod tests {
             torn.record_count
         );
 
-        // ⚠⚠ FINDING, pinned as it behaves TODAY rather than as it should.
-        //
-        // `DurableSegmentStore::scan_global` hard-codes `torn_tail_skipped: 0`
-        // with the comment "this is the segment store, not the JSONL log, so it
-        // has no partial-final-line case (noetl/ehdb#262)". That comment is
-        // contradicted by the same file, which implements torn-tail recovery
-        // ("A truncated header at EOF is a torn tail — stop, keep the prefix")
-        // and by this test: a record is silently dropped and the counter still
-        // reads 0.
-        //
-        // So on the SEGMENT store — the one the `durable_segment` backend uses —
-        // the ehdb#262 signal does not exist. A scan returning 23 of 24 records
-        // is indistinguishable from a complete one, which is precisely the quiet
-        // wrong answer that field was put on the wire to prevent. The worker's
-        // plumbing (added with this pin bump) is correct and carries whatever
-        // the store reports; the store reports nothing.
-        //
-        // Asserted as `== 0` deliberately: when ehdb starts reporting it, this
-        // goes RED and whoever fixes it is told to flip the assertion, instead
-        // of the fix landing with nothing noticing.
-        assert_eq!(
-            torn.torn_tail_skipped, 0,
-            "GOOD NEWS, AND THIS ASSERTION IS NOW WRONG: the segment store has \
-             started reporting torn tails ({} skipped). Flip this to `>= 1` and \
-             delete this message — the worker side already sums correctly.",
-            torn.torn_tail_skipped
+        // The segment store now REPORTS the torn tail (ehdb#412, picked up with
+        // the ehdb v0.14.1 bump). Until then `scan_global` hard-coded
+        // `torn_tail_skipped: 0`, so 23 of 24 records read exactly like a complete
+        // scan — this test pinned that as `== 0`, with a message telling whoever
+        // fixed it to flip the assertion. It fired on the bump; flipped here. The
+        // worker's merge carries the count, and must keep carrying it: a merge
+        // that dropped it would reinstate the quiet wrong answer at this layer.
+        assert!(
+            torn.torn_tail_skipped >= 1,
+            "a record was dropped ({} -> {}) but the scan reports no torn tail",
+            clean.record_count,
+            torn.record_count
         );
 
         let _ = std::fs::remove_dir_all(&dir);
