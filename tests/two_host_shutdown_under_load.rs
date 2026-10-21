@@ -128,6 +128,11 @@ async fn events_resume_after_reopen(dir: &std::path::Path) -> (u64, bool, u64) {
 /// SIGTERM lands with real work in flight rather than on a quiet writer. This is
 /// the whole difference between this file and the idle suite that passed while
 /// prod was losing records.
+/// One append pair per writer per `PACE`; see [`Backlog::spawn`].
+const PACE: Duration = Duration::from_millis(2);
+/// 8 writers × 120 = 960 per log, under `seal_max_records` (1024).
+const PER_WRITER_CAP: u64 = 120;
+
 struct Backlog {
     stop: Arc<AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<(u64, u64)>>,
@@ -138,7 +143,9 @@ impl Backlog {
         cmd: Arc<ehdb_feed::FeedWriter<ehdb_l0::D1EventLog>>,
         events: Arc<ehdb_feed::FeedWriter<ehdb_l0::D1EventLog>>,
         writers: u64,
+        per_writer_cap: Option<u64>,
     ) -> Self {
+        let cap = per_writer_cap.unwrap_or(u64::MAX);
         let stop = Arc::new(AtomicBool::new(false));
         let tasks = (0..writers)
             .map(|w| {
@@ -146,7 +153,18 @@ impl Backlog {
                 tokio::spawn(async move {
                     let (mut c, mut e) = (0u64, 0u64);
                     let mut seq = w * 100_000;
-                    while !stop.load(Ordering::SeqCst) {
+                    // PACED and CAPPED, not free-running. The free-running loop
+                    // sized the backlog by runner speed: CI began producing
+                    // 2.5k-8k records per log in the 200 ms window (2026-10-20),
+                    // past seal_max_records, so the "nothing auto-sealed"
+                    // precondition failed on every run, main included. At one
+                    // pair per PACE, a writer's PER_WRITER_CAP takes longer than
+                    // the 200 ms lead-in, so appends are still in flight when the
+                    // seal runs — the condition this test exists for — and the
+                    // total stays under the cap however fast the runner is.
+                    // Uncapped (`None`) for callers that need the log to keep
+                    // growing for as long as they watch it.
+                    while !stop.load(Ordering::SeqCst) && c < cap {
                         seq += 1;
                         // Both logs are loaded at once — the prod shape, where
                         // the command bus and the events feed are busy together.
@@ -156,7 +174,7 @@ impl Backlog {
                         if events.append(rec(seq, "action_started")).is_ok() {
                             e += 1;
                         }
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(PACE).await;
                     }
                     (c, e)
                 })
@@ -223,7 +241,12 @@ fn both_hosts_seal_with_a_backlog_in_flight() {
             spawn_event_writer_host(&event_config(&events_dir, None))
                 .await
                 .unwrap();
-        let backlog = Backlog::spawn(cmd_writer.clone(), events_coord.writer(), 8);
+        let backlog = Backlog::spawn(
+            cmd_writer.clone(),
+            events_coord.writer(),
+            8,
+            Some(PER_WRITER_CAP),
+        );
         // Let a real backlog accumulate, then seal underneath it.
         tokio::time::sleep(Duration::from_millis(200)).await;
         (backlog, vec![cmd_shutdown, events_shutdown])
@@ -317,7 +340,7 @@ async fn negative_control_host_at_a_time_lets_the_second_host_keep_appending() {
     // seeded with at open — 0 — no matter how much has landed since.
     let tip = events_writer.tip_receiver();
 
-    let backlog = Backlog::spawn(cmd_writer.clone(), events_writer.clone(), 8);
+    let backlog = Backlog::spawn(cmd_writer.clone(), events_writer.clone(), 8, None);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // The old shape: run host 1's *entire* sequence first.
