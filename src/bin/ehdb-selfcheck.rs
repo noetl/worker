@@ -58,7 +58,7 @@ fn main() -> ExitCode {
             // `main` is sync; the load driver needs a runtime because the tier
             // client is async.
             match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt.block_on(run_tier_load(&flags)),
+                Ok(rt) => rt.block_on(run_tier_load(&env, &flags)),
                 Err(e) => {
                     eprintln!("tier-load: could not start a runtime: {e}");
                     ExitCode::from(2)
@@ -1091,7 +1091,7 @@ fn run_durable_eventlog(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
 ///
 /// Reports what the SERVICE did, not what the driver hoped: appended vs
 /// refused, wall time, and the slowest single append.
-async fn run_tier_load(flags: &Flags) -> ExitCode {
+async fn run_tier_load(env: &ehdb::EnvMap, flags: &Flags) -> ExitCode {
     let records = flags.parse_usize("records").unwrap_or(1_000);
     let concurrency = flags.parse_usize("concurrency").unwrap_or(1).max(1);
     let pad = flags.parse_usize("pad").unwrap_or(512);
@@ -1106,7 +1106,7 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
         .and_then(|t| ehdb::store_tier::StoreTier::parse(&t))
         .unwrap_or(ehdb::store_tier::StoreTier::EventLog);
 
-    let cfg = match ehdb::tier_client::TierClientConfig::build(Some(&addr), None, None) {
+    let cfg = match tier_load_config(env, flags, &addr) {
         Some(c) => c,
         None => {
             println!(
@@ -1124,19 +1124,7 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
     // attribution has to separate.
     let read_only = flags.get("read-only").is_some();
     if read_only {
-        let client = ehdb::tier_client::TierClient::new(cfg.clone());
-        let t = std::time::Instant::now();
-        let r = client.read_execution_tier(tier, &exec).await;
-        println!(
-            "{}",
-            serde_json::json!({
-                "suite":"tier-load","mode":"read","tier":tier.as_str(),
-                "seconds": (t.elapsed().as_secs_f64()*100.0).round()/100.0,
-                "ok": r.is_ok(),
-                "bytes": r.as_ref().map(|b| b.len()).unwrap_or(0),
-                "error": r.err().unwrap_or_default(),
-            })
-        );
+        println!("{}", tier_read_once(cfg.clone(), tier, &exec).await);
         return ExitCode::SUCCESS;
     }
 
@@ -1149,33 +1137,7 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
         let exec = exec.clone();
         let filler = filler.clone();
         tasks.push(tokio::spawn(async move {
-            let client = ehdb::tier_client::TierClient::new(cfg);
-            let (mut ok, mut err, mut slowest_ms) = (0u64, 0u64, 0u64);
-            let mut last_err = String::new();
-            for i in 0..per {
-                let t = std::time::Instant::now();
-                let r = client
-                    .append_tier(
-                        tier,
-                        &exec,
-                        &format!("{{\"c\":{c},\"i\":{i},\"pad\":\"{filler}\"}}"),
-                    )
-                    .await;
-                let ms = t.elapsed().as_millis() as u64;
-                if ms > slowest_ms {
-                    slowest_ms = ms;
-                }
-                match r {
-                    Ok(_) => ok += 1,
-                    Err(e) => {
-                        err += 1;
-                        if last_err.is_empty() {
-                            last_err = e;
-                        }
-                    }
-                }
-            }
-            (ok, err, slowest_ms, last_err)
+            tier_append_burst(cfg, tier, &exec, c, per, &filler).await
         }));
     }
     let (mut ok, mut err, mut slowest, mut last_err) = (0u64, 0u64, 0u64, String::new());
@@ -1218,6 +1180,120 @@ async fn run_tier_load(flags: &Flags) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Did the tier service SERVE this request, or answer it with a refusal?
+///
+/// ⚠ noetl/ai-meta#353. A reply frame is not a success. The service answers a
+/// shed with `TIER_BUSY_REPLY` (`err tier service busy: …`) and its typed
+/// refusals with `invalid …` / `error …` / `unavailable …` — all delivered as
+/// `Ok` by the client, because the transport worked. This tool read every one of
+/// them as `ok:true`, so a load sweep reported a shed tier as serving at every
+/// load level. Everything the service serves is a JSON object; anything else is
+/// the service saying no, and its text is the error.
+fn served(reply: Result<String, String>) -> Result<String, String> {
+    let body = reply?;
+    let served = body.trim_start().starts_with('{')
+        && serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|v| v.is_object());
+    if served {
+        Ok(body)
+    } else {
+        let t = body.trim();
+        Err(t.chars().take(300).collect())
+    }
+}
+
+/// One connection's share of a `tier-load` burst: `(appended, refused,
+/// slowest_ms, first_error)`. A refusal the service answered counts as refused,
+/// not appended — see [`served`].
+async fn tier_append_burst(
+    cfg: ehdb::tier_client::TierClientConfig,
+    tier: ehdb::store_tier::StoreTier,
+    exec: &str,
+    c: usize,
+    per: usize,
+    filler: &str,
+) -> (u64, u64, u64, String) {
+    let client = ehdb::tier_client::TierClient::new(cfg);
+    let (mut ok, mut err, mut slowest_ms) = (0u64, 0u64, 0u64);
+    let mut last_err = String::new();
+    for i in 0..per {
+        let t = std::time::Instant::now();
+        let r = client
+            .append_tier(
+                tier,
+                exec,
+                &format!("{{\"c\":{c},\"i\":{i},\"pad\":\"{filler}\"}}"),
+            )
+            .await;
+        let ms = t.elapsed().as_millis() as u64;
+        if ms > slowest_ms {
+            slowest_ms = ms;
+        }
+        match served(r) {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                err += 1;
+                if last_err.is_empty() {
+                    last_err = e;
+                }
+            }
+        }
+    }
+    (ok, err, slowest_ms, last_err)
+}
+
+/// One `--read-only` probe, as the JSON line `tier-load` prints.
+async fn tier_read_once(
+    cfg: ehdb::tier_client::TierClientConfig,
+    tier: ehdb::store_tier::StoreTier,
+    exec: &str,
+) -> serde_json::Value {
+    let client = ehdb::tier_client::TierClient::new(cfg);
+    let t = std::time::Instant::now();
+    let raw = client.read_execution_tier(tier, exec).await;
+    let bytes = raw.as_ref().map(|b| b.len()).unwrap_or(0);
+    let r = served(raw);
+    serde_json::json!({
+        "suite":"tier-load","mode":"read","tier":tier.as_str(),
+        "seconds": (t.elapsed().as_secs_f64()*100.0).round()/100.0,
+        "ok": r.is_ok(),
+        "bytes": bytes,
+        "error": r.err().unwrap_or_default(),
+    })
+}
+
+/// The client config `tier-load` drives with: `addr` plus the resolved timeouts.
+fn tier_load_config(
+    env: &ehdb::EnvMap,
+    flags: &Flags,
+    addr: &str,
+) -> Option<ehdb::tier_client::TierClientConfig> {
+    let (timeout, append_timeout) = tier_load_timeouts(env, flags);
+    ehdb::tier_client::TierClientConfig::build(
+        Some(addr),
+        timeout.as_deref(),
+        append_timeout.as_deref(),
+    )
+}
+
+/// `tier-load`'s client timeouts: `--timeout-ms` / `--append-timeout-ms`, else
+/// the same env vars the worker reads, else the client defaults.
+///
+/// ⚠ noetl/ai-meta#353. Both were passed as `None`, so the driver used the
+/// hardcoded 2 s whatever it was told — and a saturation harness could not hold a
+/// reader open past 2 s, so it counted zero readers while the server was still
+/// replaying.
+fn tier_load_timeouts(env: &ehdb::EnvMap, flags: &Flags) -> (Option<String>, Option<String>) {
+    use ehdb::tier_client::{TIER_SERVICE_APPEND_TIMEOUT_MS_ENV, TIER_SERVICE_TIMEOUT_MS_ENV};
+    (
+        flags
+            .get("timeout-ms")
+            .or_else(|| env.get(TIER_SERVICE_TIMEOUT_MS_ENV).cloned()),
+        flags
+            .get("append-timeout-ms")
+            .or_else(|| env.get(TIER_SERVICE_APPEND_TIMEOUT_MS_ENV).cloned()),
+    )
 }
 
 /// Drive one **segment-GC pass** over the live durable store's owned shards and
@@ -2601,5 +2677,168 @@ fn run_tier_concurrency(flags: &Flags) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tier_load_tests {
+    use super::*;
+    use noetl_worker::ehdb::tier_service::TIER_BUSY_REPLY;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn flags(pairs: &[(&str, &str)]) -> Flags {
+        Flags(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    /// A one-shot fake tier service: reads one request frame, waits `delay`,
+    /// answers `reply` in the service's framing (4-byte BE length prefix).
+    async fn fake_tier(reply: &'static str, delay: std::time::Duration) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).await.unwrap();
+            let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+            s.read_exact(&mut req).await.unwrap();
+            tokio::time::sleep(delay).await;
+            let _ = s.write_all(&(reply.len() as u32).to_be_bytes()).await;
+            let _ = s.write_all(reply.as_bytes()).await;
+        });
+        addr
+    }
+
+    /// A fake tier service that answers EVERY frame on every connection.
+    async fn fake_tier_always(reply: &'static str) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut len = [0u8; 4];
+                    while s.read_exact(&mut len).await.is_ok() {
+                        let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                        if s.read_exact(&mut req).await.is_err() {
+                            break;
+                        }
+                        let _ = s.write_all(&(reply.len() as u32).to_be_bytes()).await;
+                        let _ = s.write_all(reply.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_shed_append_is_counted_as_refused_not_appended() {
+        let addr = fake_tier_always(TIER_BUSY_REPLY).await;
+        let cfg = tier_load_config(&Default::default(), &flags(&[]), &addr).unwrap();
+        let (ok, err, _, first) =
+            tier_append_burst(cfg, ehdb::store_tier::StoreTier::EventLog, "x", 0, 4, "p").await;
+        assert_eq!((ok, err), (0, 4), "sheds counted as appends");
+        assert!(first.starts_with("err tier service busy"), "{first}");
+
+        let addr = fake_tier_always(r#"{"appended":true,"global_sequence":1}"#).await;
+        let cfg = tier_load_config(&Default::default(), &flags(&[]), &addr).unwrap();
+        let (ok, err, _, _) =
+            tier_append_burst(cfg, ehdb::store_tier::StoreTier::EventLog, "x", 0, 4, "p").await;
+        assert_eq!((ok, err), (4, 0), "control: a served append must count");
+    }
+
+    #[tokio::test]
+    async fn a_shed_read_is_reported_as_a_refusal_not_ok() {
+        let addr = fake_tier(TIER_BUSY_REPLY, std::time::Duration::ZERO).await;
+        let cfg = tier_load_config(&Default::default(), &flags(&[]), &addr).unwrap();
+        let out = tier_read_once(cfg, ehdb::store_tier::StoreTier::EventLog, "x").await;
+        assert_eq!(out["ok"], false, "a shed read as success: {out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("err tier service busy"),
+            "{out}"
+        );
+        assert_eq!(out["bytes"], TIER_BUSY_REPLY.len());
+    }
+
+    #[tokio::test]
+    async fn a_served_read_is_ok() {
+        let addr = fake_tier(
+            r#"{"action":"eventlog-read-execution","exists":false,"records":[]}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let cfg = tier_load_config(&Default::default(), &flags(&[]), &addr).unwrap();
+        let out = tier_read_once(cfg, ehdb::store_tier::StoreTier::EventLog, "x").await;
+        assert_eq!(out["ok"], true, "{out}");
+        assert_eq!(out["error"], "");
+    }
+
+    /// `--timeout-ms` must reach the client: a reply at 2.5 s is past the 2 s
+    /// default and inside an explicit 5 s.
+    #[tokio::test]
+    async fn the_timeout_flag_reaches_the_client() {
+        let slow = std::time::Duration::from_millis(2_500);
+        let addr = fake_tier(r#"{"records":[]}"#, slow).await;
+        let cfg = tier_load_config(
+            &Default::default(),
+            &flags(&[("timeout-ms", "5000")]),
+            &addr,
+        )
+        .unwrap();
+        let out = tier_read_once(cfg, ehdb::store_tier::StoreTier::EventLog, "x").await;
+        assert_eq!(out["ok"], true, "the flag was ignored: {out}");
+
+        let addr = fake_tier(r#"{"records":[]}"#, slow).await;
+        let cfg = tier_load_config(&Default::default(), &flags(&[]), &addr).unwrap();
+        let out = tier_read_once(cfg, ehdb::store_tier::StoreTier::EventLog, "x").await;
+        assert_eq!(
+            out["ok"], false,
+            "control: the 2 s default should have expired: {out}"
+        );
+    }
+
+    #[test]
+    fn timeouts_come_from_the_flag_then_the_env() {
+        use ehdb::tier_client::{TIER_SERVICE_APPEND_TIMEOUT_MS_ENV, TIER_SERVICE_TIMEOUT_MS_ENV};
+        let env: ehdb::EnvMap = [
+            (TIER_SERVICE_TIMEOUT_MS_ENV.to_string(), "7000".to_string()),
+            (
+                TIER_SERVICE_APPEND_TIMEOUT_MS_ENV.to_string(),
+                "8000".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let c = tier_load_config(&env, &flags(&[]), "h:1").unwrap();
+        assert_eq!(c.timeout, std::time::Duration::from_millis(7000));
+        assert_eq!(c.append_timeout, std::time::Duration::from_millis(8000));
+        let c = tier_load_config(&env, &flags(&[("timeout-ms", "9000")]), "h:1").unwrap();
+        assert_eq!(c.timeout, std::time::Duration::from_millis(9000));
+    }
+
+    #[test]
+    fn every_typed_refusal_is_not_served() {
+        for r in [
+            TIER_BUSY_REPLY,
+            "invalid execution_id is empty",
+            "error disk full",
+            "unavailable no tier store configured",
+            "[1,2]",
+            "",
+        ] {
+            assert!(served(Ok(r.to_string())).is_err(), "{r:?} read as served");
+        }
+        assert!(served(Ok(r#"{"appended":true,"global_sequence":3}"#.into())).is_ok());
+        assert_eq!(
+            served(Err("timed out after 2s".into())),
+            Err("timed out after 2s".into())
+        );
     }
 }

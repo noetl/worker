@@ -53,6 +53,13 @@ pub enum DemoteReason {
     NoDurableService,
     /// EHDB answered but disagreed with the incumbent.
     ParityDiverged,
+    /// The durable service was reached but this record did not land in it —
+    /// shed under load, refused as oversize or invalid, or a transport failure
+    /// mid-request. There is no parity verdict to report: nothing was written
+    /// to compare. Reporting it as `parity_diverged` sent the 2026-10-20 prod
+    /// investigation looking for a correctness defect behind what was a
+    /// `tier service busy` shed that the server's retry landed ~4 s later.
+    AppendRefused,
 }
 
 impl DemoteReason {
@@ -61,6 +68,7 @@ impl DemoteReason {
             Self::NotPrimary => "not_primary",
             Self::NoDurableService => "no_durable_service",
             Self::ParityDiverged => "parity_diverged",
+            Self::AppendRefused => "append_refused",
         }
     }
 
