@@ -1100,8 +1100,8 @@ async fn ehdb_tier_append_handler(
 /// the first anyone hears of it, at which point the cause is a store away.
 ///
 /// `serve_state` is the serve decision's own label (`served_primary`,
-/// `no_durable_service`, `parity_diverged`, `not_primary`, or `unknown` before
-/// the first append). It is in the body because a serve decision that is only
+/// `no_durable_service`, `parity_diverged`, `append_refused`, `not_primary`, or
+/// `unknown` before the first append). It is in the body because a serve decision that is only
 /// visible as a metric delta cannot be asserted at the endpoint level — and the
 /// P0 this closes was found by a gate reading a metric family that turned out to
 /// be absent, which reads identically to a build that does not have it.
