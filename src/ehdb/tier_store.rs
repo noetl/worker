@@ -1393,7 +1393,8 @@ fn read_segment_then_release<T>(
     out
 }
 
-/// Global scan across sealed segments + the active one, oldest first.
+/// A merged scan in progress across sealed segments + the active one, oldest
+/// first.
 ///
 /// ⚠ `after` is applied to the **merged, renumbered** sequence, not to each
 /// segment's own numbering. Passing it down per segment would skip a different
@@ -1407,26 +1408,36 @@ fn read_segment_then_release<T>(
 /// past the first page of a segment landed in the NEXT segment, silently
 /// skipping the rest. Same failure class as noetl/ai-meta#490's 1000-record
 /// read cap, on the scan side.
-fn scan_across_segments(
-    cfg: &TierStoreConfig,
-    tier: StoreTier,
-    sealed: &[PathBuf],
-    after: Option<u64>,
+struct MergedScan {
+    after: u64,
     limit: usize,
-) -> TierStoreOutcome {
-    let after = after.unwrap_or(0);
-    let mut page: Vec<serde_json::Value> = Vec::new();
-    let mut total: u64 = 0;
-    let mut torn: usize = 0;
-    let mut paths: Vec<PathBuf> = sealed.to_vec();
-    paths.push(cfg.path_for(tier));
-    let last = paths.len() - 1;
-    for (i, path) in paths.iter().enumerate() {
-        let sealed_seg = i < last; // the final entry is the ACTIVE segment
-        let base = total;
-        let want = limit - page.len();
+    total: u64,
+    torn: usize,
+    page: Vec<serde_json::Value>,
+    /// Sealed segments already folded in, oldest first.
+    sealed: Vec<PathBuf>,
+}
+
+impl MergedScan {
+    fn new(after: Option<u64>, limit: usize) -> Self {
+        Self {
+            after: after.unwrap_or(0),
+            limit,
+            total: 0,
+            torn: 0,
+            page: Vec::new(),
+            sealed: Vec::new(),
+        }
+    }
+
+    /// Fold one segment in: count it, then take whatever part of the page it
+    /// owns.
+    fn add_segment(&mut self, path: &Path, is_sealed: bool) -> Result<(), String> {
+        let base = self.total;
+        let want = self.limit - self.page.len();
+        let after = self.after;
         // Both reads inside one closure, so a sealed segment is loaded once.
-        let read = read_segment_then_release(path, sealed_seg, |d| {
+        let read = read_segment_then_release(path, is_sealed, |d| {
             let count = d.scan_global(&EventLogScanRequest {
                 after: None,
                 limit: 0,
@@ -1441,46 +1452,70 @@ fn scan_across_segments(
                 limit: want,
             })?;
             Ok::<_, ehdb_reference::EhdbError>((count, Some((local_after, rows))))
-        });
-        match read {
-            Ok((count, rows)) => {
-                total += count.record_count as u64;
-                torn += count.torn_tail_skipped;
-                if let Some((local_after, rows)) = rows {
-                    for (k, mut r) in records_of(&rows).into_iter().enumerate() {
-                        if let Some(o) = r.as_object_mut() {
-                            o.insert(
-                                "global_sequence".to_string(),
-                                serde_json::Value::from(base + local_after + k as u64 + 1),
-                            );
-                        }
-                        page.push(r);
-                    }
+        })
+        .map_err(|e| format!("tier segment {} unreadable: {e}", path.display()))?;
+        let (count, rows) = read;
+        self.total += count.record_count as u64;
+        self.torn += count.torn_tail_skipped;
+        if let Some((local_after, rows)) = rows {
+            for (k, mut r) in records_of(&rows).into_iter().enumerate() {
+                if let Some(o) = r.as_object_mut() {
+                    o.insert(
+                        "global_sequence".to_string(),
+                        serde_json::Value::from(base + local_after + k as u64 + 1),
+                    );
                 }
-            }
-            Err(e) => {
-                return TierStoreOutcome::Error(format!(
-                    "tier segment {} unreadable: {e}",
-                    path.display()
-                ))
+                self.page.push(r);
             }
         }
+        Ok(())
     }
-    let mut body = serde_json::json!({
-        "action": "eventlog-scan",
-        "exists": total > 0,
-        "record_count": total,
-        "returned": page.len(),
-        "records": page,
-        "segments": sealed.len() + 1,
-    });
-    // noetl/ehdb#262: a torn tail skipped in ANY segment stays visible on the
-    // wire, exactly as the single-segment driver reply carries it. Absent when
-    // zero, matching the driver.
-    if torn > 0 {
-        body["torn_tail_skipped"] = serde_json::Value::from(torn);
+
+    fn finish(self) -> TierStoreOutcome {
+        let mut body = serde_json::json!({
+            "action": "eventlog-scan",
+            "exists": self.total > 0,
+            "record_count": self.total,
+            "returned": self.page.len(),
+            "records": self.page,
+            "segments": self.sealed.len() + 1,
+        });
+        // noetl/ehdb#262: a torn tail skipped in ANY segment stays visible on
+        // the wire, exactly as the single-segment driver reply carries it.
+        // Absent when zero, matching the driver.
+        if self.torn > 0 {
+            body["torn_tail_skipped"] = serde_json::Value::from(self.torn);
+        }
+        TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
     }
-    TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// The unlocked phase of a scan: fold in every sealed segment not yet seen.
+///
+/// ⚠ A sealed segment is immutable and new seals only ever take the next
+/// higher number, so the list can only GROW at its end. Anything else — a
+/// segment gone or renumbered — means the store changed shape under the scan,
+/// and the merged numbering is no longer one total order; refuse rather than
+/// return it.
+fn scan_sealed_phase(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    mut acc: MergedScan,
+) -> Result<MergedScan, String> {
+    let sealed = sealed_segments(cfg, tier);
+    if !sealed.starts_with(&acc.sealed) {
+        return Err("tier segments changed during the scan; retry".to_string());
+    }
+    let fresh = sealed[acc.sealed.len()..].to_vec();
+    if !fresh.is_empty() {
+        #[cfg(test)]
+        tests::probe_sealed_phase(cfg, tier);
+    }
+    for path in &fresh {
+        acc.add_segment(path, true)?;
+        acc.sealed.push(path.clone());
+    }
+    Ok(acc)
 }
 
 /// The `records` array of a driver read, as JSON values.
@@ -1577,22 +1612,44 @@ pub async fn scan(
     let Some(cfg) = cfg else {
         return TierStoreOutcome::Unavailable;
     };
+    let limit = limit.clamp(1, MAX_SCAN_LIMIT);
     let lock = store_lock(cfg, tier);
-    let _shared = lock.read().await;
-    let cfg = cfg.clone();
-    match off_runtime(move || scan_locked(&cfg, tier, after, limit)).await {
-        Ok(v) => v,
-        Err(e) => TierStoreOutcome::Error(e),
+    let mut acc = MergedScan::new(after, limit);
+    // ⚠⚠ Sealed segments are read with the store lock RELEASED, as in
+    // `read_execution` (noetl/ai-meta#490): holding the shared guard across a
+    // 256 MiB replay queues every append behind the scan, because tokio's RwLock
+    // is write-preferring. Only the active segment is read under the guard, and
+    // only once the sealed list re-read under that same guard matches what was
+    // already folded in. A seal in between moved records from the active file
+    // into a new sealed one, so the loop releases, folds the new segment in, and
+    // checks again. Seals are hours apart; this converges on the second pass.
+    loop {
+        acc = {
+            let cfg = cfg.clone();
+            match off_runtime(move || scan_sealed_phase(&cfg, tier, acc)).await {
+                Ok(Ok(a)) => a,
+                Ok(Err(e)) | Err(e) => return TierStoreOutcome::Error(e),
+            }
+        };
+        let _shared = lock.read().await;
+        let cfg = cfg.clone();
+        match off_runtime(move || scan_locked(&cfg, tier, acc)).await {
+            Ok(LockedScan::Done(outcome)) => return outcome,
+            Ok(LockedScan::SealedSince(a)) => acc = a,
+            Err(e) => return TierStoreOutcome::Error(e),
+        }
     }
 }
 
-fn scan_locked(
-    cfg: &TierStoreConfig,
-    tier: StoreTier,
-    after: Option<u64>,
-    limit: usize,
-) -> TierStoreOutcome {
-    let limit = limit.clamp(1, MAX_SCAN_LIMIT);
+/// What the locked phase of a scan produced.
+enum LockedScan {
+    Done(TierStoreOutcome),
+    /// A segment was sealed after the unlocked phase listed them; fold it in
+    /// without the lock and come back.
+    SealedSince(MergedScan),
+}
+
+fn scan_locked(cfg: &TierStoreConfig, tier: StoreTier, mut acc: MergedScan) -> LockedScan {
     // ⚠⚠ Sealed segments first, same as `read_execution`. This was MISSED in the
     // first cut of the seal — `read_execution` merged and `scan` did not — and a
     // leaked env var in a sibling test is what exposed it: a scan that had been
@@ -1600,15 +1657,26 @@ fn scan_locked(
     // returning a suffix of the log is the data-loss failure this seal must not
     // cause, so both readers go through the same merge.
     let sealed = sealed_segments(cfg, tier);
-    if !sealed.is_empty() {
-        return scan_across_segments(cfg, tier, &sealed, after, limit);
+    if sealed != acc.sealed {
+        return LockedScan::SealedSince(acc);
     }
-    match driver(cfg, tier).scan_global(&EventLogScanRequest { after, limit }) {
-        Ok(out) => {
-            TierStoreOutcome::Ok(serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()))
-        }
-        Err(e) => TierStoreOutcome::Error(e.to_string()),
+    if sealed.is_empty() {
+        // Unsealed store: the driver's own reply, unchanged.
+        let request = EventLogScanRequest {
+            after: (acc.after > 0).then_some(acc.after),
+            limit: acc.limit,
+        };
+        return LockedScan::Done(match driver(cfg, tier).scan_global(&request) {
+            Ok(out) => TierStoreOutcome::Ok(
+                serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()),
+            ),
+            Err(e) => TierStoreOutcome::Error(e.to_string()),
+        });
     }
+    LockedScan::Done(match acc.add_segment(&cfg.path_for(tier), false) {
+        Ok(()) => acc.finish(),
+        Err(e) => TierStoreOutcome::Error(e),
+    })
 }
 
 #[cfg(test)]
@@ -2679,6 +2747,85 @@ mod tests {
         let (total, rows) = scan_page(&scan(Some(&cfg), EL, Some(N as u64), 10).await);
         assert!(rows.is_empty());
         assert_eq!(total as usize, N);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐⭐ The scan reads sealed segments with the store lock RELEASED, as
+    /// `read_execution` does (noetl/ai-meta#490). The probe tries the WRITE
+    /// lock — what an append needs — at the start of the sealed phase.
+    #[tokio::test]
+    async fn a_scan_reads_sealed_segments_without_the_store_lock() {
+        let cfg = multi_page_segment_fixture("scan-unlocked", 40, 5).await;
+        let probe = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        sealed_probes()
+            .lock()
+            .unwrap()
+            .insert(cfg.dir.clone(), probe.clone());
+        let got = scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await;
+        sealed_probes().lock().unwrap().remove(&cfg.dir);
+        let (total, rows) = scan_page(&got);
+        assert_eq!(total, 45);
+        assert_eq!(rows, (0..45u64).map(|i| (i + 1, i)).collect::<Vec<_>>());
+        match probe.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => {}
+            0 => panic!("the sealed phase never ran — this test measured nothing"),
+            _ => panic!("the store lock was HELD while the scan read sealed segments"),
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// A seal landing BETWEEN the unlocked sealed phase and the locked active
+    /// read moves records out of the active file into a new sealed one. The
+    /// locked phase must notice and send the scan back for that segment, or
+    /// those records vanish from the reply.
+    #[tokio::test]
+    async fn a_seal_between_the_scan_phases_loses_no_records() {
+        let cfg = multi_page_segment_fixture("scan-race", 20, 10).await;
+        let acc = scan_sealed_phase(&cfg, EL, MergedScan::new(None, MAX_SCAN_LIMIT)).unwrap();
+        assert_eq!(acc.sealed.len(), 1);
+
+        // The race: the active segment is sealed as .2, and appends continue.
+        let active = cfg.path_for(EL);
+        std::fs::rename(&active, active.with_file_name("eventlog.jsonl.2")).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        for i in 30..35 {
+            let _ = append_with_seal(
+                Some(&cfg),
+                EL,
+                "exec-after",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+
+        let LockedScan::SealedSince(acc) = scan_locked(&cfg, EL, acc) else {
+            panic!("the locked phase answered from a sealed list that is out of date");
+        };
+        let acc = scan_sealed_phase(&cfg, EL, acc).unwrap();
+        let LockedScan::Done(out) = scan_locked(&cfg, EL, acc) else {
+            panic!("the scan did not converge once the new segment was folded in");
+        };
+        let (total, rows) = scan_page(&out);
+        assert_eq!(total, 35, "records lost across the seal");
+        assert_eq!(rows, (0..35u64).map(|i| (i + 1, i)).collect::<Vec<_>>());
+
+        // And the public entry point agrees.
+        let (total, rows) = scan_page(&scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await);
+        assert_eq!(total, 35);
+        assert_eq!(rows.len(), 35);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// A sealed segment that disappears or is renumbered mid-scan breaks the
+    /// merged numbering; the scan refuses instead of answering.
+    #[tokio::test]
+    async fn a_segment_vanishing_mid_scan_is_an_error_not_an_answer() {
+        let cfg = multi_page_segment_fixture("scan-vanish", 5, 2).await;
+        let acc = scan_sealed_phase(&cfg, EL, MergedScan::new(None, MAX_SCAN_LIMIT)).unwrap();
+        let sealed = cfg.path_for(EL).with_file_name("eventlog.jsonl.1");
+        std::fs::rename(&sealed, sealed.with_file_name("eventlog.jsonl.7")).unwrap();
+        assert!(scan_sealed_phase(&cfg, EL, acc).is_err());
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
