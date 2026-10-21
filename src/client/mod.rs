@@ -9,7 +9,7 @@ pub mod tls;
 
 pub use control_plane::{
     BatchExecuteResponse, BatchItemOutcome, ClaimResult, Command, ControlPlaneClient, Credential,
-    CredentialHttpError, DispatchItem, ExecutorEvent, SinkStateAction, SubscriptionStatus,
-    CLAIM_UNRESOLVABLE,
+    CredentialHttpError, DispatchItem, ExecutorEvent, HeartbeatOutcome, SinkStateAction,
+    SubscriptionStatus, CLAIM_UNRESOLVABLE,
 };
 pub use sealed::{open as sealed_open, SealedEnvelope, SEAL_ALG, SEAL_V};
