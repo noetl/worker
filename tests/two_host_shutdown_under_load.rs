@@ -145,6 +145,7 @@ impl Backlog {
         writers: u64,
         per_writer_cap: Option<u64>,
     ) -> Self {
+        let paced = per_writer_cap.is_some();
         let cap = per_writer_cap.unwrap_or(u64::MAX);
         let stop = Arc::new(AtomicBool::new(false));
         let tasks = (0..writers)
@@ -174,7 +175,17 @@ impl Backlog {
                         if events.append(rec(seq, "action_started")).is_ok() {
                             e += 1;
                         }
-                        tokio::time::sleep(PACE).await;
+                        // Pace only a CAPPED backlog. The uncapped control
+                        // (host-at-a-time) must see the events log grow through
+                        // the command host's shutdown; paced at 2 ms, a fast
+                        // runner can finish that shutdown inside one sleep and
+                        // read no growth at all (main 85704a97: 498 -> 498).
+                        // Uncapped, it free-runs exactly as before #369.
+                        if paced {
+                            tokio::time::sleep(PACE).await;
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
                     }
                     (c, e)
                 })
