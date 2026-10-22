@@ -40,10 +40,38 @@ if [[ "${AFTER}" != "${VERSION}" ]]; then
   exit 1
 fi
 
-# Keep Cargo.lock's own entry for this package in step with Cargo.toml. No
-# `--locked` is used anywhere in this repo's build path, so cargo would fix this
-# itself; doing it explicitly keeps the lock honest for anyone reading the build
-# context, and makes a future `--locked` not a silent landmine.
-cargo generate-lockfile --offline >/dev/null 2>&1 || cargo generate-lockfile >/dev/null
+# Keep Cargo.lock's own entry for this package in step with Cargo.toml: the
+# Dockerfile builds with `--locked` (tests/release_image_uses_the_lock.rs), which
+# refuses a lock whose root version disagrees with Cargo.toml.
+# ⚠⚠ Stamp the ROOT package's entry in Cargo.lock by text, and nothing else
+# (noetl/ai-meta#494). This used to be `cargo generate-lockfile`, which
+# RE-RESOLVES THE WHOLE GRAPH against the registry at release time — so the
+# Dockerfile's `cargo build --locked` (tests/release_image_uses_the_lock.rs, the
+# 2026-10-10 E0308 fix) honoured a lock regenerated minutes earlier, not the one
+# CI tested. Locally it rewrote 295 lines for a one-line version change. Cargo
+# only needs the root entry's version to match Cargo.toml for `--locked` to
+# accept the lock; every dependency stays exactly as committed.
+NAME="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^name = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
+if [[ -z "${NAME}" ]]; then
+  echo "stamp-version: could not read [package] name from Cargo.toml" >&2
+  exit 1
+fi
+LOCK_BEFORE="$(mktemp)"
+cp Cargo.lock "${LOCK_BEFORE}"
+perl -0777 -i -pe "s/(\[\[package\]\]\nname = \"\Q${NAME}\E\"\nversion = )\"[^\"]*\"/\${1}\"${VERSION}\"/" Cargo.lock
+LOCK_VERSION="$(awk -v n="${NAME}" '$0=="name = \""n"\"" {getline; gsub(/version = |"/,""); print; exit}' Cargo.lock)"
+if [[ "${LOCK_VERSION}" != "${VERSION}" ]]; then
+  echo "stamp-version: FAILED — Cargo.lock's ${NAME} entry reads '${LOCK_VERSION}', wanted '${VERSION}'" >&2
+  exit 1
+fi
+# The lock may differ from the committed one in exactly ONE line: the root
+# package's version. Anything more means something re-resolved, which is the
+# failure this exists to prevent — so it is fatal, not a warning.
+CHANGED="$(diff "${LOCK_BEFORE}" Cargo.lock | grep -c '^>' || true)"
+rm -f "${LOCK_BEFORE}"
+if [[ "${CHANGED}" -gt 1 ]]; then
+  echo "stamp-version: FAILED — Cargo.lock changed in ${CHANGED} lines; only the ${NAME} version may change" >&2
+  exit 1
+fi
 
 echo "stamp-version: Cargo.toml ${BEFORE} -> ${AFTER} (committed value is a floor; the tag is authoritative)"
