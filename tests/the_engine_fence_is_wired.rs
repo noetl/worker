@@ -91,7 +91,9 @@ fn the_fence_block_is_on_the_scrape() {
 fn the_fence_is_off_unless_asked_for() {
     // ⚠ Reads the ambient env rather than setting it: `cargo test` does not
     // serialise, and a test that set NOETL_EHDB_FENCING would race every other
-    // reader in this binary.
+    // reader in this binary. One now does
+    // (`a_configured_but_unarmed_fence_…`), so this reader takes its lock.
+    let _g = serialised();
     assert!(
         std::env::var("NOETL_EHDB_FENCING").is_err(),
         "NOETL_EHDB_FENCING is set in this test environment"
@@ -120,6 +122,11 @@ fn the_fence_is_off_unless_asked_for() {
 
 #[test]
 fn nothing_is_registered_in_a_process_that_hosts_no_writer() {
+    // ⚠ Serialised: `a_configured_but_unarmed_fence_…` sets NOETL_EHDB_FENCING
+    // under this lock, and the renderer reads that variable — unlocked, this
+    // test saw the `registered 0` block whenever the two overlapped (6/30 runs
+    // on main, and it blocked a merge twice in CI).
+    let _g = serialised();
     // The renderer must emit NOTHING rather than a zeroed block, because there
     // is no useful zero for a component that does not exist in this process.
     assert!(

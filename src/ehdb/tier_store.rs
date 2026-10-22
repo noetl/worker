@@ -66,6 +66,19 @@ pub const TIER_SERVICE_DIR_ENV: &str = "NOETL_EHDB_TIER_SERVICE_DIR";
 /// count so the truncation is visible rather than silent.
 pub const MAX_SCAN_LIMIT: usize = 1_000;
 
+/// The record limit for a per-execution read: none.
+///
+/// ⚠ noetl/ai-meta#492. This used to be [`MAX_SCAN_LIMIT`], and the driver
+/// applies it with `take`, so an execution with more than 1000 records in one
+/// segment came back cut at 1000 — and the merged (sealed) path then reported
+/// `record_count` as the RETURNED count, so the cut was invisible. Every reader
+/// of this op wants the whole execution: the comparator would call the tail
+/// `missing_event`, recovery would fold a prefix. The scan cap exists because a
+/// global scan is unbounded by construction; one execution is not. A reply
+/// that outgrows the frame cap is refused loudly by the service
+/// (`reply_too_large`), which is the right failure for an oversized answer.
+pub const READ_EXECUTION_LIMIT: usize = usize::MAX;
+
 /// Resolved store configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierStoreConfig {
@@ -847,18 +860,36 @@ pub(crate) fn store_bytes(cfg: &TierStoreConfig, tier: StoreTier) -> u64 {
 /// Without this, a writer that restarts in front of a populated store reports
 /// `sequence 0` until the next append — which reads exactly like an empty store,
 /// on the component being promoted to authoritative.
+///
+/// ⚠ Pages to the END. This used to read one `MAX_SCAN_LIMIT` page and take its
+/// max, so a store holding more than 1000 records reported the 1000th record's
+/// sequence after every restart — a confident wrong number, not a zero, on the
+/// gauge meant to show the store is populated (noted on noetl/worker#368).
 pub(crate) fn startup_sequence(cfg: &TierStoreConfig, tier: StoreTier) -> u64 {
-    match driver(cfg, tier).scan_global(&EventLogScanRequest {
-        after: None,
-        limit: MAX_SCAN_LIMIT,
-    }) {
-        Ok(out) => out
-            .records
-            .iter()
-            .map(|r| r.global_sequence)
-            .max()
-            .unwrap_or(0),
-        Err(_) => 0,
+    let d = driver(cfg, tier);
+    let mut highest = 0u64;
+    let mut after: Option<u64> = None;
+    loop {
+        let page = match d.scan_global(&EventLogScanRequest {
+            after,
+            limit: MAX_SCAN_LIMIT,
+        }) {
+            Ok(out) => out.records,
+            Err(_) => return highest,
+        };
+        let Some(last) = page.iter().map(|r| r.global_sequence).max() else {
+            return highest;
+        };
+        // A page that does not move past what we already have means the cursor
+        // is not advancing; stop rather than spin at startup forever.
+        if last <= highest {
+            return highest;
+        }
+        highest = last;
+        if page.len() < MAX_SCAN_LIMIT {
+            return highest;
+        }
+        after = Some(last);
     }
 }
 
@@ -895,11 +926,25 @@ pub async fn read_execution(
     match locked_phase {
         Err(e) => TierStoreOutcome::Error(e),
         Ok(LockedRead::Complete(outcome)) => outcome,
-        Ok(LockedRead::NeedsSealed { sealed, active }) => {
+        Ok(LockedRead::NeedsSealed {
+            sealed,
+            active,
+            active_torn,
+            lease,
+        }) => {
             let cfg = cfg.clone();
             let execution_id = execution_id.to_string();
             match off_runtime(move || {
-                read_execution_across_segments(&cfg, tier, &execution_id, &sealed, active)
+                let out = read_execution_across_segments(
+                    &cfg,
+                    tier,
+                    &execution_id,
+                    &sealed,
+                    active,
+                    active_torn,
+                );
+                drop(lease);
+                out
             })
             .await
             {
@@ -908,6 +953,29 @@ pub async fn read_execution(
             }
         }
     }
+}
+
+/// Sealed segments that end mid-line: a torn tail (noetl/ehdb#262).
+///
+/// ⚠ A sealed segment is immutable, so its last byte answers this for good,
+/// and it answers it for EVERY sealed segment, not only the ones a read
+/// replays. The torn line is unparseable, so its execution is unknowable:
+/// neither the index nor the offset index can say which reads it belongs to,
+/// and a read that skipped the segment via either one could be missing it.
+/// Every JSONL line the store writes ends in `\n`, so any other last byte is a
+/// write cut short.
+fn sealed_torn_tails(cfg: &TierStoreConfig, tier: StoreTier) -> usize {
+    use std::io::{Read, Seek, SeekFrom};
+    sealed_segments(cfg, tier)
+        .iter()
+        .filter(|path| {
+            let Ok(mut f) = std::fs::File::open(path) else {
+                return false;
+            };
+            let mut last = [0u8; 1];
+            f.seek(SeekFrom::End(-1)).is_ok() && f.read_exact(&mut last).is_ok() && last[0] != b'\n'
+        })
+        .count()
 }
 
 /// What the locked phase of a read produced.
@@ -919,6 +987,11 @@ enum LockedRead {
     NeedsSealed {
         sealed: Vec<PathBuf>,
         active: Result<Vec<serde_json::Value>, String>,
+        /// The active segment's own torn-tail count, from the driver.
+        active_torn: usize,
+        /// Held until the unlocked sealed read finishes, so a prune cannot
+        /// unlink a segment this read has already named (noetl/ai-meta#491).
+        lease: SegmentLease,
     },
 }
 
@@ -926,7 +999,7 @@ fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &
     let request = EventLogReadExecutionRequest {
         execution_id: execution_id.to_string(),
         after: None,
-        limit: MAX_SCAN_LIMIT,
+        limit: READ_EXECUTION_LIMIT,
     };
     // ⚠⚠ Sealed segments FIRST, then the active one. A read that consulted only
     // the active segment would silently lose every record written before the
@@ -943,9 +1016,20 @@ fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &
         // caller after it releases the lock.
         let active =
             read_segment_then_release(&cfg.path_for(tier), false, |d| d.read_execution(&request))
-                .map_err(|e| e.to_string())
-                .map(|out| records_of(&out));
-        return LockedRead::NeedsSealed { sealed, active };
+                .map_err(|e| e.to_string());
+        let active_torn = active.as_ref().map_or(0, |out| out.torn_tail_skipped);
+        let active = active.map(|out| records_of(&out));
+        // ⚠ Leased HERE, under the shared lock, in the same instant the sealed
+        // list was snapshot. The prune takes the WRITE lock and skips a leased
+        // segment, so the two cannot interleave: a segment is either leased
+        // before the prune looks, or gone before any reader can name it.
+        let lease = SegmentLease::acquire(&sealed);
+        return LockedRead::NeedsSealed {
+            sealed,
+            active,
+            active_torn,
+            lease,
+        };
     }
     if total_sealed > 0 {
         // Every sealed segment was ruled out by its index; the active segment
@@ -972,6 +1056,15 @@ fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &
                     .and_then(|c| c.as_u64())
                     .unwrap_or(0);
                 obj.insert("exists".to_string(), serde_json::Value::Bool(n > 0));
+                // The driver saw the active segment only; sealed segments the
+                // index ruled out can still hold a torn tail.
+                let torn = out.torn_tail_skipped + sealed_torn_tails(cfg, tier);
+                if torn > 0 {
+                    obj.insert(
+                        "torn_tail_skipped".to_string(),
+                        serde_json::Value::from(torn),
+                    );
+                }
             }
             TierStoreOutcome::Ok(serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()))
         }
@@ -1393,66 +1486,133 @@ fn read_segment_then_release<T>(
     out
 }
 
-/// Global scan across sealed segments + the active one, oldest first.
+/// A merged scan in progress across sealed segments + the active one, oldest
+/// first.
 ///
 /// ⚠ `after` is applied to the **merged, renumbered** sequence, not to each
 /// segment's own numbering. Passing it down per segment would skip a different
 /// set of records in every file, because each driver numbers from 1 within its
 /// own log.
-fn scan_across_segments(
+///
+/// ⚠⚠ Each segment is counted IN FULL before it is paged. This used to read one
+/// `MAX_SCAN_LIMIT` page from every segment and renumber what came back, so a
+/// sealed segment (~80k records at the 256 MiB seal) contributed its first 1000
+/// and nothing else: `record_count` under-reported the log, and every cursor
+/// past the first page of a segment landed in the NEXT segment, silently
+/// skipping the rest. Same failure class as noetl/ai-meta#490's 1000-record
+/// read cap, on the scan side.
+struct MergedScan {
+    after: u64,
+    limit: usize,
+    total: u64,
+    torn: usize,
+    page: Vec<serde_json::Value>,
+    /// Sealed segments already folded in, oldest first.
+    sealed: Vec<PathBuf>,
+}
+
+impl MergedScan {
+    fn new(after: Option<u64>, limit: usize) -> Self {
+        Self {
+            after: after.unwrap_or(0),
+            limit,
+            total: 0,
+            torn: 0,
+            page: Vec::new(),
+            sealed: Vec::new(),
+        }
+    }
+
+    /// Fold one segment in: count it, then take whatever part of the page it
+    /// owns.
+    fn add_segment(&mut self, path: &Path, is_sealed: bool) -> Result<(), String> {
+        let base = self.total;
+        let want = self.limit - self.page.len();
+        let after = self.after;
+        // Both reads inside one closure, so a sealed segment is loaded once.
+        let read = read_segment_then_release(path, is_sealed, |d| {
+            let count = d.scan_global(&EventLogScanRequest {
+                after: None,
+                limit: 0,
+            })?;
+            let n = count.record_count as u64;
+            let local_after = after.saturating_sub(base).min(n);
+            if want == 0 || local_after >= n {
+                return Ok((count, None));
+            }
+            let rows = d.scan_global(&EventLogScanRequest {
+                after: (local_after > 0).then_some(local_after),
+                limit: want,
+            })?;
+            Ok::<_, ehdb_reference::EhdbError>((count, Some((local_after, rows))))
+        })
+        .map_err(|e| format!("tier segment {} unreadable: {e}", path.display()))?;
+        let (count, rows) = read;
+        self.total += count.record_count as u64;
+        self.torn += count.torn_tail_skipped;
+        if let Some((local_after, rows)) = rows {
+            for (k, mut r) in records_of(&rows).into_iter().enumerate() {
+                if let Some(o) = r.as_object_mut() {
+                    o.insert(
+                        "global_sequence".to_string(),
+                        serde_json::Value::from(base + local_after + k as u64 + 1),
+                    );
+                }
+                self.page.push(r);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> TierStoreOutcome {
+        let mut body = serde_json::json!({
+            "action": "eventlog-scan",
+            "exists": self.total > 0,
+            "record_count": self.total,
+            "returned": self.page.len(),
+            "records": self.page,
+            "segments": self.sealed.len() + 1,
+        });
+        // noetl/ehdb#262: a torn tail skipped in ANY segment stays visible on
+        // the wire, exactly as the single-segment driver reply carries it.
+        // Absent when zero, matching the driver.
+        if self.torn > 0 {
+            body["torn_tail_skipped"] = serde_json::Value::from(self.torn);
+        }
+        TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
+    }
+}
+
+/// The unlocked phase of a scan: fold in every sealed segment not yet seen.
+///
+/// ⚠ A sealed segment is immutable and new seals only ever take the next
+/// higher number, so the list can only GROW at its end. Anything else — a
+/// segment gone or renumbered — means the store changed shape under the scan,
+/// and the merged numbering is no longer one total order; refuse rather than
+/// return it.
+fn scan_sealed_phase(
     cfg: &TierStoreConfig,
     tier: StoreTier,
-    sealed: &[PathBuf],
-    after: Option<u64>,
-    limit: usize,
-) -> TierStoreOutcome {
-    let mut records: Vec<serde_json::Value> = Vec::new();
-    let mut paths: Vec<PathBuf> = sealed.to_vec();
-    paths.push(cfg.path_for(tier));
-    let last = paths.len() - 1;
-    for (i, path) in paths.iter().enumerate() {
-        let sealed_seg = i < last; // the final entry is the ACTIVE segment
-        match read_segment_then_release(path, sealed_seg, |d| {
-            d.scan_global(&EventLogScanRequest {
-                after: None,
-                limit: MAX_SCAN_LIMIT,
-            })
-        }) {
-            Ok(out) => {
-                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out) {
-                    if let Some(serde_json::Value::Array(rs)) = o.remove("records") {
-                        records.extend(rs);
-                    }
-                }
-            }
-            Err(e) => {
-                return TierStoreOutcome::Error(format!(
-                    "tier segment {} unreadable: {e}",
-                    path.display()
-                ))
-            }
-        }
+    mut acc: MergedScan,
+    sealed: Vec<PathBuf>,
+) -> Result<MergedScan, String> {
+    // The store is named only for the test probes; the list arrives leased.
+    let _ = (cfg, tier);
+    if !sealed.starts_with(&acc.sealed) {
+        return Err("tier segments changed during the scan; retry".to_string());
     }
-    let total = records.len();
-    for (i, r) in records.iter_mut().enumerate() {
-        if let Some(o) = r.as_object_mut() {
-            o.insert(
-                "global_sequence".to_string(),
-                serde_json::Value::from((i + 1) as u64),
-            );
-        }
+    let fresh = sealed[acc.sealed.len()..].to_vec();
+    if !fresh.is_empty() {
+        #[cfg(test)]
+        tests::probe_sealed_phase(cfg, tier);
+        #[cfg(test)]
+        tests::probe_scan_leases(cfg, &fresh);
     }
-    let skip = after.unwrap_or(0) as usize;
-    let page: Vec<serde_json::Value> = records.into_iter().skip(skip).take(limit).collect();
-    let body = serde_json::json!({
-        "action": "eventlog-scan",
-        "exists": total > 0,
-        "record_count": total,
-        "returned": page.len(),
-        "records": page,
-        "segments": sealed.len() + 1,
-    });
-    TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
+    for path in &fresh {
+        acc.add_segment(path, true)?;
+        acc.sealed.push(path.clone());
+    }
+    Ok(acc)
 }
 
 /// The `records` array of a driver read, as JSON values.
@@ -1479,13 +1639,17 @@ fn read_execution_across_segments(
     execution_id: &str,
     sealed: &[PathBuf],
     active: Result<Vec<serde_json::Value>, String>,
+    active_torn: usize,
 ) -> TierStoreOutcome {
     #[cfg(test)]
     tests::probe_sealed_phase(cfg, tier);
     let request = EventLogReadExecutionRequest {
         execution_id: execution_id.to_string(),
         after: None,
-        limit: MAX_SCAN_LIMIT,
+        // noetl/ai-meta#492: the sealed replay builds its own request, so it
+        // needs the same uncapped limit as the locked phase, or a sealed segment
+        // holding >1000 of one execution's records is cut here instead.
+        limit: READ_EXECUTION_LIMIT,
     };
     let mut records: Vec<serde_json::Value> = Vec::new();
     for path in sealed {
@@ -1527,7 +1691,7 @@ fn read_execution_across_segments(
         }
     }
     let n = records.len();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "action": "eventlog-read-execution",
         "execution_id": execution_id,
         "exists": n > 0,
@@ -1536,6 +1700,13 @@ fn read_execution_across_segments(
         "records": records,
         "segments": sealed.len() + 1,
     });
+    // noetl/ehdb#262: the merge used to drop every segment's torn-tail count,
+    // so a torn write read exactly like a complete log. Absent when zero,
+    // matching the driver.
+    let torn = active_torn + sealed_torn_tails(cfg, tier);
+    if torn > 0 {
+        body["torn_tail_skipped"] = serde_json::Value::from(torn);
+    }
     TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
@@ -1549,22 +1720,67 @@ pub async fn scan(
     let Some(cfg) = cfg else {
         return TierStoreOutcome::Unavailable;
     };
+    let limit = limit.clamp(1, MAX_SCAN_LIMIT);
     let lock = store_lock(cfg, tier);
-    let _shared = lock.read().await;
-    let cfg = cfg.clone();
-    match off_runtime(move || scan_locked(&cfg, tier, after, limit)).await {
-        Ok(v) => v,
-        Err(e) => TierStoreOutcome::Error(e),
+    let mut acc = MergedScan::new(after, limit);
+    // ⚠⚠ Sealed segments are read with the store lock RELEASED, as in
+    // `read_execution` (noetl/ai-meta#490): holding the shared guard across a
+    // 256 MiB replay queues every append behind the scan, because tokio's RwLock
+    // is write-preferring. Only the active segment is read under the guard, and
+    // only once the sealed list re-read under that same guard matches what was
+    // already folded in. A seal in between moved records from the active file
+    // into a new sealed one, so the loop releases, folds the new segment in, and
+    // checks again. Seals are hours apart; this converges on the second pass.
+    // ⚠ The sealed list is taken, and LEASED, under a brief shared guard — the
+    // same invariant `read_execution` keeps (noetl/ai-meta#491): the prune takes
+    // the write lock and skips a leased segment, so a segment is either leased
+    // before the prune looks or gone before this scan can name it. The leases
+    // are held until the scan returns.
+    let mut leases: Vec<SegmentLease> = Vec::new();
+    loop {
+        let sealed = {
+            let _shared = lock.read().await;
+            let cfg = cfg.clone();
+            match off_runtime(move || {
+                let s = sealed_segments(&cfg, tier);
+                let l = SegmentLease::acquire(&s);
+                (s, l)
+            })
+            .await
+            {
+                Ok((s, l)) => {
+                    leases.push(l);
+                    s
+                }
+                Err(e) => return TierStoreOutcome::Error(e),
+            }
+        };
+        acc = {
+            let cfg = cfg.clone();
+            match off_runtime(move || scan_sealed_phase(&cfg, tier, acc, sealed)).await {
+                Ok(Ok(a)) => a,
+                Ok(Err(e)) | Err(e) => return TierStoreOutcome::Error(e),
+            }
+        };
+        let _shared = lock.read().await;
+        let cfg = cfg.clone();
+        match off_runtime(move || scan_locked(&cfg, tier, acc)).await {
+            Ok(LockedScan::Done(outcome)) => return outcome,
+            Ok(LockedScan::SealedSince(a)) => acc = a,
+            Err(e) => return TierStoreOutcome::Error(e),
+        }
     }
 }
 
-fn scan_locked(
-    cfg: &TierStoreConfig,
-    tier: StoreTier,
-    after: Option<u64>,
-    limit: usize,
-) -> TierStoreOutcome {
-    let limit = limit.clamp(1, MAX_SCAN_LIMIT);
+/// What the locked phase of a scan produced.
+enum LockedScan {
+    Done(TierStoreOutcome),
+    /// A segment was sealed after the unlocked phase listed them; fold it in
+    /// without the lock and come back.
+    SealedSince(MergedScan),
+}
+
+fn scan_locked(cfg: &TierStoreConfig, tier: StoreTier, mut acc: MergedScan) -> LockedScan {
     // ⚠⚠ Sealed segments first, same as `read_execution`. This was MISSED in the
     // first cut of the seal — `read_execution` merged and `scan` did not — and a
     // leaked env var in a sibling test is what exposed it: a scan that had been
@@ -1572,14 +1788,337 @@ fn scan_locked(
     // returning a suffix of the log is the data-loss failure this seal must not
     // cause, so both readers go through the same merge.
     let sealed = sealed_segments(cfg, tier);
-    if !sealed.is_empty() {
-        return scan_across_segments(cfg, tier, &sealed, after, limit);
+    if sealed != acc.sealed {
+        return LockedScan::SealedSince(acc);
     }
-    match driver(cfg, tier).scan_global(&EventLogScanRequest { after, limit }) {
-        Ok(out) => {
-            TierStoreOutcome::Ok(serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()))
+    if sealed.is_empty() {
+        // Unsealed store: the driver's own reply, unchanged.
+        let request = EventLogScanRequest {
+            after: (acc.after > 0).then_some(acc.after),
+            limit: acc.limit,
+        };
+        return LockedScan::Done(match driver(cfg, tier).scan_global(&request) {
+            Ok(out) => TierStoreOutcome::Ok(
+                serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()),
+            ),
+            Err(e) => TierStoreOutcome::Error(e.to_string()),
+        });
+    }
+    LockedScan::Done(match acc.add_segment(&cfg.path_for(tier), false) {
+        Ok(()) => acc.finish(),
+        Err(e) => TierStoreOutcome::Error(e),
+    })
+}
+
+// ===========================================================================
+// Segment leases + the retention planner (noetl/ai-meta#491).
+// ===========================================================================
+
+/// Per-segment read refcounts: a sealed segment a read has named and not yet
+/// finished with. The prune skips any segment with a non-zero count.
+fn lease_counts() -> &'static StdMutex<HashMap<PathBuf, usize>> {
+    static L: OnceLock<StdMutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    L.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// A read's hold on the sealed segments it is about to read.
+///
+/// ⚠ Why a lease rather than holding the files open: the replay fallback hands
+/// `LocalReferenceEventLogDriver` a PATH and the driver opens it lazily, so a
+/// file handle held here would protect only the offset path. A refcount checked
+/// by the prune under the write lock protects both.
+///
+/// Released on drop, so a panic or an early return cannot strand a lease.
+pub(crate) struct SegmentLease(Vec<PathBuf>);
+
+impl SegmentLease {
+    /// Take a lease on `segments`. Call under the store's shared lock.
+    pub(crate) fn acquire(segments: &[PathBuf]) -> Self {
+        let mut g = lease_counts().lock().unwrap_or_else(|e| e.into_inner());
+        for s in segments {
+            *g.entry(s.clone()).or_insert(0) += 1;
         }
-        Err(e) => TierStoreOutcome::Error(e.to_string()),
+        Self(segments.to_vec())
+    }
+}
+
+impl Drop for SegmentLease {
+    fn drop(&mut self) {
+        let mut g = lease_counts().lock().unwrap_or_else(|e| e.into_inner());
+        for s in &self.0 {
+            if let Some(n) = g.get_mut(s) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    g.remove(s);
+                }
+            }
+        }
+    }
+}
+
+/// How many reads currently hold `segment`.
+pub(crate) fn lease_count(segment: &Path) -> usize {
+    lease_counts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(segment)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `NOETL_EHDB_TIER_PRUNE_MODE`. Default `off`.
+pub const TIER_PRUNE_MODE_ENV: &str = "NOETL_EHDB_TIER_PRUNE_MODE";
+/// `NOETL_EHDB_TIER_RETENTION_HOURS`. Default 168.
+pub const TIER_RETENTION_HOURS_ENV: &str = "NOETL_EHDB_TIER_RETENTION_HOURS";
+/// Default retention: 7 days, 7x the longest live reader window (repair sweep,
+/// 180 min). See the #491 reader table.
+pub const TIER_RETENTION_HOURS_DEFAULT: u64 = 168;
+/// Below this the live readers (comparator 1 h, repair sweep 3 h) could lose
+/// records they still read; refused, not clamped.
+pub const TIER_RETENTION_HOURS_MIN: u64 = 24;
+
+/// What the retention pass is allowed to do.
+///
+/// ⚠ There is deliberately NO deleting mode in this build. Deleting waits on
+/// owner decisions (archive-before-delete, the window, rollout order —
+/// noetl/ai-meta#491), and on a reviewed dry-run pass. `on` is recognised only
+/// so that asking for it is refused out loud instead of read as a typo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneMode {
+    Off,
+    DryRun,
+}
+
+/// Parse the mode. Anything but `dry_run` is `Off`; `on` is refused loudly.
+pub fn parse_prune_mode(raw: Option<&str>) -> PruneMode {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("dry_run") | Some("dry-run") | Some("dryrun") => PruneMode::DryRun,
+        Some("on") | Some("true") | Some("enabled") => {
+            tracing::error!(
+                env = TIER_PRUNE_MODE_ENV,
+                "tier prune mode `on` is NOT available in this build: deleting \
+                 waits on the noetl/ai-meta#491 decisions and a reviewed dry run. \
+                 Treated as `off`."
+            );
+            PruneMode::Off
+        }
+        _ => PruneMode::Off,
+    }
+}
+
+/// Parse the retention window. `None` = refused (below the minimum, or
+/// unparsable); the caller must then not run the pass at all.
+pub fn parse_retention_hours(raw: Option<&str>) -> Option<u64> {
+    let h = match raw {
+        None => TIER_RETENTION_HOURS_DEFAULT,
+        Some(v) => v.trim().parse::<u64>().ok()?,
+    };
+    (h >= TIER_RETENTION_HOURS_MIN).then_some(h)
+}
+
+/// The tiers retention may ever touch. Catalog needs full history (its fold
+/// reads from sequence 1); kv/object parity reads the oldest records. Code, not
+/// configuration, so no env value can widen it.
+pub const PRUNABLE_TIERS: &[StoreTier] = &[StoreTier::EventLog, StoreTier::Projection];
+
+/// One sealed segment's verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PruneVerdict {
+    /// Every rule held; a deleting build would remove it.
+    WouldPrune,
+    /// Kept, and why.
+    Keep(&'static str),
+    /// Not considered: an older segment of the same tier was kept, and pruning
+    /// is strictly oldest-first.
+    BehindAKeptSegment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneDecision {
+    pub segment: PathBuf,
+    pub bytes: u64,
+    pub verdict: PruneVerdict,
+}
+
+/// Execution ids appearing anywhere in the ACTIVE segment, by streaming it.
+/// `None` = a line whose subject cannot be read: treat as unknown, prune nothing.
+fn active_execution_ids(path: &Path) -> Option<std::collections::HashSet<String>> {
+    use std::io::BufRead;
+    let mut out = std::collections::HashSet::new();
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(out),
+        Err(_) => return None,
+    };
+    for line in std::io::BufReader::with_capacity(1 << 20, f).lines() {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.insert(execution_id_from_line(&line)?);
+    }
+    Some(out)
+}
+
+/// Plan a retention pass for one tier. Reads only; changes nothing.
+///
+/// A sealed segment is `WouldPrune` only if ALL hold:
+/// 1. the tier is in [`PRUNABLE_TIERS`];
+/// 2. it is older than `retention` (its mtime is its seal time: a sealed file
+///    is never written again, and `rename` preserves mtime);
+/// 3. it has an `.idx` (unknown contents are kept);
+/// 4. none of its executions appears in a segment sealed WITHIN `retention`,
+///    nor in the active segment — an execution still writing pins every segment
+///    it touches;
+/// 5. no read currently holds a lease on it;
+/// 6. every OLDER segment of the tier is also `WouldPrune` (oldest-first).
+pub fn plan_tier_prune(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    retention: std::time::Duration,
+    now: std::time::SystemTime,
+) -> Vec<PruneDecision> {
+    let segs = sealed_segments(cfg, tier);
+    let bytes = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    if !PRUNABLE_TIERS.contains(&tier) {
+        return segs
+            .into_iter()
+            .map(|s| PruneDecision {
+                bytes: bytes(&s),
+                segment: s,
+                verdict: PruneVerdict::Keep("tier is never pruned"),
+            })
+            .collect();
+    }
+    let age = |p: &Path| -> Option<std::time::Duration> {
+        let m = std::fs::metadata(p).ok()?.modified().ok()?;
+        now.duration_since(m).ok()
+    };
+    let is_old = |p: &Path| age(p).is_some_and(|a| a >= retention);
+
+    // Execution ids still "hot": in any recently sealed segment or the active one.
+    let mut hot: Option<std::collections::HashSet<String>> =
+        active_execution_ids(&cfg.path_for(tier));
+    for s in segs.iter().filter(|s| !is_old(s)) {
+        match (hot.as_mut(), load_segment_index(s)) {
+            (Some(h), Some(ids)) => h.extend(ids),
+            // A recent segment with no index: its ids are unknown, so nothing
+            // older can be proven unpinned.
+            _ => hot = None,
+        }
+    }
+
+    let mut out = Vec::with_capacity(segs.len());
+    let mut stopped = false;
+    for s in segs {
+        let verdict = if stopped {
+            PruneVerdict::BehindAKeptSegment
+        } else if !is_old(&s) {
+            PruneVerdict::Keep("younger than the retention window")
+        } else {
+            match (load_segment_index(&s), hot.as_ref()) {
+                (None, _) => PruneVerdict::Keep("no .idx: contents unknown"),
+                (_, None) => PruneVerdict::Keep(
+                    "hot set unknown (unreadable active line or unindexed recent segment)",
+                ),
+                (Some(ids), Some(h)) if ids.iter().any(|id| h.contains(id)) => {
+                    PruneVerdict::Keep("pinned: an execution in it is still writing")
+                }
+                _ if lease_count(&s) > 0 => PruneVerdict::Keep("leased by a read in flight"),
+                _ => PruneVerdict::WouldPrune,
+            }
+        };
+        if !matches!(verdict, PruneVerdict::WouldPrune) {
+            stopped = true;
+        }
+        out.push(PruneDecision {
+            bytes: bytes(&s),
+            segment: s,
+            verdict,
+        });
+    }
+    out
+}
+
+/// `NOETL_EHDB_TIER_PRUNE_INTERVAL_SECS`. Default 3600; floor 60.
+pub const TIER_PRUNE_INTERVAL_SECS_ENV: &str = "NOETL_EHDB_TIER_PRUNE_INTERVAL_SECS";
+
+/// Start the retention pass if configured. A no-op unless
+/// `NOETL_EHDB_TIER_PRUNE_MODE=dry_run` and the retention window is valid, so
+/// shipping this changes nothing on a writer that does not opt in.
+pub fn spawn_retention_pass(cfg: &TierStoreConfig) {
+    let mode = parse_prune_mode(std::env::var(TIER_PRUNE_MODE_ENV).ok().as_deref());
+    if mode == PruneMode::Off {
+        return;
+    }
+    let raw = std::env::var(TIER_RETENTION_HOURS_ENV).ok();
+    let Some(hours) = parse_retention_hours(raw.as_deref()) else {
+        tracing::error!(
+            env = TIER_RETENTION_HOURS_ENV,
+            value = raw.as_deref().unwrap_or(""),
+            min = TIER_RETENTION_HOURS_MIN,
+            "EHDB tier retention window refused (unparsable or below the minimum); \
+             the retention pass will NOT run"
+        );
+        return;
+    };
+    let interval = std::env::var(TIER_PRUNE_INTERVAL_SECS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(3600)
+        .max(60);
+    let retention = std::time::Duration::from_secs(hours * 3600);
+    let cfg = cfg.clone();
+    tracing::info!(
+        retention_hours = hours,
+        interval_secs = interval,
+        "EHDB tier retention: DRY RUN enabled — logs what would be pruned, deletes nothing"
+    );
+    tokio::spawn(async move {
+        loop {
+            let c = cfg.clone();
+            // Streaming the active segment and reading indexes is file I/O: off
+            // the runtime, like every other store entry point.
+            let _ = tokio::task::spawn_blocking(move || run_prune_dry_run(&c, retention)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        }
+    });
+}
+
+/// Log a dry-run pass over every tier. Deletes nothing.
+pub fn run_prune_dry_run(cfg: &TierStoreConfig, retention: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    for &tier in StoreTier::ALL.iter() {
+        let plan = plan_tier_prune(cfg, tier, retention, now);
+        if plan.is_empty() {
+            continue;
+        }
+        let (mut n, mut b) = (0usize, 0u64);
+        for d in &plan {
+            let verdict = match &d.verdict {
+                PruneVerdict::WouldPrune => {
+                    n += 1;
+                    b += d.bytes;
+                    "would_prune".to_string()
+                }
+                PruneVerdict::Keep(why) => format!("keep: {why}"),
+                PruneVerdict::BehindAKeptSegment => "keep: behind a kept segment".to_string(),
+            };
+            tracing::info!(
+                tier = tier.as_str(),
+                segment = %d.segment.display(),
+                bytes = d.bytes,
+                verdict,
+                "EHDB tier retention DRY RUN (nothing deleted)"
+            );
+        }
+        tracing::info!(
+            tier = tier.as_str(),
+            would_prune_segments = n,
+            would_prune_bytes = b,
+            retention_hours = retention.as_secs() / 3600,
+            "EHDB tier retention DRY RUN summary (nothing deleted; noetl/ai-meta#491)"
+        );
     }
 }
 
@@ -1602,6 +2141,60 @@ mod tests {
         TierStoreConfig { dir: d }
     }
 
+    fn read_count(body: &str) -> (usize, usize) {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        (
+            v["records"].as_array().unwrap().len(),
+            v["record_count"].as_u64().unwrap() as usize,
+        )
+    }
+
+    /// ⭐ noetl/ai-meta#492: a long execution comes back WHOLE, sealed or not.
+    #[tokio::test]
+    async fn a_long_execution_is_not_truncated_at_the_scan_cap() {
+        const N: usize = MAX_SCAN_LIMIT + 200;
+        let payloads: Vec<String> = (0..N).map(|i| format!("{{\"i\":{i}}}")).collect();
+
+        // One segment (the driver's own path).
+        let cfg = seal_cfg("long-active");
+        for chunk in payloads.chunks(100) {
+            let _ = append_batch(Some(&cfg), StoreTier::EventLog, "exec-long", chunk).await;
+        }
+        let TierStoreOutcome::Ok(b) =
+            read_execution(Some(&cfg), StoreTier::EventLog, "exec-long").await
+        else {
+            panic!("read failed")
+        };
+        assert_eq!(read_count(&b), (N, N), "unsealed read truncated");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+
+        // Sealed: every record in ONE sealed segment, then a fresh active one —
+        // the merged path, which also reported the cut as the total.
+        let cfg = seal_cfg("long-sealed");
+        for chunk in payloads.chunks(100) {
+            let _ = append_batch(Some(&cfg), StoreTier::EventLog, "exec-long", chunk).await;
+        }
+        let active = cfg.path_for(StoreTier::EventLog);
+        std::fs::rename(
+            &active,
+            active.with_file_name(format!(
+                "{}.1",
+                active.file_name().unwrap().to_str().unwrap()
+            )),
+        )
+        .unwrap();
+        ehdb_reference::forget_runtime(&active);
+        let _ = append(Some(&cfg), StoreTier::EventLog, "exec-other", "{}").await;
+        assert_eq!(sealed_segments(&cfg, StoreTier::EventLog).len(), 1);
+        let TierStoreOutcome::Ok(b) =
+            read_execution(Some(&cfg), StoreTier::EventLog, "exec-long").await
+        else {
+            panic!("merged read failed")
+        };
+        assert_eq!(read_count(&b), (N, N), "merged read truncated");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
     /// Sealed-phase probes, keyed by store dir: `0` not reached, `1` the store
     /// lock was free when the sealed segments were read, `2` it was held.
     /// Keyed so a parallel test's reads cannot answer for this one.
@@ -1609,6 +2202,51 @@ mod tests {
         static P: OnceLock<StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicU8>>>> =
             OnceLock::new();
         P.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    /// Lowest lease count seen on any segment a scan's sealed phase read, keyed
+    /// by store dir. `usize::MAX` until the phase runs.
+    fn scan_lease_probes() -> &'static StdMutex<HashMap<PathBuf, usize>> {
+        static P: OnceLock<StdMutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+        P.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    pub(super) fn probe_scan_leases(cfg: &TierStoreConfig, fresh: &[PathBuf]) {
+        let mut g = scan_lease_probes().lock().unwrap();
+        if let Some(min) = g.get_mut(&cfg.dir) {
+            for p in fresh {
+                *min = (*min).min(lease_count(p));
+            }
+        }
+    }
+
+    /// noetl/ai-meta#491: every sealed segment a scan reads unlocked is LEASED
+    /// while it reads it, so a prune cannot unlink it underneath the scan.
+    #[tokio::test]
+    async fn a_scan_holds_a_lease_on_every_sealed_segment_it_reads() {
+        let cfg = multi_page_segment_fixture("scan-lease", 20, 3).await;
+        scan_lease_probes()
+            .lock()
+            .unwrap()
+            .insert(cfg.dir.clone(), usize::MAX);
+        let (total, _) = scan_page(&scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await);
+        let min = scan_lease_probes()
+            .lock()
+            .unwrap()
+            .remove(&cfg.dir)
+            .unwrap();
+        assert_eq!(total, 23);
+        assert_ne!(min, usize::MAX, "the sealed phase never ran — vacuous");
+        assert!(
+            min >= 1,
+            "a sealed segment was read with NO lease held (count {min})"
+        );
+        let sealed = sealed_segments(&cfg, EL);
+        assert!(
+            sealed.iter().all(|p| lease_count(p) == 0),
+            "the scan leaked its leases past its return"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
     pub(super) fn probe_sealed_phase(cfg: &TierStoreConfig, tier: StoreTier) {
@@ -1620,6 +2258,244 @@ mod tests {
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
+        let lease_probe = lease_probes().lock().unwrap().get(&cfg.dir).cloned();
+        if let Some(p) = lease_probe {
+            let leased = sealed_segments(cfg, tier)
+                .iter()
+                .map(|s| lease_count(s))
+                .min()
+                .unwrap_or(0);
+            p.store(leased, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Lease probes, keyed by store dir: the MINIMUM lease count over the
+    /// store's sealed segments, observed at the start of the sealed phase.
+    fn lease_probes() -> &'static StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicUsize>>> {
+        static P: OnceLock<StdMutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicUsize>>>> =
+            OnceLock::new();
+        P.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    // ---- noetl/ai-meta#491: leases + the retention planner ----
+
+    /// Seal the active segment by hand, exactly as `maybe_seal` does (a rename),
+    /// so a test controls which executions land in which segment.
+    fn seal_now(cfg: &TierStoreConfig, tier: StoreTier) -> PathBuf {
+        let active = cfg.path_for(tier);
+        let n = sealed_segments(cfg, tier).len() + 1;
+        let sealed = active.with_file_name(format!(
+            "{}.{n}",
+            active.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::rename(&active, &sealed).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        build_segment_index(&sealed).unwrap();
+        sealed
+    }
+
+    async fn put(cfg: &TierStoreConfig, tier: StoreTier, exec: &str, n: usize) {
+        for i in 0..n {
+            let _ = append(Some(cfg), tier, exec, &format!("{{\"i\":{i}}}")).await;
+        }
+    }
+
+    fn age(path: &Path, hours: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    const R: std::time::Duration = std::time::Duration::from_secs(168 * 3600);
+
+    fn verdicts(cfg: &TierStoreConfig, tier: StoreTier) -> Vec<PruneVerdict> {
+        plan_tier_prune(cfg, tier, R, std::time::SystemTime::now())
+            .into_iter()
+            .map(|d| d.verdict)
+            .collect()
+    }
+
+    /// ⭐ The rules, one case each. Segment 1 old+finished, 2 old+finished,
+    /// 3 recent; exec-live writes in the ACTIVE segment.
+    #[tokio::test]
+    async fn an_old_finished_segment_would_prune_and_a_recent_one_is_kept() {
+        let cfg = seal_cfg("prune-basic");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 5).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 5).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-c", 5).await;
+        let _s3 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-live", 2).await;
+        age(&s1, 400);
+        age(&s2, 300);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![
+                PruneVerdict::WouldPrune,
+                PruneVerdict::WouldPrune,
+                PruneVerdict::Keep("younger than the retention window"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// An execution still writing — in the active segment or a recent one —
+    /// pins every old segment it touches, and oldest-first stops behind it.
+    #[tokio::test]
+    async fn a_long_runner_pins_its_old_segment_and_everything_behind_it() {
+        let cfg = seal_cfg("prune-pin");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-long", 3).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 3).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-long", 1).await; // still writing, in the ACTIVE segment
+        age(&s1, 400);
+        age(&s2, 300);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![
+                PruneVerdict::Keep("pinned: an execution in it is still writing"),
+                PruneVerdict::BehindAKeptSegment,
+            ]
+        );
+
+        // Pinned by a RECENT sealed segment too, not only the active one.
+        let cfg2 = seal_cfg("prune-pin2");
+        put(&cfg2, t, "exec-long", 3).await;
+        let a = seal_now(&cfg2, t);
+        put(&cfg2, t, "exec-long", 1).await;
+        let _recent = seal_now(&cfg2, t);
+        age(&a, 400);
+        assert_eq!(
+            verdicts(&cfg2, t)[0],
+            PruneVerdict::Keep("pinned: an execution in it is still writing")
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+        let _ = std::fs::remove_dir_all(&cfg2.dir);
+    }
+
+    #[tokio::test]
+    async fn an_unindexed_segment_is_kept() {
+        let cfg = seal_cfg("prune-noidx");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        std::fs::remove_file(segment_index_path(&s1)).unwrap();
+        age(&s1, 400);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![PruneVerdict::Keep("no .idx: contents unknown")]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn the_catalog_tier_is_never_pruned_however_old() {
+        let cfg = seal_cfg("prune-catalog");
+        let t = StoreTier::Catalog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        age(&s1, 10_000);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![PruneVerdict::Keep("tier is never pruned")]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[tokio::test]
+    async fn a_leased_segment_is_kept() {
+        let cfg = seal_cfg("prune-leased");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        age(&s1, 400);
+        let lease = SegmentLease::acquire(std::slice::from_ref(&s1));
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![PruneVerdict::Keep("leased by a read in flight")]
+        );
+        drop(lease);
+        assert_eq!(verdicts(&cfg, t), vec![PruneVerdict::WouldPrune]);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// The read path actually takes the lease for the sealed phase, and releases it.
+    #[tokio::test]
+    async fn a_sealed_read_holds_a_lease_and_releases_it() {
+        let cfg = seal_cfg("lease-read");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-a", 2).await;
+        let probe = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        lease_probes()
+            .lock()
+            .unwrap()
+            .insert(cfg.dir.clone(), probe.clone());
+        let got = read_execution(Some(&cfg), t, "exec-a").await;
+        lease_probes().lock().unwrap().remove(&cfg.dir);
+        assert!(matches!(got, TierStoreOutcome::Ok(_)), "{got:?}");
+        let seen = probe.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(
+            seen,
+            usize::MAX,
+            "the sealed phase never ran — measured nothing"
+        );
+        assert!(
+            seen >= 1,
+            "the sealed segment was NOT leased during the read"
+        );
+        assert_eq!(lease_count(&s1), 0, "the lease outlived the read");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// Dry run is a dry run: every file survives a pass that finds work.
+    #[tokio::test]
+    async fn a_dry_run_deletes_nothing() {
+        let cfg = seal_cfg("prune-dry");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        age(&s1, 400);
+        assert_eq!(
+            verdicts(&cfg, t),
+            vec![PruneVerdict::WouldPrune],
+            "precondition"
+        );
+        let before: Vec<_> = std::fs::read_dir(&cfg.dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        run_prune_dry_run(&cfg, R);
+        for p in &before {
+            assert!(p.exists(), "dry run removed {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[test]
+    fn mode_on_is_refused_and_retention_below_the_floor_is_refused() {
+        assert_eq!(parse_prune_mode(None), PruneMode::Off);
+        assert_eq!(parse_prune_mode(Some("dry_run")), PruneMode::DryRun);
+        assert_eq!(
+            parse_prune_mode(Some("on")),
+            PruneMode::Off,
+            "no deleting mode in this build"
+        );
+        assert_eq!(parse_prune_mode(Some("bogus")), PruneMode::Off);
+        assert_eq!(parse_retention_hours(None), Some(168));
+        assert_eq!(parse_retention_hours(Some("24")), Some(24));
+        assert_eq!(parse_retention_hours(Some("23")), None);
+        assert_eq!(parse_retention_hours(Some("nope")), None);
     }
 
     /// ⭐⭐ The sealed segments are read with the store lock RELEASED.
@@ -1787,6 +2663,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
+    /// One sealed segment holding `exec-a`, an active one holding `exec-b`,
+    /// and the sealed segment torn (a write cut short) when `tear` is set.
+    ///
+    /// ⚠ The index is built BEFORE the tear: `build_segment_index` refuses a
+    /// torn segment outright, so a torn segment in practice is unindexed and
+    /// always replayed. Indexes that predate the damage are the case where a
+    /// read can step around the segment, which is what this exercises.
+    async fn torn_sealed_fixture(tag: &str, tear: bool, index: bool) -> (TierStoreConfig, PathBuf) {
+        let cfg = seal_cfg(tag);
+        for i in 0..6 {
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-a",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+        let active = cfg.path_for(StoreTier::EventLog);
+        let sealed = active.with_file_name("eventlog.jsonl.1");
+        std::fs::rename(&active, &sealed).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        for i in 0..3 {
+            let _ = append_with_seal(
+                Some(&cfg),
+                StoreTier::EventLog,
+                "exec-b",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+        if index {
+            build_segment_index(&sealed).expect("index build");
+            assert!(
+                load_offset_spans(&sealed, "exec-a").is_some(),
+                "offset index unusable"
+            );
+        }
+        if tear {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&sealed)
+                .unwrap();
+            std::io::Write::write_all(&mut f, b"{\"torn").unwrap();
+        }
+        ehdb_reference::forget_runtime(&sealed);
+        (cfg, sealed)
+    }
+
+    fn torn_of(out: &TierStoreOutcome) -> (u64, Option<u64>) {
+        let TierStoreOutcome::Ok(b) = out else {
+            panic!("read failed: {out:?}")
+        };
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        (
+            v["record_count"].as_u64().unwrap(),
+            v["torn_tail_skipped"].as_u64(),
+        )
+    }
+
+    /// noetl/ehdb#262: a torn tail in a SEALED segment stays visible on a
+    /// per-execution read, whichever path the read takes through that segment —
+    /// replayed, answered from the offset index, or ruled out by the index.
+    #[tokio::test]
+    async fn a_torn_sealed_segment_is_reported_by_every_read_path() {
+        // Clean control: no field at all, on any path.
+        let (cfg, _) = torn_sealed_fixture("torn-clean", false, true).await;
+        for exec in ["exec-a", "exec-b"] {
+            let (n, torn) = torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, exec).await);
+            assert!(n > 0, "{exec}: control read returned nothing");
+            assert_eq!(torn, None, "{exec}: a clean store reported a torn tail");
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+
+        // Replayed: no index, so the sealed segment is opened by the driver.
+        let (cfg, _) = torn_sealed_fixture("torn-replay", true, false).await;
+        assert_eq!(
+            torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await),
+            (6, Some(1)),
+            "replay path dropped the sealed segment's torn tail"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+
+        // Offset index: the segment is never replayed, so the driver never
+        // sees the tear.
+        let (cfg, _) = torn_sealed_fixture("torn-offset", true, true).await;
+        assert_eq!(
+            torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await),
+            (6, Some(1)),
+            "offset-index path dropped the sealed segment's torn tail"
+        );
+        // Ruled out by the index: only the active segment is read, but the torn
+        // line's execution is unknowable, so this read may be missing it too.
+        assert_eq!(
+            torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, "exec-b").await),
+            (3, Some(1)),
+            "index-ruled-out path dropped the sealed segment's torn tail"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+
+        // The ACTIVE segment torn, on a read that also merges a sealed one: the
+        // driver's own count must survive the merge.
+        let (cfg, _) = torn_sealed_fixture("torn-active", false, false).await;
+        let active = cfg.path_for(StoreTier::EventLog);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{\"torn").unwrap();
+        drop(f);
+        ehdb_reference::forget_runtime(&active);
+        assert_eq!(
+            torn_of(&read_execution(Some(&cfg), StoreTier::EventLog, "exec-a").await),
+            (6, Some(1)),
+            "the merged read dropped the active segment's torn tail"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
     /// An offset index that does not describe the file is not used.
     #[tokio::test]
     async fn a_stale_or_wrong_offset_index_falls_back_to_replay() {
@@ -1916,6 +2913,21 @@ mod tests {
             std::fs::read_to_string(segment_index_path(&segs[0])).unwrap(),
             idx_before
         );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// The restart gauge reads the store's TRUE highest sequence, not the
+    /// highest within the first scan page.
+    #[tokio::test]
+    async fn startup_sequence_reads_past_the_first_page() {
+        let cfg = seal_cfg("startseq");
+        const N: usize = MAX_SCAN_LIMIT + 250;
+        let payloads: Vec<String> = (0..N).map(|i| format!("{{\"i\":{i}}}")).collect();
+        for chunk in payloads.chunks(100) {
+            let _ = append_batch(Some(&cfg), StoreTier::EventLog, "exec-many", chunk).await;
+        }
+        ehdb_reference::forget_runtime(&cfg.path_for(StoreTier::EventLog));
+        assert_eq!(startup_sequence(&cfg, StoreTier::EventLog), N as u64);
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
@@ -2528,6 +3540,260 @@ mod tests {
             "scan LOST records: {} of {N} — a scan that returns only the active \
              segment is silent data loss",
             sv["record_count"]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// A sealed segment holding MORE than one scan page, then a small active one.
+    async fn multi_page_segment_fixture(
+        tag: &str,
+        sealed_n: usize,
+        active_n: usize,
+    ) -> TierStoreConfig {
+        let cfg = seal_cfg(tag);
+        for i in 0..sealed_n {
+            let _ = append_with_seal(
+                Some(&cfg),
+                EL,
+                "exec-sealed",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+        let active = cfg.path_for(EL);
+        std::fs::rename(&active, active.with_file_name("eventlog.jsonl.1")).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        for i in sealed_n..sealed_n + active_n {
+            let _ = append_with_seal(
+                Some(&cfg),
+                EL,
+                "exec-active",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+        assert_eq!(
+            sealed_segments(&cfg, EL).len(),
+            1,
+            "fixture must have one sealed segment"
+        );
+        cfg
+    }
+
+    fn scan_page(body: &TierStoreOutcome) -> (u64, Vec<(u64, u64)>) {
+        let TierStoreOutcome::Ok(b) = body else {
+            panic!("scan failed: {body:?}")
+        };
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        let rows = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let i = serde_json::from_str::<serde_json::Value>(r["payload"].as_str().unwrap())
+                    .unwrap()["i"]
+                    .as_u64()
+                    .unwrap();
+                (r["global_sequence"].as_u64().unwrap(), i)
+            })
+            .collect();
+        (v["record_count"].as_u64().unwrap(), rows)
+    }
+
+    /// The scan pages THROUGH a sealed segment larger than one page, instead of
+    /// taking its first `MAX_SCAN_LIMIT` records and jumping to the next file.
+    #[tokio::test]
+    async fn a_scan_pages_through_a_sealed_segment_larger_than_one_page() {
+        const SEALED: usize = MAX_SCAN_LIMIT + 250;
+        const ACTIVE: usize = 30;
+        const N: usize = SEALED + ACTIVE;
+        let cfg = multi_page_segment_fixture("scan-pages", SEALED, ACTIVE).await;
+
+        let (total, _) = scan_page(&scan(Some(&cfg), EL, None, 1).await);
+        assert_eq!(
+            total as usize,
+            N,
+            "record_count must be the whole log; a per-segment page cap reports \
+             {} here",
+            MAX_SCAN_LIMIT + ACTIVE
+        );
+
+        // Walk the log with the cursor, the way a remote reader does.
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let mut after = None;
+        loop {
+            let (_, rows) = scan_page(&scan(Some(&cfg), EL, after, MAX_SCAN_LIMIT).await);
+            let Some(&(last, _)) = rows.last() else { break };
+            seen.extend(rows);
+            after = Some(last);
+            assert!(seen.len() <= N, "the cursor walk never ended");
+        }
+        let expected: Vec<(u64, u64)> = (0..N as u64).map(|i| (i + 1, i)).collect();
+        assert_eq!(
+            seen.len(),
+            N,
+            "the cursor walk returned {} of {N} records",
+            seen.len()
+        );
+        assert_eq!(
+            seen, expected,
+            "sequences and payloads must be 1..N over 0..N-1, in order"
+        );
+
+        // A cursor INSIDE the sealed segment's second page lands there, not in
+        // the active segment.
+        let (_, rows) =
+            scan_page(&scan(Some(&cfg), EL, Some(MAX_SCAN_LIMIT as u64 + 100), 5).await);
+        let want: Vec<(u64, u64)> = (0..5u64)
+            .map(|k| {
+                (
+                    MAX_SCAN_LIMIT as u64 + 101 + k,
+                    MAX_SCAN_LIMIT as u64 + 100 + k,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows, want,
+            "a cursor past the first page skipped into the next segment"
+        );
+
+        // A cursor at the end returns nothing and still states the total.
+        let (total, rows) = scan_page(&scan(Some(&cfg), EL, Some(N as u64), 10).await);
+        assert!(rows.is_empty());
+        assert_eq!(total as usize, N);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐⭐ The scan reads sealed segments with the store lock RELEASED, as
+    /// `read_execution` does (noetl/ai-meta#490). The probe tries the WRITE
+    /// lock — what an append needs — at the start of the sealed phase.
+    #[tokio::test]
+    async fn a_scan_reads_sealed_segments_without_the_store_lock() {
+        let cfg = multi_page_segment_fixture("scan-unlocked", 40, 5).await;
+        let probe = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        sealed_probes()
+            .lock()
+            .unwrap()
+            .insert(cfg.dir.clone(), probe.clone());
+        let got = scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await;
+        sealed_probes().lock().unwrap().remove(&cfg.dir);
+        let (total, rows) = scan_page(&got);
+        assert_eq!(total, 45);
+        assert_eq!(rows, (0..45u64).map(|i| (i + 1, i)).collect::<Vec<_>>());
+        match probe.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => {}
+            0 => panic!("the sealed phase never ran — this test measured nothing"),
+            _ => panic!("the store lock was HELD while the scan read sealed segments"),
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// A seal landing BETWEEN the unlocked sealed phase and the locked active
+    /// read moves records out of the active file into a new sealed one. The
+    /// locked phase must notice and send the scan back for that segment, or
+    /// those records vanish from the reply.
+    #[tokio::test]
+    async fn a_seal_between_the_scan_phases_loses_no_records() {
+        let cfg = multi_page_segment_fixture("scan-race", 20, 10).await;
+        let acc = scan_sealed_phase(
+            &cfg,
+            EL,
+            MergedScan::new(None, MAX_SCAN_LIMIT),
+            sealed_segments(&cfg, EL),
+        )
+        .unwrap();
+        assert_eq!(acc.sealed.len(), 1);
+
+        // The race: the active segment is sealed as .2, and appends continue.
+        let active = cfg.path_for(EL);
+        std::fs::rename(&active, active.with_file_name("eventlog.jsonl.2")).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        for i in 30..35 {
+            let _ = append_with_seal(
+                Some(&cfg),
+                EL,
+                "exec-after",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+
+        let LockedScan::SealedSince(acc) = scan_locked(&cfg, EL, acc) else {
+            panic!("the locked phase answered from a sealed list that is out of date");
+        };
+        let acc = scan_sealed_phase(&cfg, EL, acc, sealed_segments(&cfg, EL)).unwrap();
+        let LockedScan::Done(out) = scan_locked(&cfg, EL, acc) else {
+            panic!("the scan did not converge once the new segment was folded in");
+        };
+        let (total, rows) = scan_page(&out);
+        assert_eq!(total, 35, "records lost across the seal");
+        assert_eq!(rows, (0..35u64).map(|i| (i + 1, i)).collect::<Vec<_>>());
+
+        // And the public entry point agrees.
+        let (total, rows) = scan_page(&scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await);
+        assert_eq!(total, 35);
+        assert_eq!(rows.len(), 35);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// A sealed segment that disappears or is renumbered mid-scan breaks the
+    /// merged numbering; the scan refuses instead of answering.
+    #[tokio::test]
+    async fn a_segment_vanishing_mid_scan_is_an_error_not_an_answer() {
+        let cfg = multi_page_segment_fixture("scan-vanish", 5, 2).await;
+        let acc = scan_sealed_phase(
+            &cfg,
+            EL,
+            MergedScan::new(None, MAX_SCAN_LIMIT),
+            sealed_segments(&cfg, EL),
+        )
+        .unwrap();
+        let sealed = cfg.path_for(EL).with_file_name("eventlog.jsonl.1");
+        std::fs::rename(&sealed, sealed.with_file_name("eventlog.jsonl.7")).unwrap();
+        assert!(scan_sealed_phase(&cfg, EL, acc, sealed_segments(&cfg, EL)).is_err());
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// noetl/ehdb#262: a torn tail in a SEALED segment stays visible on the
+    /// merged scan, as it is on a single-segment driver reply.
+    #[tokio::test]
+    async fn a_torn_tail_in_a_sealed_segment_is_reported_by_the_merged_scan() {
+        let cfg = multi_page_segment_fixture("scan-torn", 10, 3).await;
+        let clean = scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await;
+        let TierStoreOutcome::Ok(b) = &clean else {
+            panic!("{clean:?}")
+        };
+        assert!(
+            !b.contains("torn_tail_skipped"),
+            "a clean store must not report a torn tail: {b}"
+        );
+
+        let sealed = cfg.path_for(EL).with_file_name("eventlog.jsonl.1");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&sealed)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{\"torn").unwrap();
+        drop(f);
+        ehdb_reference::forget_runtime(&sealed);
+
+        let torn = scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await;
+        let TierStoreOutcome::Ok(b) = &torn else {
+            panic!("{torn:?}")
+        };
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        assert_eq!(
+            v["record_count"].as_u64(),
+            Some(13),
+            "intact records still read: {b}"
+        );
+        assert_eq!(
+            v["torn_tail_skipped"].as_u64(),
+            Some(1),
+            "the sealed segment's torn tail vanished from the merged reply: {b}"
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
