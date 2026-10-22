@@ -272,6 +272,19 @@ pub struct ControlPlaneClient {
     ehdb_object_hook: Arc<Option<crate::ehdb::EnvMap>>,
 }
 
+/// What one heartbeat learned from the server (noetl/ai-meta#495).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatOutcome {
+    /// 2xx: the server knows this worker and refreshed it.
+    Accepted,
+    /// 404: the server has no runtime row for this worker — it is
+    /// unregistered (e.g. its startup registration failed) and a heartbeat
+    /// alone can never fix that.
+    UnknownRuntime,
+    /// Any other non-2xx, with its status.
+    Rejected(u16),
+}
+
 impl ControlPlaneClient {
     /// Return a clone of this client with a different server URL.
     ///
@@ -1069,7 +1082,12 @@ impl ControlPlaneClient {
     /// Wire shape matches the Python broker's
     /// `RuntimeHeartbeatRequest`: `name` only.  The broker upserts
     /// the heartbeat timestamp keyed by `name`.
-    pub async fn heartbeat(&self, worker_id: &str, _pool_name: &str) -> Result<()> {
+    ///
+    /// ⚠ noetl/ai-meta#495: returns what the server SAID, not just `Ok`. It used
+    /// to log a non-2xx and return `Ok(())`, so a `404 Runtime not found` — the
+    /// server telling this worker it is unregistered — was indistinguishable
+    /// from a healthy beat, and nothing ever re-registered.
+    pub async fn heartbeat(&self, worker_id: &str, _pool_name: &str) -> Result<HeartbeatOutcome> {
         let response = self
             .client
             .post(format!("{}/api/worker/pool/heartbeat", self.server_url))
@@ -1079,12 +1097,17 @@ impl ControlPlaneClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            tracing::warn!("Heartbeat failed: {}", body);
+        let status = response.status();
+        if status.is_success() {
+            return Ok(HeartbeatOutcome::Accepted);
         }
-
-        Ok(())
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!("Heartbeat failed: {}", body);
+        Ok(if status == reqwest::StatusCode::NOT_FOUND {
+            HeartbeatOutcome::UnknownRuntime
+        } else {
+            HeartbeatOutcome::Rejected(status.as_u16())
+        })
     }
 
     /// Deregister the worker pool.
