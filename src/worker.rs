@@ -608,19 +608,25 @@ impl Worker {
         let worker_id = self.config.worker_id.clone();
         let pool_name = self.config.pool_name.clone();
         let interval = self.config.heartbeat_interval;
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // Skip first immediate tick
+            let mut since_attempt: Option<u32> = None;
 
             loop {
                 ticker.tick().await;
-
-                if let Err(e) = client.heartbeat(&worker_id, &pool_name).await {
-                    tracing::warn!(error = %e, "Heartbeat failed");
-                } else {
-                    tracing::trace!("Heartbeat sent");
-                }
+                heartbeat_tick(
+                    &client,
+                    &worker_id,
+                    &pool_name,
+                    &hostname,
+                    &mut since_attempt,
+                )
+                .await;
             }
         })
     }
@@ -1040,9 +1046,193 @@ fn dead_letter_enabled() -> bool {
     )
 }
 
+/// Re-register at most once per this many heartbeats while the server keeps
+/// answering `404 Runtime not found` (noetl/ai-meta#495).
+pub(crate) const REREGISTER_EVERY_BEATS: u32 = 4;
+
+/// Should this beat re-register? `since_attempt` = beats since the last
+/// re-registration attempt (`None` = never tried).
+///
+/// The first unknown-runtime beat re-registers at once; after that, once per
+/// [`REREGISTER_EVERY_BEATS`], so a server that keeps refusing is not hammered
+/// at the heartbeat rate.
+pub(crate) fn should_reregister(
+    outcome: crate::client::HeartbeatOutcome,
+    since_attempt: Option<u32>,
+) -> bool {
+    matches!(outcome, crate::client::HeartbeatOutcome::UnknownRuntime)
+        && since_attempt.is_none_or(|n| n + 1 >= REREGISTER_EVERY_BEATS)
+}
+
+/// One heartbeat, and — when the server says this worker is unregistered — the
+/// re-registration the startup path promises ("the heartbeat will re-assert
+/// presence") and, before noetl/ai-meta#495, never performed: a writer whose
+/// startup registration hit a transient error 404'd every 15 s indefinitely.
+pub(crate) async fn heartbeat_tick(
+    client: &ControlPlaneClient,
+    worker_id: &str,
+    pool_name: &str,
+    hostname: &str,
+    since_attempt: &mut Option<u32>,
+) {
+    use crate::client::HeartbeatOutcome;
+    match client.heartbeat(worker_id, pool_name).await {
+        Ok(HeartbeatOutcome::Accepted) => {
+            *since_attempt = None;
+            tracing::trace!("Heartbeat sent");
+        }
+        Ok(outcome @ HeartbeatOutcome::UnknownRuntime) => {
+            if should_reregister(outcome, *since_attempt) {
+                *since_attempt = Some(0);
+                match client.register_worker(worker_id, pool_name, hostname).await {
+                    Ok(()) => {
+                        crate::metrics::record_worker_registration(true);
+                        tracing::info!(
+                            worker_id,
+                            pool_name,
+                            "worker RE-registered after the server reported it unknown \
+                             (heartbeat 404) — presence restored (noetl/ai-meta#495)"
+                        );
+                    }
+                    Err(e) => {
+                        crate::metrics::record_worker_registration(false);
+                        tracing::warn!(
+                            error = %e,
+                            worker_id,
+                            "re-registration after heartbeat 404 failed; will retry \
+                             in {REREGISTER_EVERY_BEATS} beats"
+                        );
+                    }
+                }
+            } else {
+                *since_attempt = since_attempt.map(|n| n + 1);
+            }
+        }
+        Ok(HeartbeatOutcome::Rejected(_)) => {}
+        Err(e) => tracing::warn!(error = %e, "Heartbeat failed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- noetl/ai-meta#495: re-register on heartbeat 404 ----
+
+    #[test]
+    fn reregistration_is_immediate_then_rate_limited() {
+        use crate::client::HeartbeatOutcome::*;
+        // Twelve consecutive 404 beats: attempts at beats 1, 5, 9 — never every beat.
+        let mut since: Option<u32> = None;
+        let mut attempts = Vec::new();
+        for beat in 1..=12u32 {
+            if should_reregister(UnknownRuntime, since) {
+                attempts.push(beat);
+                since = Some(0);
+            } else {
+                since = since.map(|n| n + 1);
+            }
+        }
+        assert_eq!(attempts, vec![1, 5, 9]);
+        // A healthy or otherwise-rejected beat never re-registers.
+        assert!(!should_reregister(Accepted, None));
+        assert!(!should_reregister(Rejected(500), None));
+    }
+
+    /// A fake control plane: heartbeats 404 until the worker is registered;
+    /// registration succeeds unless `refuse` is set.
+    async fn fake_control_plane(
+        refuse: bool,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let registered = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (r1, r2, c1) = (registered.clone(), registered.clone(), calls.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/worker/pool/register",
+                axum::routing::post(move || {
+                    let (r, c) = (r1.clone(), c1.clone());
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        if refuse {
+                            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no")
+                        } else {
+                            r.store(true, Ordering::SeqCst);
+                            (axum::http::StatusCode::OK, "{}")
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/worker/pool/heartbeat",
+                axum::routing::post(move || {
+                    let r = r2.clone();
+                    async move {
+                        if r.load(Ordering::SeqCst) {
+                            (axum::http::StatusCode::OK, "{}".to_string())
+                        } else {
+                            (
+                                axum::http::StatusCode::NOT_FOUND,
+                                r#"{"error":"Runtime not found: worker_pool w","status":404}"#
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (url, registered, calls)
+    }
+
+    /// The prod shape: startup registration lost, heartbeat 404s. One tick must
+    /// restore presence, and the next beat is accepted.
+    #[tokio::test]
+    async fn a_heartbeat_404_re_registers_the_worker() {
+        use crate::client::HeartbeatOutcome;
+        let (url, registered, calls) = fake_control_plane(false).await;
+        let client = ControlPlaneClient::new(&url);
+        assert_eq!(
+            client.heartbeat("w", "p").await.unwrap(),
+            HeartbeatOutcome::UnknownRuntime,
+            "precondition: an unregistered worker's heartbeat is a 404"
+        );
+        let mut since = None;
+        heartbeat_tick(&client, "w", "p", "h", &mut since).await;
+        assert!(
+            registered.load(std::sync::atomic::Ordering::SeqCst),
+            "never re-registered"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            client.heartbeat("w", "p").await.unwrap(),
+            HeartbeatOutcome::Accepted
+        );
+    }
+
+    /// A server that keeps refusing registration is retried at the rate limit,
+    /// not at the heartbeat rate.
+    #[tokio::test]
+    async fn a_refusing_server_is_retried_at_the_rate_limit() {
+        let (url, _registered, calls) = fake_control_plane(true).await;
+        let client = ControlPlaneClient::new(&url);
+        let mut since = None;
+        for _ in 0..12 {
+            heartbeat_tick(&client, "w", "p", "h", &mut since).await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "attempts at beats 1, 5, 9"
+        );
+    }
 
     #[test]
     fn test_worker_config() {
