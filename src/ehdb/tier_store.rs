@@ -1430,6 +1430,14 @@ fn read_segment_then_release<T>(
 /// segment's own numbering. Passing it down per segment would skip a different
 /// set of records in every file, because each driver numbers from 1 within its
 /// own log.
+///
+/// ⚠⚠ Each segment is counted IN FULL before it is paged. This used to read one
+/// `MAX_SCAN_LIMIT` page from every segment and renumber what came back, so a
+/// sealed segment (~80k records at the 256 MiB seal) contributed its first 1000
+/// and nothing else: `record_count` under-reported the log, and every cursor
+/// past the first page of a segment landed in the NEXT segment, silently
+/// skipping the rest. Same failure class as noetl/ai-meta#490's 1000-record
+/// read cap, on the scan side.
 fn scan_across_segments(
     cfg: &TierStoreConfig,
     tier: StoreTier,
@@ -1437,22 +1445,47 @@ fn scan_across_segments(
     after: Option<u64>,
     limit: usize,
 ) -> TierStoreOutcome {
-    let mut records: Vec<serde_json::Value> = Vec::new();
+    let after = after.unwrap_or(0);
+    let mut page: Vec<serde_json::Value> = Vec::new();
+    let mut total: u64 = 0;
+    let mut torn: usize = 0;
     let mut paths: Vec<PathBuf> = sealed.to_vec();
     paths.push(cfg.path_for(tier));
     let last = paths.len() - 1;
     for (i, path) in paths.iter().enumerate() {
         let sealed_seg = i < last; // the final entry is the ACTIVE segment
-        match read_segment_then_release(path, sealed_seg, |d| {
-            d.scan_global(&EventLogScanRequest {
+        let base = total;
+        let want = limit - page.len();
+        // Both reads inside one closure, so a sealed segment is loaded once.
+        let read = read_segment_then_release(path, sealed_seg, |d| {
+            let count = d.scan_global(&EventLogScanRequest {
                 after: None,
-                limit: MAX_SCAN_LIMIT,
-            })
-        }) {
-            Ok(out) => {
-                if let Ok(serde_json::Value::Object(mut o)) = serde_json::to_value(&out) {
-                    if let Some(serde_json::Value::Array(rs)) = o.remove("records") {
-                        records.extend(rs);
+                limit: 0,
+            })?;
+            let n = count.record_count as u64;
+            let local_after = after.saturating_sub(base).min(n);
+            if want == 0 || local_after >= n {
+                return Ok((count, None));
+            }
+            let rows = d.scan_global(&EventLogScanRequest {
+                after: (local_after > 0).then_some(local_after),
+                limit: want,
+            })?;
+            Ok::<_, ehdb_reference::EhdbError>((count, Some((local_after, rows))))
+        });
+        match read {
+            Ok((count, rows)) => {
+                total += count.record_count as u64;
+                torn += count.torn_tail_skipped;
+                if let Some((local_after, rows)) = rows {
+                    for (k, mut r) in records_of(&rows).into_iter().enumerate() {
+                        if let Some(o) = r.as_object_mut() {
+                            o.insert(
+                                "global_sequence".to_string(),
+                                serde_json::Value::from(base + local_after + k as u64 + 1),
+                            );
+                        }
+                        page.push(r);
                     }
                 }
             }
@@ -1464,18 +1497,7 @@ fn scan_across_segments(
             }
         }
     }
-    let total = records.len();
-    for (i, r) in records.iter_mut().enumerate() {
-        if let Some(o) = r.as_object_mut() {
-            o.insert(
-                "global_sequence".to_string(),
-                serde_json::Value::from((i + 1) as u64),
-            );
-        }
-    }
-    let skip = after.unwrap_or(0) as usize;
-    let page: Vec<serde_json::Value> = records.into_iter().skip(skip).take(limit).collect();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "action": "eventlog-scan",
         "exists": total > 0,
         "record_count": total,
@@ -1483,6 +1505,12 @@ fn scan_across_segments(
         "records": page,
         "segments": sealed.len() + 1,
     });
+    // noetl/ehdb#262: a torn tail skipped in ANY segment stays visible on the
+    // wire, exactly as the single-segment driver reply carries it. Absent when
+    // zero, matching the driver.
+    if torn > 0 {
+        body["torn_tail_skipped"] = serde_json::Value::from(torn);
+    }
     TierStoreOutcome::Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
@@ -2631,6 +2659,169 @@ mod tests {
             "scan LOST records: {} of {N} — a scan that returns only the active \
              segment is silent data loss",
             sv["record_count"]
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// A sealed segment holding MORE than one scan page, then a small active one.
+    async fn multi_page_segment_fixture(
+        tag: &str,
+        sealed_n: usize,
+        active_n: usize,
+    ) -> TierStoreConfig {
+        let cfg = seal_cfg(tag);
+        for i in 0..sealed_n {
+            let _ = append_with_seal(
+                Some(&cfg),
+                EL,
+                "exec-sealed",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+        let active = cfg.path_for(EL);
+        std::fs::rename(&active, active.with_file_name("eventlog.jsonl.1")).unwrap();
+        ehdb_reference::forget_runtime(&active);
+        for i in sealed_n..sealed_n + active_n {
+            let _ = append_with_seal(
+                Some(&cfg),
+                EL,
+                "exec-active",
+                &format!("{{\"i\":{i}}}"),
+                None,
+            )
+            .await;
+        }
+        assert_eq!(
+            sealed_segments(&cfg, EL).len(),
+            1,
+            "fixture must have one sealed segment"
+        );
+        cfg
+    }
+
+    fn scan_page(body: &TierStoreOutcome) -> (u64, Vec<(u64, u64)>) {
+        let TierStoreOutcome::Ok(b) = body else {
+            panic!("scan failed: {body:?}")
+        };
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        let rows = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let i = serde_json::from_str::<serde_json::Value>(r["payload"].as_str().unwrap())
+                    .unwrap()["i"]
+                    .as_u64()
+                    .unwrap();
+                (r["global_sequence"].as_u64().unwrap(), i)
+            })
+            .collect();
+        (v["record_count"].as_u64().unwrap(), rows)
+    }
+
+    /// The scan pages THROUGH a sealed segment larger than one page, instead of
+    /// taking its first `MAX_SCAN_LIMIT` records and jumping to the next file.
+    #[tokio::test]
+    async fn a_scan_pages_through_a_sealed_segment_larger_than_one_page() {
+        const SEALED: usize = MAX_SCAN_LIMIT + 250;
+        const ACTIVE: usize = 30;
+        const N: usize = SEALED + ACTIVE;
+        let cfg = multi_page_segment_fixture("scan-pages", SEALED, ACTIVE).await;
+
+        let (total, _) = scan_page(&scan(Some(&cfg), EL, None, 1).await);
+        assert_eq!(
+            total as usize,
+            N,
+            "record_count must be the whole log; a per-segment page cap reports \
+             {} here",
+            MAX_SCAN_LIMIT + ACTIVE
+        );
+
+        // Walk the log with the cursor, the way a remote reader does.
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        let mut after = None;
+        loop {
+            let (_, rows) = scan_page(&scan(Some(&cfg), EL, after, MAX_SCAN_LIMIT).await);
+            let Some(&(last, _)) = rows.last() else { break };
+            seen.extend(rows);
+            after = Some(last);
+            assert!(seen.len() <= N, "the cursor walk never ended");
+        }
+        let expected: Vec<(u64, u64)> = (0..N as u64).map(|i| (i + 1, i)).collect();
+        assert_eq!(
+            seen.len(),
+            N,
+            "the cursor walk returned {} of {N} records",
+            seen.len()
+        );
+        assert_eq!(
+            seen, expected,
+            "sequences and payloads must be 1..N over 0..N-1, in order"
+        );
+
+        // A cursor INSIDE the sealed segment's second page lands there, not in
+        // the active segment.
+        let (_, rows) =
+            scan_page(&scan(Some(&cfg), EL, Some(MAX_SCAN_LIMIT as u64 + 100), 5).await);
+        let want: Vec<(u64, u64)> = (0..5u64)
+            .map(|k| {
+                (
+                    MAX_SCAN_LIMIT as u64 + 101 + k,
+                    MAX_SCAN_LIMIT as u64 + 100 + k,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows, want,
+            "a cursor past the first page skipped into the next segment"
+        );
+
+        // A cursor at the end returns nothing and still states the total.
+        let (total, rows) = scan_page(&scan(Some(&cfg), EL, Some(N as u64), 10).await);
+        assert!(rows.is_empty());
+        assert_eq!(total as usize, N);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// noetl/ehdb#262: a torn tail in a SEALED segment stays visible on the
+    /// merged scan, as it is on a single-segment driver reply.
+    #[tokio::test]
+    async fn a_torn_tail_in_a_sealed_segment_is_reported_by_the_merged_scan() {
+        let cfg = multi_page_segment_fixture("scan-torn", 10, 3).await;
+        let clean = scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await;
+        let TierStoreOutcome::Ok(b) = &clean else {
+            panic!("{clean:?}")
+        };
+        assert!(
+            !b.contains("torn_tail_skipped"),
+            "a clean store must not report a torn tail: {b}"
+        );
+
+        let sealed = cfg.path_for(EL).with_file_name("eventlog.jsonl.1");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&sealed)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{\"torn").unwrap();
+        drop(f);
+        ehdb_reference::forget_runtime(&sealed);
+
+        let torn = scan(Some(&cfg), EL, None, MAX_SCAN_LIMIT).await;
+        let TierStoreOutcome::Ok(b) = &torn else {
+            panic!("{torn:?}")
+        };
+        let v: serde_json::Value = serde_json::from_str(b).unwrap();
+        assert_eq!(
+            v["record_count"].as_u64(),
+            Some(13),
+            "intact records still read: {b}"
+        );
+        assert_eq!(
+            v["torn_tail_skipped"].as_u64(),
+            Some(1),
+            "the sealed segment's torn tail vanished from the merged reply: {b}"
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
