@@ -66,6 +66,19 @@ pub const TIER_SERVICE_DIR_ENV: &str = "NOETL_EHDB_TIER_SERVICE_DIR";
 /// count so the truncation is visible rather than silent.
 pub const MAX_SCAN_LIMIT: usize = 1_000;
 
+/// The record limit for a per-execution read: none.
+///
+/// ⚠ noetl/ai-meta#492. This used to be [`MAX_SCAN_LIMIT`], and the driver
+/// applies it with `take`, so an execution with more than 1000 records in one
+/// segment came back cut at 1000 — and the merged (sealed) path then reported
+/// `record_count` as the RETURNED count, so the cut was invisible. Every reader
+/// of this op wants the whole execution: the comparator would call the tail
+/// `missing_event`, recovery would fold a prefix. The scan cap exists because a
+/// global scan is unbounded by construction; one execution is not. A reply
+/// that outgrows the frame cap is refused loudly by the service
+/// (`reply_too_large`), which is the right failure for an oversized answer.
+pub const READ_EXECUTION_LIMIT: usize = usize::MAX;
+
 /// Resolved store configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierStoreConfig {
@@ -944,7 +957,7 @@ fn read_execution_locked(cfg: &TierStoreConfig, tier: StoreTier, execution_id: &
     let request = EventLogReadExecutionRequest {
         execution_id: execution_id.to_string(),
         after: None,
-        limit: MAX_SCAN_LIMIT,
+        limit: READ_EXECUTION_LIMIT,
     };
     // ⚠⚠ Sealed segments FIRST, then the active one. A read that consulted only
     // the active segment would silently lose every record written before the
@@ -1503,7 +1516,10 @@ fn read_execution_across_segments(
     let request = EventLogReadExecutionRequest {
         execution_id: execution_id.to_string(),
         after: None,
-        limit: MAX_SCAN_LIMIT,
+        // noetl/ai-meta#492: the sealed replay builds its own request, so it
+        // needs the same uncapped limit as the locked phase, or a sealed segment
+        // holding >1000 of one execution's records is cut here instead.
+        limit: READ_EXECUTION_LIMIT,
     };
     let mut records: Vec<serde_json::Value> = Vec::new();
     for path in sealed {
@@ -1618,6 +1634,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         TierStoreConfig { dir: d }
+    }
+
+    fn read_count(body: &str) -> (usize, usize) {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        (
+            v["records"].as_array().unwrap().len(),
+            v["record_count"].as_u64().unwrap() as usize,
+        )
+    }
+
+    /// ⭐ noetl/ai-meta#492: a long execution comes back WHOLE, sealed or not.
+    #[tokio::test]
+    async fn a_long_execution_is_not_truncated_at_the_scan_cap() {
+        const N: usize = MAX_SCAN_LIMIT + 200;
+        let payloads: Vec<String> = (0..N).map(|i| format!("{{\"i\":{i}}}")).collect();
+
+        // One segment (the driver's own path).
+        let cfg = seal_cfg("long-active");
+        for chunk in payloads.chunks(100) {
+            let _ = append_batch(Some(&cfg), StoreTier::EventLog, "exec-long", chunk).await;
+        }
+        let TierStoreOutcome::Ok(b) =
+            read_execution(Some(&cfg), StoreTier::EventLog, "exec-long").await
+        else {
+            panic!("read failed")
+        };
+        assert_eq!(read_count(&b), (N, N), "unsealed read truncated");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+
+        // Sealed: every record in ONE sealed segment, then a fresh active one —
+        // the merged path, which also reported the cut as the total.
+        let cfg = seal_cfg("long-sealed");
+        for chunk in payloads.chunks(100) {
+            let _ = append_batch(Some(&cfg), StoreTier::EventLog, "exec-long", chunk).await;
+        }
+        let active = cfg.path_for(StoreTier::EventLog);
+        std::fs::rename(
+            &active,
+            active.with_file_name(format!(
+                "{}.1",
+                active.file_name().unwrap().to_str().unwrap()
+            )),
+        )
+        .unwrap();
+        ehdb_reference::forget_runtime(&active);
+        let _ = append(Some(&cfg), StoreTier::EventLog, "exec-other", "{}").await;
+        assert_eq!(sealed_segments(&cfg, StoreTier::EventLog).len(), 1);
+        let TierStoreOutcome::Ok(b) =
+            read_execution(Some(&cfg), StoreTier::EventLog, "exec-long").await
+        else {
+            panic!("merged read failed")
+        };
+        assert_eq!(read_count(&b), (N, N), "merged read truncated");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
     /// Sealed-phase probes, keyed by store dir: `0` not reached, `1` the store
