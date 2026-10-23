@@ -145,6 +145,12 @@ struct EhdbMetricsState {
     tier_service_appends: BTreeMap<&'static str, u64>,
     /// Appends refused by the seal-straddling dedup window (noetl/ai-meta#472).
     tier_dedup_hits: BTreeMap<&'static str, u64>,
+    /// Retention-pass outcomes per sealed segment, by (tier, outcome):
+    /// `pruned` | `failed` | `archive_failed` | `skipped_revalidation`
+    /// (noetl/ai-meta#491). Only an `enabled` pass records these.
+    tier_prune_segments: BTreeMap<(&'static str, &'static str), u64>,
+    /// Bytes actually unlinked by the retention pass, per tier.
+    tier_prune_bytes: BTreeMap<&'static str, u64>,
     /// Highest `global_sequence` each store has reported. Sampled at pin time
     /// from the store file too, so it is meaningful before the first append.
     tier_service_sequence: BTreeMap<&'static str, u64>,
@@ -530,6 +536,14 @@ pub fn pin_tier_service_series(samples: &[(StoreTier, u64, u64)]) {
         // a binary too old to have the window at all, which is the question an
         // operator asks first when duplicates reappear (noetl/ai-meta#472).
         s.tier_dedup_hits.entry(tier.as_str()).or_insert(0);
+        // Pinned at 0 so "nothing pruned" reads as 0, not as a binary without
+        // the pass (noetl/ai-meta#491).
+        for outcome in TIER_PRUNE_OUTCOMES {
+            s.tier_prune_segments
+                .entry((tier.as_str(), outcome))
+                .or_insert(0);
+        }
+        s.tier_prune_bytes.entry(tier.as_str()).or_insert(0);
         s.tier_service_sequence.entry(tier.as_str()).or_insert(0);
         s.tier_service_store_bytes.entry(tier.as_str()).or_insert(0);
     }
@@ -675,6 +689,22 @@ pub fn record_tier_service_append(tier: StoreTier, sequence: u64, store_bytes: u
 pub fn record_tier_dedup_hit(tier: StoreTier) {
     let mut s = state().lock().expect("ehdb metrics lock");
     *s.tier_dedup_hits.entry(tier.as_str()).or_insert(0) += 1;
+}
+
+/// Every outcome the retention pass records, so each series is pinned at 0.
+pub const TIER_PRUNE_OUTCOMES: [&str; 4] =
+    ["pruned", "failed", "archive_failed", "skipped_revalidation"];
+
+/// Record one segment's retention-pass outcome (noetl/ai-meta#491). `bytes` is
+/// added to the pruned-bytes counter only for `pruned`.
+pub fn record_tier_prune(tier: StoreTier, outcome: &'static str, bytes: u64) {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    *s.tier_prune_segments
+        .entry((tier.as_str(), outcome))
+        .or_insert(0) += 1;
+    if outcome == "pruned" {
+        *s.tier_prune_bytes.entry(tier.as_str()).or_insert(0) += bytes;
+    }
 }
 
 /// Record how many records one tier-append request took through each path.
@@ -1087,6 +1117,26 @@ pub fn render_lines() -> Vec<String> {
         for (tier, v) in &s.tier_dedup_hits {
             lines.push(format!(
                 "noetl_ehdb_tier_dedup_hits_total{{tier=\"{tier}\"}} {v}"
+            ));
+        }
+        lines.push(
+            "# HELP noetl_ehdb_tier_prune_segments_total Sealed segments handled by an enabled retention pass, by outcome (noetl/ai-meta#491)"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_ehdb_tier_prune_segments_total counter".to_string());
+        for ((tier, outcome), v) in &s.tier_prune_segments {
+            lines.push(format!(
+                "noetl_ehdb_tier_prune_segments_total{{tier=\"{tier}\",outcome=\"{outcome}\"}} {v}"
+            ));
+        }
+        lines.push(
+            "# HELP noetl_ehdb_tier_prune_bytes_total Bytes unlinked by an enabled retention pass (noetl/ai-meta#491)"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_ehdb_tier_prune_bytes_total counter".to_string());
+        for (tier, v) in &s.tier_prune_bytes {
+            lines.push(format!(
+                "noetl_ehdb_tier_prune_bytes_total{{tier=\"{tier}\"}} {v}"
             ));
         }
         lines.push(
