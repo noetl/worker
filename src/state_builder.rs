@@ -1758,23 +1758,117 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
     run_drain_loop_nats(config, index).await
 }
 
-/// The EHDB WAL drain — replays the retained events log from cursor 0 and
-/// indexes every record, exactly like the ephemeral `DeliverAll` JetStream
-/// consumer it replaces (noetl/ai-meta#119, #217).
+/// How long a resubscription waits for the writer to redeliver our last applied
+/// record before concluding the writer's log no longer holds it. A writer that
+/// still has the record delivers it in the first batch, so this only elapses on
+/// a log that regressed below our cursor. Env `NOETL_STATE_BUILDER_RESUME_VERIFY_MS`
+/// (default 10000).
+fn resume_verify_window() -> Duration {
+    Duration::from_millis(env_u64("NOETL_STATE_BUILDER_RESUME_VERIFY_MS", 10_000).max(1))
+}
+
+/// Where a (re)subscription starts, and what it must prove first.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResumePlan {
+    /// The exclusive feed cursor to subscribe from.
+    pub cursor: u64,
+    /// The record that must arrive first for the resume to be trusted, as
+    /// `(global_sequence, transaction_id)`. `None` = a full replay from 0.
+    pub expect: Option<(u64, String)>,
+}
+
+/// Plan a (re)subscription from the last record applied **in this process**.
+///
+/// The feed cursor is exclusive (records with `global_sequence > cursor`), so
+/// subscribing from `seq - 1` makes the writer redeliver exactly our last record
+/// first. That overlap is the proof the writer's log still agrees with the
+/// index; without it a resume would silently skip anything a regressed log
+/// re-sequenced below our cursor.
+pub(crate) fn resume_plan(last_applied: Option<&(u64, String)>) -> ResumePlan {
+    match last_applied {
+        Some((seq, txn)) if *seq > 0 => ResumePlan {
+            cursor: seq - 1,
+            expect: Some((*seq, txn.clone())),
+        },
+        _ => ResumePlan {
+            cursor: 0,
+            expect: None,
+        },
+    }
+}
+
+/// Is the first delivered record of a resumed subscription exactly our last
+/// applied one? `None` = this batch says nothing yet (empty).
+pub(crate) fn overlap_matches(
+    records: &[ehdb_l0::EventRecord],
+    expect: &(u64, String),
+) -> Option<bool> {
+    let first = records.first()?;
+    Some(first.global_sequence == expect.0 && first.transaction_id == expect.1)
+}
+
+/// What verifying a resumed subscription found.
+enum ResumeOutcome {
+    /// The writer redelivered our last record first; carry on from here.
+    Verified(Vec<ehdb_l0::EventRecord>),
+    /// The writer does not hold our last record (wrong first record, or none
+    /// within the window): its log regressed — replay from 0.
+    NotHeld(Option<(u64, String)>),
+    /// The feed dropped before the check could finish: retry the same resume.
+    Dropped(String),
+}
+
+/// Should the drain report unhealthy, having been unable to serve for `down_for`?
+///
+/// The grace is what keeps an ordinary writer restart (~20-30 s on prod) from
+/// failing `/livez`: before it, the drain flipped unhealthy at the first dropped
+/// read, and the kubelet killed every system pool on every writer roll. The
+/// backstop is unchanged past the grace — a writer that stays unreachable still
+/// fails `/livez` and gets the pod restarted (noetl/ai-meta#161/#225).
+pub(crate) fn drain_unhealthy(down_for: Duration, grace: Duration) -> bool {
+    down_for >= grace
+}
+
+/// Fold one failed serve attempt into the outage timer and the health gauge.
+fn note_drain_down(down_since: &mut Option<Instant>, grace: Duration) {
+    let since = *down_since.get_or_insert_with(Instant::now);
+    if drain_unhealthy(since.elapsed(), grace) {
+        crate::metrics::set_state_builder_healthy(false);
+    }
+}
+
+/// The EHDB WAL drain — rebuilds the index by replaying the retained events log
+/// from cursor 0 **when the process starts**, then follows the feed.
 ///
 /// **A subscription, not a consumer group, and that is the load-bearing
 /// choice.** A group would persist a cursor, and a persisted cursor that
 /// outruns a freshly-restarted worker's empty in-memory index is exactly the
 /// #119 stall: the drive asks for a chain the index never rebuilt, every
 /// orchestrate returns `WAL chain incomplete`, and executions wedge with no
-/// error anywhere. Replaying from 0 on every boot makes the index
+/// error anywhere. Replaying from 0 at process start makes the index
 /// self-rehydrating by construction.
 ///
+/// ⚠ **A reconnect within the same process resumes instead of replaying.** The
+/// #119 hazard is a cursor outliving its index; a cursor held in memory beside
+/// the index it describes cannot. So after a dropped feed the drain resubscribes
+/// from its last applied record, and trusts that only after the writer
+/// redelivers that exact record ([`resume_plan`] / [`overlap_matches`]). If the
+/// writer's log no longer holds it — a regressed or rewritten log — the drain
+/// falls back to a full replay from 0. Re-applying a record is idempotent (the
+/// index keys on `event_id`), so the one-record overlap is never double-counted.
+///
+/// Before this, every writer restart resubscribed from 0: new executions waited
+/// behind a full replay (~660k events, ~10 min on prod 2026-10-22) of
+/// `off-server drive … WAL chain incomplete` no-ops.
+///
 /// There is no ack and no dead-consumer machinery here: `FeedSubscription` is a
-/// plain socket, so a writer restart surfaces as a read error and the reconnect
-/// below re-subscribes from 0. The NATS loop's #161/#163 rebuild logic has no
-/// EHDB counterpart because there is no server-side consumer to orphan.
-async fn run_drain_loop_ehdb(config: DrainConfig, index: SharedWalIndex) -> Result<()> {
+/// plain socket, so a writer restart surfaces as a read error and the loop
+/// below resubscribes. The NATS loop's #161/#163 rebuild logic has no EHDB
+/// counterpart because there is no server-side consumer to orphan.
+///
+/// `pub` so the restart behaviour can be exercised end to end against a real
+/// feed server (`tests/state_builder_survives_writer_restart.rs`).
+pub async fn run_drain_loop_ehdb(config: DrainConfig, index: SharedWalIndex) -> Result<()> {
     let addr = config.wal_addr.clone().ok_or_else(|| {
         anyhow!("NOETL_STATE_BUILDER source=ehdb requires NOETL_EVENT_BUS_WAL_ADDR")
     })?;
@@ -1784,53 +1878,129 @@ async fn run_drain_loop_ehdb(config: DrainConfig, index: SharedWalIndex) -> Resu
     let mut last_sweep = Instant::now();
     let sweep_interval = Duration::from_secs(env_u64("NOETL_STATE_INDEX_SWEEP_SECS", 15));
     let mut backoff = REBUILD_BACKOFF_MIN;
+    let grace = unhealthy_after();
     let shard: u32 = std::env::var("NOETL_EVENT_BUS_SHARD")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
+    // The last record applied in THIS process — the in-process resume point.
+    let mut last_applied: Option<(u64, String)> = None;
+    // When the drain last stopped being able to serve; `None` while serving.
+    let mut down_since: Option<Instant> = None;
 
     tracing::info!(
         %addr,
         shard,
         mode = ?config.mode,
         "off-server state-builder WAL drain started on the EHDB events feed \
-         (replay-from-0 per boot, no acks — the #119 self-rehydrating shape)"
+         (replay-from-0 at process start, verified in-process resume on reconnect, \
+         no acks — the #119 self-rehydrating shape)"
     );
 
     loop {
-        // Always resume from 0: the in-memory index is rebuilt on every
-        // (re)connect, so the retained log is the only source of truth for it.
-        let mut sub = match ehdb_feed::FeedSubscription::connect(addr.as_str(), shard, 0).await {
-            Ok(s) => {
-                backoff = REBUILD_BACKOFF_MIN;
-                crate::metrics::set_state_builder_healthy(true);
-                s
-            }
+        let plan = resume_plan(last_applied.as_ref());
+        let connect = crate::event_bus::bounded_connect(ehdb_feed::FeedSubscription::connect(
+            addr.as_str(),
+            shard,
+            plan.cursor,
+        ));
+        let mut sub = match connect.await {
+            Ok(s) => s,
             Err(error) => {
-                crate::metrics::set_state_builder_healthy(false);
-                tracing::warn!(%addr, %error, "state-builder WAL subscribe failed; retrying");
+                note_drain_down(&mut down_since, grace);
+                tracing::warn!(%addr, %error, cursor = plan.cursor, "state-builder WAL subscribe failed; retrying");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(REBUILD_BACKOFF_MAX);
                 continue;
             }
         };
 
-        loop {
-            let records: Vec<ehdb_l0::EventRecord> = match sub.recv_batch().await {
-                Ok(r) => r,
-                Err(error) => {
-                    // noetl/ai-meta#225: the WAL fan-out had TCP keepalive but no
-                    // application-level heartbeat, so it could not tell "writer
-                    // alive but stuck" from "feed idle" and this arm went
-                    // unreached while the drive could not advance any execution
-                    // past its first command. The heartbeat makes a stuck peer an
-                    // ordinary read error, which this already knew how to handle.
-                    crate::metrics::record_events_consumer_redial("wal");
-                    crate::metrics::set_state_builder_healthy(false);
-                    tracing::warn!(%addr, %error, "state-builder WAL feed dropped; resubscribing from 0");
-                    break;
+        // A resume is trusted only once the writer redelivers our last record.
+        let mut pending: Vec<ehdb_l0::EventRecord> = Vec::new();
+        if let Some(expect) = plan.expect.as_ref() {
+            let deadline = Instant::now() + resume_verify_window();
+            let outcome = loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break ResumeOutcome::NotHeld(None);
+                }
+                match tokio::time::timeout(remaining, sub.recv_batch::<ehdb_l0::EventRecord>())
+                    .await
+                {
+                    Ok(Ok(records)) => match overlap_matches(&records, expect) {
+                        None => continue,
+                        Some(true) => break ResumeOutcome::Verified(records),
+                        Some(false) => {
+                            let found = records
+                                .first()
+                                .map(|r| (r.global_sequence, r.transaction_id.clone()));
+                            break ResumeOutcome::NotHeld(found);
+                        }
+                    },
+                    Ok(Err(error)) => break ResumeOutcome::Dropped(error.to_string()),
+                    Err(_elapsed) => break ResumeOutcome::NotHeld(None),
                 }
             };
+            match outcome {
+                ResumeOutcome::Verified(records) => {
+                    crate::metrics::record_state_builder_wal_resubscribe("resume");
+                    tracing::info!(
+                        %addr,
+                        resumed_after = expect.0,
+                        "state-builder WAL drain resumed in-process (writer redelivered our last record; no replay)"
+                    );
+                    pending = records;
+                }
+                // An ordinary outage while verifying: retry the same resume.
+                ResumeOutcome::Dropped(error) => {
+                    note_drain_down(&mut down_since, grace);
+                    tracing::warn!(%addr, %error, "state-builder WAL feed dropped while verifying resume; retrying");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(REBUILD_BACKOFF_MAX);
+                    continue;
+                }
+                ResumeOutcome::NotHeld(found) => {
+                    crate::metrics::record_state_builder_wal_resubscribe("regression_replay");
+                    tracing::warn!(
+                        %addr,
+                        expected_sequence = expect.0,
+                        expected_transaction = %expect.1,
+                        found = ?found,
+                        "state-builder WAL resume NOT verified: the writer's log no longer holds our \
+                         last applied record; falling back to a full replay from 0"
+                    );
+                    last_applied = None;
+                    continue;
+                }
+            }
+        } else {
+            crate::metrics::record_state_builder_wal_resubscribe("cold");
+        }
+        backoff = REBUILD_BACKOFF_MIN;
+        down_since = None;
+        crate::metrics::set_state_builder_healthy(true);
+
+        loop {
+            let records: Vec<ehdb_l0::EventRecord> = if !pending.is_empty() {
+                std::mem::take(&mut pending)
+            } else {
+                match sub.recv_batch().await {
+                    Ok(r) => r,
+                    Err(error) => {
+                        // noetl/ai-meta#225: the heartbeat makes a stuck peer an
+                        // ordinary read error. Health is NOT flipped here: an
+                        // ordinary writer restart must not fail `/livez` — only
+                        // an outage past the grace does (`note_drain_down`).
+                        crate::metrics::record_events_consumer_redial("wal");
+                        note_drain_down(&mut down_since, grace);
+                        tracing::warn!(%addr, %error, "state-builder WAL feed dropped; resubscribing (in-process resume)");
+                        break;
+                    }
+                }
+            };
+            if let Some(last) = records.last() {
+                last_applied = Some((last.global_sequence, last.transaction_id.clone()));
+            }
             let payloads: Vec<serde_json::Value> = records
                 .iter()
                 .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.payload).ok())
@@ -4136,6 +4306,71 @@ mod t227_rehydrate_transport_tests {
             rehydrate_execution_from_ehdb(&cfg, &index, 42).await,
             0,
             "missing wal_addr degrades to the fallback, it does not panic"
+        );
+    }
+
+    /// A reconnect resumes one record before our last, and must see that exact
+    /// record first; with nothing applied yet it is a plain replay from 0.
+    #[test]
+    fn the_resume_plan_overlaps_by_exactly_our_last_record() {
+        assert_eq!(
+            resume_plan(None),
+            ResumePlan {
+                cursor: 0,
+                expect: None
+            }
+        );
+        let last = (42u64, "tx-42".to_string());
+        assert_eq!(
+            resume_plan(Some(&last)),
+            ResumePlan {
+                cursor: 41,
+                expect: Some((42, "tx-42".to_string()))
+            },
+            "cursor is exclusive: from 41 the writer redelivers 42 first"
+        );
+        assert_eq!(resume_plan(Some(&(0, "x".to_string()))).cursor, 0);
+    }
+
+    #[test]
+    fn the_overlap_check_needs_the_same_sequence_and_transaction() {
+        let rec = |seq: u64, txn: &str| ehdb_l0::EventRecord::new(seq, "e", txn, "{}");
+        let expect = (42u64, "tx-42".to_string());
+        assert_eq!(
+            overlap_matches(&[], &expect),
+            None,
+            "an empty batch proves nothing yet"
+        );
+        assert_eq!(
+            overlap_matches(&[rec(42, "tx-42"), rec(43, "tx-43")], &expect),
+            Some(true)
+        );
+        assert_eq!(
+            overlap_matches(&[rec(42, "OTHER")], &expect),
+            Some(false),
+            "same sequence, different record = a rewritten log"
+        );
+        assert_eq!(
+            overlap_matches(&[rec(43, "tx-43")], &expect),
+            Some(false),
+            "our record missing = the log does not hold it"
+        );
+    }
+
+    /// The grace: a short outage never reports unhealthy; a long one still does
+    /// (the #161/#225 backstop is preserved).
+    #[test]
+    fn the_drain_reports_unhealthy_only_past_the_grace() {
+        let grace = Duration::from_secs(45);
+        assert!(!drain_unhealthy(Duration::from_secs(0), grace));
+        assert!(
+            !drain_unhealthy(Duration::from_secs(30), grace),
+            "a ~30 s writer roll stays healthy"
+        );
+        assert!(drain_unhealthy(Duration::from_secs(45), grace));
+        assert!(
+            drain_unhealthy(Duration::from_secs(300), grace),
+            "a writer gone for good still fails /livez"
         );
     }
 

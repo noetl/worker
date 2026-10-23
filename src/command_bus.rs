@@ -744,7 +744,12 @@ impl EhdbCommandSource {
         let mut guard = self.ack_conn.lock().await;
         if guard.is_none() {
             *guard = Some(
-                ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await?,
+                crate::event_bus::bounded_connect(ClaimClient::connect(
+                    &self.claim_addr,
+                    self.member,
+                    self.filter.clone(),
+                ))
+                .await?,
             );
         }
         Ok(guard)
@@ -782,7 +787,12 @@ impl CommandSource for EhdbCommandSource {
     async fn next(&mut self) -> Result<Option<Pulled<Self::AckHandle>>> {
         loop {
             if self.pull.is_none() {
-                match ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await
+                match crate::event_bus::bounded_connect(ClaimClient::connect(
+                    &self.claim_addr,
+                    self.member,
+                    self.filter.clone(),
+                ))
+                .await
                 {
                     // NOT progress: a frozen peer's kernel still completes the
                     // handshake, so redialling a stuck writer "connects" every
