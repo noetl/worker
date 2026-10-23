@@ -85,6 +85,12 @@ struct Proxy {
     addr: SocketAddr,
     upstream: Arc<Mutex<SocketAddr>>,
     up: Arc<AtomicBool>,
+    /// Hold the writer->drain direction of each NEW connection this long before
+    /// forwarding: a freshly restarted writer that is slow to serve its first
+    /// read (the prod 2026-10-23 shape). Heartbeats are held too.
+    hold_first: Arc<Mutex<Duration>>,
+    /// When the last connection was accepted (to sample health mid-wait).
+    last_accept: Arc<Mutex<Option<Instant>>>,
     conns: Arc<Mutex<Vec<JoinHandle<()>>>>,
     acceptor: Mutex<Option<JoinHandle<()>>>,
 }
@@ -97,6 +103,8 @@ impl Proxy {
             addr,
             upstream: Arc::new(Mutex::new(upstream)),
             up: Arc::new(AtomicBool::new(true)),
+            hold_first: Arc::new(Mutex::new(Duration::ZERO)),
+            last_accept: Arc::new(Mutex::new(None)),
             conns: Arc::new(Mutex::new(Vec::new())),
             acceptor: Mutex::new(None),
         };
@@ -107,15 +115,26 @@ impl Proxy {
     fn spawn_acceptor(&self, l: TcpListener) {
         let upstream = self.upstream.clone();
         let conns = self.conns.clone();
+        let hold_first = self.hold_first.clone();
+        let last_accept = self.last_accept.clone();
         let h = tokio::spawn(async move {
             loop {
-                let Ok((mut client, _)) = l.accept().await else {
+                let Ok((client, _)) = l.accept().await else {
                     return;
                 };
+                *last_accept.lock().unwrap() = Some(Instant::now());
                 let target = *upstream.lock().unwrap();
+                let hold = *hold_first.lock().unwrap();
                 let h = tokio::spawn(async move {
-                    if let Ok(mut server) = TcpStream::connect(target).await {
-                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    if let Ok(server) = TcpStream::connect(target).await {
+                        let (mut cr, mut cw) = client.into_split();
+                        let (mut sr, mut sw) = server.into_split();
+                        let up = tokio::spawn(async move {
+                            let _ = tokio::io::copy(&mut cr, &mut sw).await;
+                        });
+                        tokio::time::sleep(hold).await;
+                        let _ = tokio::io::copy(&mut sr, &mut cw).await;
+                        up.abort();
                     }
                 });
                 conns.lock().unwrap().push(h);
@@ -149,6 +168,14 @@ impl Proxy {
 
     fn repoint(&self, upstream: SocketAddr) {
         *self.upstream.lock().unwrap() = upstream;
+    }
+
+    fn hold_first_delivery(&self, d: Duration) {
+        *self.hold_first.lock().unwrap() = d;
+    }
+
+    fn last_accept(&self) -> Option<Instant> {
+        *self.last_accept.lock().unwrap()
     }
 }
 
@@ -358,4 +385,116 @@ async fn a_shorter_log_times_out_the_check_and_replays_from_zero() {
         got, 65,
         "the re-sequenced records of the shorter log must not be skipped"
     );
+}
+
+/// ⭐ noetl/ai-meta prod 2026-10-23: the restarted writer is slow to serve its
+/// first read. With the OLD 10 s window both pools gave up (`found=None`) and
+/// replayed ~369k events from 0 although the record was there. On the DEFAULT
+/// window the drain must wait it out and RESUME — no replay, nothing lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_first_delivery_after_a_restart_still_resumes_on_the_default_window() {
+    let _g = SERIAL.lock().await;
+    set_test_env();
+    // The production default, not the test override: this asserts the default.
+    unsafe { std::env::remove_var("NOETL_STATE_BUILDER_RESUME_VERIFY_MS") };
+    let w = writer("slowfirst").await;
+    let proxy = Proxy::start(w.addr).await;
+    let index = SharedWalIndex::new(WalEventIndex::new());
+    const N: i64 = 300;
+    const M: i64 = 40;
+    append(&w, 31, 1, N, "s");
+    let drain = tokio::spawn(run_drain_loop_ehdb(drain_config(proxy.addr), index.clone()));
+    assert_eq!(
+        wait_for(&index, N as usize, Duration::from_secs(10)).await,
+        N as usize
+    );
+    let after_cold = counts();
+
+    proxy.outage();
+    append(&w, 31, 1 + N, M, "s");
+    // Longer than the old 10 s window, well inside the new default.
+    proxy.hold_first_delivery(Duration::from_secs(12));
+    proxy.restore().await;
+    let got = wait_for(&index, (N + M) as usize, Duration::from_secs(40)).await;
+    let end = counts();
+    drain.abort();
+    set_test_env();
+
+    assert_eq!(
+        got,
+        (N + M) as usize,
+        "no event lost and none double-counted"
+    );
+    assert_eq!(
+        end.regression - after_cold.regression,
+        0,
+        "a slow-but-intact writer was treated as a regressed log and replayed from 0"
+    );
+    assert_eq!(end.cold - after_cold.cold, 0, "no second cold replay");
+    assert!(
+        end.resume - after_cold.resume >= 1,
+        "the reconnect must resume"
+    );
+    assert!(
+        end.wal - after_cold.wal <= (M + 5) as u64,
+        "re-read {} records after the restart; a replay would re-read ~{}",
+        end.wal - after_cold.wal,
+        N + M
+    );
+}
+
+/// ⭐ Once connected, the drain is healthy WHILE it waits for the resume to
+/// verify — even after an outage long enough to have flipped it unhealthy. The
+/// longer window must never turn a slow first read into a `/livez` kill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_drain_is_healthy_while_connected_and_waiting_to_verify() {
+    let _g = SERIAL.lock().await;
+    set_test_env();
+    unsafe {
+        std::env::set_var("NOETL_STATE_BUILDER_RESUME_VERIFY_MS", "20000");
+        // A 2 s grace so the outage below provably flips health first.
+        std::env::set_var("NOETL_STATE_BUILDER_UNHEALTHY_SECS", "2");
+    }
+    let w = writer("healthwait").await;
+    let proxy = Proxy::start(w.addr).await;
+    let index = SharedWalIndex::new(WalEventIndex::new());
+    append(&w, 41, 1, 50, "h");
+    let drain = tokio::spawn(run_drain_loop_ehdb(drain_config(proxy.addr), index.clone()));
+    assert_eq!(wait_for(&index, 50, Duration::from_secs(10)).await, 50);
+
+    proxy.outage();
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut went_unhealthy = false;
+    while Instant::now() < until {
+        went_unhealthy |= !metrics::state_builder_healthy();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Positive control: a 5 s outage against a 2 s grace DOES flip health.
+    assert!(
+        went_unhealthy,
+        "the outage never flipped health — the check below proves nothing"
+    );
+
+    let mark = proxy.last_accept();
+    proxy.hold_first_delivery(Duration::from_secs(6));
+    proxy.restore().await;
+    // Wait for the drain to reconnect, then sample health during the held wait.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while proxy.last_accept() == mark && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_ne!(proxy.last_accept(), mark, "the drain never reconnected");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let healthy_mid_wait = metrics::state_builder_healthy();
+    let got = wait_for(&index, 50, Duration::from_secs(15)).await;
+    drain.abort();
+    unsafe { std::env::remove_var("NOETL_STATE_BUILDER_UNHEALTHY_SECS") };
+    set_test_env();
+
+    assert!(
+        healthy_mid_wait,
+        "connected but still unhealthy while waiting to verify the resume: a slow first \
+         read after a writer restart would fail /livez"
+    );
+    assert_eq!(got, 50);
 }

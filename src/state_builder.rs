@@ -1759,12 +1759,20 @@ async fn run_drain_loop(config: DrainConfig, index: SharedWalIndex) -> Result<()
 }
 
 /// How long a resubscription waits for the writer to redeliver our last applied
-/// record before concluding the writer's log no longer holds it. A writer that
-/// still has the record delivers it in the first batch, so this only elapses on
-/// a log that regressed below our cursor. Env `NOETL_STATE_BUILDER_RESUME_VERIFY_MS`
-/// (default 10000).
+/// record before concluding the writer's log no longer holds it. Env
+/// `NOETL_STATE_BUILDER_RESUME_VERIFY_MS` (default 90000).
+///
+/// ⚠ "No record yet" is ambiguous — a log that regressed below our cursor sends
+/// nothing, but so does a writer that is merely slow to serve its first read.
+/// The old 10 s default treated slow as regressed: on prod 2026-10-23 08:20Z
+/// both system pools gave up on `expected_sequence=420561 … found=None` after a
+/// writer roll and replayed ~369k events from 0, although the record was there
+/// (the replay re-read all of it), stalling dispatch ~2.5 min. Waiting longer is
+/// safe: the subscription is connected and heartbeating the whole time, the
+/// drain reports healthy while it waits, and a regressed log still ends in a
+/// full replay — only later.
 fn resume_verify_window() -> Duration {
-    Duration::from_millis(env_u64("NOETL_STATE_BUILDER_RESUME_VERIFY_MS", 10_000).max(1))
+    Duration::from_millis(env_u64("NOETL_STATE_BUILDER_RESUME_VERIFY_MS", 90_000).max(1))
 }
 
 /// Where a (re)subscription starts, and what it must prove first.
@@ -1914,6 +1922,13 @@ pub async fn run_drain_loop_ehdb(config: DrainConfig, index: SharedWalIndex) -> 
                 continue;
             }
         };
+        // ⚠ Connected = the writer is back: the outage is over for health
+        // purposes, BEFORE the resume is verified. Verification can now wait up
+        // to `resume_verify_window()` (90 s) on a slow first read, and a drain
+        // still counted "down" through that wait would trip `/livez` on exactly
+        // the writer restart this exists to survive.
+        down_since = None;
+        crate::metrics::set_state_builder_healthy(true);
 
         // A resume is trusted only once the writer redelivers our last record.
         let mut pending: Vec<ehdb_l0::EventRecord> = Vec::new();
@@ -4354,6 +4369,21 @@ mod t227_rehydrate_transport_tests {
             overlap_matches(&[rec(43, "tx-43")], &expect),
             Some(false),
             "our record missing = the log does not hold it"
+        );
+
+        // ⚠ The prod shape: events-feed records carry an EMPTY transaction id
+        // (prod 2026-10-23: `expected_transaction=` was blank), so the sequence
+        // is the only thing that tells our record from its neighbour.
+        let expect_blank = (42u64, String::new());
+        assert_eq!(
+            overlap_matches(&[rec(42, "")], &expect_blank),
+            Some(true),
+            "same sequence, both transaction ids empty = our record"
+        );
+        assert_eq!(
+            overlap_matches(&[rec(43, "")], &expect_blank),
+            Some(false),
+            "a different sequence must not match just because both ids are empty"
         );
     }
 
