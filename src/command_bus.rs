@@ -744,7 +744,12 @@ impl EhdbCommandSource {
         let mut guard = self.ack_conn.lock().await;
         if guard.is_none() {
             *guard = Some(
-                ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await?,
+                crate::event_bus::bounded_connect(ClaimClient::connect(
+                    &self.claim_addr,
+                    self.member,
+                    self.filter.clone(),
+                ))
+                .await?,
             );
         }
         Ok(guard)
@@ -775,6 +780,36 @@ impl EhdbCommandSource {
     }
 }
 
+/// How long the first post-failure park may wait before the loop asks whether
+/// the coordinator proved itself alive. Must exceed the heartbeat-miss deadline
+/// (5 s x 3) so a dead coordinator errors first. `NOETL_CLAIM_PROBE_SECS`,
+/// default 20.
+pub(crate) fn claim_probe_window() -> Duration {
+    let secs = std::env::var("NOETL_CLAIM_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(20);
+    Duration::from_secs(secs)
+}
+
+/// What a bounded post-failure park that saw no claim proves.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeVerdict {
+    /// The coordinator heartbeated on this connection: alive, just idle.
+    Recovered,
+    /// No heartbeat: nothing proven (a frozen writer looks like this).
+    NoProof,
+}
+
+pub(crate) fn claim_probe_verdict(peer_heartbeated: bool) -> ProbeVerdict {
+    if peer_heartbeated {
+        ProbeVerdict::Recovered
+    } else {
+        ProbeVerdict::NoProof
+    }
+}
+
 #[async_trait]
 impl CommandSource for EhdbCommandSource {
     type AckHandle = EhdbAckHandle;
@@ -782,7 +817,12 @@ impl CommandSource for EhdbCommandSource {
     async fn next(&mut self) -> Result<Option<Pulled<Self::AckHandle>>> {
         loop {
             if self.pull.is_none() {
-                match ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await
+                match crate::event_bus::bounded_connect(ClaimClient::connect(
+                    &self.claim_addr,
+                    self.member,
+                    self.filter.clone(),
+                ))
+                .await
                 {
                     // NOT progress: a frozen peer's kernel still completes the
                     // handshake, so redialling a stuck writer "connects" every
@@ -803,13 +843,54 @@ impl CommandSource for EhdbCommandSource {
             // microseconds-to-milliseconds.  Timing the two halves separately
             // is the only way to tell a slow hand-over from a slow claim ack.
             let park_started = std::time::Instant::now();
-            let claimed = match self
-                .pull
-                .as_mut()
-                .unwrap()
-                .claim_next::<EventRecord>()
-                .await
-            {
+            // ⚠ After a failure streak (a writer restart), the first park on the
+            // fresh connection is BOUNDED, because an idle bus never produces the
+            // claim that is otherwise the only progress signal (#297): a recovered
+            // but idle pool stayed "wedged" for NOETL_CLAIM_LOOP_UNHEALTHY_SECS
+            // and the kubelet killed it on every writer roll.
+            let probing = crate::metrics::claim_loop_consecutive_failures() > 0;
+            let next = self.pull.as_mut().unwrap().claim_next::<EventRecord>();
+            let result = if probing {
+                match tokio::time::timeout(claim_probe_window(), next).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        // The future is dropped, so the client can be asked what
+                        // it saw: a coordinator that heartbeated on this connection
+                        // is alive (a stuck one would have errored on the missed
+                        // beats). Silence proves nothing — a frozen peer's kernel
+                        // still completes the handshake — so it stays a failure.
+                        let proven = self
+                            .pull
+                            .as_ref()
+                            .map(|c| c.peer_heartbeats())
+                            .unwrap_or(false);
+                        match claim_probe_verdict(proven) {
+                            ProbeVerdict::Recovered => {
+                                crate::metrics::record_claim_loop_progress();
+                                tracing::info!(
+                                    claim_addr = %self.claim_addr,
+                                    "EHDB claim coordinator heartbeating after a failure streak; claim loop recovered (idle)"
+                                );
+                            }
+                            ProbeVerdict::NoProof => {
+                                crate::metrics::record_claim_loop_failure();
+                                tracing::warn!(
+                                    claim_addr = %self.claim_addr,
+                                    "EHDB claim coordinator silent with no heartbeat after a failure streak; redialling"
+                                );
+                            }
+                        }
+                        // Never leave a claim request outstanding on a connection
+                        // we stop reading: drop it and redial. Anything the
+                        // coordinator assigned to it redelivers after ack_wait.
+                        self.pull = None;
+                        continue;
+                    }
+                }
+            } else {
+                next.await
+            };
+            let claimed = match result {
                 Ok(c) => c,
                 Err(e) => {
                     // Reachable at all only because the claim connection can now
@@ -922,6 +1003,26 @@ impl CommandSource for WorkerCommandSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bounded post-failure park that saw no claim proves the coordinator alive
+    /// only if it heartbeated; silence is not evidence (a frozen writer's kernel
+    /// still completes the handshake — #297).
+    #[test]
+    fn only_a_heartbeat_proves_an_idle_coordinator_alive() {
+        assert_eq!(claim_probe_verdict(true), ProbeVerdict::Recovered);
+        assert_eq!(claim_probe_verdict(false), ProbeVerdict::NoProof);
+    }
+
+    #[test]
+    fn the_probe_window_outlasts_the_heartbeat_deadline() {
+        unsafe { std::env::remove_var("NOETL_CLAIM_PROBE_SECS") };
+        let w = claim_probe_window();
+        assert_eq!(w, Duration::from_secs(20));
+        assert!(
+            w > ehdb_feed::DEFAULT_HEARTBEAT * ehdb_feed::HEARTBEAT_MISS_FACTOR,
+            "a dead coordinator must error before the probe gives up"
+        );
+    }
 
     /// noetl/ai-meta#243 — the regression guard.
     ///
