@@ -454,6 +454,13 @@ pub struct WorkerMetrics {
     /// writer restart is the reattach working; a flat count while a group cursor
     /// is not advancing is the wedge.
     pub events_consumer_redials_total: IntCounterVec,
+    /// How the off-server state-builder's EHDB WAL drain (re)subscribed, by
+    /// `kind`: `cold` (process start, replay from 0), `resume` (an in-process
+    /// reconnect that verified the writer still holds the last applied record and
+    /// continued from it), `regression_replay` (that verification failed — the
+    /// writer's log no longer matches — so it replayed from 0). A writer restart
+    /// should show `resume`; a run of `cold` after one means the pool restarted.
+    pub state_builder_wal_resubscribe_total: IntCounterVec,
     pub shutdown_hosts_sealed: IntGauge,
     pub shutdown_hosts_total: IntGauge,
     pub state_builder_indexed_executions: IntGauge,
@@ -1381,6 +1388,20 @@ impl WorkerMetrics {
             .register(Box::new(events_consumer_redials_total.clone()))
             .expect("register events_consumer_redials_total");
 
+        let state_builder_wal_resubscribe_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_state_builder_wal_resubscribe_total",
+                "State-builder EHDB WAL drain (re)subscriptions by kind: cold \
+                 (replay from 0 at start), resume (verified in-process resume), \
+                 regression_replay (the writer's log no longer held our last record).",
+            ),
+            &["kind"],
+        )
+        .expect("state_builder_wal_resubscribe_total metric");
+        registry
+            .register(Box::new(state_builder_wal_resubscribe_total.clone()))
+            .expect("register state_builder_wal_resubscribe_total");
+
         let shutdown_hosts_sealed = IntGauge::new(
             "noetl_worker_shutdown_hosts_sealed",
             "EHDB writer hosts that sealed on the graceful shutdown path (noetl/ai-meta#226). Compare against noetl_worker_shutdown_hosts_total: sealed < total means an unsealed tail whose next resume will clamp.",
@@ -2002,6 +2023,7 @@ impl WorkerMetrics {
             state_builder_drive_wait_total,
             state_builder_tail_total,
             events_consumer_redials_total,
+            state_builder_wal_resubscribe_total,
             shutdown_hosts_sealed,
             shutdown_hosts_total,
             state_builder_indexed_executions,
@@ -2533,6 +2555,23 @@ pub fn record_result_producer_stage(outcome: &str) {
 /// state builder (noetl/ai-meta#115 Phase 4).
 /// Count a reattach to an events face after its connection was found dead
 /// (noetl/ai-meta#225). `face` is `group_claim` (:9104) or `wal` (:9108).
+/// Record how the state-builder WAL drain (re)subscribed (`cold` | `resume` |
+/// `regression_replay`).
+pub fn record_state_builder_wal_resubscribe(kind: &str) {
+    WorkerMetrics::global()
+        .state_builder_wal_resubscribe_total
+        .with_label_values(&[kind])
+        .inc();
+}
+
+/// Current count for one resubscribe `kind` (tests and diagnostics).
+pub fn state_builder_wal_resubscribes(kind: &str) -> u64 {
+    WorkerMetrics::global()
+        .state_builder_wal_resubscribe_total
+        .with_label_values(&[kind])
+        .get()
+}
+
 pub fn record_events_consumer_redial(face: &str) {
     WorkerMetrics::global()
         .events_consumer_redials_total
@@ -2550,6 +2589,11 @@ pub fn record_shutdown_seal(sealed: usize, hosts: usize) {
     let m = WorkerMetrics::global();
     m.shutdown_hosts_sealed.set(sealed as i64);
     m.shutdown_hosts_total.set(hosts as i64);
+}
+
+/// Total WAL events the state-builder drain has consumed (tests and diagnostics).
+pub fn state_builder_wal_events() -> u64 {
+    WorkerMetrics::global().state_builder_wal_events_total.get()
 }
 
 pub fn record_state_builder_wal_events(n: u64) {

@@ -46,6 +46,53 @@ use tokio::net::TcpListener;
 
 use crate::graceful::WriterShutdown;
 
+/// `NOETL_EHDB_CONNECT_TIMEOUT_MS` — the bound on every client connect to an
+/// EHDB writer face (WAL feed, command claim, events group claim). Default 5000;
+/// `0` or unparsable falls back to the default.
+///
+/// ⚠ Why every connect needs one: right after the writer pod is replaced its
+/// headless DNS name can still resolve to the DEAD pod's IP, and a TCP connect to
+/// a vanished IP gets no RST — the kernel retries the SYN for ~75-127 s. The
+/// state-builder drain sat inside exactly that connect with `/livez` already
+/// failing, so the kubelet killed the pool and it cold-replayed the whole log
+/// (kind: restart 34→35 on one writer delete; prod 2026-10-22: ~10 min of
+/// `WAL chain incomplete` no-op drives). Bounded, a timeout is a retry, and the
+/// next attempt re-resolves the name and finds the new pod.
+pub fn ehdb_connect_timeout() -> Duration {
+    let ms = std::env::var("NOETL_EHDB_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(5000);
+    Duration::from_millis(ms)
+}
+
+/// Run an EHDB client connect under [`ehdb_connect_timeout`]. A timeout comes
+/// back as an ordinary `io::ErrorKind::TimedOut` error, so every caller's
+/// existing connect-failed retry path handles it unchanged.
+pub async fn bounded_connect<T>(
+    connect: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    bounded_connect_within(ehdb_connect_timeout(), connect).await
+}
+
+/// [`bounded_connect`] with an explicit bound.
+pub async fn bounded_connect_within<T>(
+    bound: Duration,
+    connect: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    match tokio::time::timeout(bound, connect).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "EHDB connect did not complete within {}ms (NOETL_EHDB_CONNECT_TIMEOUT_MS)",
+                bound.as_millis()
+            ),
+        )),
+    }
+}
+
 /// The named durable groups this feed serves — the EHDB twins of the three
 /// JetStream durable consumers on `noetl_events`. Named here (rather than
 /// discovered from client traffic) so the host can open them at startup and log
@@ -733,6 +780,51 @@ async fn serve_event_metrics(
 mod tests {
     use super::*;
 
+    /// ⭐ A connect to an address that never answers is bounded. TEST-NET-1 gets
+    /// no RST — the same shape as the dead writer pod IP the headless DNS still
+    /// returns right after a writer restart, where an unbounded connect sat for
+    /// the kernel's SYN retries (~75-127 s) while `/livez` failed.
+    #[tokio::test]
+    async fn an_unanswered_connect_is_bounded() {
+        let started = std::time::Instant::now();
+        let r = bounded_connect_within(
+            Duration::from_millis(700),
+            tokio::net::TcpStream::connect("192.0.2.1:9108"),
+        )
+        .await;
+        let took = started.elapsed();
+        assert!(r.is_err(), "an unroutable address cannot connect");
+        assert!(
+            took < Duration::from_secs(5),
+            "the connect must be bounded, took {took:?}"
+        );
+    }
+
+    /// The ONLY test that touches `NOETL_EHDB_CONNECT_TIMEOUT_MS`, so the env is
+    /// never raced: the default, the refusal of 0, and that the production
+    /// wrapper (`bounded_connect`, which every connect site calls) honours it.
+    #[tokio::test]
+    async fn the_connect_timeout_comes_from_the_env_and_bounds_the_wrapper() {
+        unsafe { std::env::remove_var("NOETL_EHDB_CONNECT_TIMEOUT_MS") };
+        assert_eq!(ehdb_connect_timeout(), Duration::from_millis(5000));
+        unsafe { std::env::set_var("NOETL_EHDB_CONNECT_TIMEOUT_MS", "0") };
+        assert_eq!(
+            ehdb_connect_timeout(),
+            Duration::from_millis(5000),
+            "0 must not mean unbounded"
+        );
+        unsafe { std::env::set_var("NOETL_EHDB_CONNECT_TIMEOUT_MS", "600") };
+        let started = std::time::Instant::now();
+        let r = bounded_connect(tokio::net::TcpStream::connect("192.0.2.1:9108")).await;
+        let took = started.elapsed();
+        unsafe { std::env::remove_var("NOETL_EHDB_CONNECT_TIMEOUT_MS") };
+        assert!(r.is_err());
+        assert!(
+            took < Duration::from_secs(4),
+            "bounded_connect ignored the env bound: {took:?}"
+        );
+    }
+
     /// Build a real D1 event engine in a tempdir — the shipped type, not a stub.
     fn test_writer(tag: &str) -> Arc<FeedWriter<D1EventLog>> {
         let dir = std::env::temp_dir().join(format!("ehdb-durwin-{tag}-{}", std::process::id()));
@@ -1121,12 +1213,12 @@ impl EhdbGroupSource {
         let mut guard = self.ack.lock().await;
         if guard.is_none() {
             *guard = Some(
-                ehdb_feed::GroupClaimClient::connect(
+                bounded_connect(ehdb_feed::GroupClaimClient::connect(
                     self.claim_addr.as_str(),
                     self.group.clone(),
                     self.member,
                     ALL_EVENTS_FILTER,
-                )
+                ))
                 .await
                 .with_context(|| format!("events-feed ack connect ({})", self.claim_addr))?,
             );
@@ -1169,12 +1261,12 @@ async fn claim_loop(
 ) {
     let mut backoff = Duration::from_millis(200);
     loop {
-        let client = match ehdb_feed::GroupClaimClient::connect(
+        let client = match bounded_connect(ehdb_feed::GroupClaimClient::connect(
             claim_addr.as_str(),
             group.clone(),
             member,
             filter.clone(),
-        )
+        ))
         .await
         {
             Ok(c) => {

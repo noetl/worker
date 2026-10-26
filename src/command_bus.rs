@@ -200,6 +200,72 @@ impl CommandBusConfig {
     }
 }
 
+/// Records read per engine-lock hold by [`scan_command_subjects`]. Small enough
+/// that a claim waiting on the same `std::sync::Mutex` is delayed by one chunk's
+/// read (~0.1 s at the ~180k records/s measured on kind), not by the whole log;
+/// large enough that the per-chunk seek/decode overhead of
+/// `read_partition_after_limited` stays small.
+const SEED_CHUNK: usize = 20_000;
+
+/// Every routing subject in the retained command log, read in `chunk`-sized
+/// pieces with the engine lock released between them.
+///
+/// BLOCKING — call it from `spawn_blocking`, never on a runtime thread. Uses the
+/// same [`ehdb_feed::d1_command_subject`] the coordinator routes by, so the set
+/// is exactly what `seed_subjects` would have produced. A read error ends the
+/// scan with what it has (best-effort, as before: live traffic fills the rest).
+pub(crate) fn scan_command_subjects(
+    writer: &Arc<FeedWriter<D1EventLog>>,
+    shard: u32,
+    shard_count: u32,
+    chunk: usize,
+) -> std::collections::BTreeSet<String> {
+    let subject_of = ehdb_feed::d1_command_subject(shard_count);
+    let engine = writer.engine();
+    let mut out = std::collections::BTreeSet::new();
+    let mut cursor = 0u64;
+    loop {
+        // The lock is held for ONE chunk, then dropped before the next.
+        let batch = {
+            let e = engine.read();
+            e.read_partition_after_limited(shard, cursor, chunk.max(1))
+        };
+        match batch {
+            Ok(b) if b.is_empty() => break,
+            Ok(b) => {
+                for rec in &b {
+                    out.insert(subject_of(rec).as_str());
+                }
+                cursor = b.last().map(|r| r.global_sequence).unwrap_or(cursor);
+            }
+            Err(e) => {
+                tracing::warn!(shard, error = %e, "command-bus subject seed read failed; reporting what was scanned");
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `lags` plus every `seeded` subject it lacks, at 0 — the label set KEDA reads
+/// stays complete from the first scrape (noetl/ai-meta#194), even though the
+/// coordinator itself is no longer seeded.
+pub(crate) fn merge_seeded_subjects(
+    mut lags: Vec<ehdb_feed::SubjectLag>,
+    seeded: &std::collections::BTreeSet<String>,
+) -> Vec<ehdb_feed::SubjectLag> {
+    for s in seeded {
+        if !lags.iter().any(|l| &l.subject == s) {
+            lags.push(ehdb_feed::SubjectLag {
+                subject: s.clone(),
+                lag: 0,
+            });
+        }
+    }
+    lags.sort_by(|a, b| a.subject.cmp(&b.subject));
+    lags
+}
+
 /// Host the shard's writer: open the durable command-log engine and spawn its
 /// ingest (publish-in), claim (compete-out), and `/metrics` (lag) faces.
 ///
@@ -378,6 +444,7 @@ pub async fn spawn_writer_host(
         let coordinator = coordinator.clone();
         let writer = writer.clone();
         let shard = config.shard;
+        let shard_count = config.shard_count;
         tokio::spawn(async move {
             // Seed the reported subject label set from the existing log **before** the
             // endpoint is up, so the very first scrape after a restart already carries
@@ -385,7 +452,25 @@ pub async fn spawn_writer_host(
             // freshly-restarted writer reports an empty subject set until each pool's
             // next command arrives — and to KEDA a `valueLocation` that matches no
             // line is a *scaler error*, not a backlog of 0 (noetl/ai-meta#194).
-            coordinator.seed_subjects().await;
+            //
+            // ⚠⚠ OFF the runtime, in bounded chunks (prod 2026-10-24). This used to
+            // be `coordinator.seed_subjects().await`, which reads the WHOLE
+            // retained partition in one call while holding the engine
+            // `std::sync::Mutex` — synchronously, on a Tokio worker thread. The
+            // writer runs two worker threads; the first claim then blocked the
+            // second on the same Mutex, and the entire runtime froze for the scan
+            // (~41 s on prod: the events-feed WAL fan-out could not deliver, so
+            // the system pools' resume record arrived 59 s late). The scan now
+            // runs in the blocking pool and releases the engine lock between
+            // chunks, so claims interleave and no runtime thread is held.
+            let seeded = {
+                let w = writer.clone();
+                tokio::task::spawn_blocking(move || {
+                    scan_command_subjects(&w, shard, shard_count, SEED_CHUNK)
+                })
+                .await
+                .unwrap_or_default()
+            };
 
             // The scaler provider is sync; publish the async lag into an atomic that a
             // background sampler refreshes.
@@ -398,7 +483,12 @@ pub async fn spawn_writer_host(
             // triggers on. Whole-shard lag mixes the pools that share this shard, so a
             // stuck system-pool command would pin it high and hold the user pool at
             // maxReplicaCount forever (noetl/ai-meta#194, noetl/ai-meta#210).
-            let subjects = Arc::new(std::sync::Mutex::new(Vec::<ehdb_feed::SubjectLag>::new()));
+            // Pre-filled with the seeded set at 0, so a scrape that lands before
+            // the sampler's first tick still carries every subject (#194).
+            let subjects = Arc::new(std::sync::Mutex::new(merge_seeded_subjects(
+                Vec::new(),
+                &seeded,
+            )));
             // Delivered-but-unacked depth, on the same sampler.
             //
             // ⚠⚠ This is sampled rather than left at 0 because `render_snapshot`
@@ -420,7 +510,7 @@ pub async fn spawn_writer_host(
                     sampler.store(coord.lag().await, Ordering::Relaxed);
                     committed_sampler.store(coord.committed_cursor().await, Ordering::Relaxed);
                     inflight_sampler.store(coord.inflight().await, Ordering::Relaxed);
-                    let split = coord.subject_lags().await;
+                    let split = merge_seeded_subjects(coord.subject_lags().await, &seeded);
                     if let Ok(mut guard) = subject_sampler.lock() {
                         *guard = split;
                     }
@@ -744,7 +834,12 @@ impl EhdbCommandSource {
         let mut guard = self.ack_conn.lock().await;
         if guard.is_none() {
             *guard = Some(
-                ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await?,
+                crate::event_bus::bounded_connect(ClaimClient::connect(
+                    &self.claim_addr,
+                    self.member,
+                    self.filter.clone(),
+                ))
+                .await?,
             );
         }
         Ok(guard)
@@ -775,6 +870,36 @@ impl EhdbCommandSource {
     }
 }
 
+/// How long the first post-failure park may wait before the loop asks whether
+/// the coordinator proved itself alive. Must exceed the heartbeat-miss deadline
+/// (5 s x 3) so a dead coordinator errors first. `NOETL_CLAIM_PROBE_SECS`,
+/// default 20.
+pub(crate) fn claim_probe_window() -> Duration {
+    let secs = std::env::var("NOETL_CLAIM_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(20);
+    Duration::from_secs(secs)
+}
+
+/// What a bounded post-failure park that saw no claim proves.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeVerdict {
+    /// The coordinator heartbeated on this connection: alive, just idle.
+    Recovered,
+    /// No heartbeat: nothing proven (a frozen writer looks like this).
+    NoProof,
+}
+
+pub(crate) fn claim_probe_verdict(peer_heartbeated: bool) -> ProbeVerdict {
+    if peer_heartbeated {
+        ProbeVerdict::Recovered
+    } else {
+        ProbeVerdict::NoProof
+    }
+}
+
 #[async_trait]
 impl CommandSource for EhdbCommandSource {
     type AckHandle = EhdbAckHandle;
@@ -782,7 +907,12 @@ impl CommandSource for EhdbCommandSource {
     async fn next(&mut self) -> Result<Option<Pulled<Self::AckHandle>>> {
         loop {
             if self.pull.is_none() {
-                match ClaimClient::connect(&self.claim_addr, self.member, self.filter.clone()).await
+                match crate::event_bus::bounded_connect(ClaimClient::connect(
+                    &self.claim_addr,
+                    self.member,
+                    self.filter.clone(),
+                ))
+                .await
                 {
                     // NOT progress: a frozen peer's kernel still completes the
                     // handshake, so redialling a stuck writer "connects" every
@@ -803,13 +933,54 @@ impl CommandSource for EhdbCommandSource {
             // microseconds-to-milliseconds.  Timing the two halves separately
             // is the only way to tell a slow hand-over from a slow claim ack.
             let park_started = std::time::Instant::now();
-            let claimed = match self
-                .pull
-                .as_mut()
-                .unwrap()
-                .claim_next::<EventRecord>()
-                .await
-            {
+            // ⚠ After a failure streak (a writer restart), the first park on the
+            // fresh connection is BOUNDED, because an idle bus never produces the
+            // claim that is otherwise the only progress signal (#297): a recovered
+            // but idle pool stayed "wedged" for NOETL_CLAIM_LOOP_UNHEALTHY_SECS
+            // and the kubelet killed it on every writer roll.
+            let probing = crate::metrics::claim_loop_consecutive_failures() > 0;
+            let next = self.pull.as_mut().unwrap().claim_next::<EventRecord>();
+            let result = if probing {
+                match tokio::time::timeout(claim_probe_window(), next).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        // The future is dropped, so the client can be asked what
+                        // it saw: a coordinator that heartbeated on this connection
+                        // is alive (a stuck one would have errored on the missed
+                        // beats). Silence proves nothing — a frozen peer's kernel
+                        // still completes the handshake — so it stays a failure.
+                        let proven = self
+                            .pull
+                            .as_ref()
+                            .map(|c| c.peer_heartbeats())
+                            .unwrap_or(false);
+                        match claim_probe_verdict(proven) {
+                            ProbeVerdict::Recovered => {
+                                crate::metrics::record_claim_loop_progress();
+                                tracing::info!(
+                                    claim_addr = %self.claim_addr,
+                                    "EHDB claim coordinator heartbeating after a failure streak; claim loop recovered (idle)"
+                                );
+                            }
+                            ProbeVerdict::NoProof => {
+                                crate::metrics::record_claim_loop_failure();
+                                tracing::warn!(
+                                    claim_addr = %self.claim_addr,
+                                    "EHDB claim coordinator silent with no heartbeat after a failure streak; redialling"
+                                );
+                            }
+                        }
+                        // Never leave a claim request outstanding on a connection
+                        // we stop reading: drop it and redial. Anything the
+                        // coordinator assigned to it redelivers after ack_wait.
+                        self.pull = None;
+                        continue;
+                    }
+                }
+            } else {
+                next.await
+            };
+            let claimed = match result {
                 Ok(c) => c,
                 Err(e) => {
                     // Reachable at all only because the claim connection can now
@@ -922,6 +1093,26 @@ impl CommandSource for WorkerCommandSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bounded post-failure park that saw no claim proves the coordinator alive
+    /// only if it heartbeated; silence is not evidence (a frozen writer's kernel
+    /// still completes the handshake — #297).
+    #[test]
+    fn only_a_heartbeat_proves_an_idle_coordinator_alive() {
+        assert_eq!(claim_probe_verdict(true), ProbeVerdict::Recovered);
+        assert_eq!(claim_probe_verdict(false), ProbeVerdict::NoProof);
+    }
+
+    #[test]
+    fn the_probe_window_outlasts_the_heartbeat_deadline() {
+        unsafe { std::env::remove_var("NOETL_CLAIM_PROBE_SECS") };
+        let w = claim_probe_window();
+        assert_eq!(w, Duration::from_secs(20));
+        assert!(
+            w > ehdb_feed::DEFAULT_HEARTBEAT * ehdb_feed::HEARTBEAT_MISS_FACTOR,
+            "a dead coordinator must error before the probe gives up"
+        );
+    }
 
     /// noetl/ai-meta#243 — the regression guard.
     ///
