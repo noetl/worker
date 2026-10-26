@@ -1868,41 +1868,204 @@ pub(crate) fn lease_count(segment: &Path) -> usize {
 
 /// `NOETL_EHDB_TIER_PRUNE_MODE`. Default `off`.
 pub const TIER_PRUNE_MODE_ENV: &str = "NOETL_EHDB_TIER_PRUNE_MODE";
-/// `NOETL_EHDB_TIER_RETENTION_HOURS`. Default 168.
+/// `NOETL_EHDB_TIER_RETENTION_HOURS`. Default 49.
 pub const TIER_RETENTION_HOURS_ENV: &str = "NOETL_EHDB_TIER_RETENTION_HOURS";
-/// Default retention: 7 days, 7x the longest live reader window (repair sweep,
-/// 180 min). See the #491 reader table.
-pub const TIER_RETENTION_HOURS_DEFAULT: u64 = 168;
+/// Default retention: 49 hours (owner decision, noetl/ai-meta#491). Still ~16x
+/// the longest live reader window (repair sweep, 180 min) and above the 24 h
+/// floor below.
+pub const TIER_RETENTION_HOURS_DEFAULT: u64 = 49;
 /// Below this the live readers (comparator 1 h, repair sweep 3 h) could lose
 /// records they still read; refused, not clamped.
 pub const TIER_RETENTION_HOURS_MIN: u64 = 24;
 
 /// What the retention pass is allowed to do.
 ///
-/// ⚠ There is deliberately NO deleting mode in this build. Deleting waits on
-/// owner decisions (archive-before-delete, the window, rollout order —
-/// noetl/ai-meta#491), and on a reviewed dry-run pass. `on` is recognised only
-/// so that asking for it is refused out loud instead of read as a typo.
+/// Three gates, `Off` by default (noetl/ai-meta#491):
+/// - `Off` — no pass at all.
+/// - `DryRun` — plan and log; deletes nothing.
+/// - `Enabled` — unlink the planner's `WouldPrune` prefix (archiving first when
+///   [`TIER_PRUNE_ARCHIVE_ENV`] is set). Armed ONLY by the exact value
+///   `enabled`: the casual spellings `on` / `true` / `1` stay refused out loud,
+///   so a deleting pass can never be switched on by a typo or a boolean habit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PruneMode {
     Off,
     DryRun,
+    Enabled,
 }
 
-/// Parse the mode. Anything but `dry_run` is `Off`; `on` is refused loudly.
+/// Parse the mode. `dry_run` -> `DryRun`; exactly `enabled` -> `Enabled`;
+/// `on`/`true`/`1`/`yes` are refused loudly; anything else is `Off`.
+///
+/// ⚠ `Enabled` is matched on the RAW value, byte for byte: no trimming, no case
+/// folding. `ENABLED`, `Enabled` or `enabled ` are refused out loud like `on`,
+/// because the owner decision is that real deletion arms on the exact word only
+/// (noetl/ai-meta#491). The non-deleting spellings stay forgiving.
 pub fn parse_prune_mode(raw: Option<&str>) -> PruneMode {
+    if raw == Some("enabled") {
+        return PruneMode::Enabled;
+    }
     match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("dry_run") | Some("dry-run") | Some("dryrun") => PruneMode::DryRun,
-        Some("on") | Some("true") | Some("enabled") => {
+        Some("enabled") | Some("on") | Some("true") | Some("1") | Some("yes") => {
             tracing::error!(
                 env = TIER_PRUNE_MODE_ENV,
-                "tier prune mode `on` is NOT available in this build: deleting \
-                 waits on the noetl/ai-meta#491 decisions and a reviewed dry run. \
-                 Treated as `off`."
+                "tier prune mode must be spelled `enabled` to delete; `on`/`true` \
+                 are refused so a deleting pass is never armed by accident \
+                 (noetl/ai-meta#491). Treated as `off`."
             );
             PruneMode::Off
         }
         _ => PruneMode::Off,
+    }
+}
+
+/// `NOETL_EHDB_TIER_PRUNE_ARCHIVE`. Unset (the default) = an enabled pass
+/// deletes outright, with NO archive. Set to `gs://bucket[/prefix]` = every
+/// segment (and its `.idx` / `.offidx`) is uploaded to GCS and the upload's size
+/// verified BEFORE it is unlinked; a segment whose archive fails is not
+/// unlinked, and the pass stops. Setting this one variable is all it takes.
+pub const TIER_PRUNE_ARCHIVE_ENV: &str = "NOETL_EHDB_TIER_PRUNE_ARCHIVE";
+/// `NOETL_EHDB_TIER_PRUNE_ARCHIVE_ENDPOINT`. GCS JSON-API base URL; defaults to
+/// `https://storage.googleapis.com`. Overridable for tests and emulators — a
+/// non-default endpoint is called WITHOUT a metadata-server token.
+pub const TIER_PRUNE_ARCHIVE_ENDPOINT_ENV: &str = "NOETL_EHDB_TIER_PRUNE_ARCHIVE_ENDPOINT";
+const GCS_DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
+
+/// Where an enabled pass archives to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveTarget {
+    pub bucket: String,
+    /// Normalised: no leading/trailing `/`; may be empty.
+    pub prefix: String,
+}
+
+/// Parse [`TIER_PRUNE_ARCHIVE_ENV`]. `Ok(None)` = unset/blank (no archive).
+/// `Err` = set but not a `gs://bucket[/prefix]` URL: the caller must then NOT
+/// delete, because the operator asked for an archive and would silently lose it.
+pub fn parse_archive_target(raw: Option<&str>) -> Result<Option<ArchiveTarget>, String> {
+    let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let rest = v
+        .strip_prefix("gs://")
+        .ok_or_else(|| format!("{TIER_PRUNE_ARCHIVE_ENV}={v:?} is not a gs:// URL"))?;
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    if bucket.is_empty() {
+        return Err(format!("{TIER_PRUNE_ARCHIVE_ENV}={v:?} names no bucket"));
+    }
+    Ok(Some(ArchiveTarget {
+        bucket: bucket.to_string(),
+        prefix: prefix.trim_matches('/').to_string(),
+    }))
+}
+
+/// Uploads one file of a segment being pruned. Returns the size the remote
+/// store reports for the uploaded object, which the pass compares with the
+/// local length before it will unlink anything.
+#[async_trait::async_trait]
+pub trait SegmentArchiver: Send + Sync {
+    async fn archive(&self, tier: StoreTier, file: &Path) -> Result<u64, String>;
+}
+
+/// GCS archiver over the JSON API (`uploadType=media`), authenticated with the
+/// GCE metadata server's token (Workload Identity on GKE).
+pub struct GcsArchiver {
+    target: ArchiveTarget,
+    endpoint: String,
+    client: reqwest::Client,
+}
+
+impl GcsArchiver {
+    pub fn new(target: ArchiveTarget, endpoint: Option<String>) -> Self {
+        Self {
+            target,
+            endpoint: endpoint
+                .map(|e| e.trim_end_matches('/').to_string())
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| GCS_DEFAULT_ENDPOINT.to_string()),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// `<prefix>/<tier>/<file-name>`.
+    pub fn object_name(&self, tier: StoreTier, file: &Path) -> String {
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("segment");
+        if self.target.prefix.is_empty() {
+            format!("{}/{name}", tier.as_str())
+        } else {
+            format!("{}/{}/{name}", self.target.prefix, tier.as_str())
+        }
+    }
+
+    async fn token(&self) -> Result<Option<String>, String> {
+        if self.endpoint != GCS_DEFAULT_ENDPOINT {
+            return Ok(None);
+        }
+        let r = self
+            .client
+            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+            .header("Metadata-Flavor", "Google")
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("metadata token: {e}"))?;
+        if !r.status().is_success() {
+            return Err(format!("metadata token: HTTP {}", r.status()));
+        }
+        let v: serde_json::Value = r.json().await.map_err(|e| format!("metadata token: {e}"))?;
+        v.get("access_token")
+            .and_then(|t| t.as_str())
+            .map(|t| Some(t.to_string()))
+            .ok_or_else(|| "metadata token: no access_token".to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl SegmentArchiver for GcsArchiver {
+    async fn archive(&self, tier: StoreTier, file: &Path) -> Result<u64, String> {
+        // ⚠ Whole-file read: a sealed segment is ~256 MiB (the oldest prod
+        // segment is ~1 GiB). One at a time, once per pass; the writer's limit
+        // is 12 GiB. Streaming would need reqwest's `stream` feature.
+        let bytes = tokio::fs::read(file)
+            .await
+            .map_err(|e| format!("read {}: {e}", file.display()))?;
+        let object = self.object_name(tier, file);
+        let url = format!(
+            "{}/upload/storage/v1/b/{}/o",
+            self.endpoint, self.target.bucket
+        );
+        let mut req = self
+            .client
+            .post(&url)
+            .query(&[("uploadType", "media"), ("name", object.as_str())])
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .timeout(std::time::Duration::from_secs(600))
+            .body(bytes);
+        if let Some(t) = self.token().await? {
+            req = req.bearer_auth(t);
+        }
+        let r = req
+            .send()
+            .await
+            .map_err(|e| format!("upload {object}: {e}"))?;
+        if !r.status().is_success() {
+            return Err(format!("upload {object}: HTTP {}", r.status()));
+        }
+        let v: serde_json::Value = r
+            .json()
+            .await
+            .map_err(|e| format!("upload {object}: {e}"))?;
+        // GCS reports `size` as a decimal string (uint64); accept a number too.
+        match v.get("size") {
+            Some(serde_json::Value::String(s)) => s.parse::<u64>().ok(),
+            Some(serde_json::Value::Number(n)) => n.as_u64(),
+            _ => None,
+        }
+        .ok_or_else(|| format!("upload {object}: reply has no parseable size"))
     }
 }
 
@@ -1913,7 +2076,10 @@ pub fn parse_retention_hours(raw: Option<&str>) -> Option<u64> {
         None => TIER_RETENTION_HOURS_DEFAULT,
         Some(v) => v.trim().parse::<u64>().ok()?,
     };
-    (h >= TIER_RETENTION_HOURS_MIN).then_some(h)
+    // ⚠ The caller turns this into `h * 3600` seconds. Without the overflow
+    // check, a 16-digit value wraps (release builds do not trap) to a window of
+    // minutes and slips under the 24 h floor.
+    (h >= TIER_RETENTION_HOURS_MIN && h.checked_mul(3600).is_some()).then_some(h)
 }
 
 /// The tiers retention may ever touch. Catalog needs full history (its fold
@@ -1943,13 +2109,21 @@ pub struct PruneDecision {
 /// Execution ids appearing anywhere in the ACTIVE segment, by streaming it.
 /// `None` = a line whose subject cannot be read: treat as unknown, prune nothing.
 fn active_execution_ids(path: &Path) -> Option<std::collections::HashSet<String>> {
-    use std::io::BufRead;
+    execution_ids_since(path, 0)
+}
+
+/// Execution ids in `path` from byte `offset` on. `offset` must be a line
+/// boundary — the enabled pass takes it under the store lock, where no append
+/// is mid-write. `None` = unreadable: treat as unknown, prune nothing.
+fn execution_ids_since(path: &Path, offset: u64) -> Option<std::collections::HashSet<String>> {
+    use std::io::{BufRead, Seek, SeekFrom};
     let mut out = std::collections::HashSet::new();
-    let f = match std::fs::File::open(path) {
+    let mut f = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(out),
         Err(_) => return None,
     };
+    f.seek(SeekFrom::Start(offset)).ok()?;
     for line in std::io::BufReader::with_capacity(1 << 20, f).lines() {
         let line = line.ok()?;
         if line.trim().is_empty() {
@@ -1968,10 +2142,18 @@ fn active_execution_ids(path: &Path) -> Option<std::collections::HashSet<String>
 ///    is never written again, and `rename` preserves mtime);
 /// 3. it has an `.idx` (unknown contents are kept);
 /// 4. none of its executions appears in a segment sealed WITHIN `retention`,
-///    nor in the active segment — an execution still writing pins every segment
-///    it touches;
+///    nor in the active segment. Whole executions are kept together, so a run
+///    whose records straddle a seal pins the older segment until the younger one
+///    ages out too — and a long-lived ACTIVE segment (a tier that rarely reaches
+///    the size seal) pins every older segment holding any of its executions;
 /// 5. no read currently holds a lease on it;
-/// 6. every OLDER segment of the tier is also `WouldPrune` (oldest-first).
+/// 6. every OLDER segment of the tier is also `WouldPrune` (oldest-first);
+/// 7. it is not the NEWEST sealed segment. `maybe_seal` names the next segment
+///    `<highest surviving number> + 1`, so unlinking the newest would make the
+///    next seal REUSE its name: a leftover `.idx`/`.offidx` (a crash between the
+///    segment's unlink and its sidecars') would then describe the wrong file, so
+///    reads would skip records that index does not list, and an archive object
+///    of that name would be overwritten.
 pub fn plan_tier_prune(
     cfg: &TierStoreConfig,
     tier: StoreTier,
@@ -2010,11 +2192,14 @@ pub fn plan_tier_prune(
 
     let mut out = Vec::with_capacity(segs.len());
     let mut stopped = false;
+    let newest = segs.last().cloned();
     for s in segs {
         let verdict = if stopped {
             PruneVerdict::BehindAKeptSegment
         } else if !is_old(&s) {
             PruneVerdict::Keep("younger than the retention window")
+        } else if Some(&s) == newest.as_ref() {
+            PruneVerdict::Keep("newest sealed segment: kept so a later seal never reuses its name")
         } else {
             match (load_segment_index(&s), hot.as_ref()) {
                 (None, _) => PruneVerdict::Keep("no .idx: contents unknown"),
@@ -2022,7 +2207,7 @@ pub fn plan_tier_prune(
                     "hot set unknown (unreadable active line or unindexed recent segment)",
                 ),
                 (Some(ids), Some(h)) if ids.iter().any(|id| h.contains(id)) => {
-                    PruneVerdict::Keep("pinned: an execution in it is still writing")
+                    PruneVerdict::Keep("pinned: an execution in it also appears in the active segment or a segment younger than the window")
                 }
                 _ if lease_count(&s) > 0 => PruneVerdict::Keep("leased by a read in flight"),
                 _ => PruneVerdict::WouldPrune,
@@ -2069,6 +2254,40 @@ pub fn spawn_retention_pass(cfg: &TierStoreConfig) {
         .max(60);
     let retention = std::time::Duration::from_secs(hours * 3600);
     let cfg = cfg.clone();
+    if mode == PruneMode::Enabled {
+        let raw_archive = std::env::var(TIER_PRUNE_ARCHIVE_ENV).ok();
+        match parse_archive_target(raw_archive.as_deref()) {
+            Ok(target) => {
+                let archiver = target.clone().map(|t| {
+                    GcsArchiver::new(t, std::env::var(TIER_PRUNE_ARCHIVE_ENDPOINT_ENV).ok())
+                });
+                tracing::warn!(
+                    retention_hours = hours,
+                    interval_secs = interval,
+                    archive = ?target,
+                    "EHDB tier retention: ENABLED — unlinking the WouldPrune prefix \
+                     (noetl/ai-meta#491)"
+                );
+                tokio::spawn(async move {
+                    loop {
+                        let a = archiver.as_ref().map(|a| a as &dyn SegmentArchiver);
+                        let _ = run_prune_enabled(&cfg, retention, a).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    }
+                });
+                return;
+            }
+            Err(e) => {
+                // Asked for an archive and could not have one: deleting now would
+                // lose data the operator meant to keep. Fall back to the dry run.
+                tracing::error!(
+                    error = %e,
+                    "EHDB tier retention: archive target invalid; refusing to delete, \
+                     running the DRY RUN instead"
+                );
+            }
+        }
+    }
     tracing::info!(
         retention_hours = hours,
         interval_secs = interval,
@@ -2120,6 +2339,249 @@ pub fn run_prune_dry_run(cfg: &TierStoreConfig, retention: std::time::Duration) 
             "EHDB tier retention DRY RUN summary (nothing deleted; noetl/ai-meta#491)"
         );
     }
+}
+
+/// What an enabled pass did to one tier.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PruneReport {
+    pub pruned: Vec<PathBuf>,
+    pub pruned_bytes: u64,
+    /// Why the pass stopped before the end of its plan, if it did.
+    pub stopped: Option<String>,
+}
+
+/// One ENABLED retention pass over every prunable tier.
+pub async fn run_prune_enabled(
+    cfg: &TierStoreConfig,
+    retention: std::time::Duration,
+    archiver: Option<&dyn SegmentArchiver>,
+) -> Vec<(StoreTier, PruneReport)> {
+    let mut out = Vec::new();
+    for &tier in PRUNABLE_TIERS {
+        let r = prune_tier_enabled(cfg, tier, retention, archiver).await;
+        tracing::info!(
+            tier = tier.as_str(),
+            pruned_segments = r.pruned.len(),
+            pruned_bytes = r.pruned_bytes,
+            stopped = r.stopped.as_deref().unwrap_or(""),
+            retention_hours = retention.as_secs() / 3600,
+            archived = archiver.is_some(),
+            "EHDB tier retention ENABLED summary (noetl/ai-meta#491)"
+        );
+        out.push((tier, r));
+    }
+    out
+}
+
+/// Prune one tier: plan, archive, then unlink under the write lock.
+///
+/// ⚠⚠ Three phases, and the lock is held for the LAST one only.
+///
+/// 1. **Snapshot + plan.** The active segment's length and the sealed list are
+///    read under a brief SHARED guard (so the length is a line boundary), then
+///    [`plan_tier_prune`] runs with no lock, exactly as the dry run does.
+/// 2. **Archive** (when configured), with no lock: sealed segments are
+///    immutable, and holding the write lock across a 256 MiB upload would queue
+///    every append behind it — the noetl/ai-meta#490 starvation shape. A failed
+///    or size-mismatched upload stops the pass; that segment and everything
+///    newer stay on disk.
+/// 3. **Re-validate + unlink under the WRITE lock.** Only what could have
+///    changed since phase 1 is re-checked, so the hold is short: each segment
+///    still exists, is not leased, and none of its executions appears in the
+///    records written since the snapshot (the active tail, plus any segment
+///    sealed in between). Then the segment is unlinked, then its sidecars.
+async fn prune_tier_enabled(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    retention: std::time::Duration,
+    archiver: Option<&dyn SegmentArchiver>,
+) -> PruneReport {
+    use crate::ehdb::metrics::record_tier_prune;
+    let mut report = PruneReport::default();
+    let lock = store_lock(cfg, tier);
+    let active = cfg.path_for(tier);
+
+    // ---- phase 1: snapshot (shared guard) + plan (no lock)
+    let (active_len0, sealed0) = {
+        let _r = lock.read().await;
+        let len = std::fs::metadata(&active).map(|m| m.len()).unwrap_or(0);
+        (len, sealed_segments(cfg, tier))
+    };
+    let plan = {
+        let c = cfg.clone();
+        match off_runtime(move || {
+            plan_tier_prune(&c, tier, retention, std::time::SystemTime::now())
+        })
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                report.stopped = Some(format!("plan failed: {e}"));
+                return report;
+            }
+        }
+    };
+    let candidates: Vec<PathBuf> = plan
+        .into_iter()
+        .take_while(|d| d.verdict == PruneVerdict::WouldPrune)
+        .map(|d| d.segment)
+        .collect();
+    if candidates.is_empty() {
+        return report;
+    }
+
+    // ---- phase 2: archive, no lock
+    let mut ready: Vec<PathBuf> = Vec::new();
+    'segments: for seg in candidates {
+        if let Some(a) = archiver {
+            for file in [
+                seg.clone(),
+                segment_index_path(&seg),
+                segment_offset_index_path(&seg),
+            ] {
+                let Ok(local) = std::fs::metadata(&file).map(|m| m.len()) else {
+                    if file == seg {
+                        report.stopped = Some(format!("{} vanished before archive", seg.display()));
+                        break 'segments;
+                    }
+                    continue; // a missing sidecar is not data
+                };
+                let why = match a.archive(tier, &file).await {
+                    Ok(remote) if remote == local => None,
+                    Ok(remote) => Some(format!(
+                        "archive size mismatch for {}: local {local} remote {remote}",
+                        file.display()
+                    )),
+                    Err(e) => Some(format!("archive failed for {}: {e}", file.display())),
+                };
+                if let Some(why) = why {
+                    tracing::error!(tier = tier.as_str(), segment = %seg.display(), error = %why,
+                        "EHDB tier retention: archive failed; NOT unlinking, pass stopped");
+                    record_tier_prune(tier, "archive_failed", 0);
+                    report.stopped = Some(why);
+                    break 'segments;
+                }
+            }
+        }
+        ready.push(seg);
+    }
+
+    #[cfg(test)]
+    tests::probe_before_unlink(cfg);
+
+    // ---- phase 3: re-validate + unlink under the WRITE lock
+    // ⚠ The guard lives in this async frame; the tail scan and the unlinks run
+    // on the blocking pool (`off_runtime`), like every other store entry point.
+    // A seal between the snapshot and here makes the scan cover the WHOLE
+    // active file plus the new segment, which must not occupy one of the
+    // writer's two runtime threads (the 2026-09-22 outage).
+    let _w = lock.write().await;
+    let c = cfg.clone();
+    let archived = archiver.is_some();
+    match off_runtime(move || {
+        unlink_revalidated_locked(&c, tier, active_len0, &sealed0, ready, archived, report)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => PruneReport {
+            stopped: Some(e),
+            ..Default::default()
+        },
+    }
+}
+
+/// Phase 3 of [`prune_tier_enabled`]. Caller holds the store's WRITE lock.
+fn unlink_revalidated_locked(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    active_len0: u64,
+    sealed0: &[PathBuf],
+    ready: Vec<PathBuf>,
+    archived: bool,
+    mut report: PruneReport,
+) -> PruneReport {
+    use crate::ehdb::metrics::record_tier_prune;
+    let active = cfg.path_for(tier);
+    let sealed_now = sealed_segments(cfg, tier);
+    let sealed_since: Vec<PathBuf> = sealed_now
+        .iter()
+        .filter(|p| !sealed0.contains(p))
+        .cloned()
+        .collect();
+    // Records written since the snapshot: a segment sealed in between holds the
+    // whole former active file; otherwise only the active tail is new.
+    let mut fresh: Option<std::collections::HashSet<String>> = Some(Default::default());
+    for p in &sealed_since {
+        match (
+            fresh.as_mut(),
+            load_segment_index(p).or_else(|| execution_ids_since(p, 0)),
+        ) {
+            (Some(f), Some(ids)) => f.extend(ids),
+            _ => fresh = None,
+        }
+    }
+    let from = if sealed_since.is_empty() {
+        active_len0
+    } else {
+        0
+    };
+    match (fresh.as_mut(), execution_ids_since(&active, from)) {
+        (Some(f), Some(ids)) => f.extend(ids),
+        _ => fresh = None,
+    }
+    let Some(fresh) = fresh else {
+        record_tier_prune(tier, "skipped_revalidation", 0);
+        report.stopped = Some("records written since the plan are unreadable".into());
+        return report;
+    };
+    for seg in ready {
+        let skip = if !seg.exists() {
+            Some("segment vanished")
+        } else if lease_count(&seg) > 0 {
+            Some("leased by a read in flight")
+        } else {
+            match load_segment_index(&seg) {
+                None => Some("no .idx at unlink time"),
+                Some(ids) if ids.iter().any(|id| fresh.contains(id)) => {
+                    Some("an execution in it wrote again since the plan")
+                }
+                Some(_) => None,
+            }
+        };
+        if let Some(why) = skip {
+            record_tier_prune(tier, "skipped_revalidation", 0);
+            report.stopped = Some(format!("{}: {why}", seg.display()));
+            break;
+        }
+        let bytes = std::fs::metadata(&seg).map(|m| m.len()).unwrap_or(0);
+        if let Err(e) = std::fs::remove_file(&seg) {
+            tracing::error!(tier = tier.as_str(), segment = %seg.display(), error = %e,
+                "EHDB tier retention: unlink failed; pass stopped");
+            record_tier_prune(tier, "failed", 0);
+            report.stopped = Some(format!("unlink {}: {e}", seg.display()));
+            break;
+        }
+        ehdb_reference::forget_runtime(&seg);
+        // The segment goes first: a sidecar left behind is harmless (nothing
+        // reads an index without its segment, and the planner never prunes the
+        // newest segment, so no later seal can reuse this name and inherit it);
+        // a segment without its index is merely kept by the next plan.
+        for side in [segment_index_path(&seg), segment_offset_index_path(&seg)] {
+            if let Err(e) = std::fs::remove_file(&side) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(file = %side.display(), error = %e,
+                        "EHDB tier retention: sidecar not removed");
+                }
+            }
+        }
+        tracing::info!(tier = tier.as_str(), segment = %seg.display(), bytes,
+            archived, "EHDB tier retention: segment pruned");
+        record_tier_prune(tier, "pruned", bytes);
+        report.pruned_bytes += bytes;
+        report.pruned.push(seg);
+    }
+    report
 }
 
 #[cfg(test)]
@@ -2277,6 +2739,366 @@ mod tests {
         P.get_or_init(|| StdMutex::new(HashMap::new()))
     }
 
+    // ---- noetl/ai-meta#491 follow-up: the ENABLED pass + archive ----
+
+    /// What `probe_before_unlink` does for a store dir: lease these segments
+    /// and/or append for these executions, between the plan and the unlink.
+    #[derive(Default)]
+    struct RaceAction {
+        lease: Vec<PathBuf>,
+        append_exec: Vec<String>,
+    }
+    fn race_actions() -> &'static StdMutex<HashMap<PathBuf, RaceAction>> {
+        static P: OnceLock<StdMutex<HashMap<PathBuf, RaceAction>>> = OnceLock::new();
+        P.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+    fn held_leases() -> &'static StdMutex<Vec<SegmentLease>> {
+        static L: OnceLock<StdMutex<Vec<SegmentLease>>> = OnceLock::new();
+        L.get_or_init(|| StdMutex::new(Vec::new()))
+    }
+    pub(super) fn probe_before_unlink(cfg: &TierStoreConfig) {
+        let Some(a) = race_actions().lock().unwrap().remove(&cfg.dir) else {
+            return;
+        };
+        if !a.lease.is_empty() {
+            held_leases()
+                .lock()
+                .unwrap()
+                .push(SegmentLease::acquire(&a.lease));
+        }
+        for exec in a.append_exec {
+            // A raw line in the driver's shape, appended directly: the probe
+            // runs on the async path and must not take the store lock.
+            let line = format!(
+                "{{\"sequence\":999999,\"transaction_id\":\"race\",\"tenant\":\"{t}\",\"namespace\":\"{n}\",\"mutations\":[{{\"Stream\":{{\"Publish\":{{\"stream\":\"{s}\",\"subject\":\"{p}.{exec}\",\"payload\":[123,125]}}}}}}]}}\n",
+                t = DEFAULT_LOCAL_REFERENCE_TENANT,
+                n = DEFAULT_LOCAL_REFERENCE_NAMESPACE,
+                s = ehdb_reference::EVENT_LOG_STREAM,
+                p = ehdb_reference::EVENT_LOG_SUBJECT_PREFIX,
+            );
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(cfg.path_for(StoreTier::EventLog))
+                .unwrap();
+            std::io::Write::write_all(&mut f, line.as_bytes()).unwrap();
+        }
+    }
+
+    const R49: std::time::Duration = std::time::Duration::from_secs(49 * 3600);
+
+    /// s1 old+finished, s2 old but PINNED (exec-b also in recent s3), s3 recent,
+    /// exec-live in the ACTIVE segment. The prunable prefix is exactly [s1].
+    async fn enabled_fixture(tag: &str) -> (TierStoreConfig, PathBuf, PathBuf, PathBuf) {
+        let cfg = seal_cfg(tag);
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 4).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 4).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 2).await;
+        put(&cfg, t, "exec-c", 2).await;
+        let s3 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-live", 3).await;
+        for p in [&s1, &s2] {
+            age(p, 60);
+        }
+        (cfg, s1, s2, s3)
+    }
+
+    fn sidecars(seg: &Path) -> [PathBuf; 2] {
+        [segment_index_path(seg), segment_offset_index_path(seg)]
+    }
+
+    /// A stub GCS JSON-API upload endpoint. `mode`: "ok" | "fail" | "short".
+    async fn stub_gcs(mode: &'static str) -> (String, Arc<StdMutex<Vec<(String, usize)>>>) {
+        use axum::{extract::Query, routing::post, Router};
+        let seen: Arc<StdMutex<Vec<(String, usize)>>> = Arc::default();
+        let s2 = seen.clone();
+        let app = Router::new().route(
+            "/upload/storage/v1/b/{bucket}/o",
+            post(
+                move |Query(q): Query<HashMap<String, String>>, body: axum::body::Bytes| {
+                    let seen = s2.clone();
+                    async move {
+                        let name = q.get("name").cloned().unwrap_or_default();
+                        seen.lock().unwrap().push((name, body.len()));
+                        match mode {
+                            "fail" => (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                "boom".to_string(),
+                            ),
+                            "short" => (
+                                axum::http::StatusCode::OK,
+                                format!("{{\"size\":\"{}\"}}", body.len() + 1),
+                            ),
+                            _ => (
+                                axum::http::StatusCode::OK,
+                                format!("{{\"size\":\"{}\"}}", body.len()),
+                            ),
+                        }
+                    }
+                },
+            ),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn stub_archiver(endpoint: &str) -> GcsArchiver {
+        GcsArchiver::new(
+            parse_archive_target(Some("gs://noetl-archive/tier"))
+                .unwrap()
+                .unwrap(),
+            Some(endpoint.to_string()),
+        )
+    }
+
+    /// ⭐ Enabled unlinks EXACTLY the WouldPrune prefix — the segment and its
+    /// sidecars — and nothing else: the pinned, the recent and the active
+    /// segment survive.
+    #[tokio::test]
+    async fn enabled_unlinks_exactly_the_would_prune_prefix() {
+        let (cfg, s1, s2, s3) = enabled_fixture("en-prefix").await;
+        let r = run_prune_enabled(&cfg, R49, None).await;
+        let el = &r.iter().find(|(t, _)| *t == StoreTier::EventLog).unwrap().1;
+        assert_eq!(el.pruned, vec![s1.clone()], "pruned the wrong set: {el:?}");
+        assert!(!s1.exists(), "the prunable segment is still there");
+        for side in sidecars(&s1) {
+            assert!(
+                !side.exists(),
+                "sidecar {} survived its segment",
+                side.display()
+            );
+        }
+        for keep in [&s2, &s3, &cfg.path_for(StoreTier::EventLog)] {
+            assert!(
+                keep.exists(),
+                "{} was unlinked but is not in the prefix",
+                keep.display()
+            );
+        }
+        assert!(
+            sidecars(&s2).iter().all(|p| p.exists()),
+            "a kept segment lost its index"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// The dry run, run over the same store, deletes nothing.
+    #[tokio::test]
+    async fn the_dry_run_deletes_nothing_on_an_enabled_shaped_store() {
+        let (cfg, s1, s2, s3) = enabled_fixture("en-dry").await;
+        run_prune_dry_run(&cfg, R49);
+        for p in [&s1, &s2, &s3] {
+            assert!(p.exists(), "dry run removed {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    #[test]
+    fn only_the_exact_word_enabled_arms_deletion() {
+        assert_eq!(parse_prune_mode(Some("enabled")), PruneMode::Enabled);
+        for casual in [
+            "on",
+            "true",
+            "1",
+            "yes",
+            "enable",
+            "ENABLED-ish",
+            // Exact word only: no case folding, no trimming.
+            "ENABLED",
+            "Enabled",
+            " enabled",
+            "enabled ",
+            "enabled\n",
+        ] {
+            assert_eq!(
+                parse_prune_mode(Some(casual)),
+                PruneMode::Off,
+                "{casual:?} armed deletion"
+            );
+        }
+        assert_eq!(
+            parse_retention_hours(None),
+            Some(49),
+            "default window is 49 h"
+        );
+    }
+
+    #[test]
+    fn the_archive_target_is_off_unless_a_gs_url_is_given() {
+        assert_eq!(parse_archive_target(None), Ok(None));
+        assert_eq!(parse_archive_target(Some("  ")), Ok(None));
+        assert_eq!(
+            parse_archive_target(Some("gs://b/x/y/")),
+            Ok(Some(ArchiveTarget {
+                bucket: "b".into(),
+                prefix: "x/y".into()
+            }))
+        );
+        assert_eq!(
+            parse_archive_target(Some("gs://b")),
+            Ok(Some(ArchiveTarget {
+                bucket: "b".into(),
+                prefix: String::new()
+            }))
+        );
+        assert!(parse_archive_target(Some("s3://b/x")).is_err());
+        assert!(parse_archive_target(Some("gs:///x")).is_err());
+    }
+
+    /// ⭐ Archive on: every file of the segment is uploaded (named
+    /// `<prefix>/<tier>/<file>`) BEFORE it is unlinked.
+    #[tokio::test]
+    async fn with_an_archive_the_segment_is_uploaded_then_unlinked() {
+        let (cfg, s1, s2, _s3) = enabled_fixture("en-arch-ok").await;
+        let (ep, seen) = stub_gcs("ok").await;
+        let a = stub_archiver(&ep);
+        let r = run_prune_enabled(&cfg, R49, Some(&a)).await;
+        let el = &r.iter().find(|(t, _)| *t == StoreTier::EventLog).unwrap().1;
+        assert_eq!(el.pruned, vec![s1.clone()]);
+        let names: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        let f1 = s1.file_name().unwrap().to_str().unwrap();
+        for want in [
+            format!("tier/eventlog/{f1}"),
+            format!("tier/eventlog/{f1}.idx"),
+            format!("tier/eventlog/{f1}.offidx"),
+        ] {
+            assert!(names.contains(&want), "missing upload {want}: {names:?}");
+        }
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains(s2.file_name().unwrap().to_str().unwrap())),
+            "a kept segment was archived: {names:?}"
+        );
+        assert!(!s1.exists() && s2.exists());
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⚠⚠ A failed upload: NOTHING is unlinked.
+    #[tokio::test]
+    async fn an_archive_failure_keeps_the_segment() {
+        let (cfg, s1, _s2, _s3) = enabled_fixture("en-arch-fail").await;
+        let (ep, seen) = stub_gcs("fail").await;
+        let r = run_prune_enabled(&cfg, R49, Some(&stub_archiver(&ep))).await;
+        let el = &r.iter().find(|(t, _)| *t == StoreTier::EventLog).unwrap().1;
+        assert!(
+            el.pruned.is_empty(),
+            "unlinked despite a failed archive: {el:?}"
+        );
+        assert!(s1.exists() && sidecars(&s1).iter().all(|p| p.exists()));
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "the stub was never called — vacuous"
+        );
+        assert!(el
+            .stopped
+            .as_deref()
+            .unwrap_or("")
+            .contains("archive failed"));
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⚠⚠ The store reports a different size than we sent: NOT unlinked.
+    #[tokio::test]
+    async fn an_archive_size_mismatch_keeps_the_segment() {
+        let (cfg, s1, _s2, _s3) = enabled_fixture("en-arch-short").await;
+        let (ep, _seen) = stub_gcs("short").await;
+        let r = run_prune_enabled(&cfg, R49, Some(&stub_archiver(&ep))).await;
+        let el = &r.iter().find(|(t, _)| *t == StoreTier::EventLog).unwrap().1;
+        assert!(
+            el.pruned.is_empty(),
+            "unlinked despite a size mismatch: {el:?}"
+        );
+        assert!(s1.exists());
+        assert!(el
+            .stopped
+            .as_deref()
+            .unwrap_or("")
+            .contains("size mismatch"));
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// A lease taken AFTER the plan and before the unlink keeps the segment.
+    #[tokio::test]
+    async fn a_lease_taken_after_the_plan_keeps_the_segment() {
+        let (cfg, s1, _s2, _s3) = enabled_fixture("en-lease").await;
+        race_actions().lock().unwrap().insert(
+            cfg.dir.clone(),
+            RaceAction {
+                lease: vec![s1.clone()],
+                ..Default::default()
+            },
+        );
+        let r = run_prune_enabled(&cfg, R49, None).await;
+        held_leases().lock().unwrap().clear();
+        let el = &r.iter().find(|(t, _)| *t == StoreTier::EventLog).unwrap().1;
+        assert!(el.pruned.is_empty(), "unlinked a leased segment: {el:?}");
+        assert!(s1.exists());
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// An execution that writes again AFTER the plan pins its old segment.
+    #[tokio::test]
+    async fn a_write_after_the_plan_keeps_that_executions_segment() {
+        let (cfg, s1, _s2, _s3) = enabled_fixture("en-race-write").await;
+        race_actions().lock().unwrap().insert(
+            cfg.dir.clone(),
+            RaceAction {
+                append_exec: vec!["exec-a".into()],
+                ..Default::default()
+            },
+        );
+        let r = run_prune_enabled(&cfg, R49, None).await;
+        let el = &r.iter().find(|(t, _)| *t == StoreTier::EventLog).unwrap().1;
+        assert!(
+            el.pruned.is_empty(),
+            "unlinked a segment whose execution wrote again: {el:?}"
+        );
+        assert!(s1.exists());
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⚠⚠ The NEWEST sealed segment is never unlinked, however old. `maybe_seal`
+    /// numbers the next segment from the highest surviving one, so pruning the
+    /// newest made the next seal reuse its name: a sidecar left by a crash
+    /// mid-unlink then indexed the WRONG file (reads skip what it does not
+    /// list), and its archive object was overwritten.
+    #[tokio::test]
+    async fn the_newest_sealed_segment_is_kept_so_a_seal_never_reuses_its_name() {
+        let cfg = seal_cfg("en-newest");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 3).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-live", 2).await;
+        age(&s1, 400);
+        age(&s2, 300);
+        let r = run_prune_enabled(&cfg, R49, None).await;
+        let el = &r.iter().find(|(t, _)| *t == StoreTier::EventLog).unwrap().1;
+        assert_eq!(el.pruned, vec![s1.clone()], "pruned the wrong set: {el:?}");
+        assert!(
+            s2.exists() && sidecars(&s2).iter().all(|p| p.exists()),
+            "the newest sealed segment was unlinked"
+        );
+        let next = maybe_seal(&cfg, t, Some(1)).expect("seal");
+        assert!(
+            next != s1 && next != s2,
+            "the next seal reused a name: {}",
+            next.display()
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
     // ---- noetl/ai-meta#491: leases + the retention planner ----
 
     /// Seal the active segment by hand, exactly as `maybe_seal` does (a rename),
@@ -2361,7 +3183,7 @@ mod tests {
         assert_eq!(
             verdicts(&cfg, t),
             vec![
-                PruneVerdict::Keep("pinned: an execution in it is still writing"),
+                PruneVerdict::Keep("pinned: an execution in it also appears in the active segment or a segment younger than the window"),
                 PruneVerdict::BehindAKeptSegment,
             ]
         );
@@ -2375,7 +3197,7 @@ mod tests {
         age(&a, 400);
         assert_eq!(
             verdicts(&cfg2, t)[0],
-            PruneVerdict::Keep("pinned: an execution in it is still writing")
+            PruneVerdict::Keep("pinned: an execution in it also appears in the active segment or a segment younger than the window")
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
         let _ = std::fs::remove_dir_all(&cfg2.dir);
@@ -2387,11 +3209,13 @@ mod tests {
         let t = StoreTier::EventLog;
         put(&cfg, t, "exec-a", 3).await;
         let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-z", 1).await;
+        let _recent = seal_now(&cfg, t); // s1 must not be the newest (rule 7)
         std::fs::remove_file(segment_index_path(&s1)).unwrap();
         age(&s1, 400);
         assert_eq!(
-            verdicts(&cfg, t),
-            vec![PruneVerdict::Keep("no .idx: contents unknown")]
+            verdicts(&cfg, t)[0],
+            PruneVerdict::Keep("no .idx: contents unknown")
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
@@ -2416,14 +3240,16 @@ mod tests {
         let t = StoreTier::EventLog;
         put(&cfg, t, "exec-a", 3).await;
         let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-z", 1).await;
+        let _recent = seal_now(&cfg, t); // s1 must not be the newest (rule 7)
         age(&s1, 400);
         let lease = SegmentLease::acquire(std::slice::from_ref(&s1));
         assert_eq!(
-            verdicts(&cfg, t),
-            vec![PruneVerdict::Keep("leased by a read in flight")]
+            verdicts(&cfg, t)[0],
+            PruneVerdict::Keep("leased by a read in flight")
         );
         drop(lease);
-        assert_eq!(verdicts(&cfg, t), vec![PruneVerdict::WouldPrune]);
+        assert_eq!(verdicts(&cfg, t)[0], PruneVerdict::WouldPrune);
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
@@ -2464,10 +3290,12 @@ mod tests {
         let t = StoreTier::EventLog;
         put(&cfg, t, "exec-a", 3).await;
         let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-z", 1).await;
+        let _recent = seal_now(&cfg, t); // s1 must not be the newest (rule 7)
         age(&s1, 400);
         assert_eq!(
-            verdicts(&cfg, t),
-            vec![PruneVerdict::WouldPrune],
+            verdicts(&cfg, t)[0],
+            PruneVerdict::WouldPrune,
             "precondition"
         );
         let before: Vec<_> = std::fs::read_dir(&cfg.dir)
@@ -2489,13 +3317,21 @@ mod tests {
         assert_eq!(
             parse_prune_mode(Some("on")),
             PruneMode::Off,
-            "no deleting mode in this build"
+            "`on` must never arm deletion; only the exact word `enabled` does"
         );
         assert_eq!(parse_prune_mode(Some("bogus")), PruneMode::Off);
-        assert_eq!(parse_retention_hours(None), Some(168));
+        assert_eq!(parse_retention_hours(None), Some(49));
         assert_eq!(parse_retention_hours(Some("24")), Some(24));
         assert_eq!(parse_retention_hours(Some("23")), None);
         assert_eq!(parse_retention_hours(Some("nope")), None);
+        // u64::MAX / 3600 + 1 hours: `* 3600` wraps to 3584 s (~1 h) in a
+        // release build, under the floor. Refused, not wrapped.
+        assert_eq!(parse_retention_hours(Some("5124095576030432")), None);
+        assert_eq!(
+            parse_retention_hours(Some("5124095576030431")),
+            Some(5124095576030431),
+            "the largest window that fits is still accepted"
+        );
     }
 
     /// ⭐⭐ The sealed segments are read with the store lock RELEASED.
@@ -3097,6 +3933,7 @@ mod tests {
             ("pub async fn scan(", "scan_locked"),
             ("pub async fn append_with_seal(", "append_locked"),
             ("pub async fn append_batch(", "append_batch_locked"),
+            ("async fn prune_tier_enabled(", "unlink_revalidated_locked"),
         ] {
             let body = src
                 .split(entry)
@@ -3112,8 +3949,12 @@ mod tests {
                 body.contains(locked),
                 "{entry} no longer calls {locked}; this guard is measuring nothing"
             );
+            // The call must sit INSIDE an `off_runtime` closure, not merely
+            // share a body with some other `off_runtime` call.
+            let at = body.find(locked).unwrap_or(0);
+            let lead = String::from_utf8_lossy(&body.as_bytes()[at.saturating_sub(160)..at]);
             assert!(
-                body.contains("off_runtime("),
+                lead.contains("off_runtime("),
                 "{entry} calls {locked} directly on the async runtime. A tier \
                  replay there occupies one of only two runtime threads and \
                  starves the accept loop, the shed path, the metrics server and \
@@ -3122,8 +3963,8 @@ mod tests {
             checked += 1;
         }
         assert_eq!(
-            checked, 4,
-            "expected to check 4 entry points, checked {checked}"
+            checked, 5,
+            "expected to check 5 entry points, checked {checked}"
         );
         // The helper must actually use the blocking pool, or the call above is
         // decorative.
