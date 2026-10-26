@@ -284,6 +284,10 @@ async fn the_inflight_gauge_reports_claimed_unacked_work_not_a_literal_zero() {
     // makes this test flaky in exactly one direction (reading the pre-sample 0
     // and calling it a pass is impossible here, but reading it and calling it a
     // FAILURE is a false alarm).
+    //
+    // Poll until the gauge reaches all three, not merely > 0: a sampler tick can
+    // land between the first and third claim, and that sample stays published
+    // for a whole 2s cadence (CI on main 2026-10-26 read 1).
     let mut scraped = String::new();
     let mut inflight: Option<u64> = None;
     for _ in 0..40 {
@@ -292,7 +296,7 @@ async fn the_inflight_gauge_reports_claimed_unacked_work_not_a_literal_zero() {
             .lines()
             .find_map(|l| l.strip_prefix("ehdb_feed_shard_inflight{shard=\"0\"} "))
             .and_then(|v| v.trim().parse::<u64>().ok());
-        if inflight.unwrap_or(0) > 0 {
+        if inflight.unwrap_or(0) >= 3 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
