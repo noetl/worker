@@ -1896,11 +1896,18 @@ pub enum PruneMode {
 
 /// Parse the mode. `dry_run` -> `DryRun`; exactly `enabled` -> `Enabled`;
 /// `on`/`true`/`1`/`yes` are refused loudly; anything else is `Off`.
+///
+/// ⚠ `Enabled` is matched on the RAW value, byte for byte: no trimming, no case
+/// folding. `ENABLED`, `Enabled` or `enabled ` are refused out loud like `on`,
+/// because the owner decision is that real deletion arms on the exact word only
+/// (noetl/ai-meta#491). The non-deleting spellings stay forgiving.
 pub fn parse_prune_mode(raw: Option<&str>) -> PruneMode {
+    if raw == Some("enabled") {
+        return PruneMode::Enabled;
+    }
     match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("dry_run") | Some("dry-run") | Some("dryrun") => PruneMode::DryRun,
-        Some("enabled") => PruneMode::Enabled,
-        Some("on") | Some("true") | Some("1") | Some("yes") => {
+        Some("enabled") | Some("on") | Some("true") | Some("1") | Some("yes") => {
             tracing::error!(
                 env = TIER_PRUNE_MODE_ENV,
                 "tier prune mode must be spelled `enabled` to delete; `on`/`true` \
@@ -2069,7 +2076,10 @@ pub fn parse_retention_hours(raw: Option<&str>) -> Option<u64> {
         None => TIER_RETENTION_HOURS_DEFAULT,
         Some(v) => v.trim().parse::<u64>().ok()?,
     };
-    (h >= TIER_RETENTION_HOURS_MIN).then_some(h)
+    // ⚠ The caller turns this into `h * 3600` seconds. Without the overflow
+    // check, a 16-digit value wraps (release builds do not trap) to a window of
+    // minutes and slips under the 24 h floor.
+    (h >= TIER_RETENTION_HOURS_MIN && h.checked_mul(3600).is_some()).then_some(h)
 }
 
 /// The tiers retention may ever touch. Catalog needs full history (its fold
@@ -2137,7 +2147,13 @@ fn execution_ids_since(path: &Path, offset: u64) -> Option<std::collections::Has
 ///    ages out too — and a long-lived ACTIVE segment (a tier that rarely reaches
 ///    the size seal) pins every older segment holding any of its executions;
 /// 5. no read currently holds a lease on it;
-/// 6. every OLDER segment of the tier is also `WouldPrune` (oldest-first).
+/// 6. every OLDER segment of the tier is also `WouldPrune` (oldest-first);
+/// 7. it is not the NEWEST sealed segment. `maybe_seal` names the next segment
+///    `<highest surviving number> + 1`, so unlinking the newest would make the
+///    next seal REUSE its name: a leftover `.idx`/`.offidx` (a crash between the
+///    segment's unlink and its sidecars') would then describe the wrong file, so
+///    reads would skip records that index does not list, and an archive object
+///    of that name would be overwritten.
 pub fn plan_tier_prune(
     cfg: &TierStoreConfig,
     tier: StoreTier,
@@ -2176,11 +2192,14 @@ pub fn plan_tier_prune(
 
     let mut out = Vec::with_capacity(segs.len());
     let mut stopped = false;
+    let newest = segs.last().cloned();
     for s in segs {
         let verdict = if stopped {
             PruneVerdict::BehindAKeptSegment
         } else if !is_old(&s) {
             PruneVerdict::Keep("younger than the retention window")
+        } else if Some(&s) == newest.as_ref() {
+            PruneVerdict::Keep("newest sealed segment: kept so a later seal never reuses its name")
         } else {
             match (load_segment_index(&s), hot.as_ref()) {
                 (None, _) => PruneVerdict::Keep("no .idx: contents unknown"),
@@ -2451,7 +2470,39 @@ async fn prune_tier_enabled(
     tests::probe_before_unlink(cfg);
 
     // ---- phase 3: re-validate + unlink under the WRITE lock
+    // ⚠ The guard lives in this async frame; the tail scan and the unlinks run
+    // on the blocking pool (`off_runtime`), like every other store entry point.
+    // A seal between the snapshot and here makes the scan cover the WHOLE
+    // active file plus the new segment, which must not occupy one of the
+    // writer's two runtime threads (the 2026-09-22 outage).
     let _w = lock.write().await;
+    let c = cfg.clone();
+    let archived = archiver.is_some();
+    match off_runtime(move || {
+        unlink_revalidated_locked(&c, tier, active_len0, &sealed0, ready, archived, report)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => PruneReport {
+            stopped: Some(e),
+            ..Default::default()
+        },
+    }
+}
+
+/// Phase 3 of [`prune_tier_enabled`]. Caller holds the store's WRITE lock.
+fn unlink_revalidated_locked(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    active_len0: u64,
+    sealed0: &[PathBuf],
+    ready: Vec<PathBuf>,
+    archived: bool,
+    mut report: PruneReport,
+) -> PruneReport {
+    use crate::ehdb::metrics::record_tier_prune;
+    let active = cfg.path_for(tier);
     let sealed_now = sealed_segments(cfg, tier);
     let sealed_since: Vec<PathBuf> = sealed_now
         .iter()
@@ -2513,8 +2564,9 @@ async fn prune_tier_enabled(
         }
         ehdb_reference::forget_runtime(&seg);
         // The segment goes first: a sidecar left behind is harmless (nothing
-        // reads an index without its segment), a segment without its index is
-        // merely kept by the next plan.
+        // reads an index without its segment, and the planner never prunes the
+        // newest segment, so no later seal can reuse this name and inherit it);
+        // a segment without its index is merely kept by the next plan.
         for side in [segment_index_path(&seg), segment_offset_index_path(&seg)] {
             if let Err(e) = std::fs::remove_file(&side) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -2524,7 +2576,7 @@ async fn prune_tier_enabled(
             }
         }
         tracing::info!(tier = tier.as_str(), segment = %seg.display(), bytes,
-            archived = archiver.is_some(), "EHDB tier retention: segment pruned");
+            archived, "EHDB tier retention: segment pruned");
         record_tier_prune(tier, "pruned", bytes);
         report.pruned_bytes += bytes;
         report.pruned.push(seg);
@@ -2848,8 +2900,20 @@ mod tests {
     #[test]
     fn only_the_exact_word_enabled_arms_deletion() {
         assert_eq!(parse_prune_mode(Some("enabled")), PruneMode::Enabled);
-        assert_eq!(parse_prune_mode(Some(" Enabled ")), PruneMode::Enabled);
-        for casual in ["on", "true", "1", "yes", "enable", "ENABLED-ish"] {
+        for casual in [
+            "on",
+            "true",
+            "1",
+            "yes",
+            "enable",
+            "ENABLED-ish",
+            // Exact word only: no case folding, no trimming.
+            "ENABLED",
+            "Enabled",
+            " enabled",
+            "enabled ",
+            "enabled\n",
+        ] {
             assert_eq!(
                 parse_prune_mode(Some(casual)),
                 PruneMode::Off,
@@ -3003,6 +3067,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
+    /// ⚠⚠ The NEWEST sealed segment is never unlinked, however old. `maybe_seal`
+    /// numbers the next segment from the highest surviving one, so pruning the
+    /// newest made the next seal reuse its name: a sidecar left by a crash
+    /// mid-unlink then indexed the WRONG file (reads skip what it does not
+    /// list), and its archive object was overwritten.
+    #[tokio::test]
+    async fn the_newest_sealed_segment_is_kept_so_a_seal_never_reuses_its_name() {
+        let cfg = seal_cfg("en-newest");
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 3).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 3).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-live", 2).await;
+        age(&s1, 400);
+        age(&s2, 300);
+        let r = run_prune_enabled(&cfg, R49, None).await;
+        let el = &r.iter().find(|(t, _)| *t == StoreTier::EventLog).unwrap().1;
+        assert_eq!(el.pruned, vec![s1.clone()], "pruned the wrong set: {el:?}");
+        assert!(
+            s2.exists() && sidecars(&s2).iter().all(|p| p.exists()),
+            "the newest sealed segment was unlinked"
+        );
+        let next = maybe_seal(&cfg, t, Some(1)).expect("seal");
+        assert!(
+            next != s1 && next != s2,
+            "the next seal reused a name: {}",
+            next.display()
+        );
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
     // ---- noetl/ai-meta#491: leases + the retention planner ----
 
     /// Seal the active segment by hand, exactly as `maybe_seal` does (a rename),
@@ -3113,11 +3209,13 @@ mod tests {
         let t = StoreTier::EventLog;
         put(&cfg, t, "exec-a", 3).await;
         let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-z", 1).await;
+        let _recent = seal_now(&cfg, t); // s1 must not be the newest (rule 7)
         std::fs::remove_file(segment_index_path(&s1)).unwrap();
         age(&s1, 400);
         assert_eq!(
-            verdicts(&cfg, t),
-            vec![PruneVerdict::Keep("no .idx: contents unknown")]
+            verdicts(&cfg, t)[0],
+            PruneVerdict::Keep("no .idx: contents unknown")
         );
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
@@ -3142,14 +3240,16 @@ mod tests {
         let t = StoreTier::EventLog;
         put(&cfg, t, "exec-a", 3).await;
         let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-z", 1).await;
+        let _recent = seal_now(&cfg, t); // s1 must not be the newest (rule 7)
         age(&s1, 400);
         let lease = SegmentLease::acquire(std::slice::from_ref(&s1));
         assert_eq!(
-            verdicts(&cfg, t),
-            vec![PruneVerdict::Keep("leased by a read in flight")]
+            verdicts(&cfg, t)[0],
+            PruneVerdict::Keep("leased by a read in flight")
         );
         drop(lease);
-        assert_eq!(verdicts(&cfg, t), vec![PruneVerdict::WouldPrune]);
+        assert_eq!(verdicts(&cfg, t)[0], PruneVerdict::WouldPrune);
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
@@ -3190,10 +3290,12 @@ mod tests {
         let t = StoreTier::EventLog;
         put(&cfg, t, "exec-a", 3).await;
         let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-z", 1).await;
+        let _recent = seal_now(&cfg, t); // s1 must not be the newest (rule 7)
         age(&s1, 400);
         assert_eq!(
-            verdicts(&cfg, t),
-            vec![PruneVerdict::WouldPrune],
+            verdicts(&cfg, t)[0],
+            PruneVerdict::WouldPrune,
             "precondition"
         );
         let before: Vec<_> = std::fs::read_dir(&cfg.dir)
@@ -3222,6 +3324,14 @@ mod tests {
         assert_eq!(parse_retention_hours(Some("24")), Some(24));
         assert_eq!(parse_retention_hours(Some("23")), None);
         assert_eq!(parse_retention_hours(Some("nope")), None);
+        // u64::MAX / 3600 + 1 hours: `* 3600` wraps to 3584 s (~1 h) in a
+        // release build, under the floor. Refused, not wrapped.
+        assert_eq!(parse_retention_hours(Some("5124095576030432")), None);
+        assert_eq!(
+            parse_retention_hours(Some("5124095576030431")),
+            Some(5124095576030431),
+            "the largest window that fits is still accepted"
+        );
     }
 
     /// ⭐⭐ The sealed segments are read with the store lock RELEASED.
@@ -3823,6 +3933,7 @@ mod tests {
             ("pub async fn scan(", "scan_locked"),
             ("pub async fn append_with_seal(", "append_locked"),
             ("pub async fn append_batch(", "append_batch_locked"),
+            ("async fn prune_tier_enabled(", "unlink_revalidated_locked"),
         ] {
             let body = src
                 .split(entry)
@@ -3838,8 +3949,12 @@ mod tests {
                 body.contains(locked),
                 "{entry} no longer calls {locked}; this guard is measuring nothing"
             );
+            // The call must sit INSIDE an `off_runtime` closure, not merely
+            // share a body with some other `off_runtime` call.
+            let at = body.find(locked).unwrap_or(0);
+            let lead = String::from_utf8_lossy(&body.as_bytes()[at.saturating_sub(160)..at]);
             assert!(
-                body.contains("off_runtime("),
+                lead.contains("off_runtime("),
                 "{entry} calls {locked} directly on the async runtime. A tier \
                  replay there occupies one of only two runtime threads and \
                  starves the accept loop, the shed path, the metrics server and \
@@ -3848,8 +3963,8 @@ mod tests {
             checked += 1;
         }
         assert_eq!(
-            checked, 4,
-            "expected to check 4 entry points, checked {checked}"
+            checked, 5,
+            "expected to check 5 entry points, checked {checked}"
         );
         // The helper must actually use the blocking pool, or the call above is
         // decorative.
