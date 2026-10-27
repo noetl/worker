@@ -100,7 +100,11 @@ const STAMP: &str = include_str!("../ci/stamp-version.sh");
 
 #[test]
 fn the_stamp_step_does_not_re_resolve_the_graph() {
-    assert!(STAMP.len() > 300, "stamp script read as {} bytes", STAMP.len());
+    assert!(
+        STAMP.len() > 300,
+        "stamp script read as {} bytes",
+        STAMP.len()
+    );
     for line in STAMP.lines().map(str::trim).filter(|l| !l.starts_with('#')) {
         for forbidden in ["generate-lockfile", "cargo update"] {
             assert!(
@@ -158,7 +162,10 @@ fn stamping_changes_only_the_root_version_line_of_the_lock() {
     assert_eq!(changed.len(), 1, "lock lines changed: {changed:?}");
     assert_eq!(changed[0].1, r#"version = "9.8.7""#);
     let toml = std::fs::read_to_string(d.join("Cargo.toml")).unwrap();
-    assert!(toml.contains("version = \"9.8.7\""), "Cargo.toml not stamped");
+    assert!(
+        toml.contains("version = \"9.8.7\""),
+        "Cargo.toml not stamped"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -174,6 +181,9 @@ fn a_lock_without_the_root_entry_is_refused() {
     )
     .unwrap();
     let out = stamp_in(&d, "9.8.7");
-    assert!(!out.status.success(), "a lock with no root entry was accepted");
+    assert!(
+        !out.status.success(),
+        "a lock with no root entry was accepted"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }

@@ -285,9 +285,21 @@ where
             // mutation and was never covered by the old fence, which decorated
             // a backend this writer does not use. A superseded writer must not
             // seal: sealing publishes a part and advances the manifest.
-            let sealed = match engine.write(ehdb_core::fence::MutationPath::SealAgedParts) {
-                Ok(mut e) => e.seal_aged_parts(),
-                Err(e) => {
+            //
+            // ⚠⚠ On the blocking pool, not here (noetl/ai-meta#501). `write()`
+            // takes the engine `std::sync::Mutex` and a seal writes a part: done
+            // inline, every tick that met another holder (a startup scan chunk,
+            // an append's fsync) parked a runtime worker for the wait plus the
+            // seal, on a writer with a handful of workers on a 2-CPU quota.
+            let e2 = engine.clone();
+            let swept = tokio::task::spawn_blocking(move || {
+                e2.write(ehdb_core::fence::MutationPath::SealAgedParts)
+                    .map(|mut e| e.seal_aged_parts())
+            })
+            .await;
+            let sealed = match swept {
+                Ok(Ok(sealed)) => sealed,
+                Ok(Err(e)) => {
                     // ⚠ Distinct from a panic: this is the fence refusing a
                     // superseded writer, which is the system working. Logged at
                     // warn because a writer that keeps trying to seal while
@@ -296,6 +308,10 @@ where
                         %label, shard, error = %e,
                         "age-seal sweep refused by the epoch fence — this writer is superseded"
                     );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(%label, shard, error = %e, "age-seal sweep task failed");
                     continue;
                 }
             };
