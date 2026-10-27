@@ -392,6 +392,205 @@ pub fn parse_seal_max_bytes(raw: Option<&str>) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
+/// `NOETL_EHDB_TIER_SEAL_MAX_AGE_HOURS` — seal the ACTIVE segment once its
+/// oldest record is older than this, even below [`TIER_SEAL_MAX_BYTES_ENV`]
+/// (noetl/ai-meta#491 follow-up).
+///
+/// ⚠⚠ Why this exists. The retention planner keeps a sealed segment while any
+/// of its executions also appears in the ACTIVE segment (rule 4), and always
+/// keeps the newest sealed segment (rule 7). A tier that writes slowly never
+/// reaches the size seal, so its active segment grows old and, with it, pins
+/// every older segment forever. Production, 2026-10-27: the projection active
+/// segment had been open for 34 days (146 MB of a 256 MiB cap), so
+/// `projection.jsonl.1` (3.3 GB) stayed "pinned" and `.2` (268 MB) stayed
+/// "newest sealed" — 3.57 GB the enabled pass could never reclaim.
+///
+/// Values:
+/// * **unset** ⇒ [`TIER_SEAL_MAX_AGE_HOURS_DEFAULT`] (48 h), but ONLY when the
+///   size seal is armed. A store that never opted into sealing stays
+///   byte-identical: no env ⇒ no rotation, as before.
+/// * `0` / `off` / `false` / `none` ⇒ no age seal.
+/// * a positive number of hours (fractional allowed, e.g. `0.05` = 3 min for a
+///   test cluster) ⇒ that age, floored at [`TIER_SEAL_MAX_AGE_FLOOR`]. An
+///   explicit value arms the age seal even without the size seal.
+/// * anything else ⇒ **off** (the size seal's fail-safe direction: a typo must
+///   not start rotating a store).
+///
+/// Only [`PRUNABLE_TIERS`] age-seal. The age seal exists to make data
+/// prunable; a tier that is never pruned (catalog, kv, object, ...) would only
+/// be fragmented into more segments for every read to merge.
+pub const TIER_SEAL_MAX_AGE_HOURS_ENV: &str = "NOETL_EHDB_TIER_SEAL_MAX_AGE_HOURS";
+
+/// 48 h: just over the observed event-log size-seal cadence in production
+/// (every 1-2 days; the longest gap on 2026-10-24..25 was 41 h), so the event
+/// log keeps sealing by size as before and the age rule is only its backstop
+/// on a quiet stretch. For projection it bounds a finished execution's time to
+/// prunable at age + retention window (48 + 49 h) instead of "never".
+pub const TIER_SEAL_MAX_AGE_HOURS_DEFAULT: f64 = 48.0;
+
+/// The shortest age seal accepted. A seal renames the active file and starts a
+/// background index build, so an absurdly small value must not turn every
+/// append into a seal. One minute keeps a test cluster's "few minutes" usable.
+pub const TIER_SEAL_MAX_AGE_FLOOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When the active segment is sealed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SealPolicy {
+    /// Size cap ([`TIER_SEAL_MAX_BYTES_ENV`]). `None` ⇒ no size seal.
+    pub max_bytes: Option<u64>,
+    /// Age cap ([`TIER_SEAL_MAX_AGE_HOURS_ENV`]). `None` ⇒ no age seal.
+    pub max_age: Option<std::time::Duration>,
+}
+
+/// A bare size threshold is a size-only policy — what every caller that
+/// predates the age seal (and every size-seal test) means.
+impl From<Option<u64>> for SealPolicy {
+    fn from(max_bytes: Option<u64>) -> Self {
+        SealPolicy {
+            max_bytes,
+            max_age: None,
+        }
+    }
+}
+
+impl SealPolicy {
+    /// The policy the process env asks for.
+    pub fn from_env() -> Self {
+        let max_bytes = tier_seal_max_bytes();
+        SealPolicy {
+            max_bytes,
+            max_age: parse_seal_max_age(
+                std::env::var(TIER_SEAL_MAX_AGE_HOURS_ENV).ok().as_deref(),
+                max_bytes.is_some(),
+            ),
+        }
+    }
+}
+
+/// Pure parse of [`TIER_SEAL_MAX_AGE_HOURS_ENV`]; see it for the rules.
+/// `size_seal_armed` decides what UNSET means.
+pub fn parse_seal_max_age(raw: Option<&str>, size_seal_armed: bool) -> Option<std::time::Duration> {
+    let hours = match raw.map(str::trim) {
+        None | Some("") => {
+            return size_seal_armed.then(|| {
+                std::time::Duration::from_secs_f64(TIER_SEAL_MAX_AGE_HOURS_DEFAULT * 3600.0)
+            })
+        }
+        Some(v) => v,
+    };
+    if matches!(
+        hours.to_ascii_lowercase().as_str(),
+        "0" | "off" | "false" | "none"
+    ) {
+        return None;
+    }
+    let h = hours
+        .parse::<f64>()
+        .ok()
+        .filter(|h| h.is_finite() && *h > 0.0)?;
+    // ⚠ `try_from_secs_f64`, not `from_secs_f64`: the latter PANICS on a value
+    // too large for a Duration, and this runs on every append.
+    let age = std::time::Duration::try_from_secs_f64(h * 3600.0).ok()?;
+    Some(age.max(TIER_SEAL_MAX_AGE_FLOOR))
+}
+
+/// When the ACTIVE segment of `tier` began, from durable state only.
+///
+/// ⚠ Not the active file's mtime: an active file is written continuously, so
+/// its mtime is "now" and says nothing about how old its contents are. Not an
+/// in-memory "opened at" either: it would reset on every writer restart, and a
+/// writer that restarts more often than the age would never seal.
+///
+/// 1. **The first record's transaction id.** Every tier-store append mints
+///    `ehdbel-<snowflake>` (`eventlog::new_transaction_id`), and a snowflake
+///    carries its wall-clock ms. The first line of the file is the oldest
+///    record in it, and it is on disk, so this survives restarts. Verified on
+///    production 2026-10-27: `projection.jsonl` line 1 decodes to
+///    2026-09-23 23:19:46 UTC, one second after `projection.jsonl.2`'s mtime.
+/// 2. Otherwise **the newest sealed segment's mtime** — its last write, i.e. the
+///    seal that created this active file (a seal is a rename, which keeps the
+///    mtime, and the planner's rule 7 never unlinks the newest segment). It errs
+///    old if the store sat idle before that seal, which only seals sooner.
+/// 3. Otherwise unknown ⇒ `None` ⇒ no age seal.
+///
+/// Reads at most 4 KiB: the id sits in the first ~60 bytes of a line, but a
+/// line can be megabytes (payloads are numeric byte arrays).
+fn active_segment_started(cfg: &TierStoreConfig, tier: StoreTier) -> Option<std::time::SystemTime> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(4096);
+    if let Ok(f) = std::fs::File::open(cfg.path_for(tier)) {
+        let _ = f.take(4096).read_to_end(&mut head);
+    }
+    if let Some(ms) = first_record_ms(&head) {
+        return Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+    }
+    sealed_segments(cfg, tier)
+        .last()
+        .and_then(|p| std::fs::metadata(p).ok()?.modified().ok())
+}
+
+/// The wall-clock ms in the FIRST line's `ehdbel-<snowflake>` transaction id.
+fn first_record_ms(head: &[u8]) -> Option<u64> {
+    const KEY: &[u8] = b"\"transaction_id\":\"ehdbel-";
+    let first_line = head.split(|b| *b == b'\n').next()?;
+    let at = first_line.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+    let digits: Vec<u8> = first_line[at..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    let id = std::str::from_utf8(&digits).ok()?.parse::<i64>().ok()?;
+    let ms = crate::snowflake::timestamp_ms(id);
+    (ms > 0).then_some(ms as u64)
+}
+
+/// Why a seal happened. A metrics label and a log field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealReason {
+    Size,
+    Age,
+}
+
+impl SealReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SealReason::Size => "size",
+            SealReason::Age => "age",
+        }
+    }
+}
+
+/// Should the active segment of `tier` (`len` bytes) be sealed now?
+///
+/// ⚠ Never for an empty or missing active segment: sealing it would produce an
+/// empty segment and, worse, a seal per append. After any seal the active file
+/// is absent until the append that follows writes a record minted NOW, so its
+/// age restarts at ~0 and an age seal cannot repeat until `max_age` later.
+fn seal_reason(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    len: u64,
+    policy: SealPolicy,
+    now: std::time::SystemTime,
+) -> Option<SealReason> {
+    if len == 0 {
+        return None;
+    }
+    if policy.max_bytes.is_some_and(|max| len >= max) {
+        return Some(SealReason::Size);
+    }
+    let max_age = policy.max_age?;
+    if !PRUNABLE_TIERS.contains(&tier) {
+        return None;
+    }
+    // A start in the future (clock step, foreign epoch) is "not old": the fail
+    // direction is to not seal.
+    let age = now
+        .duration_since(active_segment_started(cfg, tier)?)
+        .ok()?;
+    (age >= max_age).then_some(SealReason::Age)
+}
+
 /// Sealed segments of `tier`, oldest first.
 ///
 /// Named `<active>.<seq>` beside the active file — same directory, **same JSONL
@@ -431,21 +630,39 @@ pub fn sealed_segments(cfg: &TierStoreConfig, tier: StoreTier) -> Vec<PathBuf> {
     found.into_iter().map(|(_, p)| p).collect()
 }
 
-/// Seal the active log if it is over the threshold. Returns the sealed path.
+/// Seal the active log if it is over the size threshold or older than the age
+/// threshold ([`SealPolicy`]). Returns the sealed path.
 ///
 /// ⚠ Called with the store's WRITE lock held, before an append, so no reader or
-/// writer can be mid-operation on the file being renamed.
+/// writer can be mid-operation on the file being renamed. Both reasons take the
+/// SAME path below: same rename, same runtime drop, same `.idx`/`.offidx`
+/// build — an age-sealed segment is indistinguishable from a size-sealed one.
 ///
 /// ⚠ The rename is the whole operation. There is no copy and no truncate, so
 /// there is no window in which data exists in neither file and no way for this
 /// to lose a record: either the rename happened or it did not.
-fn maybe_seal(cfg: &TierStoreConfig, tier: StoreTier, max: Option<u64>) -> Option<PathBuf> {
-    let max = max?;
-    let active = cfg.path_for(tier);
-    let len = std::fs::metadata(&active).ok()?.len();
-    if len < max {
+fn maybe_seal(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    policy: impl Into<SealPolicy>,
+) -> Option<PathBuf> {
+    maybe_seal_at(cfg, tier, policy.into(), std::time::SystemTime::now())
+}
+
+/// [`maybe_seal`] with the clock injected, so a test can age a segment without
+/// sleeping or forging records.
+fn maybe_seal_at(
+    cfg: &TierStoreConfig,
+    tier: StoreTier,
+    policy: SealPolicy,
+    now: std::time::SystemTime,
+) -> Option<PathBuf> {
+    if policy.max_bytes.is_none() && policy.max_age.is_none() {
         return None;
     }
+    let active = cfg.path_for(tier);
+    let len = std::fs::metadata(&active).ok()?.len();
+    let reason = seal_reason(cfg, tier, len, policy, now)?;
     let next = sealed_segments(cfg, tier)
         .last()
         .and_then(|p| {
@@ -470,11 +687,15 @@ fn maybe_seal(cfg: &TierStoreConfig, tier: StoreTier, max: Option<u64>) -> Optio
             // the memory — without this the seal bounds the FILE and not the
             // process, which is the entire point.
             ehdb_reference::forget_runtime(&active);
+            super::metrics::record_tier_seal(tier, reason.as_str());
             tracing::info!(
                 tier = tier.as_str(),
                 bytes = len,
+                reason = reason.as_str(),
+                max_bytes = ?policy.max_bytes,
+                max_age_secs = ?policy.max_age.map(|d| d.as_secs()),
                 sealed = %sealed.display(),
-                "EHDB tier store sealed (noetl/ai-meta#332 writer OOM)"
+                "EHDB tier store sealed (noetl/ai-meta#332 size cap, #491 age cap)"
             );
             // ⚠ Indexed in the BACKGROUND, not here: building it replays the
             // whole segment, and this runs under the store's write lock on the
@@ -564,7 +785,7 @@ pub async fn append(
         tier,
         execution_id,
         payload,
-        tier_seal_max_bytes(),
+        SealPolicy::from_env(),
     )
     .await
 }
@@ -582,8 +803,9 @@ pub async fn append_with_seal(
     tier: StoreTier,
     execution_id: &str,
     payload: &str,
-    seal_max: Option<u64>,
+    seal: impl Into<SealPolicy>,
 ) -> TierStoreOutcome {
+    let seal: SealPolicy = seal.into();
     let Some(cfg) = cfg else {
         return TierStoreOutcome::Unavailable;
     };
@@ -597,12 +819,13 @@ pub async fn append_with_seal(
     let _exclusive = lock.write().await;
     // ⚠ Under the WRITE lock, before the append: no reader or writer can be
     // mid-operation on the file being renamed. No-op unless a threshold is
-    // configured AND the active segment is over it.
+    // configured AND the active segment is over it (size) or older than it
+    // (age). Inside `off_runtime`: the age check reads the file.
     let cfg = cfg.clone();
     let execution_id = execution_id.to_string();
     let payload = payload.to_string();
     match off_runtime(move || {
-        let _ = maybe_seal(&cfg, tier, seal_max);
+        let _ = maybe_seal(&cfg, tier, seal);
         append_locked(&cfg, tier, &execution_id, &payload)
     })
     .await
@@ -659,11 +882,21 @@ pub async fn append_batch(
 
     let lock = store_lock(cfg, tier);
     let _exclusive = lock.write().await;
-    let _ = maybe_seal(cfg, tier, tier_seal_max_bytes());
+    let seal = SealPolicy::from_env();
     let cfg = cfg.clone();
     let execution_id = execution_id.to_string();
     let payloads: Vec<String> = payloads.to_vec();
-    match off_runtime(move || append_batch_locked(&cfg, tier, &execution_id, &payloads)).await {
+    // ⚠ The seal runs INSIDE `off_runtime`, under the same write lock, exactly
+    // as on the single path. It used to run on the runtime thread here; a stat
+    // and a rename were cheap enough to get away with, but the age check reads
+    // the active file, and blocking file I/O does not belong on one of the
+    // writer's two runtime threads (the 2026-09-22 outage).
+    match off_runtime(move || {
+        let _ = maybe_seal(&cfg, tier, seal);
+        append_batch_locked(&cfg, tier, &execution_id, &payloads)
+    })
+    .await
+    {
         Ok(v) => v,
         Err(e) => vec![TierStoreOutcome::Error(e)],
     }
@@ -3099,6 +3332,310 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cfg.dir);
     }
 
+    // ---- noetl/ai-meta#491 follow-up: the age seal ----
+
+    const H: u64 = 3600;
+
+    fn hours(h: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(h * H)
+    }
+
+    /// Age-only policy: no size cap, so any seal these tests see is an age seal.
+    fn age_only(h: u64) -> SealPolicy {
+        SealPolicy {
+            max_bytes: None,
+            max_age: Some(hours(h)),
+        }
+    }
+
+    fn later(h: u64) -> std::time::SystemTime {
+        std::time::SystemTime::now() + hours(h)
+    }
+
+    /// The sidecars are built in the background by the seal (as for a size
+    /// seal); wait for both.
+    async fn wait_for_sidecars(seg: &Path) {
+        for _ in 0..200 {
+            if sidecars(seg).iter().all(|p| p.exists()) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("no .idx/.offidx for {} after 5 s", seg.display());
+    }
+
+    #[test]
+    fn the_age_seal_defaults_on_only_with_the_size_seal_and_typos_turn_it_off() {
+        let d48 = Some(hours(48));
+        assert_eq!(
+            parse_seal_max_age(None, true),
+            d48,
+            "unset + size seal armed"
+        );
+        assert_eq!(parse_seal_max_age(Some(" "), true), d48);
+        assert_eq!(
+            parse_seal_max_age(None, false),
+            None,
+            "unset without a size seal must stay byte-identical (no rotation)"
+        );
+        for off in ["0", "off", "OFF", "false", "none"] {
+            assert_eq!(parse_seal_max_age(Some(off), true), None, "{off}");
+        }
+        for typo in ["4 8", "48h", "-1", "nan", "inf"] {
+            assert_eq!(parse_seal_max_age(Some(typo), true), None, "{typo}");
+        }
+        assert_eq!(
+            parse_seal_max_age(Some("24"), false),
+            Some(hours(24)),
+            "explicit arms alone"
+        );
+        assert_eq!(
+            parse_seal_max_age(Some("0.05"), true),
+            Some(std::time::Duration::from_secs(180))
+        );
+        assert_eq!(
+            parse_seal_max_age(Some("0.00001"), true),
+            Some(TIER_SEAL_MAX_AGE_FLOOR),
+            "a tiny value is floored, not a seal per append"
+        );
+        // Too large for a Duration: refused, not a panic on the append path.
+        assert_eq!(parse_seal_max_age(Some("1e300"), true), None);
+    }
+
+    /// The age is the FIRST record's minted time — durable, so a writer restart
+    /// does not reset it — not the active file's mtime (always "now").
+    #[tokio::test]
+    async fn the_active_segment_age_comes_from_its_first_record() {
+        let cfg = seal_cfg("age-first");
+        let t = StoreTier::Projection;
+        assert_eq!(
+            active_segment_started(&cfg, t),
+            None,
+            "no file, no sealed: unknown"
+        );
+        let before = std::time::SystemTime::now() - std::time::Duration::from_millis(5);
+        put(&cfg, t, "exec-a", 3).await;
+        let after = std::time::SystemTime::now() + std::time::Duration::from_millis(5);
+        let started = active_segment_started(&cfg, t).expect("decoded");
+        assert!(started >= before && started <= after, "{started:?}");
+        // The file's mtime moves with every write; the start must not.
+        age(&cfg.path_for(t), 1);
+        put(&cfg, t, "exec-a", 1).await;
+        ehdb_reference::forget_runtime(&cfg.path_for(t)); // a "restart"
+        assert_eq!(active_segment_started(&cfg, t), Some(started));
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// No snowflake in line 1 (a foreign writer): fall back to the newest sealed
+    /// segment's mtime, i.e. when this active file was opened. Neither: no seal.
+    #[tokio::test]
+    async fn without_a_readable_first_record_the_newest_seal_time_is_the_start() {
+        let cfg = seal_cfg("age-fallback");
+        let t = StoreTier::Projection;
+        std::fs::write(
+            cfg.path_for(t),
+            b"{\"sequence\":1,\"transaction_id\":\"legacy-1\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            maybe_seal_at(&cfg, t, age_only(1), later(1000)),
+            None,
+            "unknown age"
+        );
+        let sealed = cfg.path_for(t).with_file_name("projection.jsonl.4");
+        std::fs::write(&sealed, b"{}\n").unwrap();
+        age(&sealed, 3);
+        assert_eq!(
+            maybe_seal_at(&cfg, t, age_only(4), later(0)),
+            None,
+            "3 h < 4 h"
+        );
+        let got = maybe_seal_at(&cfg, t, age_only(2), later(0)).expect("3 h >= 2 h");
+        assert_eq!(got.file_name().unwrap(), "projection.jsonl.5");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐ Triggers once the first record is older than the cap, even far below
+    /// the size cap; writes the same sidecars a size seal does; numbers the
+    /// segment after the highest existing one; and does not seal again until
+    /// the NEW segment is itself that old.
+    #[tokio::test]
+    async fn an_old_active_segment_is_age_sealed_below_the_size_cap() {
+        let cfg = seal_cfg("age-seal");
+        let t = StoreTier::Projection;
+        put(&cfg, t, "exec-a", 2).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-a", 2).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-b", 4).await;
+        let len = std::fs::metadata(cfg.path_for(t)).unwrap().len();
+        let policy = SealPolicy {
+            max_bytes: Some(len * 100),
+            max_age: Some(hours(48)),
+        };
+        assert_eq!(
+            maybe_seal_at(&cfg, t, policy, later(47)),
+            None,
+            "young: 47 h < 48 h"
+        );
+        assert_eq!(
+            maybe_seal_at(&cfg, t, policy.max_bytes.into(), later(1000)),
+            None,
+            "size-only policy: no age seal"
+        );
+        let s3 = maybe_seal_at(&cfg, t, policy, later(48)).expect("aged: 48 h >= 48 h");
+        assert_eq!(s3.file_name().unwrap(), "projection.jsonl.3");
+        assert!(!cfg.path_for(t).exists(), "the rename IS the seal");
+        assert_eq!(sealed_segments(&cfg, t), vec![s1, s2, s3.clone()]);
+        wait_for_sidecars(&s3).await;
+        assert_eq!(load_segment_index(&s3).unwrap().len(), 1, "exec-b only");
+        assert_eq!(
+            read_execution_across_segments_count(&cfg, t, "exec-b").await,
+            4,
+            "an age-sealed segment reads like any other"
+        );
+        // No hot loop: nothing to seal while the active segment is absent, and
+        // the next record starts a fresh clock.
+        assert_eq!(
+            maybe_seal_at(&cfg, t, policy, later(1000)),
+            None,
+            "absent active"
+        );
+        put(&cfg, t, "exec-c", 1).await;
+        assert_eq!(
+            maybe_seal_at(&cfg, t, policy, later(47)),
+            None,
+            "fresh segment"
+        );
+        let s4 = maybe_seal_at(&cfg, t, policy, later(49)).expect("and it ages too");
+        assert_eq!(s4.file_name().unwrap(), "projection.jsonl.4");
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    async fn read_execution_across_segments_count(
+        cfg: &TierStoreConfig,
+        t: StoreTier,
+        exec: &str,
+    ) -> usize {
+        match read_execution(Some(cfg), t, exec).await {
+            TierStoreOutcome::Ok(body) => read_count(&body).0,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_active_segment_is_never_age_sealed() {
+        let cfg = seal_cfg("age-empty");
+        let t = StoreTier::Projection;
+        put(&cfg, t, "exec-a", 1).await;
+        let s1 = seal_now(&cfg, t);
+        age(&s1, 1000);
+        std::fs::write(cfg.path_for(t), b"").unwrap();
+        assert_eq!(maybe_seal_at(&cfg, t, age_only(1), later(1000)), None);
+        assert_eq!(sealed_segments(&cfg, t), vec![s1]);
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// The event log gets the same rule (deliberately: it is prunable, and the
+    /// same pin applies on a quiet stretch); its size seal is unchanged. A tier
+    /// that is never pruned is never age-sealed.
+    #[tokio::test]
+    async fn the_event_log_age_seals_too_and_unprunable_tiers_never_do() {
+        let cfg = seal_cfg("age-tiers");
+        for t in [StoreTier::EventLog, StoreTier::Projection] {
+            put(&cfg, t, "exec-a", 2).await;
+            let s = maybe_seal_at(&cfg, t, age_only(48), later(48)).expect("prunable tier");
+            assert!(s.to_str().unwrap().ends_with(".jsonl.1"), "{}", s.display());
+        }
+        for &t in StoreTier::ALL
+            .iter()
+            .filter(|t| !PRUNABLE_TIERS.contains(t))
+        {
+            put(&cfg, t, "exec-a", 2).await;
+            assert_eq!(
+                maybe_seal_at(&cfg, t, age_only(1), later(10_000)),
+                None,
+                "{t:?}"
+            );
+            // ...and its size seal still works exactly as before.
+            let both = SealPolicy {
+                max_bytes: Some(1),
+                max_age: Some(hours(1)),
+            };
+            assert!(
+                maybe_seal_at(&cfg, t, both, later(0)).is_some(),
+                "{t:?} size seal"
+            );
+        }
+        // Size wins over age and both use the same numbering.
+        let t = StoreTier::EventLog;
+        put(&cfg, t, "exec-a", 2).await;
+        let s = maybe_seal_at(&cfg, t, Some(1).into(), later(0)).expect("size");
+        assert!(s.to_str().unwrap().ends_with("eventlog.jsonl.2"));
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
+    /// ⭐ End to end, the production shape: `.1` is old but pinned because an
+    /// execution in it still writes to a long-open active segment, and `.2` is
+    /// the newest sealed segment, so retention can reclaim neither. An age seal
+    /// moves that execution's live records into `.3`; once `.3` is older than
+    /// the window, `.1` and `.2` would prune and an enabled pass unlinks them.
+    #[tokio::test]
+    async fn an_age_seal_unpins_old_projection_segments_once_it_ages() {
+        let cfg = seal_cfg("age-e2e");
+        let t = StoreTier::Projection;
+        put(&cfg, t, "exec-long", 3).await;
+        let s1 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-x", 3).await;
+        let s2 = seal_now(&cfg, t);
+        put(&cfg, t, "exec-long", 2).await; // still writing into the active segment
+        age(&s1, 900);
+        age(&s2, 850);
+        let plan = |now| -> Vec<PruneVerdict> {
+            plan_tier_prune(&cfg, t, R49, now)
+                .into_iter()
+                .map(|d| d.verdict)
+                .collect()
+        };
+        let pinned = PruneVerdict::Keep("pinned: an execution in it also appears in the active segment or a segment younger than the window");
+        let newest =
+            PruneVerdict::Keep("newest sealed segment: kept so a later seal never reuses its name");
+        // Without an age seal: stuck however far into the future we look.
+        assert_eq!(
+            plan(later(10_000)),
+            vec![pinned.clone(), PruneVerdict::BehindAKeptSegment]
+        );
+
+        let s3 = maybe_seal_at(&cfg, t, age_only(48), later(48)).expect("age seal");
+        wait_for_sidecars(&s3).await;
+        // Traffic after the seal lands in a fresh active segment.
+        put(&cfg, t, "exec-new", 1).await;
+        // .3 is younger than the window and still holds exec-long, so .1 stays
+        // pinned (rule 4) and everything newer waits behind it (rule 6).
+        assert_eq!(
+            plan(later(1)),
+            vec![
+                pinned,
+                PruneVerdict::BehindAKeptSegment,
+                PruneVerdict::BehindAKeptSegment
+            ]
+        );
+        // .3 older than the window: .1 and .2 would prune; .3 is the newest (rule 7).
+        assert_eq!(
+            plan(later(50)),
+            vec![PruneVerdict::WouldPrune, PruneVerdict::WouldPrune, newest]
+        );
+        // And the enabled pass (real clock) agrees once .3 really is that old.
+        age(&s3, 50);
+        let bytes = std::fs::metadata(&s1).unwrap().len() + std::fs::metadata(&s2).unwrap().len();
+        let r = run_prune_enabled(&cfg, R49, None).await;
+        let pr = &r.iter().find(|(x, _)| *x == t).unwrap().1;
+        assert_eq!(pr.pruned, vec![s1.clone(), s2.clone()], "{pr:?}");
+        assert_eq!(pr.pruned_bytes, bytes);
+        assert!(s3.exists() && !s1.exists() && !s2.exists());
+        let _ = std::fs::remove_dir_all(&cfg.dir);
+    }
+
     // ---- noetl/ai-meta#491: leases + the retention planner ----
 
     /// Seal the active segment by hand, exactly as `maybe_seal` does (a rename),
@@ -3933,6 +4470,9 @@ mod tests {
             ("pub async fn scan(", "scan_locked"),
             ("pub async fn append_with_seal(", "append_locked"),
             ("pub async fn append_batch(", "append_batch_locked"),
+            // The seal (size or age) stats, reads and renames the active file.
+            ("pub async fn append_with_seal(", "maybe_seal("),
+            ("pub async fn append_batch(", "maybe_seal("),
             ("async fn prune_tier_enabled(", "unlink_revalidated_locked"),
         ] {
             let body = src
@@ -3963,8 +4503,8 @@ mod tests {
             checked += 1;
         }
         assert_eq!(
-            checked, 5,
-            "expected to check 5 entry points, checked {checked}"
+            checked, 7,
+            "expected to check 7 entry points, checked {checked}"
         );
         // The helper must actually use the blocking pool, or the call above is
         // decorative.
