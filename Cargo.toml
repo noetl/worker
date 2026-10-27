@@ -353,21 +353,21 @@ arrow = "53"
 # ehdb-service depends on ehdb-reference in-workspace, so a split pin would pull
 # two incompatible copies of ehdb-reference (its `ProjectionDriver` /
 # `ExecutionStateView` would be distinct types).  This rev is the merge SHA of
-# noetl/ehdb#338 on ehdb main.  ⚠ ALL FOUR ehdb pins move together on every
+# noetl/ehdb#338 on ehdb main.  ⚠ ALL FIVE ehdb pins move together on every
 # bump -- reference, service, feed and l0.  A repin that matches only some of
 # them reintroduces the split this note warns about.
-ehdb-reference = { git = "https://github.com/noetl/ehdb", rev = "f3c708372201925f7656040026cb6c46f831955b" }
+ehdb-reference = { git = "https://github.com/noetl/ehdb", tag = "v0.14.2" }
 # ehdb-service: the Flight SQL projection-tier read surface the external
 # data-plane endpoint (src/ehdb/flight_sql_endpoint.rs) serves.  Inert at rest:
 # no listener binds unless NOETL_EHDB_FLIGHT_SQL is truthy AND the role is a
 # data-plane role.
-ehdb-service = { git = "https://github.com/noetl/ehdb", rev = "f3c708372201925f7656040026cb6c46f831955b" }
+ehdb-service = { git = "https://github.com/noetl/ehdb", tag = "v0.14.2" }
 # ⚠ Same git source AND tag as the other ehdb pins, so cargo resolves ONE copy
 # of each crate. Needed directly because `FeedWriter::new_fenced` takes an
 # `ehdb_core::fence::EpochFence`, so the type must be nameable here.
-ehdb-core = { git = "https://github.com/noetl/ehdb", rev = "f3c708372201925f7656040026cb6c46f831955b" }
-ehdb-feed = { git = "https://github.com/noetl/ehdb", rev = "f3c708372201925f7656040026cb6c46f831955b" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", rev = "f3c708372201925f7656040026cb6c46f831955b" }
+ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.14.2" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.14.2" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.14.2" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
