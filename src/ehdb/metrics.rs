@@ -151,6 +151,9 @@ struct EhdbMetricsState {
     tier_prune_segments: BTreeMap<(&'static str, &'static str), u64>,
     /// Bytes actually unlinked by the retention pass, per tier.
     tier_prune_bytes: BTreeMap<&'static str, u64>,
+    /// Active-segment seals by (tier, reason): `size` | `age`
+    /// (noetl/ai-meta#332 size cap, #491 age cap).
+    tier_seals: BTreeMap<(&'static str, &'static str), u64>,
     /// Highest `global_sequence` each store has reported. Sampled at pin time
     /// from the store file too, so it is meaningful before the first append.
     tier_service_sequence: BTreeMap<&'static str, u64>,
@@ -544,6 +547,11 @@ pub fn pin_tier_service_series(samples: &[(StoreTier, u64, u64)]) {
                 .or_insert(0);
         }
         s.tier_prune_bytes.entry(tier.as_str()).or_insert(0);
+        // Pinned at 0: "never age-sealed" must read as 0, not as a binary
+        // without the age seal.
+        for reason in TIER_SEAL_REASONS {
+            s.tier_seals.entry((tier.as_str(), reason)).or_insert(0);
+        }
         s.tier_service_sequence.entry(tier.as_str()).or_insert(0);
         s.tier_service_store_bytes.entry(tier.as_str()).or_insert(0);
     }
@@ -705,6 +713,15 @@ pub fn record_tier_prune(tier: StoreTier, outcome: &'static str, bytes: u64) {
     if outcome == "pruned" {
         *s.tier_prune_bytes.entry(tier.as_str()).or_insert(0) += bytes;
     }
+}
+
+/// Every reason a seal records, so each series is pinned at 0.
+pub const TIER_SEAL_REASONS: [&str; 2] = ["size", "age"];
+
+/// Record one active-segment seal and why it happened.
+pub fn record_tier_seal(tier: StoreTier, reason: &'static str) {
+    let mut s = state().lock().expect("ehdb metrics lock");
+    *s.tier_seals.entry((tier.as_str(), reason)).or_insert(0) += 1;
 }
 
 /// Record how many records one tier-append request took through each path.
@@ -1117,6 +1134,16 @@ pub fn render_lines() -> Vec<String> {
         for (tier, v) in &s.tier_dedup_hits {
             lines.push(format!(
                 "noetl_ehdb_tier_dedup_hits_total{{tier=\"{tier}\"}} {v}"
+            ));
+        }
+        lines.push(
+            "# HELP noetl_ehdb_tier_seals_total Active-segment seals, by reason: size (NOETL_EHDB_TIER_SEAL_MAX_BYTES) or age (NOETL_EHDB_TIER_SEAL_MAX_AGE_HOURS)"
+                .to_string(),
+        );
+        lines.push("# TYPE noetl_ehdb_tier_seals_total counter".to_string());
+        for ((tier, reason), v) in &s.tier_seals {
+            lines.push(format!(
+                "noetl_ehdb_tier_seals_total{{tier=\"{tier}\",reason=\"{reason}\"}} {v}"
             ));
         }
         lines.push(
