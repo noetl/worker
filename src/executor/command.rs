@@ -643,7 +643,7 @@ impl CommandExecutor {
         // `auth_alias` module + noetl/ai-meta#48 for the regression
         // brief.  Idempotent: if `auth` is already a struct (or
         // absent), this is a no-op + no HTTP call.
-        let alias_secrets = match super::auth_alias::resolve_auth_alias(
+        let alias_secrets = match resolve_auth_alias_through_outage(
             &mut tool_config_value,
             &dispatch_client,
             command.execution_id,
@@ -1577,6 +1577,72 @@ impl CommandExecutor {
     }
 }
 
+/// [`super::auth_alias::resolve_auth_alias`], waiting out a restarting server.
+///
+/// The command was claimed and acked before this runs, so nothing redelivers it:
+/// giving up on a transient failure leaves the step at `command.started` for good
+/// (noetl/ai-meta#504). Each attempt starts from the unresolved config.
+async fn resolve_auth_alias_through_outage(
+    tool_config_value: &mut serde_json::Value,
+    client: &ControlPlaneClient,
+    execution_id: i64,
+) -> std::result::Result<
+    std::collections::HashMap<String, String>,
+    super::auth_alias::CredentialResolutionError,
+> {
+    let budget = crate::client::server_outage_budget();
+    let started = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(500);
+    loop {
+        let mut attempt = tool_config_value.clone();
+        match super::auth_alias::resolve_auth_alias(&mut attempt, client, execution_id).await {
+            Ok(secrets) => {
+                *tool_config_value = attempt;
+                return Ok(secrets);
+            }
+            Err(e) if !e.is_terminal() && started.elapsed() < budget => {
+                tracing::warn!(
+                    execution_id,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    error = %e,
+                    "Credential lookup failed transiently, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_auth_alias_outage {
+    use super::*;
+
+    /// A lookup that starts while the server is away must get an answer once it
+    /// returns. A 404 is terminal, so `AliasNotFound` proves the retry reached the
+    /// server; giving up early would surface `Transient`, the shape that stranded
+    /// the step.
+    #[tokio::test]
+    async fn a_credential_lookup_waits_for_the_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = ControlPlaneClient::new(&format!("http://{addr}"));
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+
+        let mut config = serde_json::json!({"kind": "http", "auth": "absent_alias"});
+        let err = resolve_auth_alias_through_outage(&mut config, &client, 1)
+            .await
+            .expect_err("the alias does not exist");
+        assert!(err.is_terminal(), "gave up during the outage: {err}");
+    }
+}
+
 /// Soft upper bound for the JSON-serialised size of
 /// `payload.result.context` on `call.done` events.  Matches the
 /// Python broker's `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES` default
@@ -1589,7 +1655,7 @@ const INLINE_CONTEXT_MAX_BYTES: usize = 100 * 1024;
 /// command (`system/orchestrate` wasm dispatch).  Results emitted under this
 /// step are decoded synchronously by the server to advance the drive, so they
 /// are exempt from the inline-budget offload — see `build_call_done_result`.
-const ORCHESTRATE_STEP_NAME: &str = "__orchestrate__";
+pub(crate) const ORCHESTRATE_STEP_NAME: &str = "__orchestrate__";
 
 /// The effective inline budget, read once from `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`
 /// (default [`INLINE_CONTEXT_MAX_BYTES`] = 100KB).  Lets ops tune when a tool

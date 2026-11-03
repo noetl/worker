@@ -103,6 +103,66 @@ pub struct CredentialHttpError {
     pub body: String,
 }
 
+/// A non-success HTTP response from `POST /api/events`.
+///
+/// Carries the status so [`is_server_outage`] can tell "the server is
+/// restarting" from "the server refused this event" without matching on the
+/// formatted message (noetl/ai-meta#504).
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to emit event: HTTP {status} {body}")]
+pub struct EventEmitHttpError {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Default for `NOETL_EVENT_EMIT_OUTAGE_BUDGET_SECS`: how long a step's result
+/// keeps retrying while the server is unreachable.
+///
+/// A prod server roll takes about 29 s and the old retry gave up after about
+/// 3.5 s, so a step that finished during a roll lost its result and the
+/// execution stayed RUNNING until the 24 h non-convergence sweep failed it
+/// (noetl/ai-meta#504). 120 s is about four rolls.
+const DEFAULT_EVENT_EMIT_OUTAGE_BUDGET_SECS: u64 = 120;
+
+/// Longest wait between outage retries, so a result lands within this long of
+/// the server returning. The dispatch slot stays held meanwhile: nothing can
+/// complete while the server is away, so holding it is back-pressure.
+const OUTAGE_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// The patience a control-plane call gets while the server is restarting.
+/// `0` restores the old behaviour.
+pub(crate) fn server_outage_budget() -> Duration {
+    Duration::from_secs(
+        std::env::var("NOETL_EVENT_EMIT_OUTAGE_BUDGET_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_EVENT_EMIT_OUTAGE_BUDGET_SECS),
+    )
+}
+
+/// True when an emit failed in a way a restarting server produces: the request
+/// never got an answer, or a gateway-class status. A 400 or a deterministic 500
+/// is the server refusing this event, and waiting will not change that.
+fn is_server_outage(err: &anyhow::Error) -> bool {
+    if let Some(http) = err.downcast_ref::<EventEmitHttpError>() {
+        return matches!(http.status, 408 | 429 | 502 | 503 | 504);
+    }
+    err.downcast_ref::<reqwest::Error>()
+        .is_some_and(|re| !re.is_decode() && !re.is_body())
+}
+
+/// Whether an event may wait out a server outage.
+///
+/// ⚠ The drive step must not. Its `call.done` is applied on arrival, and it
+/// issues the commands the drive decided on. By the time a late one arrives the
+/// restarted server's reconcile may have run a newer drive, so applying it could
+/// issue those commands a second time. A lost drive result costs nothing: the
+/// reconcile re-drives from the event log. A step's result is the opposite: no
+/// other copy exists, and a repeat is harmless because it keeps its `event_id`.
+fn may_wait_out_outage(event: &ExecutorEvent) -> bool {
+    event.step != crate::executor::command::ORCHESTRATE_STEP_NAME
+}
+
 /// Marker prefix on a [`ClaimResult::Failed`] that can never succeed
 /// (noetl/ai-meta#249).
 ///
@@ -520,8 +580,9 @@ impl ControlPlaneClient {
             .await?;
 
         if !response.status().is_success() {
+            let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to emit event: {}", body);
+            return Err(EventEmitHttpError { status, body }.into());
         }
 
         // noetl/ai-meta#258 — read the AUTHORITATIVE identity back.
@@ -673,44 +734,79 @@ impl ControlPlaneClient {
         }
     }
 
-    /// Emit an event with retry.
+    /// Emit an event with retry: `max_retries` for any failure, and on top of
+    /// that up to [`server_outage_budget`] while the server looks like it is
+    /// restarting. Every attempt sends the same `event_id`.
     pub async fn emit_event_with_retry(
         &self,
         event: ExecutorEvent,
         max_retries: u32,
     ) -> Result<()> {
-        let mut delay = Duration::from_millis(500);
+        let budget = if may_wait_out_outage(&event) {
+            server_outage_budget()
+        } else {
+            Duration::ZERO
+        };
+        self.emit_event_with_budget(event, max_retries, budget)
+            .await
+    }
 
-        for attempt in 0..=max_retries {
-            match self.emit_event(event.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(e) if attempt < max_retries => {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_retries,
-                        error = %e,
-                        "Event emission failed, retrying"
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, Duration::from_secs(10));
+    async fn emit_event_with_budget(
+        &self,
+        event: ExecutorEvent,
+        max_retries: u32,
+        outage_budget: Duration,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut delay = Duration::from_millis(500);
+        let mut attempt = 0;
+
+        loop {
+            let e = match self.emit_event(event.clone()).await {
+                Ok(()) => {
+                    if attempt > max_retries {
+                        tracing::info!(
+                            execution_id = event.execution_id,
+                            step = %event.step,
+                            event_type = %event.event_type,
+                            attempts = attempt + 1,
+                            waited_ms = started.elapsed().as_millis() as u64,
+                            "Event emitted after waiting out a server outage"
+                        );
+                    }
+                    return Ok(());
                 }
-                Err(e) => {
-                    // Abandoned after the retry window.  Both callers are the
-                    // container-poll resume path, where a lost `call.done`
-                    // means the execution never continues — it simply stops,
-                    // with no terminal event to notice (noetl/ai-meta#227).
-                    //
-                    // Recorded here rather than at the call sites so every
-                    // caller is covered, and on the SAME counter as the
-                    // emitter's abandon path, so "an event was given up on"
-                    // is one number regardless of which emit path took it.
-                    crate::metrics::record_event_emit_failed(&event.event_type.to_string());
-                    return Err(e);
-                }
+                Err(e) => e,
+            };
+            let in_budget = started.elapsed() < outage_budget && is_server_outage(&e);
+            if attempt < max_retries || in_budget {
+                attempt += 1;
+                tracing::warn!(
+                    execution_id = event.execution_id,
+                    step = %event.step,
+                    event_type = %event.event_type,
+                    attempt,
+                    max_retries,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    error = %e,
+                    "Event emission failed, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, OUTAGE_RETRY_MAX_DELAY);
+            } else {
+                // Abandoned after the retry window.  A lost `call.done` or
+                // `command.completed` means the execution never continues — it
+                // simply stops, with no terminal event to notice
+                // (noetl/ai-meta#227).
+                //
+                // Recorded here rather than at the call sites so every caller
+                // is covered, and on the SAME counter as the emitter's abandon
+                // path, so "an event was given up on" is one number regardless
+                // of which emit path took it.
+                crate::metrics::record_event_emit_failed(&event.event_type.to_string());
+                return Err(e);
             }
         }
-
-        Ok(())
     }
 
     /// Get a variable value for an execution.
@@ -1403,6 +1499,151 @@ pub struct SubscriptionStatus {
     pub state: String,
     #[serde(default)]
     pub last_event_type: String,
+}
+
+#[cfg(test)]
+mod tests_outage_retry {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn event(step: &str) -> ExecutorEvent {
+        ExecutorEvent {
+            execution_id: 1,
+            event_type: "command.completed".to_string(),
+            step: step.to_string(),
+            status: "COMPLETED".to_string(),
+            created_at: chrono::Utc::now(),
+            context: serde_json::json!({}),
+            event_id: Some(42),
+            worker_id: None,
+            meta: None,
+        }
+    }
+
+    /// Serve `/api/events` with `status` on `listener`; returns the hit counter
+    /// and every `event_id` received.
+    fn serve(
+        listener: tokio::net::TcpListener,
+        status: u16,
+    ) -> (Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<i64>>>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (h, i) = (hits.clone(), ids.clone());
+        let app = axum::Router::new().route(
+            "/api/events",
+            axum::routing::post(move |axum::Json(v): axum::Json<serde_json::Value>| {
+                let (h, i) = (h.clone(), i.clone());
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    if let Some(id) = v["event_id"].as_str().and_then(|s| s.parse().ok()) {
+                        i.lock().unwrap().push(id);
+                    } else if let Some(id) = v["event_id"].as_i64() {
+                        i.lock().unwrap().push(id);
+                    }
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        axum::Json(serde_json::json!({"event_id": 42})),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (hits, ids)
+    }
+
+    async fn free_addr() -> SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    }
+
+    /// The bug: the server is away for longer than the old ~3.5 s window. With
+    /// `max_retries` 1 the old loop gave up after one 500 ms sleep, so reaching
+    /// the server that appears 2 s in proves the budget carried it.
+    #[tokio::test]
+    async fn a_step_result_outlasts_a_server_restart_with_one_event_id() {
+        let addr = free_addr().await;
+        let client = ControlPlaneClient::new(&format!("http://{addr}"));
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            serve(tokio::net::TcpListener::bind(addr).await.unwrap(), 200)
+        });
+
+        client
+            .emit_event_with_budget(event("work"), 1, Duration::from_secs(30))
+            .await
+            .expect("the result must land once the server returns");
+
+        let (hits, ids) = server.await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(*ids.lock().unwrap(), vec![42]);
+    }
+
+    /// Control for the test above: the same outage with no budget is lost.
+    #[tokio::test]
+    async fn no_budget_gives_up_during_the_same_outage() {
+        let addr = free_addr().await;
+        let client = ControlPlaneClient::new(&format!("http://{addr}"));
+        client
+            .emit_event_with_budget(event("work"), 1, Duration::ZERO)
+            .await
+            .expect_err("nothing is listening");
+    }
+
+    #[tokio::test]
+    async fn a_bounded_outage_still_gives_up() {
+        let addr = free_addr().await;
+        let client = ControlPlaneClient::new(&format!("http://{addr}"));
+        let started = std::time::Instant::now();
+        client
+            .emit_event_with_budget(event("work"), 0, Duration::from_secs(1))
+            .await
+            .expect_err("the budget is a bound, not a promise");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A refusal is not an outage: a poison event must not hold a dispatch slot
+    /// for the whole budget.
+    #[tokio::test]
+    async fn a_refused_event_does_not_spend_the_budget() {
+        for status in [400u16, 500] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (hits, _) = serve(listener, status);
+            let client = ControlPlaneClient::new(&format!("http://{addr}"));
+            let started = std::time::Instant::now();
+            client
+                .emit_event_with_budget(event("work"), 1, Duration::from_secs(60))
+                .await
+                .expect_err("refused");
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "HTTP {status}");
+            assert!(started.elapsed() < Duration::from_secs(5), "HTTP {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_503_counts_as_an_outage() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hits, _) = serve(listener, 503);
+        let client = ControlPlaneClient::new(&format!("http://{addr}"));
+        client
+            .emit_event_with_budget(event("work"), 0, Duration::from_secs(1))
+            .await
+            .expect_err("still 503");
+        assert!(hits.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// The drive keeps the short window: a late drive result could re-issue
+    /// commands a newer drive already issued.
+    #[test]
+    fn only_the_drive_step_is_excluded_from_waiting() {
+        assert!(may_wait_out_outage(&event("work")));
+        assert!(!may_wait_out_outage(&event(
+            crate::executor::command::ORCHESTRATE_STEP_NAME
+        )));
+    }
 }
 
 #[cfg(test)]
