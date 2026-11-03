@@ -641,8 +641,16 @@ impl Worker {
             h.abort();
         }
 
-        // Deregister worker
-        self.deregister().await?;
+        // Deregister worker. A refusal at exit is degraded, not a failure of the run: the
+        // heartbeat stops either way and the registration goes stale. Said at WARN with the
+        // status (noetl/ai-meta#514), never as a silent success.
+        if let Err(e) = self.deregister().await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %e,
+                "worker deregistration failed; its registration will expire with the heartbeat"
+            );
+        }
 
         result
     }
