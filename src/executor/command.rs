@@ -1615,34 +1615,6 @@ async fn resolve_auth_alias_through_outage(
     }
 }
 
-#[cfg(test)]
-mod tests_auth_alias_outage {
-    use super::*;
-
-    /// A lookup that starts while the server is away must get an answer once it
-    /// returns. A 404 is terminal, so `AliasNotFound` proves the retry reached the
-    /// server; giving up early would surface `Transient`, the shape that stranded
-    /// the step.
-    #[tokio::test]
-    async fn a_credential_lookup_waits_for_the_server() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let client = ControlPlaneClient::new(&format!("http://{addr}"));
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            axum::serve(listener, axum::Router::new()).await.unwrap();
-        });
-
-        let mut config = serde_json::json!({"kind": "http", "auth": "absent_alias"});
-        let err = resolve_auth_alias_through_outage(&mut config, &client, 1)
-            .await
-            .expect_err("the alias does not exist");
-        assert!(err.is_terminal(), "gave up during the outage: {err}");
-    }
-}
-
 /// Soft upper bound for the JSON-serialised size of
 /// `payload.result.context` on `call.done` events.  Matches the
 /// Python broker's `NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES` default
@@ -6343,5 +6315,33 @@ mod probe_316_observed_shapes {
             canonical.is_some(),
             "the canonical _uri must survive (FIX 2)"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_auth_alias_outage {
+    use super::*;
+
+    /// A lookup that starts while the server is away must get an answer once it
+    /// returns. A 404 is terminal, so `AliasNotFound` proves the retry reached the
+    /// server; giving up early would surface `Transient`, the shape that stranded
+    /// the step.
+    #[tokio::test]
+    async fn a_credential_lookup_waits_for_the_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = ControlPlaneClient::new(&format!("http://{addr}"));
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+
+        let mut config = serde_json::json!({"kind": "http", "auth": "absent_alias"});
+        let err = resolve_auth_alias_through_outage(&mut config, &client, 1)
+            .await
+            .expect_err("the alias does not exist");
+        assert!(err.is_terminal(), "gave up during the outage: {err}");
     }
 }
