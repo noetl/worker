@@ -99,8 +99,10 @@ async fn main() -> Result<()> {
     // Create and run worker
     let worker = Worker::new(config).await?;
 
+    let run = worker.run();
+    tokio::pin!(run);
     tokio::select! {
-        result = worker.run() => {
+        result = &mut run => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "Worker error");
                 return Err(e);
@@ -108,6 +110,16 @@ async fn main() -> Result<()> {
         }
         _ = shutdown => {
             tracing::info!("Shutting down worker");
+            // noetl/ai-meta#511: drain BEFORE anything else. This branch used to
+            // drop `run` here, which took every in-flight command — mid LLM call —
+            // and the heartbeat down with the runtime, so a KEDA scale-in or a
+            // roll killed live turns. `run` now stops claiming, waits for its
+            // in-flight commands (bounded by NOETL_WORKER_DRAIN_TIMEOUT_SECS),
+            // deregisters, and returns; only then do the writers seal.
+            worker.begin_drain();
+            if let Err(e) = (&mut run).await {
+                tracing::error!(error = %e, "Worker error while draining");
+            }
             // noetl/ai-meta#209: the seal has to happen HERE, awaited, before
             // `main` returns.  This branch used to log and fall straight through
             // — dropping the runtime while the writer hosts' own detached

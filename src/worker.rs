@@ -50,6 +50,12 @@ pub struct Worker {
     /// Semaphore for concurrency control.
     semaphore: Arc<Semaphore>,
 
+    /// Graceful drain (noetl/ai-meta#511). Set by [`Worker::begin_drain`] on
+    /// SIGTERM: the pull loop stops taking commands, waits for the ones it
+    /// already runs, and only then lets `run()` return. A `watch` so a pull
+    /// loop that first looks after the signal fired still sees it.
+    drain: tokio::sync::watch::Sender<bool>,
+
     /// Shared pool-side WAL event index (RFC #115 Phase 4).  The drain loop
     /// ([`crate::state_builder::spawn_drain`]) feeds it from the `noetl_events`
     /// WAL; the executor reads it to build off-server drive state under
@@ -237,13 +243,15 @@ impl Worker {
             })?;
         let filter = format!("commands.{pool}.>");
         tracing::info!(%claim_addr, %filter, pool = %pool, "worker consuming commands from the EHDB bus");
+        let (drain, drain_rx) = tokio::sync::watch::channel(false);
         let source = crate::command_bus::WorkerCommandSource::Ehdb(Box::new(
             crate::command_bus::EhdbCommandSource::new(
                 claim_addr,
                 filter,
                 config.worker_id.clone(),
                 client.clone(),
-            ),
+            )
+            .with_drain(drain_rx),
         ));
         let source = Arc::new(Mutex::new(source));
 
@@ -311,9 +319,80 @@ impl Worker {
             client,
             executor,
             semaphore,
+            drain,
             state_builder_index,
             metrics_handle,
         })
+    }
+
+    /// Stop taking commands and let the running ones finish (noetl/ai-meta#511).
+    ///
+    /// `main` calls this on SIGTERM and then keeps awaiting [`Worker::run`],
+    /// which returns once the in-flight commands are done or
+    /// [`drain_budget`] runs out. Before this, `main` dropped `run()` on the
+    /// signal and returned: the runtime went down with every command task in
+    /// it — mid LLM call — and the heartbeat with them, so a KEDA scale-in
+    /// after a burst killed live turns and left them to the orphan guardrail.
+    pub fn begin_drain(&self) {
+        if self.drain.send_replace(true) {
+            return;
+        }
+        // Not ready for new work. Nothing routes traffic to a worker, but the
+        // probe should not claim a pod that is leaving is healthy.
+        crate::metrics::set_worker_ready(false);
+        // No in-flight count here: at this instant the claim loop still holds the permit
+        // it parks with, so the number would read one high. `wait_in_flight` counts once
+        // the loop has let go of it.
+        tracing::info!(
+            budget_secs = drain_budget(!self.writer_shutdowns.is_empty()).as_secs(),
+            "draining: no new commands"
+        );
+    }
+
+    fn draining(&self) -> bool {
+        *self.drain.borrow()
+    }
+
+    /// Commands currently executing: every one holds a semaphore permit.
+    fn in_flight(&self) -> usize {
+        self.config
+            .max_concurrent_tasks
+            .saturating_sub(self.semaphore.available_permits())
+    }
+
+    /// Wait for the commands this worker already runs, bounded by the drain
+    /// budget. Taking every permit back is "all of them finished": each
+    /// command task holds one until it has emitted its result.
+    async fn wait_in_flight(&self) {
+        let started = std::time::Instant::now();
+        let in_flight = self.in_flight();
+        let budget = drain_budget(!self.writer_shutdowns.is_empty());
+        tracing::info!(
+            in_flight,
+            budget_secs = budget.as_secs(),
+            "draining: waiting for in-flight commands to finish"
+        );
+        match drain_in_flight(&self.semaphore, self.config.max_concurrent_tasks, budget).await {
+            Ok(()) => {
+                crate::metrics::record_worker_drain("drained", in_flight);
+                tracing::info!(
+                    in_flight,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "draining: every in-flight command finished"
+                );
+            }
+            Err(abandoned) => {
+                crate::metrics::record_worker_drain("budget_expired", abandoned);
+                // Same fate as before #511 for these, but now it is said: the
+                // orphan guardrail will fail their executions.
+                tracing::error!(
+                    abandoned,
+                    budget_secs = budget.as_secs(),
+                    "draining: budget expired with commands still running; they \
+                     are abandoned and the orphan guardrail will fail their executions"
+                );
+            }
+        }
     }
 
     /// Seal every EHDB writer this process hosts, in order, before exit
@@ -653,9 +732,18 @@ impl Worker {
         // that stops the spin).  Reset on any successful claim below.
         let mut claim_fail_backoff = crate::state_builder::REBUILD_BACKOFF_MIN;
 
+        let mut drain = self.drain.subscribe();
         loop {
-            // Wait for available slot
-            let permit = self.semaphore.clone().acquire_owned().await?;
+            if self.draining() {
+                break;
+            }
+            // Wait for available slot. A full worker parks here, so the drain
+            // must be able to end the wait — nothing is claimed yet.
+            let permit = tokio::select! {
+                biased;
+                permit = self.semaphore.clone().acquire_owned() => permit?,
+                _ = drain.wait_for(|d| *d) => break,
+            };
 
             // Pull one item from the source.  The Mutex is held only
             // for the duration of `next()` + the corresponding ack /
@@ -691,6 +779,10 @@ impl Worker {
                 // normal operation but we tolerate it for testability
                 // and the brief gap when no messages are queued.
                 drop(permit);
+                // A draining source answers `None` instead of parking.
+                if self.draining() {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             };
@@ -912,6 +1004,12 @@ impl Worker {
                 }
             }
         }
+
+        // Draining (noetl/ai-meta#511): nothing new is claimed past this point.
+        // `run()` keeps the heartbeat alive until this returns, so the orphan
+        // guardrail never sees a draining worker as dead.
+        self.wait_in_flight().await;
+        Ok(())
     }
 
     /// React to an error on the command loop's NATS path (noetl/ai-meta#163).
@@ -1006,6 +1104,52 @@ fn classify_loop_error<E: std::fmt::Display>(err: &E) -> LoopAction {
     } else {
         LoopAction::Backoff
     }
+}
+
+/// Wait until every command holding a permit has released it, or `budget`
+/// passes (noetl/ai-meta#511). `Err` carries how many were still running.
+///
+/// Taking all `total` permits back means every command task finished: each
+/// holds one from claim until after its result is emitted.
+pub(crate) async fn drain_in_flight(
+    semaphore: &Semaphore,
+    total: usize,
+    budget: std::time::Duration,
+) -> std::result::Result<(), usize> {
+    match tokio::time::timeout(budget, semaphore.acquire_many(total as u32)).await {
+        Ok(Ok(_all)) => Ok(()),
+        // A closed semaphore has nothing left to wait for.
+        Ok(Err(_closed)) => Ok(()),
+        Err(_elapsed) => Err(total.saturating_sub(semaphore.available_permits())),
+    }
+}
+
+/// Default time a draining worker waits for its in-flight commands
+/// (noetl/ai-meta#511). Covers a long LLM step plus the result post; the worker
+/// Deployments carry `terminationGracePeriodSeconds: 180` so Kubernetes does not
+/// SIGKILL a drain that is still within it.
+const DEFAULT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// The writer host (`noetl-cmdbus-writer`) must still seal its logs inside its
+/// own, shorter grace period after the drain, so a process hosting a writer
+/// waits less by default. It claims a subject nothing publishes, so in practice
+/// its drain is instant; this only bounds the case where that changes.
+const DEFAULT_WRITER_HOST_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `NOETL_WORKER_DRAIN_TIMEOUT_SECS` — how long a SIGTERM'd worker waits for
+/// its in-flight commands before exiting anyway. `0` restores the pre-#511
+/// behaviour of abandoning them at once. Keep it below the pod's
+/// `terminationGracePeriodSeconds`, minus the writer seal budget on a writer host.
+fn drain_budget(hosts_writer: bool) -> std::time::Duration {
+    std::env::var("NOETL_WORKER_DRAIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(if hosts_writer {
+            DEFAULT_WRITER_HOST_DRAIN_BUDGET
+        } else {
+            DEFAULT_DRAIN_BUDGET
+        })
 }
 
 /// Whether this worker should boot-warm the orchestrate drive plug-in
@@ -1474,6 +1618,70 @@ mod tests {
         assert_eq!(processed, vec!["c1", "c2", "c3", "c4"]);
         // Every processed command acked exactly once (no duplicate acks).
         assert_eq!(acked, vec!["c1", "c2", "c3", "c4"]);
+    }
+
+    /// noetl/ai-meta#511 — a drain waits for the commands still running, rather
+    /// than returning while they are mid-step (which is what dropped them).
+    #[tokio::test]
+    async fn a_drain_waits_for_in_flight_commands() {
+        let sem = Arc::new(Semaphore::new(4));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let d = done.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            d.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(permit);
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(
+            drain_in_flight(&sem, 4, std::time::Duration::from_secs(5)).await,
+            Ok(())
+        );
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "the drain returned while a command was still running"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+    }
+
+    /// The budget bounds the wait and reports what it gave up on, so a stuck
+    /// command cannot hold a pod past its grace period into a SIGKILL.
+    #[tokio::test]
+    async fn a_drain_gives_up_at_its_budget_and_counts_the_abandoned() {
+        let sem = Arc::new(Semaphore::new(4));
+        let _stuck_a = sem.clone().acquire_owned().await.unwrap();
+        let _stuck_b = sem.clone().acquire_owned().await.unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            drain_in_flight(&sem, 4, std::time::Duration::from_millis(200)).await,
+            Err(2)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// An idle worker drains at once.
+    #[tokio::test]
+    async fn an_idle_drain_is_immediate() {
+        let sem = Semaphore::new(4);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            drain_in_flight(&sem, 4, std::time::Duration::from_secs(5)).await,
+            Ok(())
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    /// The default budget fits inside the worker pods' grace period, and a
+    /// writer host keeps room for its seal.
+    #[test]
+    fn the_default_drain_budget_fits_the_grace_period() {
+        unsafe { std::env::remove_var("NOETL_WORKER_DRAIN_TIMEOUT_SECS") };
+        let grace = std::time::Duration::from_secs(180);
+        assert!(drain_budget(false) < grace);
+        let writer_grace = std::time::Duration::from_secs(60);
+        let seal_budget = std::time::Duration::from_secs(15);
+        assert!(drain_budget(true) + seal_budget < writer_grace);
     }
 }
 
