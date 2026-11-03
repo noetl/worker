@@ -104,12 +104,36 @@ mod release_pipeline {
         );
 
         // A job builds a shipped artifact if it invokes a container build.
+        //
+        // ⚠ A `gcloud builds submit --no-source` sends no source tree, so it cannot build
+        // this repo: since noetl/ai-meta#515 that is publish-ar COPYING the GHCR manifest
+        // (built, and stamped, by publish-image) into Artifact Registry. It is held to a
+        // different rule below — it must verify the digest it copied.
+        let is_copy = |b: &str| b.contains("gcloud builds submit --no-source");
         let builders: Vec<&(String, String)> = jobs
             .iter()
             .filter(|(_, b)| {
-                b.contains("docker/build-push-action") || b.contains("gcloud builds submit")
+                b.contains("docker/build-push-action")
+                    || (b.contains("gcloud builds submit") && !is_copy(b))
             })
             .collect();
+        for (job, b) in jobs.iter().filter(|(_, b)| is_copy(b)) {
+            assert!(
+                b.contains("cloudbuild-copy.yaml"),
+                "release.yml job `{job}` submits a source-less Cloud Build that is not \
+                 cloudbuild-copy.yaml — nothing checks what it publishes"
+            );
+        }
+        let copy_cfg = include_str!("../cloudbuild-copy.yaml");
+        assert!(
+            copy_cfg.contains("gcrane cp") || copy_cfg.contains("- cp"),
+            "cloudbuild-copy.yaml no longer copies"
+        );
+        assert!(
+            copy_cfg.contains("test \"$$src\" = \"$$dst\""),
+            "cloudbuild-copy.yaml must fail unless the Artifact Registry digest equals the \
+             GHCR digest it copied — a copy that is not read back is not a release"
+        );
         assert!(
             !builders.is_empty(),
             "no artifact-building job found in release.yml — the detector is \
