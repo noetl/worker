@@ -7,6 +7,7 @@ mod control_plane;
 pub mod sealed;
 pub mod tls;
 
+pub(crate) use control_plane::server_outage_budget;
 pub use control_plane::{
     BatchExecuteResponse, BatchItemOutcome, ClaimResult, Command, ControlPlaneClient, Credential,
     CredentialHttpError, DispatchItem, ExecutorEvent, HeartbeatOutcome, SinkStateAction,
