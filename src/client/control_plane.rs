@@ -2033,7 +2033,11 @@ mod tests_deregister {
             .deregister_worker("w-1", "pool")
             .await
             .expect("a DELETE-routed server must accept the deregistration");
-        let body = hit.lock().unwrap().clone().expect("the server was never reached");
+        let body = hit
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the server was never reached");
         assert_eq!(body["name"], "w-1");
         assert_eq!(body["component_type"], "worker_pool");
     }
