@@ -559,6 +559,7 @@ pub struct WorkerMetrics {
     /// the lazy load path).  `duration_seconds` on the warmup span is the total
     /// boot-warm cost the readiness gate hides.
     pub plugin_warm_total: IntCounterVec,
+    pub worker_drain_commands_total: IntCounterVec,
     /// Worker readiness (noetl/ai-meta#130): `1` once boot warmup completed and
     /// the pull loop is eligible to claim, `0` during startup.  The `/readyz`
     /// probe reads this so Kubernetes only routes / completes a rollout once the
@@ -1742,6 +1743,24 @@ impl WorkerMetrics {
             .register(Box::new(plugin_warm_total.clone()))
             .expect("register plugin_warm_total");
 
+        let worker_drain_commands_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_drain_commands_total",
+                "Commands in flight when a SIGTERM'd worker drained — drained (finished before exit) / budget_expired (abandoned to the orphan guardrail); noetl/ai-meta#511.",
+            ),
+            &["outcome"],
+        )
+        .expect("worker_drain_commands_total metric");
+        // Pinned at 0: absent must read as "never drained", not "not this binary".
+        for outcome in ["drained", "budget_expired"] {
+            worker_drain_commands_total
+                .with_label_values(&[outcome])
+                .inc_by(0);
+        }
+        registry
+            .register(Box::new(worker_drain_commands_total.clone()))
+            .expect("register worker_drain_commands_total");
+
         let worker_ready = IntGauge::new(
             "noetl_worker_ready",
             "Worker readiness — 1 once boot warmup completed; the /readyz probe reads this (noetl/ai-meta#130).",
@@ -2041,6 +2060,7 @@ impl WorkerMetrics {
             state_equivalence_mismatch_total,
             plugin_load_seconds,
             plugin_warm_total,
+            worker_drain_commands_total,
             worker_ready,
             state_builder_healthy,
             claim_loop_connected,
@@ -2934,6 +2954,15 @@ pub fn record_plugin_warm(outcome: &str) {
         .plugin_warm_total
         .with_label_values(&[outcome])
         .inc();
+}
+
+/// Count the commands a SIGTERM'd worker had in flight when it drained
+/// (`drained` | `budget_expired`). noetl/ai-meta#511.
+pub fn record_worker_drain(outcome: &str, commands: usize) {
+    WorkerMetrics::global()
+        .worker_drain_commands_total
+        .with_label_values(&[outcome])
+        .inc_by(commands as u64);
 }
 
 /// Set the worker-readiness gauge (`true` once boot warmup completed).  The

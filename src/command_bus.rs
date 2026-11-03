@@ -799,6 +799,10 @@ pub struct EhdbCommandSource {
     client: ControlPlaneClient,
     pull: Option<ClaimClient>,
     ack_conn: Mutex<Option<ClaimClient>>,
+    /// Graceful-drain signal (noetl/ai-meta#511). `true` means the process is
+    /// shutting down: stop taking new commands. Only the bus **park** races it —
+    /// never the server-side claim — see [`CommandSource::next`] below.
+    drain: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// EHDB ack handle: the claimed command's global sort key + the notification
@@ -827,7 +831,18 @@ impl EhdbCommandSource {
             client,
             pull: None,
             ack_conn: Mutex::new(None),
+            drain: None,
         }
+    }
+
+    /// Attach the worker's drain signal (noetl/ai-meta#511).
+    pub fn with_drain(mut self, drain: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.drain = Some(drain);
+        self
+    }
+
+    fn draining(&self) -> bool {
+        self.drain.as_ref().is_some_and(|d| *d.borrow())
     }
 
     async fn ack_client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<ClaimClient>>> {
@@ -906,6 +921,12 @@ impl CommandSource for EhdbCommandSource {
 
     async fn next(&mut self) -> Result<Option<Pulled<Self::AckHandle>>> {
         loop {
+            // noetl/ai-meta#511: a draining worker takes nothing new. `None` is the
+            // pull loop's "nothing to do" answer, which it turns into an exit.
+            if self.draining() {
+                self.pull = None;
+                return Ok(None);
+            }
             if self.pull.is_none() {
                 match crate::event_bus::bounded_connect(ClaimClient::connect(
                     &self.claim_addr,
@@ -940,8 +961,41 @@ impl CommandSource for EhdbCommandSource {
             // and the kubelet killed it on every writer roll.
             let probing = crate::metrics::claim_loop_consecutive_failures() > 0;
             let next = self.pull.as_mut().unwrap().claim_next::<EventRecord>();
+            let park = async {
+                if probing {
+                    tokio::time::timeout(claim_probe_window(), next).await
+                } else {
+                    Ok(next.await)
+                }
+            };
+            // noetl/ai-meta#511: SIGTERM must interrupt an idle park, or a drain
+            // waits on a bus that may never deliver again. Only the PARK races the
+            // drain. Dropping it is safe: nothing is ours until `claim_outcome`
+            // below, and closing the connection makes the coordinator release
+            // anything it had assigned for immediate redelivery (the same drop
+            // the probe path below already relies on). `claim_outcome` must never
+            // join this race — cancelling it after the server-side claim landed
+            // is exactly the orphaned command this issue is about.
+            let parked = match self.drain.as_mut() {
+                Some(drain) => tokio::select! {
+                    // A record that is already here wins: running it is cheaper
+                    // than making the coordinator redeliver it.
+                    biased;
+                    r = park => Some(r),
+                    _ = drain.wait_for(|d| *d) => None,
+                },
+                None => Some(park.await),
+            };
+            let Some(parked) = parked else {
+                tracing::info!(
+                    claim_addr = %self.claim_addr,
+                    "draining: stopped parking for new commands"
+                );
+                self.pull = None;
+                return Ok(None);
+            };
             let result = if probing {
-                match tokio::time::timeout(claim_probe_window(), next).await {
+                match parked {
                     Ok(r) => r,
                     Err(_elapsed) => {
                         // The future is dropped, so the client can be asked what
@@ -978,7 +1032,8 @@ impl CommandSource for EhdbCommandSource {
                     }
                 }
             } else {
-                next.await
+                // Non-probing parks are never wrapped in a timeout.
+                parked.unwrap_or_else(|_elapsed| unreachable!("an unbounded park cannot time out"))
             };
             let claimed = match result {
                 Ok(c) => c,
