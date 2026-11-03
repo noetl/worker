@@ -1212,9 +1212,12 @@ impl ControlPlaneClient {
     /// `name` + `component_type`.  POST (not DELETE) — the broker
     /// expects a JSON body with the component name and type.
     pub async fn deregister_worker(&self, worker_id: &str, _pool_name: &str) -> Result<()> {
+        // ⚠ DELETE, not POST (noetl/ai-meta#514). The server routes this path as DELETE;
+        // a POST got 405 and deregistration never worked. Nothing noticed until the #511
+        // drain made shutdown reach this call at all.
         let response = self
             .client
-            .post(format!("{}/api/worker/pool/deregister", self.server_url))
+            .delete(format!("{}/api/worker/pool/deregister", self.server_url))
             .json(&serde_json::json!({
                 "name": worker_id,
                 "component_type": "worker_pool",
@@ -1222,9 +1225,13 @@ impl ControlPlaneClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
+        // A refusal is an error, and it names the status: the body alone was empty, so
+        // the old warning said nothing, and returning Ok let the caller log
+        // "Worker deregistered" for a refusal.
+        let status = response.status();
+        if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            tracing::warn!("Deregister failed: {}", body);
+            anyhow::bail!("deregister refused: HTTP {status}: {body}");
         }
 
         Ok(())
@@ -1990,5 +1997,59 @@ mod tests {
     fn test_with_server_url_trims_trailing_slash() {
         let c = ControlPlaneClient::new("http://x/").with_server_url("http://y:8082/");
         assert_eq!(c.server_url(), "http://y:8082");
+    }
+}
+
+#[cfg(test)]
+mod tests_deregister {
+    //! noetl/ai-meta#514 — the worker must deregister with the verb the server routes.
+    use super::*;
+
+    async fn serve(router: axum::Router) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The server's shape: DELETE only. A POST would get 405, which is the bug.
+    #[tokio::test]
+    async fn deregistration_uses_delete() {
+        let hit = std::sync::Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+        let h = hit.clone();
+        let url = serve(axum::Router::new().route(
+            "/api/worker/pool/deregister",
+            axum::routing::delete(move |axum::Json(v): axum::Json<serde_json::Value>| {
+                let h = h.clone();
+                async move {
+                    *h.lock().unwrap() = Some(v);
+                    axum::Json(serde_json::json!({"status": "ok"}))
+                }
+            }),
+        ))
+        .await;
+        let client = ControlPlaneClient::new(&url);
+        client
+            .deregister_worker("w-1", "pool")
+            .await
+            .expect("a DELETE-routed server must accept the deregistration");
+        let body = hit.lock().unwrap().clone().expect("the server was never reached");
+        assert_eq!(body["name"], "w-1");
+        assert_eq!(body["component_type"], "worker_pool");
+    }
+
+    /// A refusal is an error carrying the status, never a silent Ok.
+    #[tokio::test]
+    async fn a_refusal_is_an_error_that_names_the_status() {
+        let url = serve(axum::Router::new().route(
+            "/api/worker/pool/deregister",
+            axum::routing::delete(|| async { axum::http::StatusCode::NOT_FOUND }),
+        ))
+        .await;
+        let err = ControlPlaneClient::new(&url)
+            .deregister_worker("w-1", "pool")
+            .await
+            .expect_err("a 404 must not read as deregistered");
+        assert!(err.to_string().contains("404"), "{err}");
     }
 }
