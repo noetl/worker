@@ -1,0 +1,35 @@
+# noetl/ai-meta#515 — publish the release image to Artifact Registry by COPYING the
+# multi-arch manifest the release workflow already pushed to GHCR, instead of rebuilding it.
+#
+# Why a copy: the rebuild (cloudbuild.yaml) exceeded Cloud Build's 2400 s timeout on every
+# release from v6.11.2 on, so AR — which prod pulls from — never got the image, and every
+# prod roll needed a manual `crane copy`. A copy takes seconds and guarantees AR holds the
+# exact digest CI built and tested, not a second build of the same source.
+#
+# Runs as the Cloud Build service account, which holds artifactregistry.writer; the
+# GitHub Actions identity that submits this does not, and does not need to.
+steps:
+  - id: copy
+    name: gcr.io/go-containerregistry/gcrane:latest
+    args:
+      - cp
+      - ghcr.io/noetl/worker:${_VERSION}
+      - us-central1-docker.pkg.dev/${PROJECT_ID}/noetl/noetl-worker-rust:${_VERSION}
+  # Read back here, as the account that wrote it: the GitHub Actions identity has no AR read.
+  # AR must hold the same digest as GHCR, or this is not a release.
+  - id: verify
+    name: gcr.io/go-containerregistry/gcrane:debug
+    entrypoint: /busybox/sh
+    args:
+      - -c
+      - |
+        set -e
+        src=$$(gcrane digest ghcr.io/noetl/worker:${_VERSION})
+        dst=$$(gcrane digest us-central1-docker.pkg.dev/${PROJECT_ID}/noetl/noetl-worker-rust:${_VERSION})
+        echo "ghcr=$$src ar=$$dst"
+        test "$$src" = "$$dst"
+substitutions:
+  _VERSION: ""
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 600s

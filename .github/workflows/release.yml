@@ -191,7 +191,12 @@ jobs:
   # service-account key in GitHub secrets.
   publish-ar:
     runs-on: ubuntu-latest
-    needs: [verify-version]
+    # noetl/ai-meta#515: COPY the multi-arch manifest publish-manifest pushed to GHCR,
+    # rather than rebuilding in Cloud Build. The rebuild exceeded Cloud Build's 2400 s
+    # timeout on every release from v6.11.2 on, so Artifact Registry (what prod pulls)
+    # never got the image and every roll needed a manual `crane copy`. A copy takes
+    # seconds and puts the exact digest CI built into AR.
+    needs: [verify-version, publish-manifest]
     if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_CLOUDBUILD_SA != '' }}
     permissions:
       contents: read
@@ -199,35 +204,29 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - name: Stamp the release version into Cargo.toml
-        # The bot no longer pushes a version bump to `main`, so the checked-out
-        # tree carries a stale floor. CARGO_PKG_VERSION is compiled in and
-        # reported as noetl_worker_build_info{version=...} — without this the
-        # image builds and deploys happily while reporting the previous version.
-        run: ./ci/stamp-version.sh "${{ needs.verify-version.outputs.version }}"
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_CLOUDBUILD_SA }}
       - uses: google-github-actions/setup-gcloud@v2
-      - name: Cloud Build -> Artifact Registry
+      - name: Copy the GHCR release image to Artifact Registry
         env:
           VERSION: ${{ needs.verify-version.outputs.version }}
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'shastaratech-noetl-prod' }}
         run: |
           set -euo pipefail
-          # An explicit staging dir skips gcloud's bucket-DISCOVERY call
-          # (GET /storage/v1/b?prefix=...), which needs project-level
-          # storage.buckets.list.  The build SA has bucket-scoped objectAdmin, so
-          # buckets.get returns 200 and the list 403s.  Same fix as
-          # noetl/server#339.  See noetl/ai-meta#211.
-          gcloud builds submit \
+          # The copy runs as the Cloud Build service account, which holds
+          # artifactregistry.writer; this workflow's identity does not need it.
+          # The explicit staging dir skips gcloud's bucket-discovery call, which
+          # needs project-level storage.buckets.list (noetl/ai-meta#211).
+          gcloud builds submit --no-source \
             --gcs-source-staging-dir="gs://${PROJECT_ID}_cloudbuild/source" \
             --project="${PROJECT_ID}" \
             --region=us-central1 \
-            --config=cloudbuild.yaml \
-            --substitutions=_VERSION="${VERSION}" \
-            .
+            --config=cloudbuild-copy.yaml \
+            --substitutions=_VERSION="${VERSION}"
+          # cloudbuild-copy.yaml reads the digest back as the account that wrote it
+          # and fails the build unless AR matches GHCR.
 
   github-release:
     runs-on: ubuntu-latest
