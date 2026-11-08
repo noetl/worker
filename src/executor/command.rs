@@ -257,7 +257,7 @@ impl CommandExecutor {
                 .expect("WASM plug-in host init failed"),
         );
         Self {
-            tool_registry: create_default_registry(),
+            tool_registry: worker_tool_registry(),
             case_evaluator: CaseEvaluator::new(),
             client,
             worker_id,
@@ -691,6 +691,55 @@ impl CommandExecutor {
             ctx.set_secret(&alias, &value);
         }
 
+        // RFC interop/AI-MCP Phase 2: `server: mcp/<path>` → the catalog `kind: Mcp`
+        // resource's `spec.url`. A no-op (and no HTTP call) unless an `mcp` step
+        // names a catalog server and no endpoint. Classified like a credential
+        // alias: an unregistered or malformed resource fails the step terminally,
+        // a catalog outage retries within the server-outage budget.
+        match resolve_mcp_server_through_outage(&mut tool_config_value, &dispatch_client).await {
+            Ok(Some((path, endpoint))) => tracing::info!(
+                execution_id = command.execution_id,
+                step = %command.step,
+                server = %path,
+                endpoint = %endpoint,
+                "Resolved mcp catalog server for tool dispatch"
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                record_metric(true);
+                let terminal = e.is_terminal() || command.attempts >= MAX_PREDISPATCH_ATTEMPTS;
+                return self
+                    .handle_predispatch_failure(
+                        &dispatch_client,
+                        command,
+                        ctx.call_index,
+                        terminal,
+                        anyhow::Error::new(e),
+                    )
+                    .await;
+            }
+        }
+
+        // Per-step `on_provider_error: fail | continue` (RFC Phase 2). Removed from
+        // the config here so no tool ever sees it. Absent → the process default
+        // (`NOETL_PROVIDER_ERROR_TERMINATES`) decides, exactly as before.
+        let provider_error_policy =
+            match super::mcp::take_provider_error_policy(&mut tool_config_value) {
+                Ok(p) => p,
+                Err(msg) => {
+                    record_metric(true);
+                    return self
+                        .handle_predispatch_failure(
+                            &dispatch_client,
+                            command,
+                            ctx.call_index,
+                            true,
+                            anyhow::anyhow!(msg),
+                        )
+                        .await;
+                }
+            };
+
         let tool_config: ToolConfig = match serde_json::from_value(tool_config_value) {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -954,7 +1003,19 @@ impl CommandExecutor {
                     // whether it is retryable, is a semantic decision that issue
                     // still has to make.  Measuring it is what makes the decision
                     // answerable — today the condition is invisible.
-                    if let Some(summary) = provider_error_summary(&result_obj, 12) {
+                    // A step that opted in with `on_provider_error: fail` also treats
+                    // an `mcp` transport failure (`status: "error"`, which noetl-tools
+                    // reports as a successful ToolResult) as a provider error.
+                    let opted_in =
+                        provider_error_policy == Some(super::mcp::ProviderErrorPolicy::Fail);
+                    let provider_error = provider_error_summary(&result_obj, 12).or_else(|| {
+                        if opted_in {
+                            super::mcp::mcp_transport_error(&tool_config.kind, result.data.as_ref())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(summary) = provider_error {
                         crate::metrics::record_tool_result_error();
                         tracing::warn!(
                             execution_id = command.execution_id,
@@ -963,7 +1024,10 @@ impl CommandExecutor {
                             summary = %summary,
                             "tool reported success but its result carries a provider error (noetl/ai-meta#246)",
                         );
-                        if provider_error_terminates() {
+                        if super::mcp::terminates(
+                            provider_error_policy,
+                            provider_error_terminates(),
+                        ) {
                             // noetl/ai-meta#246 — the transport succeeded but the
                             // provider did not do the thing.  Terminate the step.
                             //
@@ -1577,6 +1641,54 @@ impl CommandExecutor {
     }
 }
 
+/// The worker's tool registry: noetl-tools' defaults, with `mcp` replaced by the
+/// worker's [`WorkerMcpTool`](super::mcp::WorkerMcpTool), which adds auth headers and
+/// delegates to the upstream tool unchanged when a step sets neither `auth` nor
+/// `headers` (RFC interop/AI-MCP Phase 2).
+pub(crate) fn worker_tool_registry() -> ToolRegistry {
+    let mut registry = create_default_registry();
+    registry.register(super::mcp::WorkerMcpTool::new());
+    registry
+}
+
+/// [`super::mcp::resolve_catalog_server`] against the control plane, retrying a
+/// transport failure within the server-outage budget (same loop as the credential
+/// lookup below). Terminal failures return at once.
+async fn resolve_mcp_server_through_outage(
+    tool_config_value: &mut serde_json::Value,
+    client: &ControlPlaneClient,
+) -> std::result::Result<Option<(String, String)>, super::mcp::CatalogResolveError> {
+    if super::mcp::catalog_path(tool_config_value).is_none() {
+        return Ok(None);
+    }
+    let budget = crate::client::server_outage_budget();
+    let started = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(500);
+    loop {
+        let mut attempt = tool_config_value.clone();
+        let outcome = super::mcp::resolve_catalog_server(&mut attempt, |path| async move {
+            client.find_catalog_content(&path).await
+        })
+        .await;
+        match outcome {
+            Ok(found) => {
+                *tool_config_value = attempt;
+                return Ok(found);
+            }
+            Err(e) if !e.is_terminal() && started.elapsed() < budget => {
+                tracing::warn!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    error = %e,
+                    "mcp catalog server lookup failed transiently, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(5));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// [`super::auth_alias::resolve_auth_alias`], waiting out a restarting server.
 ///
 /// The command was claimed and acked before this runs, so nothing redelivers it:
@@ -1764,10 +1876,17 @@ fn provider_error_summary(value: &serde_json::Value, depth: u8) -> Option<String
     match value {
         serde_json::Value::Object(map) => {
             if map.get("isError") == Some(&serde_json::Value::Bool(true)) {
+                // MCP servers usually carry the message in `content[].text` (the
+                // protocol's own shape) rather than a `summary`/`error` sibling.
+                let content_text = map
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .and_then(|items| items.iter().find_map(|i| i.get("text")?.as_str()));
                 let summary = map
                     .get("summary")
                     .and_then(|v| v.as_str())
                     .or_else(|| map.get("error").and_then(|v| v.as_str()))
+                    .or(content_text)
                     .unwrap_or("(no summary in payload)");
                 return Some(summary.chars().take(300).collect());
             }
@@ -5321,6 +5440,21 @@ mod tests {
     /// The walk is depth-bounded, so a marker deeper than the budget is not
     /// found.  Locks the bound in: if someone lowers it, the dispatch path
     /// silently stops seeing real failures.
+    #[test]
+    fn provider_error_summary_falls_back_to_mcp_content_text() {
+        // ehgraph's refusal shape: the message lives only in content[].text.
+        let v = serde_json::json!({"result": {"isError": true, "content": [
+            {"type": "text", "text": "{\"ok\":false,\"error\":{\"code\":\"UNAUTHORIZED\"}}"}]}});
+        assert!(provider_error_summary(&v, 12)
+            .unwrap()
+            .contains("UNAUTHORIZED"));
+        let bare = serde_json::json!({"isError": true});
+        assert_eq!(
+            provider_error_summary(&bare, 12).unwrap(),
+            "(no summary in payload)"
+        );
+    }
+
     #[test]
     fn provider_error_summary_respects_depth_bound() {
         let deep = serde_json::json!({ "a": { "b": { "c": { "isError": true } } } });
