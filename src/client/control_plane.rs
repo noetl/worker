@@ -1263,6 +1263,33 @@ impl ControlPlaneClient {
             .ok_or_else(|| anyhow::anyhow!("catalog resource '{path}' has no 'content'"))
     }
 
+    /// Fetch a catalog entry's raw content by path, `Ok(None)` on a clean 404.
+    ///
+    /// The `kind: mcp` dispatch path uses this to resolve `server: mcp/<path>` into
+    /// the `kind: Mcp` resource's `spec.url`; the `None` arm lets it fail a step
+    /// naming an unregistered server terminally while still retrying an outage.
+    pub async fn find_catalog_content(&self, path: &str) -> Result<Option<String>> {
+        let response = self
+            .client
+            .post(format!("{}/api/catalog/resource", self.server_url))
+            .json(&serde_json::json!({ "path": path, "version": "latest" }))
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("catalog resource '{path}' fetch failed ({status}): {body}");
+        }
+        let v: serde_json::Value = response.json().await?;
+        v.get("content")
+            .and_then(|c| c.as_str())
+            .map(|c| Some(c.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("catalog resource '{path}' has no 'content'"))
+    }
+
     /// Start a per-message execution (`POST /api/execute`), routing the whole
     /// run to `execution_pool` and stamping the W3C `trace` context.  Returns
     /// the new `execution_id`.  This is the continuous runtime's "one
