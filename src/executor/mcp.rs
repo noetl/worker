@@ -914,8 +914,11 @@ mod tests {
 
     // ---- WorkerMcpTool against a real HTTP MCP server -----------------------
 
+    /// (method, Authorization, X-Tenant) per request.
+    type Request = (String, Option<String>, Option<String>);
+
     #[derive(Clone, Default)]
-    struct Seen(Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>);
+    struct Seen(Arc<Mutex<Vec<Request>>>);
 
     /// A minimal MCP server: like ehgraph, `initialize` is open and `tools/call`
     /// requires `Authorization: Bearer good`, answering `isError: true` otherwise.
