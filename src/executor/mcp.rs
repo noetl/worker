@@ -35,7 +35,7 @@
 //! # Secrets
 //!
 //! Header values and resolved credentials are never logged and never echoed into the
-//! result. The result names the header *keys* the call sent (`auth_headers`), so an
+//! result. The result names the header *keys* the call sent (`sent_headers`), so an
 //! operator can tell an unauthenticated call from an authenticated one in the event
 //! log without the event log holding the credential.
 
@@ -396,7 +396,7 @@ impl Tool for WorkerMcpTool {
                 })
             }
         };
-        data["auth_headers"] = json!(sent);
+        data["sent_headers"] = json!(sent);
         Ok(ToolResult::success(data).with_duration(duration_ms))
     }
 }
@@ -555,7 +555,7 @@ async fn call(
     endpoint: &str,
     method: &str,
     timeout: Duration,
-    auth_headers: HeaderMap,
+    sent_headers: HeaderMap,
 ) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -566,7 +566,7 @@ async fn call(
         let url = health_url(endpoint);
         let resp = client
             .get(&url)
-            .headers(auth_headers)
+            .headers(sent_headers)
             .send()
             .await
             .map_err(|e| format!("MCP HTTP error: {}", e.without_url()))?;
@@ -592,7 +592,7 @@ async fn call(
             },
         },
     });
-    let (init_env, session) = post(&client, endpoint, &init, None, &auth_headers).await?;
+    let (init_env, session) = post(&client, endpoint, &init, None, &sent_headers).await?;
 
     let (params, tool, arguments) = match method {
         "tools/call" => {
@@ -621,7 +621,7 @@ async fn call(
         ),
     };
     let body = json!({"jsonrpc": "2.0", "id": request_id + 1, "method": method, "params": params});
-    let (env, _) = post(&client, endpoint, &body, session.as_deref(), &auth_headers).await?;
+    let (env, _) = post(&client, endpoint, &body, session.as_deref(), &sent_headers).await?;
 
     let result = env.get("result").cloned().unwrap_or_else(|| json!({}));
     let result = if result.is_object() {
@@ -644,9 +644,9 @@ async fn post(
     endpoint: &str,
     payload: &Value,
     session: Option<&str>,
-    auth_headers: &HeaderMap,
+    sent_headers: &HeaderMap,
 ) -> Result<(Value, Option<String>), String> {
-    let mut headers = auth_headers.clone();
+    let mut headers = sent_headers.clone();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
         ACCEPT,
@@ -975,7 +975,7 @@ mod tests {
         assert_eq!(d["status"], "ok");
         assert_eq!(d["text"], "hello \"ionq\"");
         assert_eq!(d["result"]["isError"], false);
-        assert_eq!(d["auth_headers"], json!(["authorization"]));
+        assert_eq!(d["sent_headers"], json!(["authorization"]));
         assert_eq!(d["server"], "mcp/noetl-cluster");
         assert!(
             !d.to_string().contains("good"),
@@ -1007,7 +1007,7 @@ mod tests {
             .unwrap();
         assert_eq!(d["result"]["isError"], false);
         assert_eq!(
-            d["auth_headers"],
+            d["sent_headers"],
             json!(["authorization", "x-tenant"]),
             "an empty header is dropped"
         );
@@ -1035,7 +1035,7 @@ mod tests {
             .data
             .unwrap();
         assert!(
-            d.get("auth_headers").is_none(),
+            d.get("sent_headers").is_none(),
             "delegated to noetl-tools McpTool: {d}"
         );
         assert_eq!(

@@ -1876,10 +1876,17 @@ fn provider_error_summary(value: &serde_json::Value, depth: u8) -> Option<String
     match value {
         serde_json::Value::Object(map) => {
             if map.get("isError") == Some(&serde_json::Value::Bool(true)) {
+                // MCP servers usually carry the message in `content[].text` (the
+                // protocol's own shape) rather than a `summary`/`error` sibling.
+                let content_text = map
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .and_then(|items| items.iter().find_map(|i| i.get("text")?.as_str()));
                 let summary = map
                     .get("summary")
                     .and_then(|v| v.as_str())
                     .or_else(|| map.get("error").and_then(|v| v.as_str()))
+                    .or(content_text)
                     .unwrap_or("(no summary in payload)");
                 return Some(summary.chars().take(300).collect());
             }
@@ -5433,6 +5440,21 @@ mod tests {
     /// The walk is depth-bounded, so a marker deeper than the budget is not
     /// found.  Locks the bound in: if someone lowers it, the dispatch path
     /// silently stops seeing real failures.
+    #[test]
+    fn provider_error_summary_falls_back_to_mcp_content_text() {
+        // ehgraph's refusal shape: the message lives only in content[].text.
+        let v = serde_json::json!({"result": {"isError": true, "content": [
+            {"type": "text", "text": "{\"ok\":false,\"error\":{\"code\":\"UNAUTHORIZED\"}}"}]}});
+        assert!(provider_error_summary(&v, 12)
+            .unwrap()
+            .contains("UNAUTHORIZED"));
+        let bare = serde_json::json!({"isError": true});
+        assert_eq!(
+            provider_error_summary(&bare, 12).unwrap(),
+            "(no summary in payload)"
+        );
+    }
+
     #[test]
     fn provider_error_summary_respects_depth_bound() {
         let deep = serde_json::json!({ "a": { "b": { "c": { "isError": true } } } });
