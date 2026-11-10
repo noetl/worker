@@ -2,10 +2,9 @@
 //! per-step provider-error policy (RFC `interop-topology-and-ai-mcp-playbooks.md`
 //! Phase 2, noetl/ai-meta#539).
 //!
-//! The worker is exact-pinned to noetl-tools `=4.0.1` (see `Cargo.toml`, ai-meta#330).
-//! Its `McpTool` resolves an endpoint and speaks MCP JSON-RPC, but it cannot send an
-//! `Authorization` header, and it knows nothing about the catalog. Both gaps are
-//! closed here, in the worker, without moving the pin.
+//! Since noetl-tools 4.5 (ai-meta#330 lifted the `=4.0.1` hold) the MCP client,
+//! `auth:` and `headers:` live in noetl-tools' `McpTool`, shared with the CLI local
+//! runtime and daemon. This file keeps what only a cluster worker can do.
 //!
 //! # Three additions, each inert unless a step asks for it
 //!
@@ -16,14 +15,12 @@
 //!    name (`server: kubernetes` → `NOETL_MCP_KUBERNETES_ENDPOINT`), is untouched.
 //!    Resolution runs at dispatch, on the worker, so it covers commands the server
 //!    built and commands the off-server orchestrate drive built.
-//! 2. **Auth headers** ([`WorkerMcpTool`]). `auth:` takes the shapes every other
-//!    worker tool takes: a keychain alias string (resolved before dispatch by
-//!    `auth_alias`, exactly as for `http`), or an inline `{type: bearer|basic|api_key|
-//!    gcp_adc, ...}` block. `headers:` adds literal headers, and can carry
-//!    `{{ keychain.<alias>.<field> }}` templates, which the worker renders before
-//!    dispatch. A step with neither `auth` nor `headers` is delegated to noetl-tools'
-//!    own `McpTool` unchanged, so every existing `mcp` step behaves byte-for-byte as
-//!    before.
+//! 2. **Auth headers**. `auth:` takes the shapes every other worker tool takes: a
+//!    keychain alias string (resolved before dispatch by `auth_alias`, exactly as
+//!    for `http`), or an inline `{type: bearer|basic|api_key|gcp_adc, ...}` block.
+//!    `headers:` adds literal headers, and can carry `{{ keychain.<alias>.<field> }}`
+//!    templates. Both are sent by noetl-tools' `McpTool` ([`WorkerMcpTool`] only
+//!    delegates).
 //! 3. **`on_provider_error: fail | continue`** ([`take_provider_error_policy`]). A
 //!    per-step override of the process-wide `NOETL_PROVIDER_ERROR_TERMINATES`
 //!    (default off, ai-meta#246). With `fail`, a result that carries the MCP
@@ -39,18 +36,11 @@
 //! operator can tell an unauthenticated call from an authenticated one in the event
 //! log without the event log holding the credential.
 
-use std::collections::BTreeMap;
-use std::time::Duration;
-
 use async_trait::async_trait;
-use noetl_tools::auth::{AuthCredentials, AuthResolver};
 use noetl_tools::registry::{Tool, ToolConfig};
-use noetl_tools::template::TemplateEngine;
 use noetl_tools::tools::McpTool;
 use noetl_tools::{ExecutionContext, ToolError, ToolResult};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// The catalog path prefix that marks `server:` as a catalog reference.
 pub(crate) const CATALOG_PREFIX: &str = "mcp/";
@@ -58,19 +48,6 @@ pub(crate) const CATALOG_PREFIX: &str = "mcp/";
 /// The per-step policy key. Removed from the config before dispatch.
 pub(crate) const POLICY_KEY: &str = "on_provider_error";
 
-const DEFAULT_MCP_TIMEOUT_SECS: f64 = 60.0;
-const DEFAULT_COMMAND_TIMEOUT_SECS: f64 = 180.0;
-const MIN_TIMEOUT_SECS: f64 = 0.1;
-
-/// Headers the tool owns. A step may not set them through `headers:`, because the
-/// MCP session depends on them.
-const RESERVED_HEADERS: &[&str] = &[
-    "content-type",
-    "accept",
-    "mcp-session-id",
-    "content-length",
-    "host",
-];
 
 // ===========================================================================
 // 1. server: mcp/<path>
@@ -273,20 +250,14 @@ pub(crate) fn mcp_transport_error(kind: &str, data: Option<&Value>) -> Option<St
 // 2. WorkerMcpTool
 // ===========================================================================
 
-/// The worker's `mcp` tool: noetl-tools' `McpTool`, plus auth and headers.
+/// The worker's `mcp` tool: noetl-tools' `McpTool` (which sends `auth:` / `headers:`).
 pub struct WorkerMcpTool {
     inner: McpTool,
-    engine: TemplateEngine,
-    auth: AuthResolver,
 }
 
 impl WorkerMcpTool {
     pub fn new() -> Self {
-        Self {
-            inner: McpTool::new(),
-            engine: TemplateEngine::new(),
-            auth: AuthResolver::new(),
-        }
+        Self { inner: McpTool::new() }
     }
 }
 
@@ -294,12 +265,6 @@ impl Default for WorkerMcpTool {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Does this config need the authenticated path?
-pub(crate) fn wants_auth(config: &ToolConfig) -> bool {
-    let headers = config.config.get("headers");
-    config.auth.is_some() || headers.is_some_and(|h| h.as_object().is_some_and(|m| !m.is_empty()))
 }
 
 #[async_trait]
@@ -312,448 +277,26 @@ impl Tool for WorkerMcpTool {
         self.inner.side_effecting()
     }
 
+    /// noetl-tools' `McpTool` sends `auth:` and `headers:` itself since 4.5
+    /// (noetl/tools#118), with the same reserved-header, sensitive-value and
+    /// `sent_headers` rules this file used to implement. One implementation
+    /// now serves the worker, the CLI local runtime and the daemon. What stays
+    /// here is what only a cluster worker can do: catalog `server: mcp/<path>`
+    /// resolution and the process-wide provider-error default, both applied
+    /// before dispatch.
     async fn execute(
         &self,
         config: &ToolConfig,
         ctx: &ExecutionContext,
     ) -> Result<ToolResult, ToolError> {
-        if !wants_auth(config) {
-            return self.inner.execute(config, ctx).await;
-        }
-        let rendered = self
-            .engine
-            .render_value(&config.config, &ctx.to_template_context())?;
-        let cfg: CallConfig = serde_json::from_value(rendered)
-            .map_err(|e| ToolError::Configuration(format!("Invalid mcp config: {e}")))?;
-
-        let mut headers = extra_headers(&cfg.headers)?;
-        let mut sent: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
-        if let Some(auth) = &config.auth {
-            match self.auth.resolve(auth, ctx).await? {
-                AuthCredentials::Bearer(token) => {
-                    insert_secret(&mut headers, AUTHORIZATION, &format!("Bearer {token}"))?;
-                }
-                AuthCredentials::Basic(user, pass) => {
-                    use base64::Engine as _;
-                    let enc =
-                        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
-                    insert_secret(&mut headers, AUTHORIZATION, &format!("Basic {enc}"))?;
-                }
-                AuthCredentials::ApiKey(name, value) => {
-                    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-                        ToolError::Auth(format!("api_key header name is invalid: {e}"))
-                    })?;
-                    reject_reserved(name.as_str())?;
-                    insert_secret(&mut headers, name, &value)?;
-                }
-                AuthCredentials::None => {}
-            }
-            sent = headers.keys().map(|k| k.as_str().to_string()).collect();
-        }
-        sent.sort();
-        sent.dedup();
-
-        let server = cfg
-            .server
-            .clone()
-            .or_else(|| cfg.name.clone())
-            .unwrap_or_else(|| "kubernetes".into());
-        let endpoint = resolve_endpoint(&cfg, &server)?;
-        let method = cfg
-            .method
-            .clone()
-            .or_else(|| cfg.action.clone())
-            .unwrap_or_else(|| "tools/call".into());
-        let timeout = Duration::from_secs_f64(resolve_timeout(&cfg.timeout));
-        let started = std::time::Instant::now();
-
-        let outcome = call(&cfg, &endpoint, &method, timeout, headers).await;
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let mut data = match outcome {
-            Ok(mut ok) => {
-                ok["server"] = json!(server);
-                ok["endpoint"] = json!(endpoint);
-                ok["method"] = json!(method);
-                ok
-            }
-            Err(e) => {
-                tracing::warn!(
-                    method = %method,
-                    server = %server,
-                    endpoint = %endpoint,
-                    duration_ms,
-                    error = %e,
-                    execution_id = ctx.execution_id,
-                    "MCP request failed"
-                );
-                json!({
-                    "status": "error",
-                    "server": server,
-                    "endpoint": endpoint,
-                    "method": method,
-                    "error": e,
-                    "text": e,
-                })
-            }
-        };
-        data["sent_headers"] = json!(sent);
-        Ok(ToolResult::success(data).with_duration(duration_ms))
-    }
-}
-
-/// The playbook-facing config for the authenticated path. Same fields and aliases as
-/// noetl-tools' `McpConfig`, plus `headers`.
-#[derive(Debug, Default, Deserialize)]
-struct CallConfig {
-    endpoint: Option<String>,
-    url: Option<String>,
-    server_url: Option<String>,
-    base_url: Option<String>,
-    server: Option<String>,
-    name: Option<String>,
-    method: Option<String>,
-    action: Option<String>,
-    tool: Option<String>,
-    tool_name: Option<String>,
-    arguments: Option<Value>,
-    args: Option<Value>,
-    params: Option<Value>,
-    timeout: Option<Value>,
-    request_id: Option<u64>,
-    protocol_version: Option<String>,
-    client_name: Option<String>,
-    client_version: Option<String>,
-    capabilities: Option<Value>,
-    #[serde(default)]
-    headers: Option<BTreeMap<String, Value>>,
-}
-
-fn reject_reserved(name: &str) -> Result<(), ToolError> {
-    if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
-        return Err(ToolError::Configuration(format!(
-            "mcp header '{name}' is set by the tool and cannot be overridden"
-        )));
-    }
-    Ok(())
-}
-
-fn insert_secret(headers: &mut HeaderMap, name: HeaderName, value: &str) -> Result<(), ToolError> {
-    let mut v = HeaderValue::from_str(value).map_err(|_| {
-        ToolError::Configuration(format!("mcp header '{name}' has an invalid value"))
-    })?;
-    v.set_sensitive(true);
-    headers.insert(name, v);
-    Ok(())
-}
-
-fn extra_headers(src: &Option<BTreeMap<String, Value>>) -> Result<HeaderMap, ToolError> {
-    let mut out = HeaderMap::new();
-    for (k, v) in src.iter().flatten() {
-        reject_reserved(k)?;
-        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-            ToolError::Configuration(format!("mcp header name '{k}' is invalid: {e}"))
-        })?;
-        let value = match v {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            Value::Bool(b) => b.to_string(),
-            _ => {
-                return Err(ToolError::Configuration(format!(
-                    "mcp header '{k}' must be a string"
-                )))
-            }
-        };
-        // A header whose template rendered empty (an unresolved keychain alias) is
-        // dropped, not sent blank: the server then reports the missing credential.
-        if value.is_empty() {
-            continue;
-        }
-        insert_secret(&mut out, name, &value)?;
-    }
-    Ok(out)
-}
-
-fn resolve_endpoint(cfg: &CallConfig, server: &str) -> Result<String, ToolError> {
-    if let Some(ep) = [&cfg.endpoint, &cfg.url, &cfg.server_url, &cfg.base_url]
-        .into_iter()
-        .flatten()
-        .map(|s| s.trim())
-        .find(|s| !s.is_empty())
-    {
-        return Ok(ep.trim_end_matches('/').to_string());
-    }
-    let safe: String = server
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let env_name = format!("NOETL_MCP_{safe}_ENDPOINT");
-    for name in [env_name.as_str(), "NOETL_MCP_URL"] {
-        if let Ok(ep) = std::env::var(name) {
-            if !ep.trim().is_empty() {
-                return Ok(ep.trim().trim_end_matches('/').to_string());
-            }
-        }
-    }
-    Err(ToolError::Configuration(format!(
-        "mcp endpoint is required for server '{server}'. Set 'endpoint' in config or set the '{env_name}' env var."
-    )))
-}
-
-fn read_float_env(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(default)
-}
-
-/// Same chain as noetl-tools: `timeout` → `NOETL_MCP_REQUEST_TIMEOUT_SECONDS` → 60s,
-/// clamped to `NOETL_WORKER_COMMAND_TIMEOUT_SECONDS` (180s).
-fn resolve_timeout(value: &Option<Value>) -> f64 {
-    let default = read_float_env(
-        "NOETL_MCP_REQUEST_TIMEOUT_SECONDS",
-        DEFAULT_MCP_TIMEOUT_SECS,
-    );
-    let budget = read_float_env(
-        "NOETL_WORKER_COMMAND_TIMEOUT_SECONDS",
-        DEFAULT_COMMAND_TIMEOUT_SECS,
-    )
-    .max(1.0);
-    let requested = match value {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
-        _ => None,
-    };
-    match requested {
-        Some(r) if r.is_finite() && r > 0.0 => r.max(MIN_TIMEOUT_SECS).min(budget),
-        _ => default.min(budget),
-    }
-}
-
-fn object_or(v: Option<Value>, field: &str) -> Result<Value, String> {
-    match v {
-        None | Some(Value::Null) => Ok(json!({})),
-        Some(v @ Value::Object(_)) => Ok(v),
-        Some(Value::String(s)) => serde_json::from_str::<Value>(&s)
-            .ok()
-            .filter(Value::is_object)
-            .ok_or_else(|| format!("MCP config error: mcp {field} must be a JSON object")),
-        Some(_) => Err(format!("MCP config error: mcp {field} must be an object")),
-    }
-}
-
-/// One MCP exchange: `initialize`, then the method. Errors are strings shaped like
-/// noetl-tools' (`MCP HTTP error: ...`), and never contain a header value.
-async fn call(
-    cfg: &CallConfig,
-    endpoint: &str,
-    method: &str,
-    timeout: Duration,
-    sent_headers: HeaderMap,
-) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("MCP HTTP error: Failed to build HTTP client: {e}"))?;
-
-    if method == "health" {
-        let url = health_url(endpoint);
-        let resp = client
-            .get(&url)
-            .headers(sent_headers)
-            .send()
-            .await
-            .map_err(|e| format!("MCP HTTP error: {}", e.without_url()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("MCP HTTP error: HTTP status {status}"));
-        }
-        let text = resp.text().await.unwrap_or_default();
-        return Ok(json!({"status": "ok", "healthy": true, "text": text}));
-    }
-
-    let request_id = cfg.request_id.unwrap_or(1);
-    let init = json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": cfg.protocol_version.clone().unwrap_or_else(|| "2025-03-26".into()),
-            "capabilities": cfg.capabilities.clone().unwrap_or_else(|| json!({})),
-            "clientInfo": {
-                "name": cfg.client_name.clone().unwrap_or_else(|| "noetl-worker".into()),
-                "version": cfg.client_version.clone().unwrap_or_else(|| "0".into()),
-            },
-        },
-    });
-    let (init_env, session) = post(&client, endpoint, &init, None, &sent_headers).await?;
-
-    let (params, tool, arguments) = match method {
-        "tools/call" => {
-            let tool = cfg
-                .tool
-                .clone()
-                .or_else(|| cfg.tool_name.clone())
-                .ok_or_else(|| {
-                    "MCP config error: mcp tool name is required for tools/call".to_string()
-                })?;
-            let arguments = object_or(
-                cfg.arguments.clone().or_else(|| cfg.args.clone()),
-                "arguments",
-            )?;
-            (
-                json!({"name": tool, "arguments": arguments}),
-                json!(tool),
-                arguments,
-            )
-        }
-        "tools/list" => (json!({}), Value::Null, Value::Null),
-        _ => (
-            object_or(cfg.params.clone(), "params")?,
-            Value::Null,
-            Value::Null,
-        ),
-    };
-    let body = json!({"jsonrpc": "2.0", "id": request_id + 1, "method": method, "params": params});
-    let (env, _) = post(&client, endpoint, &body, session.as_deref(), &sent_headers).await?;
-
-    let result = env.get("result").cloned().unwrap_or_else(|| json!({}));
-    let result = if result.is_object() {
-        result
-    } else {
-        json!({"value": result})
-    };
-    Ok(json!({
-        "status": "ok",
-        "tool": tool,
-        "arguments": arguments,
-        "text": extract_text(&result),
-        "result": result,
-        "initialize": init_env.get("result"),
-    }))
-}
-
-async fn post(
-    client: &reqwest::Client,
-    endpoint: &str,
-    payload: &Value,
-    session: Option<&str>,
-    sent_headers: &HeaderMap,
-) -> Result<(Value, Option<String>), String> {
-    let mut headers = sent_headers.clone();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/json, text/event-stream"),
-    );
-    if let Some(sid) = session {
-        let v = HeaderValue::from_str(sid)
-            .map_err(|e| format!("MCP HTTP error: Invalid session id header value: {e}"))?;
-        headers.insert("Mcp-Session-Id", v);
-    }
-    let resp = client
-        .post(endpoint)
-        .headers(headers)
-        .json(payload)
-        .send()
-        .await
-        .map_err(|e| format!("MCP HTTP error: {}", e.without_url()))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("MCP HTTP error: HTTP status {status}"));
-    }
-    let session = resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let text = resp.text().await.unwrap_or_default();
-    let hint = payload
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("request");
-    let env = parse_envelope(&text, hint)?;
-    if let Some(err) = env.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| err.to_string());
-        return Err(format!("MCP JSON-RPC error: {msg}"));
-    }
-    Ok((env, session))
-}
-
-/// Plain JSON, or SSE `data:` lines joined.
-fn parse_envelope(body: &str, context: &str) -> Result<Value, String> {
-    if let Ok(v) = serde_json::from_str(body) {
-        return Ok(v);
-    }
-    let data: Vec<&str> = body
-        .lines()
-        .filter_map(|l| l.strip_prefix("data:"))
-        .map(str::trim)
-        .collect();
-    let preview = |s: &str| s.split_whitespace().take(40).collect::<Vec<_>>().join(" ");
-    if data.is_empty() {
-        return Err(format!(
-            "MCP envelope parse error: Invalid MCP response for {context}: {}",
-            preview(body)
-        ));
-    }
-    let joined = data.join("\n");
-    serde_json::from_str(&joined).map_err(|e| {
-        format!(
-            "MCP envelope parse error: Invalid MCP response for {context}: {} ({e})",
-            preview(&joined)
-        )
-    })
-}
-
-fn extract_text(result: &Value) -> String {
-    let parts: Vec<&str> = result
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|i| i.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|i| i.get("text").and_then(Value::as_str))
-        .collect();
-    if parts.is_empty() {
-        serde_json::to_string(result).unwrap_or_default()
-    } else {
-        parts.join("\n")
-    }
-}
-
-fn health_url(endpoint: &str) -> String {
-    match reqwest::Url::parse(endpoint) {
-        Ok(mut url) => {
-            let path = url.path().trim_end_matches('/').to_string();
-            let new = if matches!(path.as_str(), "" | "/mcp" | "/sse" | "/message") {
-                "/healthz".to_string()
-            } else if let Some(base) = path.strip_suffix("/mcp") {
-                format!("{base}/healthz")
-            } else {
-                format!("{path}/healthz")
-            };
-            url.set_path(&new);
-            url.set_query(None);
-            url.to_string()
-        }
-        Err(_) => format!("{endpoint}/healthz"),
+        self.inner.execute(config, ctx).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use axum::http::HeaderMap as AxHeaders;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -1030,7 +573,6 @@ mod tests {
         let seen = Seen::default();
         let ep = spawn_server(seen.clone()).await;
         let cfg = tool_config(json!({"endpoint": ep, "tool": "greet", "arguments": {"who": "x"}}));
-        assert!(!wants_auth(&cfg));
         let d = WorkerMcpTool::new()
             .execute(&cfg, &ctx())
             .await
@@ -1046,10 +588,6 @@ mod tests {
             "the server refused the unauthenticated call"
         );
         assert!(seen.0.lock().unwrap().iter().all(|(_, a, _)| a.is_none()));
-        // An empty headers map is still "no headers".
-        assert!(!wants_auth(&tool_config(
-            json!({"endpoint": ep, "headers": {}})
-        )));
     }
 
     #[tokio::test]
@@ -1070,13 +608,4 @@ mod tests {
         assert!(mcp_transport_error("mcp", Some(&d)).is_some());
     }
 
-    #[test]
-    fn health_urls_match_the_upstream_rules_and_keep_a_mount_prefix() {
-        assert_eq!(health_url("http://h:8080/mcp"), "http://h:8080/healthz");
-        assert_eq!(
-            health_url("http://h:8082/ehgraph/noetl-cluster/mcp"),
-            "http://h:8082/ehgraph/noetl-cluster/healthz"
-        );
-        assert_eq!(health_url("http://h/x"), "http://h/x/healthz");
-    }
 }
