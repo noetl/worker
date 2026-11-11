@@ -559,6 +559,10 @@ pub struct WorkerMetrics {
     /// the lazy load path).  `duration_seconds` on the warmup span is the total
     /// boot-warm cost the readiness gate hides.
     pub plugin_warm_total: IntCounterVec,
+    /// A WASM plug-in invocation stopped by a host guardrail: `fuel` (the
+    /// instruction budget ran out), `timeout` (the wall-clock deadline passed)
+    /// or `memory` (linear memory would have grown past the cap).
+    pub plugin_limit_trips_total: IntCounterVec,
     pub worker_drain_commands_total: IntCounterVec,
     /// Worker readiness (noetl/ai-meta#130): `1` once boot warmup completed and
     /// the pull loop is eligible to claim, `0` during startup.  The `/readyz`
@@ -1743,6 +1747,18 @@ impl WorkerMetrics {
             .register(Box::new(plugin_warm_total.clone()))
             .expect("register plugin_warm_total");
 
+        let plugin_limit_trips_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_plugin_limit_trips_total",
+                "WASM plug-in invocations stopped by a host guardrail, by limit (fuel / timeout / memory).",
+            ),
+            &["limit"],
+        )
+        .expect("plugin_limit_trips_total metric");
+        registry
+            .register(Box::new(plugin_limit_trips_total.clone()))
+            .expect("register plugin_limit_trips_total");
+
         let worker_drain_commands_total = IntCounterVec::new(
             prometheus::Opts::new(
                 "noetl_worker_drain_commands_total",
@@ -2060,6 +2076,7 @@ impl WorkerMetrics {
             state_equivalence_mismatch_total,
             plugin_load_seconds,
             plugin_warm_total,
+            plugin_limit_trips_total,
             worker_drain_commands_total,
             worker_ready,
             state_builder_healthy,
@@ -2953,6 +2970,14 @@ pub fn record_plugin_warm(outcome: &str) {
     WorkerMetrics::global()
         .plugin_warm_total
         .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Count a WASM invocation a host guardrail stopped (`fuel` | `timeout` | `memory`).
+pub fn record_plugin_limit_trip(limit: &str) {
+    WorkerMetrics::global()
+        .plugin_limit_trips_total
+        .with_label_values(&[limit])
         .inc();
 }
 
