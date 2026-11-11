@@ -1646,8 +1646,29 @@ impl CommandExecutor {
 /// delegates to the upstream tool unchanged when a step sets neither `auth` nor
 /// `headers` (RFC interop/AI-MCP Phase 2).
 pub(crate) fn worker_tool_registry() -> ToolRegistry {
+    worker_tool_registry_with(agent_tool_enabled())
+}
+
+/// Arms `kind: agent` on this worker (build plan item 4, noetl/ai-meta#330).
+/// Strict `true`; unset keeps the kind unregistered, so a command for it fails
+/// with "unknown tool" exactly as before.
+pub(crate) const AGENT_TOOL_ENV: &str = "NOETL_WORKER_AGENT_TOOL";
+
+pub(crate) fn agent_tool_enabled() -> bool {
+    std::env::var(AGENT_TOOL_ENV).ok().as_deref() == Some("true")
+}
+
+pub(crate) fn worker_tool_registry_with(agent: bool) -> ToolRegistry {
     let mut registry = create_default_registry();
     registry.register(super::mcp::WorkerMcpTool::new());
+    if agent {
+        // `for_shared_pool`: refuses `framework: claude-code`, which would run a
+        // local CLI under whatever account this pod is signed in to. Agents
+        // whose tools are MCP servers or external agents run in full; a
+        // playbook-bound `tools:` entry is refused before the first model call
+        // (it needs the CLI host; RFC Phase 6 Stage B on the cluster).
+        registry.register(noetl_tools::tools::AgentTool::for_shared_pool());
+    }
     registry
 }
 
@@ -4400,6 +4421,68 @@ mod tests {
         let second = cycle_logical_uri(7, "charge_card", &rc);
         assert_eq!(first, second);
         assert_eq!(first, "noetl://default/default/results/7/charge_card/0/0/1");
+    }
+
+    #[tokio::test]
+    async fn agent_kind_is_registered_only_when_armed_and_refuses_claude_code() {
+        assert!(!worker_tool_registry_with(false).has("agent"));
+        let reg = worker_tool_registry_with(true);
+        assert!(reg.has("agent"));
+        assert!(reg.has("mcp"));
+        let err = reg
+            .get("agent")
+            .unwrap()
+            .execute(
+                &tc(
+                    "agent",
+                    serde_json::json!({"framework": "claude-code", "model": "m", "prompt": "p"}),
+                ),
+                &noetl_tools::ExecutionContext::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not available on this runtime"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn armed_agent_calls_a_remote_noetl_agent() {
+        use axum::routing::{get, post};
+        let app = axum::Router::new()
+            .route(
+                "/api/agents/send",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::ACCEPTED,
+                        axum::Json(serde_json::json!({"task_id": "9", "status": "submitted"})),
+                    )
+                }),
+            )
+            .route(
+                "/api/agents/tasks/9",
+                get(|| async {
+                    axum::Json(serde_json::json!({"task_id": "9", "status": "completed", "result": {"ok": true}}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let res = worker_tool_registry_with(true)
+            .get("agent")
+            .unwrap()
+            .execute(
+                &tc(
+                    "agent",
+                    serde_json::json!({
+                        "framework": "remote",
+                        "remote": {"endpoint": format!("http://{addr}"), "agent": "peer/ask"},
+                        "input": {}
+                    }),
+                ),
+                &noetl_tools::ExecutionContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.data.unwrap()["result"]["ok"], true);
     }
 
     fn tc(kind: &str, config: serde_json::Value) -> ToolConfig {

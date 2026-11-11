@@ -246,26 +246,20 @@ wasmtime = { version = "27", optional = true }
 # which have been merged and undeployable behind this pin.
 # ⚠⚠⚠ EXACT pin, not a range, and the reason is not tidiness.
 #
-# This crate pins `async-nats = "0.38"`. noetl-tools 4.0.6 depends on
-# async-nats 0.47, so ANY resolution that picks 4.0.6 puts two incompatible
-# `async_nats::jetstream::Context` types in one graph and `spool_runtime.rs`
-# fails to compile with E0308. The versions must agree, and a range cannot
-# express that requirement — it delegates the decision to whichever resolver
-# runs last.
+# A range delegates the choice to whichever resolver runs last, and the
+# image's `cargo chef cook` stage re-resolves from `recipe.json` regardless of
+# the committed lock: two release runs (v6.2.2, v6.2.3) built a different
+# noetl-tools than `cargo test --locked` had tested. An exact pin leaves the
+# resolver no choice.
 #
-# `~4.0` + a committed lock was not enough. `cargo chef cook` works from
-# `recipe.json`, a skeleton reconstruction of the manifests, and writes its own
-# Cargo.lock over whatever is in the build directory — so the image's cook stage
-# resolved 4.0.6 even with `--locked` passed and the real lock copied in. Two
-# release runs failed that way (v6.2.2, v6.2.3) after ~45-minute builds, on
-# commits whose `cargo test --locked` was green, because the test job used the
-# lock and the image never did.
-#
-# An exact pin removes the resolver from the decision entirely: there is no
-# other version to choose. Moving to 4.0.6 means moving to async-nats 0.47
-# here too, which is a real API migration on the legacy NATS spool path and
-# belongs in its own change.
-noetl-tools = "=4.0.1"
+# 4.0.1 → 4.5.0 (noetl/ai-meta#330): the hold existed because 4.0.6+ links
+# async-nats 0.47 while this crate pinned 0.38, which put two incompatible
+# `async_nats::jetstream::Context` types in one graph. This crate now uses
+# async-nats 0.47 too (the spool / state-builder / materializer call sites
+# compile unchanged), so the graph has one async-nats again. 4.5.0 carries
+# AgentTool (kind: agent), McpTool auth/headers/on_provider_error and the
+# remote-agent client. Move this pin only together with `async-nats` below.
+noetl-tools = "=4.5.0"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
@@ -280,7 +274,7 @@ noetl-tools = "=4.0.1"
 # See Appendix H of the global hybrid cloud blueprint at
 # https://noetl.dev/docs/architecture/noetl_global_hybrid_cloud_grid_distributed_architecture_blueprint
 # and especially § H.10 (the tree-walker vs pull-model finding).
-noetl-executor = "0.10"
+noetl-executor = "0.14"
 
 # Same-node zero-copy IPC cache for over-budget tool results
 # (R-2.1 / noetl/cli#39).  When `call.done`'s serialised
@@ -389,8 +383,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 # `worker::source::CommandSource` (the trait uses #[async_trait]).
 async-trait = "0.1"
 
-# NATS messaging
-async-nats = "0.38"
+# NATS messaging.  Must be the async-nats noetl-tools links (0.47 for 4.5.x);
+# two versions in one graph do not compile (see the noetl-tools pin above).
+async-nats = "0.47"
 futures = "0.3"
 
 # Execution-affinity ownership hash (noetl/ai-meta#166 Phase 4).  Byte-identical

@@ -274,7 +274,84 @@ pub async fn resolve_auth_alias(
         return Ok(all_secrets);
     }
 
+    // `kind: agent` names credentials in several places: the step's `auth:`
+    // (the model key) and each tool source's `auth:` (`mcp_servers[*]`,
+    // `agents[*]`, `remote`). The agent tool resolves them through
+    // noetl-tools' AuthResolver, which reads the context, so each alias is
+    // fetched here and seeded under its own name. noetl/ai-meta#330.
+    let is_agent = tool_config_value
+        .as_object()
+        .and_then(|m| m.get("kind"))
+        .and_then(|v| v.as_str())
+        == Some("agent");
+    if is_agent {
+        let mut all_secrets = HashMap::new();
+        all_secrets.extend(resolve_auth_slot(tool_config_value, client, execution_id).await?);
+        if let Some(obj) = tool_config_value.as_object_mut() {
+            for key in ["mcp_servers", "agents"] {
+                if let Some(Value::Array(items)) = obj.get_mut(key) {
+                    for item in items.iter_mut() {
+                        all_secrets.extend(resolve_auth_slot(item, client, execution_id).await?);
+                    }
+                }
+            }
+            if let Some(remote) = obj.get_mut("remote") {
+                all_secrets.extend(resolve_auth_slot(remote, client, execution_id).await?);
+            }
+        }
+        return Ok(all_secrets);
+    }
+
     resolve_single_tool_alias(tool_config_value, client, execution_id).await
+}
+
+/// The keychain alias an `auth:` slot names: a bare alias string, or the
+/// `credential:` of an auth block. `(alias, was_string)`.
+pub(crate) fn auth_slot_alias(slot: &Value) -> Option<(String, bool)> {
+    match slot.get("auth")? {
+        Value::String(s) if !s.trim().is_empty() => Some((s.trim().to_string(), true)),
+        Value::Object(m) => m
+            .get("credential")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(|a| (a.to_string(), false)),
+        _ => None,
+    }
+}
+
+/// Fetch the alias one `auth:` slot names and return its secret under the
+/// alias. A bare alias string is rewritten into the auth block the credential's
+/// type implies (bearer / api_key / basic), as for any other tool; an auth
+/// block is left as written.
+async fn resolve_auth_slot(
+    slot: &mut Value,
+    client: &ControlPlaneClient,
+    execution_id: i64,
+) -> Result<HashMap<String, String>, CredentialResolutionError> {
+    let Some((alias, was_string)) = auth_slot_alias(slot) else {
+        return Ok(HashMap::new());
+    };
+    let mut credential = fetch_credential_maybe_sealed(client, &alias, execution_id)
+        .await
+        .map_err(|source| classify_fetch_error(&alias, source))?
+        .ok_or_else(|| CredentialResolutionError::AliasNotFound {
+            alias: alias.clone(),
+        })?;
+    let mut scratch = serde_json::Map::new();
+    let secrets = apply_credential(&mut scratch, &alias, &credential)?;
+    if was_string {
+        if let (Some(map), Some(block)) = (slot.as_object_mut(), scratch.remove("auth")) {
+            map.insert("auth".to_string(), block);
+        }
+    }
+    use zeroize::Zeroize;
+    for v in credential.data.values_mut() {
+        if let Value::String(s) = v {
+            s.zeroize();
+        }
+    }
+    Ok(secrets)
 }
 
 /// Resolve a keychain alias on a single (non-pipeline) tool config.
@@ -1270,5 +1347,21 @@ mod tests {
             "Invalid error must name the offending type, got: {err}"
         );
         handle.abort();
+    }
+
+    #[test]
+    fn agent_auth_slots_name_their_aliases() {
+        use serde_json::json;
+        assert_eq!(
+            auth_slot_alias(&json!({"auth": "anthropic"})),
+            Some(("anthropic".to_string(), true))
+        );
+        assert_eq!(
+            auth_slot_alias(&json!({"auth": {"type": "bearer", "credential": "ehg"}})),
+            Some(("ehg".to_string(), false))
+        );
+        assert_eq!(auth_slot_alias(&json!({"auth": {"type": "bearer", "token": "x"}})), None);
+        assert_eq!(auth_slot_alias(&json!({"endpoint": "http://x"})), None);
+        assert_eq!(auth_slot_alias(&json!({"auth": "  "})), None);
     }
 }
