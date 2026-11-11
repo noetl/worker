@@ -10,7 +10,9 @@
 //!    does.
 //! 2. A `mcp_servers:` / `agents:` call is answered by the session itself, the
 //!    same as before.
-//! 3. A `tools:` call bound to `playbook: <catalog path>` starts a **child
+//! 3. A `tools:` call bound to `playbook: <catalog path>` (optionally with
+//!    `result_step: <step>`, the child step whose result is the answer; without
+//!    it the child's last step result is used) starts a **child
 //!    execution** through the control plane (`kind: playbook`,
 //!    `return_result: true`, parent = this execution). The child is routed and
 //!    claimed like any other execution, so it runs on the shared or system
@@ -126,6 +128,7 @@ async fn run_playbook_call(
     ctx: &ExecutionContext,
     call: &AgentToolCall,
     path: &str,
+    result_step: Option<&str>,
     budget: &AgentBudget,
 ) -> (AgentToolOutput, Option<String>) {
     // The tool input becomes the child's workload, with JSON types kept (the
@@ -135,14 +138,20 @@ async fn run_playbook_call(
         Value::Null => json!({}),
         other => json!({ "input": other }),
     };
+    let mut config = json!({
+        "path": path,
+        "payload": payload,
+        "return_result": true,
+        "timeout": budget.tool_timeout_secs,
+    });
+    // Without it `kind: playbook` returns the child's LAST step result, which
+    // for most playbooks is a closing `end` noop rather than the answer.
+    if let Some(step) = result_step {
+        config["result_step"] = json!(step);
+    }
     let cfg = ToolConfig {
         kind: "playbook".into(),
-        config: json!({
-            "path": path,
-            "payload": payload,
-            "return_result": true,
-            "timeout": budget.tool_timeout_secs,
-        }),
+        config,
         timeout: Some(30),
         retry: None,
         auth: None,
@@ -262,15 +271,26 @@ pub(crate) async fn run_hosted(
                         if let Some(out) = session.run_source_tool(call).await {
                             (out, "source", None, None)
                         } else {
-                            let path = session
-                                .tool_spec(&call.name)
+                            let spec = session.tool_spec(&call.name);
+                            let path = spec
                                 .and_then(|s| s.binding.get("playbook"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            let result_step = spec
+                                .and_then(|s| s.binding.get("result_step"))
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
                             match path {
                                 Some(p) => {
-                                    let (out, child) =
-                                        run_playbook_call(registry, ctx, call, &p, &budget).await;
+                                    let (out, child) = run_playbook_call(
+                                        registry,
+                                        ctx,
+                                        call,
+                                        &p,
+                                        result_step.as_deref(),
+                                        &budget,
+                                    )
+                                    .await;
                                     (out, "playbook", Some(p), child)
                                 }
                                 None => {
@@ -439,7 +459,7 @@ mod tests {
         let cfg = agent_cfg(
             &ep,
             json!([
-                {"name":"greet","description":"g","input_schema":{"type":"object","properties":{"who":{"type":"string"}}},"playbook":"tests/ok"},
+                {"name":"greet","description":"g","input_schema":{"type":"object","properties":{"who":{"type":"string"}}},"playbook":"tests/ok","result_step":"greet"},
                 {"name":"broken","description":"b","playbook":"tests/broken"}
             ]),
         );
@@ -464,6 +484,12 @@ mod tests {
         assert_eq!(seen[0]["return_result"], json!(true));
         assert_eq!(seen[0]["payload"], json!({"who":"model"}));
         assert_eq!(seen[0]["timeout"], json!(180));
+        assert_eq!(
+            seen[0]["result_step"],
+            json!("greet"),
+            "the binding's result_step is passed through"
+        );
+        assert!(seen[1].get("result_step").is_none());
 
         let rec = sink.0.lock().unwrap();
         let types: Vec<&str> = rec.iter().map(|(t, _)| t.as_str()).collect();
