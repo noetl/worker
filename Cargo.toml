@@ -259,7 +259,7 @@ wasmtime = { version = "27", optional = true }
 # compile unchanged), so the graph has one async-nats again. 4.5.0 carries
 # AgentTool (kind: agent), McpTool auth/headers/on_provider_error and the
 # remote-agent client. Move this pin only together with `async-nats` below.
-noetl-tools = "=4.5.0"
+noetl-tools = "=4.6.0"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
