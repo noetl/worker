@@ -1,5 +1,6 @@
 //! Command execution module.
 
+pub(crate) mod agent_host;
 mod auth_alias;
 mod case_evaluator;
 pub(crate) mod command;
