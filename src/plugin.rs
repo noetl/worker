@@ -29,10 +29,147 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use wasmtime::{Caller, Engine, Linker, Module, Store};
+use wasmtime::{Caller, Engine, Linker, Module, Store, Trap};
+
+/// Default instruction budget per invocation (wasmtime fuel; roughly one unit
+/// per WebAssembly instruction). Generous: a few seconds of straight-line CPU,
+/// orders of magnitude above what the orchestrate drive or a compiled playbook
+/// spends per call. Override with `NOETL_WASM_FUEL`.
+pub const DEFAULT_PLUGIN_FUEL: u64 = 10_000_000_000;
+/// Default wall-clock deadline per invocation. Override with
+/// `NOETL_WASM_TIMEOUT_MS`.
+pub const DEFAULT_PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default cap on a plug-in's linear memory (1 GiB; wasm32's own ceiling is
+/// 4 GiB). Override with `NOETL_WASM_MAX_MEMORY_MB`.
+pub const DEFAULT_PLUGIN_MAX_MEMORY: usize = 1 << 30;
+/// Granularity of the wall-clock deadline: one engine epoch per tick.
+const EPOCH_TICK: Duration = Duration::from_millis(10);
+
+/// Guardrails on every plug-in invocation, so a module that loops, spins or
+/// balloons is stopped by the host instead of holding a worker thread (and
+/// the dispatcher lock) forever.
+///
+/// - **fuel**: an instruction budget. Deterministic: the same module and input
+///   trip at the same point on every host.
+/// - **timeout**: a wall-clock deadline, enforced by wasmtime epoch
+///   interruption. Catches what fuel cannot price, such as a slow host call.
+/// - **max_memory_bytes**: a cap on linear-memory growth. Growth past it fails
+///   (the guest sees `memory.grow` return -1, which a Rust guest turns into an
+///   abort) and the invocation is reported as a memory-limit failure.
+///
+/// Each limit is `None` when disabled. Defaults are on ([`Default`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginLimits {
+    pub fuel: Option<u64>,
+    pub timeout: Option<Duration>,
+    pub max_memory_bytes: Option<usize>,
+}
+
+impl Default for PluginLimits {
+    fn default() -> Self {
+        Self {
+            fuel: Some(DEFAULT_PLUGIN_FUEL),
+            timeout: Some(DEFAULT_PLUGIN_TIMEOUT),
+            max_memory_bytes: Some(DEFAULT_PLUGIN_MAX_MEMORY),
+        }
+    }
+}
+
+impl PluginLimits {
+    /// Every guardrail off: the pre-guardrail behaviour. Tests and benchmarks
+    /// only; a deployment opts out per limit with `0` in its env var.
+    pub fn unlimited() -> Self {
+        Self {
+            fuel: None,
+            timeout: None,
+            max_memory_bytes: None,
+        }
+    }
+
+    /// Limits from the environment, defaulting each one that is unset:
+    ///
+    /// | Variable | Unit | Default | `0` / `off` |
+    /// |---|---|---|---|
+    /// | `NOETL_WASM_FUEL` | fuel units | 10 000 000 000 | metering off |
+    /// | `NOETL_WASM_TIMEOUT_MS` | milliseconds | 30 000 | no deadline |
+    /// | `NOETL_WASM_MAX_MEMORY_MB` | MiB | 1024 | no cap |
+    ///
+    /// An unparseable value keeps the default (and is logged): a typo must not
+    /// silently remove a guardrail.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// [`from_env`](Self::from_env) over an arbitrary lookup (testable).
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        fn read(
+            get: &dyn Fn(&str) -> Option<String>,
+            var: &str,
+            default: Option<u64>,
+        ) -> Option<u64> {
+            let Some(raw) = get(var) else { return default };
+            let v = raw.trim().to_ascii_lowercase();
+            if v.is_empty() {
+                return default;
+            }
+            if matches!(v.as_str(), "0" | "off" | "none" | "unlimited") {
+                return None;
+            }
+            match v.replace('_', "").parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!(var, value = %raw, "unparseable WASM limit; keeping the default");
+                    default
+                }
+            }
+        }
+        let d = Self::default();
+        Self {
+            fuel: read(&get, "NOETL_WASM_FUEL", d.fuel),
+            timeout: read(
+                &get,
+                "NOETL_WASM_TIMEOUT_MS",
+                d.timeout.map(|t| t.as_millis() as u64),
+            )
+            .map(Duration::from_millis),
+            max_memory_bytes: read(
+                &get,
+                "NOETL_WASM_MAX_MEMORY_MB",
+                d.max_memory_bytes.map(|b| (b >> 20) as u64),
+            )
+            .map(|mb| (mb as usize).saturating_mul(1 << 20)),
+        }
+    }
+
+    /// Epoch ticks for the wall-clock deadline (at least one).
+    fn deadline_ticks(timeout: Duration) -> u64 {
+        let tick = EPOCH_TICK.as_millis().max(1);
+        (timeout.as_millis().div_ceil(tick) as u64).max(1)
+    }
+}
+
+/// Advance `engine`'s epoch every [`EPOCH_TICK`] on a background thread, for as
+/// long as the engine lives (the thread holds only a weak handle and exits when
+/// the last host drops it).
+fn spawn_epoch_ticker(engine: &Engine) {
+    let weak = engine.weak();
+    let spawned = std::thread::Builder::new()
+        .name("wasm-epoch".into())
+        .spawn(move || loop {
+            std::thread::sleep(EPOCH_TICK);
+            match weak.upgrade() {
+                Some(engine) => engine.increment_epoch(),
+                None => break,
+            }
+        });
+    if let Err(e) = spawned {
+        // Without the ticker the deadline never fires; fuel still bounds CPU.
+        tracing::error!(error = %e, "could not start the WASM epoch ticker; wall-clock limit inactive");
+    }
+}
 
 /// The canonical reference plug-in, in WebAssembly text. It imports the single
 /// granted capability (`noetl.emit`), calls it once as an observable side
@@ -122,6 +259,11 @@ pub struct HostState {
     pub emitted: Vec<i32>,
     /// The capability ring this invocation may call. Deny-by-default.
     caps: Box<dyn HostCapabilities>,
+    /// Linear-memory cap for this invocation ([`PluginLimits::max_memory_bytes`]).
+    max_memory: Option<usize>,
+    /// Set when a growth request was refused by `max_memory`, so the failure
+    /// that follows is reported as a memory-limit trip, not a generic trap.
+    memory_refused: bool,
 }
 
 impl Default for HostState {
@@ -129,7 +271,35 @@ impl Default for HostState {
         Self {
             emitted: Vec::new(),
             caps: Box::new(NullCapabilities),
+            max_memory: None,
+            memory_refused: false,
         }
+    }
+}
+
+impl wasmtime::ResourceLimiter for HostState {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> anyhow::Result<bool> {
+        match self.max_memory {
+            Some(max) if desired > max => {
+                self.memory_refused = true;
+                Ok(false)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> anyhow::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -257,6 +427,12 @@ pub enum PluginError {
     Memory(String),
     #[error("invocation trapped: {0}")]
     Invoke(#[source] anyhow::Error),
+    #[error("{path}: fuel exhausted after {fuel} units (NOETL_WASM_FUEL); the module was stopped")]
+    FuelExhausted { path: String, fuel: u64 },
+    #[error("{path}: wall-clock limit of {ms} ms exceeded (NOETL_WASM_TIMEOUT_MS); the module was stopped")]
+    Timeout { path: String, ms: u64 },
+    #[error("{path}: linear memory would exceed {limit_bytes} bytes (NOETL_WASM_MAX_MEMORY_MB); the module was stopped")]
+    MemoryLimit { path: String, limit_bytes: usize },
     #[error("plug-in source error: {0}")]
     Source(String),
 }
@@ -269,12 +445,36 @@ pub struct WasmPluginHost {
     linker: Linker<HostState>,
     cache: HashMap<PluginKey, Module>,
     compiles: u64,
+    limits: PluginLimits,
 }
 
 impl WasmPluginHost {
-    /// Build a host with the Round-1 capability ring (`noetl.emit` only).
+    /// Build a host with the limits from the environment
+    /// ([`PluginLimits::from_env`]; safe defaults when unset).
     pub fn new() -> Result<Self, PluginError> {
-        let engine = Engine::default();
+        Self::with_limits(PluginLimits::from_env())
+    }
+
+    /// Build a host with explicit invocation guardrails.
+    pub fn with_limits(limits: PluginLimits) -> Result<Self, PluginError> {
+        let mut config = wasmtime::Config::new();
+        // Fuel metering instruments compiled code, so it is compiled in only
+        // when a budget is set; epoch checks likewise.
+        config.consume_fuel(limits.fuel.is_some());
+        config.epoch_interruption(limits.timeout.is_some());
+        let engine = Engine::new(&config).map_err(|e| PluginError::Compile {
+            path: "<engine>".into(),
+            source: e,
+        })?;
+        if limits.timeout.is_some() {
+            spawn_epoch_ticker(&engine);
+        }
+        tracing::info!(
+            fuel = ?limits.fuel,
+            timeout_ms = ?limits.timeout.map(|t| t.as_millis() as u64),
+            max_memory_bytes = ?limits.max_memory_bytes,
+            "WASM plug-in host guardrails"
+        );
         let mut linker = Linker::new(&engine);
         // The capability ring. wasmtime resolves a module's imports against the
         // names registered here; an import the host did NOT register fails
@@ -312,7 +512,85 @@ impl WasmPluginHost {
             linker,
             cache: HashMap::new(),
             compiles: 0,
+            limits,
         })
+    }
+
+    /// The guardrails every invocation runs under.
+    pub fn limits(&self) -> PluginLimits {
+        self.limits
+    }
+
+    /// A fresh per-invocation store with the guardrails armed.
+    fn new_store(&self, mut state: HostState) -> Result<Store<HostState>, PluginError> {
+        state.max_memory = self.limits.max_memory_bytes;
+        state.memory_refused = false;
+        let mut store = Store::new(&self.engine, state);
+        store.limiter(|s| s as &mut dyn wasmtime::ResourceLimiter);
+        if let Some(fuel) = self.limits.fuel {
+            store.set_fuel(fuel).map_err(PluginError::Invoke)?;
+        }
+        if let Some(timeout) = self.limits.timeout {
+            store.set_epoch_deadline(PluginLimits::deadline_ticks(timeout));
+            store.epoch_deadline_trap();
+        }
+        Ok(store)
+    }
+
+    /// Turn a wasmtime error into the guardrail that caused it, if any;
+    /// otherwise `fallback`. Counts every trip in
+    /// `noetl_worker_plugin_limit_trips_total{limit}`.
+    fn classify(
+        &self,
+        key: &PluginKey,
+        store: &Store<HostState>,
+        err: anyhow::Error,
+        fallback: impl FnOnce(anyhow::Error) -> PluginError,
+    ) -> PluginError {
+        let path = key.path.clone();
+        let (limit, e) = if store.data().memory_refused {
+            (
+                "memory",
+                PluginError::MemoryLimit {
+                    path,
+                    limit_bytes: self.limits.max_memory_bytes.unwrap_or(0),
+                },
+            )
+        } else {
+            match err.downcast_ref::<Trap>() {
+                Some(Trap::OutOfFuel) => (
+                    "fuel",
+                    PluginError::FuelExhausted {
+                        path,
+                        fuel: self.limits.fuel.unwrap_or(0),
+                    },
+                ),
+                Some(Trap::Interrupt) => (
+                    "timeout",
+                    PluginError::Timeout {
+                        path,
+                        ms: self
+                            .limits
+                            .timeout
+                            .map(|t| t.as_millis() as u64)
+                            .unwrap_or(0),
+                    },
+                ),
+                _ => return fallback(err),
+            }
+        };
+        crate::metrics::record_plugin_limit_trip(limit);
+        tracing::warn!(plugin = %key.path, version = key.version, limit, error = %e, "WASM plug-in stopped by a host guardrail");
+        e
+    }
+
+    /// Fuel spent so far in `store` (debug observability; `None` when metering is off).
+    fn fuel_spent(&self, store: &Store<HostState>) -> Option<u64> {
+        let budget = self.limits.fuel?;
+        store
+            .get_fuel()
+            .ok()
+            .map(|left| budget.saturating_sub(left))
     }
 
     /// Number of compilations performed. A cache hit does not increment it — the
@@ -415,18 +693,25 @@ impl WasmPluginHost {
             .cache
             .get(key)
             .ok_or_else(|| PluginError::NotLoaded(format!("{}@{}", key.path, key.version)))?;
-        let mut store = Store::new(&self.engine, HostState::default());
-        let instance =
-            self.linker
-                .instantiate(&mut store, module)
-                .map_err(|e| PluginError::Instantiate {
-                    path: key.path.clone(),
-                    source: e,
-                })?;
+        let mut store = self.new_store(HostState::default())?;
+        let instance = match self.linker.instantiate(&mut store, module) {
+            Ok(i) => i,
+            Err(e) => {
+                return Err(
+                    self.classify(key, &store, e, |source| PluginError::Instantiate {
+                        path: key.path.clone(),
+                        source,
+                    }),
+                )
+            }
+        };
         let run = instance
             .get_typed_func::<i32, i32>(&mut store, "run")
             .map_err(|_| PluginError::MissingExport("run".into()))?;
-        let output = run.call(&mut store, input).map_err(PluginError::Invoke)?;
+        let output = match run.call(&mut store, input) {
+            Ok(o) => o,
+            Err(e) => return Err(self.classify(key, &store, e, PluginError::Invoke)),
+        };
         let emitted = std::mem::take(&mut store.data_mut().emitted);
         Ok(PluginOutcome { output, emitted })
     }
@@ -484,20 +769,21 @@ impl WasmPluginHost {
             .cache
             .get(key)
             .ok_or_else(|| PluginError::NotLoaded(format!("{}@{}", key.path, key.version)))?;
-        let mut store = Store::new(
-            &self.engine,
-            HostState {
-                emitted: Vec::new(),
-                caps,
-            },
-        );
-        let instance =
-            self.linker
-                .instantiate(&mut store, module)
-                .map_err(|e| PluginError::Instantiate {
-                    path: key.path.clone(),
-                    source: e,
-                })?;
+        let mut store = self.new_store(HostState {
+            caps,
+            ..HostState::default()
+        })?;
+        let instance = match self.linker.instantiate(&mut store, module) {
+            Ok(i) => i,
+            Err(e) => {
+                return Err(
+                    self.classify(key, &store, e, |source| PluginError::Instantiate {
+                        path: key.path.clone(),
+                        source,
+                    }),
+                )
+            }
+        };
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| PluginError::MissingExport("memory".into()))?;
@@ -510,14 +796,19 @@ impl WasmPluginHost {
 
         let len = i32::try_from(input.len())
             .map_err(|_| PluginError::Memory(format!("input {} bytes exceeds i32", input.len())))?;
-        let in_ptr = alloc.call(&mut store, len).map_err(PluginError::Invoke)?;
+        let in_ptr = match alloc.call(&mut store, len) {
+            Ok(p) => p,
+            Err(e) => return Err(self.classify(key, &store, e, PluginError::Invoke)),
+        };
         memory
             .write(&mut store, in_ptr as usize, input)
             .map_err(|e| PluginError::Memory(e.to_string()))?;
 
-        let packed = run
-            .call(&mut store, (in_ptr, len))
-            .map_err(PluginError::Invoke)?;
+        let packed = match run.call(&mut store, (in_ptr, len)) {
+            Ok(p) => p,
+            Err(e) => return Err(self.classify(key, &store, e, PluginError::Invoke)),
+        };
+        tracing::debug!(plugin = %key.path, version = key.version, entry, fuel_spent = ?self.fuel_spent(&store), "WASM plug-in invocation");
         let out_ptr = ((packed >> 32) & 0xffff_ffff) as usize;
         let out_len = (packed & 0xffff_ffff) as usize;
 
@@ -834,6 +1125,22 @@ impl WasmDispatcher {
             host: WasmPluginHost::new()?,
             source,
         })
+    }
+
+    /// Build a dispatcher with explicit invocation guardrails.
+    pub fn with_limits(
+        source: Box<dyn PluginSource>,
+        limits: PluginLimits,
+    ) -> Result<Self, PluginError> {
+        Ok(Self {
+            host: WasmPluginHost::with_limits(limits)?,
+            source,
+        })
+    }
+
+    /// The guardrails this dispatcher's host enforces.
+    pub fn limits(&self) -> PluginLimits {
+        self.host.limits()
     }
 
     /// Build a dispatcher that fetches plug-ins from the server's catalog
