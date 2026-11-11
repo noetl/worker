@@ -3191,6 +3191,8 @@ dependencies = [
 [[package]]
 name = "noetl-directives"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbc7148910450b0bcf3151481828f43d23ed7b20b75d5171761b6edf2748a2ca"
 dependencies = [
  "serde",
  "serde_json",
@@ -3237,10 +3239,14 @@ dependencies = [
 [[package]]
 name = "noetl-locator"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcdc9657471e917de19608a327a65eafb0d4bef5df5271c991c85982a5ccdf07"
 
 [[package]]
 name = "noetl-tools"
 version = "4.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1867ab332862106a9207a5dd297ee1d2e8d54af92126841b14c873fa78e7c5d"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
