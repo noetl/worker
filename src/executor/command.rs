@@ -851,8 +851,20 @@ impl CommandExecutor {
         // build dispatches exactly as before. When the Phase E barrier adopted a
         // durable result above, the tool is NOT dispatched and that result is
         // used directly.
+        // Playbook-bound agent tools (build plan item 8): the worker hosts the
+        // loop and runs each such tool as a child execution on the pools. Off
+        // unless NOETL_WORKER_AGENT_TOOL and NOETL_WORKER_AGENT_PLAYBOOK_TOOLS
+        // are both `true`; otherwise the registry agent refuses as before.
+        let hosted_agent = tool_config.kind == "agent"
+            && agent_tool_enabled()
+            && super::agent_host::playbook_tools_enabled()
+            && super::agent_host::has_playbook_tools(&tool_config.config);
         let dispatch_outcome = match barrier_adopted {
             Some(adopted) => Ok(adopted),
+            None if hosted_agent => {
+                self.dispatch_agent_hosted(&tool_config, &ctx, command, &dispatch_client)
+                    .await
+            }
             None => {
                 #[cfg(feature = "wasm-plugin")]
                 {
@@ -1649,6 +1661,79 @@ pub(crate) fn worker_tool_registry() -> ToolRegistry {
     worker_tool_registry_with(agent_tool_enabled())
 }
 
+/// Per-turn records of a hosted agent loop, emitted as events on the execution.
+struct AgentEventSink<'a> {
+    executor: &'a CommandExecutor,
+    client: &'a ControlPlaneClient,
+    command: &'a Command,
+}
+
+#[async_trait::async_trait]
+impl super::agent_host::TurnSink for AgentEventSink<'_> {
+    async fn record(&self, event_type: &str, mut context: serde_json::Value) {
+        if let Some(m) = context.as_object_mut() {
+            m.insert(
+                "command_id".into(),
+                serde_json::json!(self.command.command_id),
+            );
+        }
+        let status = if event_type == "agent.final" {
+            "COMPLETED"
+        } else {
+            "RUNNING"
+        };
+        if let Err(e) = self
+            .executor
+            .emit_event_via(
+                self.client,
+                event_type,
+                &self.command.step,
+                status,
+                self.command.execution_id,
+                self.command.attempts,
+                context,
+            )
+            .await
+        {
+            // Records are observability: a lost one must not fail the step.
+            tracing::warn!(
+                execution_id = self.command.execution_id,
+                step = %self.command.step,
+                event_type,
+                error = %e,
+                "agent turn record not emitted"
+            );
+        }
+    }
+}
+
+impl CommandExecutor {
+    /// Host an agent loop whose `tools:` include playbook bindings
+    /// ([`super::agent_host`]).
+    async fn dispatch_agent_hosted(
+        &self,
+        tool_config: &ToolConfig,
+        ctx: &ExecutionContext,
+        command: &Command,
+        client: &ControlPlaneClient,
+    ) -> Result<noetl_tools::result::ToolResult, noetl_tools::error::ToolError> {
+        let sink = AgentEventSink {
+            executor: self,
+            client,
+            command,
+        };
+        let budget = super::agent_host::AgentBudget::from_env();
+        tracing::info!(
+            execution_id = command.execution_id,
+            step = %command.step,
+            max_tool_calls = budget.max_tool_calls,
+            tool_timeout_secs = budget.tool_timeout_secs,
+            "agent: hosting a loop with playbook-bound tools (children run on the pools)"
+        );
+        super::agent_host::run_hosted(tool_config, ctx, &self.tool_registry, &sink, budget).await
+    }
+}
+
 /// Arms `kind: agent` on this worker (build plan item 4, noetl/ai-meta#330).
 /// Strict `true`; unset keeps the kind unregistered, so a command for it fails
 /// with "unknown tool" exactly as before.
@@ -1664,9 +1749,10 @@ pub(crate) fn worker_tool_registry_with(agent: bool) -> ToolRegistry {
     if agent {
         // `for_shared_pool`: refuses `framework: claude-code`, which would run a
         // local CLI under whatever account this pod is signed in to. Agents
-        // whose tools are MCP servers or external agents run in full; a
-        // playbook-bound `tools:` entry is refused before the first model call
-        // (it needs the CLI host; RFC Phase 6 Stage B on the cluster).
+        // whose tools are MCP servers or external agents run in full. A
+        // playbook-bound `tools:` entry is refused here before the first model
+        // call, unless NOETL_WORKER_AGENT_PLAYBOOK_TOOLS routes the step to the
+        // hosted loop in `agent_host` first (build plan item 8).
         registry.register(noetl_tools::tools::AgentTool::for_shared_pool());
     }
     registry
