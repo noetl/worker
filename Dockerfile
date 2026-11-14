@@ -13,6 +13,14 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # Builder stage - caches dependencies
 FROM chef AS builder
+# ⚠ Copy the toolchain pin BEFORE `cargo chef cook`. The base image ships Rust
+# 1.91.1, but rust-toolchain.toml pins a newer release and cargo honours that file.
+# Without this line, cook compiles every dependency with 1.91.1. Then `COPY . .`
+# brings the pin in, the app stage syncs the pinned toolchain and recompiles
+# every dependency a second time. That makes the cached cook layer useless and
+# doubled the build time on Cloud Build's 8-vCPU machines (worker: 27.6 min cook,
+# then a full rebuild; server: 411 s cook + 888 s rebuild).
+COPY rust-toolchain.toml ./
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies - this layer is cached as long as Cargo.toml/Cargo.lock don't change.
 # `--features duckdb-integration` keeps the DuckDB engine in the shipped image:
