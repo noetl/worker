@@ -134,9 +134,15 @@ pub fn header_for(event_id: Option<i64>) -> bool {
 }
 
 /// Command event ids this process has claimed (bounded; oldest dropped).
-fn claimed() -> &'static std::sync::Mutex<(std::collections::HashSet<i64>, std::collections::VecDeque<i64>)> {
+fn claimed() -> &'static std::sync::Mutex<(
+    std::collections::HashSet<i64>,
+    std::collections::VecDeque<i64>,
+)> {
     static C: std::sync::OnceLock<
-        std::sync::Mutex<(std::collections::HashSet<i64>, std::collections::VecDeque<i64>)>,
+        std::sync::Mutex<(
+            std::collections::HashSet<i64>,
+            std::collections::VecDeque<i64>,
+        )>,
     > = std::sync::OnceLock::new();
     C.get_or_init(Default::default)
 }
@@ -197,10 +203,12 @@ pub fn own_filter_subject() -> Option<String> {
 
 /// The index of executions this worker is chaining (see the module doc).
 pub fn new_index() -> crate::state_builder::SharedWalIndex {
-    crate::state_builder::SharedWalIndex::new(crate::state_builder::WalEventIndex::with_order_policy(
-        crate::state_builder::spine_order(),
-        crate::state_builder::EvictionPolicy::from_env(),
-    ))
+    crate::state_builder::SharedWalIndex::new(
+        crate::state_builder::WalEventIndex::with_order_policy(
+            crate::state_builder::spine_order(),
+            crate::state_builder::EvictionPolicy::from_env(),
+        ),
+    )
 }
 
 /// The outcome of one local drive.
@@ -220,12 +228,30 @@ mod tests {
 
     #[test]
     fn subject_matching() {
-        assert!(subject_matches("noetl.commands.shared.>", "noetl.commands.shared.7.x"));
-        assert!(subject_matches("noetl.commands.shared.>", "noetl.commands.shared.x"));
-        assert!(!subject_matches("noetl.commands.shared.>", "noetl.commands.shared"));
-        assert!(!subject_matches("noetl.commands.shared.>", "noetl.commands.system.x"));
-        assert!(subject_matches("noetl.commands.*.x", "noetl.commands.shared.x"));
-        assert!(!subject_matches("noetl.commands.*.x", "noetl.commands.shared.y"));
+        assert!(subject_matches(
+            "noetl.commands.shared.>",
+            "noetl.commands.shared.7.x"
+        ));
+        assert!(subject_matches(
+            "noetl.commands.shared.>",
+            "noetl.commands.shared.x"
+        ));
+        assert!(!subject_matches(
+            "noetl.commands.shared.>",
+            "noetl.commands.shared"
+        ));
+        assert!(!subject_matches(
+            "noetl.commands.shared.>",
+            "noetl.commands.system.x"
+        ));
+        assert!(subject_matches(
+            "noetl.commands.*.x",
+            "noetl.commands.shared.x"
+        ));
+        assert!(!subject_matches(
+            "noetl.commands.*.x",
+            "noetl.commands.shared.y"
+        ));
         assert!(subject_matches("a.b", "a.b"));
         assert!(!subject_matches("a.b", "a.b.c"));
     }
@@ -252,7 +278,12 @@ mod tests {
             assert!(!header_for(None));
         })
         .await;
-        assert_eq!(done, Some(Completed { trigger_event_id: 42 }));
+        assert_eq!(
+            done,
+            Some(Completed {
+                trigger_event_id: 42
+            })
+        );
         let ((), none) = with_slot(async {
             mark_completed(1);
             clear_completed();
