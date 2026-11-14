@@ -845,6 +845,7 @@ impl Worker {
                     // Per `observability.md` Principle 2.
                     crate::metrics::inc_concurrent_dispatches();
 
+                    let semaphore = self.semaphore.clone();
                     tokio::spawn(async move {
                         // Keep permit until done
                         let _permit = permit;
@@ -900,6 +901,26 @@ impl Worker {
                             // are logged exactly as on the path above.
                             let mut current = command;
                             loop {
+                                // Drive here only with spare capacity: the drive
+                                // holds this slot, where the system-pool drive
+                                // frees it. Saturated, today's path keeps the
+                                // pool's slots for tools (kind C=8: chaining on a
+                                // full pool starved queued executions).
+                                if !crate::local_drive::has_capacity(semaphore.available_permits()) {
+                                    crate::metrics::record_local_drive("skipped_no_spare_slot");
+                                    if let Err(e) =
+                                        executor.execute_with_server_url(&current, override_url).await
+                                    {
+                                        tracing::error!(
+                                            execution_id = current.execution_id,
+                                            command_id = %current.command_id,
+                                            step = %current.step,
+                                            error = %e,
+                                            "Command execution failed"
+                                        );
+                                    }
+                                    break;
+                                }
                                 let (res, done) = crate::local_drive::with_slot(
                                     executor.execute_with_server_url(&current, override_url),
                                 )

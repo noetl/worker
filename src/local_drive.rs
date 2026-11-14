@@ -61,6 +61,22 @@ pub fn disable_for_process(reason: &str) {
     }
 }
 
+/// `NOETL_LOCAL_DRIVE_MIN_FREE_SLOTS` (default 1): drive locally only while at
+/// least this many OTHER slots are free. A local drive holds its slot through
+/// begin → WASM → apply, where the system-pool drive frees it; on a saturated
+/// pool that trades queued executions' pickup for this one's drive (kind, C=8 on
+/// 4 slots: pickup p95 → 925 ms, wall p50 1.9 s → 3.7 s). 0 always drives here.
+pub fn has_capacity(available_permits: usize) -> bool {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| {
+        std::env::var("NOETL_LOCAL_DRIVE_MIN_FREE_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    });
+    available_permits >= min
+}
+
 /// The header the server keys the claim on.
 pub const HEADER: &str = "x-noetl-local-drive";
 
