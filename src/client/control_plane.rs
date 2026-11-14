@@ -546,6 +546,30 @@ impl ControlPlaneClient {
     /// Fetch full command details from the control plane.
     ///
     /// Compatibility fallback when claim endpoint is unavailable.
+    /// `POST /api/executions/{id}/advance` (noetl/ai-meta#558). Returns the HTTP
+    /// status and the JSON body (`Null` when the body is not JSON).
+    pub async fn advance(
+        &self,
+        execution_id: i64,
+        body: &serde_json::Value,
+    ) -> Result<(u16, serde_json::Value)> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/executions/{}/advance",
+                self.server_url, execution_id
+            ))
+            .json(body)
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let value = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        Ok((status, value))
+    }
+
     pub async fn fetch_command(&self, event_id: i64) -> Result<Command> {
         let response = self
             .client
@@ -572,12 +596,15 @@ impl ControlPlaneClient {
     ///
     /// [ee]: https://github.com/noetl/server/wiki/event-envelope
     pub async fn emit_event(&self, event: ExecutorEvent) -> Result<()> {
-        let response = self
+        let mut request = self
             .client
             .post(format!("{}/api/events", self.server_url))
-            .json(&event)
-            .send()
-            .await?;
+            .json(&event);
+        // noetl/ai-meta#558: the completion this worker will drive itself.
+        if crate::local_drive::header_for(event.event_id) {
+            request = request.header(crate::local_drive::HEADER, "1");
+        }
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();

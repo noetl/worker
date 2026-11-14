@@ -214,6 +214,12 @@ pub struct CommandExecutor {
     /// env the writer used, so the reader resolves the identical §7 key.
     #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
     shard_read_cell: crate::state_materializer::CellSeed,
+
+    /// Executions this worker is chaining under the worker-local drive
+    /// (noetl/ai-meta#558). Separate from `state_builder_index` (the system
+    /// pool's WAL drain) so a local drive can never perturb it.
+    #[cfg_attr(not(feature = "wasm-plugin"), allow(dead_code))]
+    local_drive_index: crate::state_builder::SharedWalIndex,
 }
 
 impl CommandExecutor {
@@ -284,6 +290,7 @@ impl CommandExecutor {
             shard_read: crate::state_reader::shard_read_enabled(),
             shard_read_verify: crate::state_reader::shard_read_verify_enabled(),
             shard_read_cell: crate::state_materializer::CellSeed::from_env(),
+            local_drive_index: crate::local_drive::new_index(),
         }
     }
 
@@ -1349,16 +1356,35 @@ impl CommandExecutor {
             &completion_status,
             matches!(tool_result.pending_callback, Some(true)),
         );
-        self.emit_event_via(
-            &dispatch_client,
-            terminal_event,
-            &command.step,
-            &completion_status,
-            command.execution_id,
-            command.attempts,
-            completed_ctx,
-        )
-        .await?;
+        // noetl/ai-meta#558: inside a local-drive slot a plain completion is
+        // marked (header) and recorded, so the caller can drive the next step
+        // here. A parked step, a failure and the drive meta-step never are.
+        let terminal_event_id = self.snowflake.next_id();
+        let local = crate::local_drive::requested()
+            && terminal_event == "command.completed"
+            && !matches!(tool_result.pending_callback, Some(true))
+            && command.step != ORCHESTRATE_STEP_NAME;
+        if local {
+            crate::local_drive::mark_completed(terminal_event_id);
+        }
+        if let Err(e) = self
+            .emit_event_via_id(
+                &dispatch_client,
+                terminal_event,
+                &command.step,
+                &completion_status,
+                command.execution_id,
+                command.attempts,
+                completed_ctx,
+                terminal_event_id,
+            )
+            .await
+        {
+            if local {
+                crate::local_drive::clear_completed();
+            }
+            return Err(e);
+        }
 
         record_metric(false);
         Ok(())
@@ -1409,6 +1435,33 @@ impl CommandExecutor {
         attempts: u32,
         context: serde_json::Value,
     ) -> Result<()> {
+        self.emit_event_via_id(
+            client,
+            event_type,
+            step,
+            status,
+            execution_id,
+            attempts,
+            context,
+            self.snowflake.next_id(),
+        )
+        .await
+    }
+
+    /// [`Self::emit_event_via`] with a caller-chosen event id (the local drive
+    /// keys on the completion's id, so it must know it before the emit).
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_event_via_id(
+        &self,
+        client: &ControlPlaneClient,
+        event_type: &str,
+        step: &str,
+        status: &str,
+        execution_id: i64,
+        attempts: u32,
+        context: serde_json::Value,
+        event_id: i64,
+    ) -> Result<()> {
         let event = ExecutorEvent {
             execution_id,
             event_type: event_type.to_string(),
@@ -1416,7 +1469,7 @@ impl CommandExecutor {
             status: status.to_string(),
             created_at: chrono::Utc::now(),
             context,
-            event_id: Some(self.snowflake.next_id()),
+            event_id: Some(event_id),
             worker_id: Some(self.worker_id.clone()),
             meta: Some(serde_json::json!({ "attempts": attempts })),
         };
@@ -2795,6 +2848,263 @@ impl CommandExecutor {
         OffserverDispatch::Wasm {
             entry: "run_state".to_string(),
             input: fallback(),
+        }
+    }
+}
+
+impl CommandExecutor {
+    /// Worker-local drive (noetl/ai-meta#558): drive `command`'s execution from
+    /// the completion this executor just emitted, instead of the server
+    /// dispatching `__orchestrate__` to the system pool. See
+    /// [`crate::local_drive`]. Never returns an error: every failure ends in the
+    /// server's normal path (`abort`, or a `begin` the server refused).
+    pub async fn local_drive(
+        &self,
+        command: &Command,
+        done: crate::local_drive::Completed,
+        server_url_override: Option<&str>,
+    ) -> crate::local_drive::Outcome {
+        #[cfg(feature = "wasm-plugin")]
+        {
+            self.local_drive_inner(command, done, server_url_override)
+                .await
+        }
+        #[cfg(not(feature = "wasm-plugin"))]
+        {
+            let _ = (command, done, server_url_override);
+            crate::local_drive::Outcome::Fallback("no_wasm".into())
+        }
+    }
+
+    #[cfg(feature = "wasm-plugin")]
+    async fn local_drive_inner(
+        &self,
+        command: &Command,
+        done: crate::local_drive::Completed,
+        server_url_override: Option<&str>,
+    ) -> crate::local_drive::Outcome {
+        use crate::local_drive::Outcome;
+        use crate::metrics::{observe_local_drive, record_local_drive};
+        let execution_id = command.execution_id;
+        let trigger = done.trigger_event_id;
+        let client = match server_url_override {
+            Some(url) if url != self.server_url => self.client.with_server_url(url),
+            _ => self.client.clone(),
+        };
+        let fallback = |label: String| {
+            record_local_drive(&label);
+            Outcome::Fallback(label)
+        };
+
+        // 1. begin
+        let t = std::time::Instant::now();
+        let begin = client
+            .advance(
+                execution_id,
+                &serde_json::json!({"phase": "begin", "trigger_event_id": trigger}),
+            )
+            .await;
+        observe_local_drive("begin", t.elapsed().as_secs_f64());
+        let body = match begin {
+            Ok((404, _)) => {
+                // Flag-off server: it never registered the claim, so its normal
+                // trigger already ran. Stop marking completions.
+                crate::local_drive::disable_for_process("advance returned 404");
+                return fallback("fallback_no_server_api".into());
+            }
+            Ok((200, body)) if body.get("status").and_then(|v| v.as_str()) == Some("drive") => body,
+            Ok((200, body)) => {
+                let reason = body
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                return fallback(format!("fallback_{reason}"));
+            }
+            Ok((status, _)) => {
+                tracing::warn!(execution_id, status, "local drive: begin refused");
+                return fallback("fallback_begin_status".into());
+            }
+            Err(e) => {
+                // The claim lapses after NOETL_LOCAL_DRIVE_CLAIM_TTL_MS and the
+                // reconcile poller drives it; nothing more to do here.
+                tracing::warn!(execution_id, error = %e, "local drive: begin failed");
+                return fallback("fallback_begin_error".into());
+            }
+        };
+        let args = body.get("args").cloned().unwrap_or(serde_json::Value::Null);
+        let playbook = args.get("playbook").cloned().unwrap_or(serde_json::Value::Null);
+        let expected_head = args.get("expected_head").and_then(|v| v.as_i64());
+
+        // 2. the drive input, with the system pool's own builder, on this
+        //    worker's execution-scoped index fed by the server's tail.
+        let t = std::time::Instant::now();
+        if let Some(tail) = args.get("tail_events").and_then(|v| v.as_array()) {
+            let mut idx = self.local_drive_index.lock().await;
+            for ev in tail {
+                let _ = idx.apply(ev);
+            }
+        }
+        let input = crate::state_builder::build_offserver_input(
+            &self.local_drive_index,
+            execution_id,
+            &playbook,
+            args.get("trigger_event_type").and_then(|v| v.as_str()),
+            Some(trigger),
+            expected_head,
+            args.get("atomic_item_context")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+        .await;
+        observe_local_drive("build", t.elapsed().as_secs_f64());
+        let Some(input) = input else {
+            self.local_drive_abort(&client, execution_id, trigger, "incomplete")
+                .await;
+            return fallback("abort_incomplete".into());
+        };
+
+        // 3. system/orchestrate, the same plug-in and entry the system pool runs
+        //    for a WAL-built drive.
+        let t = std::time::Instant::now();
+        let ran = {
+            let mut dispatcher = self.wasm_dispatcher.lock().await;
+            dispatcher
+                .run_and_apply_by_ref_entry(
+                    "system/orchestrate",
+                    1,
+                    &input,
+                    &client,
+                    execution_id,
+                    ORCHESTRATE_STEP_NAME,
+                    "run",
+                )
+                .await
+        };
+        observe_local_drive("wasm", t.elapsed().as_secs_f64());
+        let tool_result = match ran {
+            Ok((output, report)) if report.errors.is_empty() => {
+                plugin_outcome_to_tool_result(output, &report)
+            }
+            Ok((_, report)) => {
+                tracing::warn!(execution_id, errors = ?report.errors, "local drive: plug-in flush errors");
+                self.local_drive_abort(&client, execution_id, trigger, "plugin")
+                    .await;
+                return fallback("abort_plugin".into());
+            }
+            Err(e) => {
+                tracing::warn!(execution_id, error = %e, "local drive: wasm failed");
+                self.local_drive_abort(&client, execution_id, trigger, "wasm")
+                    .await;
+                return fallback("abort_wasm".into());
+            }
+        };
+
+        // 4. apply — the server's `apply_worker_orchestration`, the function the
+        //    system pool's `call.done` reaches.
+        let t = std::time::Instant::now();
+        let applied = client
+            .advance(
+                execution_id,
+                &serde_json::json!({
+                    "phase": "apply",
+                    "trigger_event_id": trigger,
+                    "payload": tool_result.data,
+                }),
+            )
+            .await;
+        observe_local_drive("apply", t.elapsed().as_secs_f64());
+        let body = match applied {
+            Ok((200, body)) if body.get("status").and_then(|v| v.as_str()) == Some("applied") => body,
+            Ok((_, body)) => {
+                let reason = body
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                self.local_drive_index.lock().await.evict(execution_id);
+                return fallback(format!("fallback_apply_{reason}"));
+            }
+            Err(e) => {
+                // The in-flight guard stays held until it expires; the reconcile
+                // poller re-drives (the same recovery as a system worker that
+                // died mid-drive).
+                tracing::warn!(execution_id, error = %e, "local drive: apply failed");
+                self.local_drive_index.lock().await.evict(execution_id);
+                return fallback("fallback_apply_error".into());
+            }
+        };
+
+        // 5. a same-pool next command is claimed here and run on this slot.
+        let filter = crate::local_drive::own_filter_subject();
+        let next = body
+            .get("issued")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .find(|c| {
+                let subject = c.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+                filter
+                    .as_deref()
+                    .is_some_and(|f| crate::local_drive::subject_matches(f, subject))
+            })
+            .cloned();
+        let Some(next) = next else {
+            self.local_drive_index.lock().await.evict(execution_id);
+            record_local_drive("applied");
+            return Outcome::Applied;
+        };
+        let notification = crate::dispatch::CommandNotification {
+            execution_id,
+            event_id: next.get("event_id").and_then(|v| v.as_i64()).unwrap_or(0),
+            command_id: next
+                .get("command_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            step: next
+                .get("step")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            server_url: client.server_url().to_string(),
+            execution_pool: next.get("pool").and_then(|v| v.as_str()).map(str::to_string),
+        };
+        let t = std::time::Instant::now();
+        let claimed =
+            crate::dispatch::claim_outcome(&self.client, &self.worker_id, &notification).await;
+        observe_local_drive("claim", t.elapsed().as_secs_f64());
+        match claimed {
+            Ok(noetl_executor::worker::source::ClaimOutcome::Claimed(cmd)) => {
+                record_local_drive("next");
+                Outcome::Next(Box::new(cmd))
+            }
+            _ => {
+                // Another worker took it off the feed first: fine, it runs there.
+                self.local_drive_index.lock().await.evict(execution_id);
+                record_local_drive("applied_next_elsewhere");
+                Outcome::Applied
+            }
+        }
+    }
+
+    #[cfg(feature = "wasm-plugin")]
+    async fn local_drive_abort(
+        &self,
+        client: &ControlPlaneClient,
+        execution_id: i64,
+        trigger: i64,
+        reason: &str,
+    ) {
+        self.local_drive_index.lock().await.evict(execution_id);
+        if let Err(e) = client
+            .advance(
+                execution_id,
+                &serde_json::json!({"phase": "abort", "trigger_event_id": trigger, "reason": reason}),
+            )
+            .await
+        {
+            tracing::warn!(execution_id, error = %e, reason, "local drive: abort failed; the in-flight guard expires and the reconcile poller re-drives");
         }
     }
 }

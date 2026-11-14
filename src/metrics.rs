@@ -2916,6 +2916,55 @@ pub const STATE_BUILDER_BUILD_OUTCOMES: [&str; 4] =
 
 /// Record one off-server DRIVE build outcome.  See
 /// [`STATE_BUILDER_DRIVE_OUTCOMES`] for the full set.
+/// `noetl_worker_local_drive_total{outcome}` (noetl/ai-meta#558): every
+/// worker-local drive attempt by how it ended — `next` (drove, claimed the next
+/// command here), `applied` (drove, nothing to run here), `fallback_<reason>`
+/// (the server's normal path ran), `abort_<reason>`, `disabled_no_server_api`.
+/// The fallback counter is what proves the fast path is taken, not a silent
+/// no-op.
+pub fn record_local_drive(outcome: &str) {
+    use std::sync::OnceLock;
+    static C: OnceLock<prometheus::IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        let c = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_worker_local_drive_total",
+                "Worker-local drive attempts by outcome (noetl/ai-meta#558)",
+            ),
+            &["outcome"],
+        )
+        .expect("local drive counter");
+        let _ = WorkerMetrics::global().registry.register(Box::new(c.clone()));
+        c
+    })
+    .with_label_values(&[outcome])
+    .inc();
+}
+
+/// `noetl_worker_local_drive_seconds{phase}` (noetl/ai-meta#558): `begin`,
+/// `build`, `wasm`, `apply`, `claim` — where a local drive's time goes.
+pub fn observe_local_drive(phase: &str, seconds: f64) {
+    use std::sync::OnceLock;
+    static H: OnceLock<prometheus::HistogramVec> = OnceLock::new();
+    H.get_or_init(|| {
+        let h = prometheus::HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "noetl_worker_local_drive_seconds",
+                "Worker-local drive phase durations (noetl/ai-meta#558)",
+            )
+            .buckets(vec![
+                0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+            ]),
+            &["phase"],
+        )
+        .expect("local drive histogram");
+        let _ = WorkerMetrics::global().registry.register(Box::new(h.clone()));
+        h
+    })
+    .with_label_values(&[phase])
+    .observe(seconds);
+}
+
 pub fn record_state_builder_drive(outcome: &str) {
     WorkerMetrics::global()
         .state_builder_drive_builds_total

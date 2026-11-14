@@ -854,44 +854,72 @@ impl Worker {
                         } else {
                             Some(dispatch_server_url.as_str())
                         };
-                        if let Err(e) = executor
-                            .execute_with_server_url(&command, override_url)
-                            .await
-                        {
-                            // Per `observability.md` Principle 4:
-                            // structured execution_id on every
-                            // ERROR.  Includes `step` for the
-                            // playbook-level correlation when
-                            // looking at a single execution's
-                            // trace.
-                            //
-                            // Invariant (noetl/ai-meta#78): by the time
-                            // `execute_with_server_url` returns `Err`,
-                            // it has ALREADY emitted the step's terminal
-                            // events for every terminal failure —
-                            // tool-execution errors (the post-dispatch
-                            // error arm) and pre-dispatch errors
-                            // (credential-alias 404, malformed tool
-                            // config, etc.) both emit `call.error` +
-                            // `command.failed` before returning.  The
-                            // only `Err` that reaches here WITHOUT a
-                            // terminal event is a transient (retryable)
-                            // pre-dispatch failure that hasn't exhausted
-                            // its attempt counter — that is deliberate,
-                            // so the command path's retry/redelivery can
-                            // still complete the step.  Therefore this
-                            // arm must NOT emit a blanket terminal event
-                            // as a "safety net": doing so would
-                            // double-emit terminals for the terminal
-                            // case and defeat the retry for the
-                            // transient case.  It logs only.
-                            tracing::error!(
-                                execution_id,
-                                command_id = %command_id,
-                                step = %step,
-                                error = %e,
-                                "Command execution failed"
-                            );
+                        if !crate::local_drive::enabled() {
+                            if let Err(e) = executor
+                                .execute_with_server_url(&command, override_url)
+                                .await
+                            {
+                                // Per `observability.md` Principle 4:
+                                // structured execution_id on every
+                                // ERROR.  Includes `step` for the
+                                // playbook-level correlation when
+                                // looking at a single execution's
+                                // trace.
+                                //
+                                // Invariant (noetl/ai-meta#78): by the time
+                                // `execute_with_server_url` returns `Err`,
+                                // it has ALREADY emitted the step's terminal
+                                // events for every terminal failure —
+                                // tool-execution errors (the post-dispatch
+                                // error arm) and pre-dispatch errors
+                                // (credential-alias 404, malformed tool
+                                // config, etc.) both emit `call.error` +
+                                // `command.failed` before returning.  The
+                                // only `Err` that reaches here WITHOUT a
+                                // terminal event is a transient (retryable)
+                                // pre-dispatch failure that hasn't exhausted
+                                // its attempt counter — that is deliberate,
+                                // so the command path's retry/redelivery can
+                                // still complete the step.  Therefore this
+                                // arm must NOT emit a blanket terminal event
+                                // as a "safety net": doing so would
+                                // double-emit terminals for the terminal
+                                // case and defeat the retry for the
+                                // transient case.  It logs only.
+                                tracing::error!(
+                                    execution_id,
+                                    command_id = %command_id,
+                                    step = %step,
+                                    error = %e,
+                                    "Command execution failed"
+                                );
+                            }
+                        } else {
+                            // noetl/ai-meta#558: drive the next step here and,
+                            // when it is ours, run it on this same slot. Errors
+                            // are logged exactly as on the path above.
+                            let mut current = command;
+                            loop {
+                                let (res, done) = crate::local_drive::with_slot(
+                                    executor.execute_with_server_url(&current, override_url),
+                                )
+                                .await;
+                                if let Err(e) = res {
+                                    tracing::error!(
+                                        execution_id = current.execution_id,
+                                        command_id = %current.command_id,
+                                        step = %current.step,
+                                        error = %e,
+                                        "Command execution failed"
+                                    );
+                                    break;
+                                }
+                                let Some(done) = done else { break };
+                                match executor.local_drive(&current, done, override_url).await {
+                                    crate::local_drive::Outcome::Next(next) => current = *next,
+                                    _ => break,
+                                }
+                            }
                         }
                         crate::metrics::dec_concurrent_dispatches();
                     });
