@@ -20,6 +20,7 @@ pub mod event_bus;
 pub mod events;
 pub mod executor;
 pub mod graceful;
+pub mod local_drive;
 pub mod materializer;
 pub mod metrics;
 pub mod metrics_server;

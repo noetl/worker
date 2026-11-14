@@ -80,7 +80,7 @@ pub fn segment_from_filter(filter: &str) -> Option<String> {
 /// Translate the worker's local `Command` into the executor's
 /// enriched `Command`.  Lossless: every field on the executor side
 /// maps to a worker-side accessor or JSON path.
-fn translate(worker: WorkerCommand) -> ExecutorCommand {
+pub(crate) fn translate(worker: WorkerCommand) -> ExecutorCommand {
     let attempts = worker
         .meta
         .get("attempts")
@@ -133,10 +133,32 @@ pub(crate) async fn claim_outcome(
     worker_id: &str,
     notification: &CommandNotification,
 ) -> Result<ClaimOutcome> {
+    // noetl/ai-meta#558: under the worker-local drive one command can reach this
+    // process twice — claimed directly by the drive that issued it AND delivered
+    // by the feed. The server answers a repeat claim from the same worker with
+    // idempotent success, so without this the command would run twice. First
+    // claimer wins; the other is told it is already claimed.
+    let guard = crate::local_drive::enabled();
+    if guard && !crate::local_drive::begin_claim(notification.event_id) {
+        crate::metrics::record_local_drive("dedup_second_delivery");
+        return Ok(ClaimOutcome::AlreadyClaimed);
+    }
     let dispatch_client = client.with_server_url(&notification.server_url);
-    let claim = dispatch_client
+    let claim = match dispatch_client
         .claim_command(notification.event_id, worker_id)
-        .await?;
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            if guard {
+                crate::local_drive::release_claim(notification.event_id);
+            }
+            return Err(e);
+        }
+    };
+    if guard && !matches!(claim, ClaimResult::Claimed(_)) {
+        crate::local_drive::release_claim(notification.event_id);
+    }
     Ok(match claim {
         ClaimResult::Claimed(worker_cmd) => ClaimOutcome::Claimed(translate(worker_cmd)),
         ClaimResult::AlreadyClaimed => ClaimOutcome::AlreadyClaimed,
