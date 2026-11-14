@@ -3010,6 +3010,12 @@ impl CommandExecutor {
                     "phase": "apply",
                     "trigger_event_id": trigger,
                     "payload": tool_result.data,
+                    // The server claims the first command on our own subject for
+                    // us and never publishes it, so the feed cannot beat us to it.
+                    "handoff": crate::local_drive::own_filter_subject().map(|f| serde_json::json!({
+                        "worker_id": self.worker_id,
+                        "subject_filter": f,
+                    })),
                 }),
             )
             .await;
@@ -3035,7 +3041,27 @@ impl CommandExecutor {
             }
         };
 
-        // 5. a same-pool next command is claimed here and run on this slot.
+        // 5a. handed off: the server already claimed it for this worker.
+        if let Some(cmd) = body.get("next_command").filter(|v| !v.is_null()) {
+            match serde_json::from_value::<crate::client::Command>(cmd.clone()) {
+                Ok(worker_cmd) => {
+                    let _ = crate::local_drive::begin_claim(
+                        cmd.get("event_id").and_then(|v| v.as_i64()).unwrap_or(0),
+                    );
+                    record_local_drive("next");
+                    return Outcome::Next(Box::new(crate::dispatch::translate(worker_cmd)));
+                }
+                Err(e) => {
+                    // Claimed for us but unreadable: say so loudly; the orphan
+                    // sweep recovers the command exactly as for a dead worker.
+                    tracing::error!(execution_id, error = %e, "local drive: handed-off command did not decode");
+                    record_local_drive("handoff_decode_error");
+                }
+            }
+        }
+
+        // 5b. otherwise a same-pool next command is claimed here (a server
+        //     without handoff support) and run on this slot.
         let filter = crate::local_drive::own_filter_subject();
         let next = body
             .get("issued")

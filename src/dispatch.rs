@@ -80,7 +80,7 @@ pub fn segment_from_filter(filter: &str) -> Option<String> {
 /// Translate the worker's local `Command` into the executor's
 /// enriched `Command`.  Lossless: every field on the executor side
 /// maps to a worker-side accessor or JSON path.
-fn translate(worker: WorkerCommand) -> ExecutorCommand {
+pub(crate) fn translate(worker: WorkerCommand) -> ExecutorCommand {
     let attempts = worker
         .meta
         .get("attempts")
