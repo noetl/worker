@@ -133,6 +133,38 @@ pub fn header_for(event_id: Option<i64>) -> bool {
     }
 }
 
+/// Command event ids this process has claimed (bounded; oldest dropped).
+fn claimed() -> &'static std::sync::Mutex<(std::collections::HashSet<i64>, std::collections::VecDeque<i64>)> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<(std::collections::HashSet<i64>, std::collections::VecDeque<i64>)>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+const CLAIMED_CAP: usize = 8192;
+
+/// Record a claim attempt for `event_id`; false when this process already
+/// claimed it (the second delivery must not run it again).
+pub fn begin_claim(event_id: i64) -> bool {
+    let mut c = claimed().lock().unwrap();
+    if !c.0.insert(event_id) {
+        return false;
+    }
+    c.1.push_back(event_id);
+    while c.1.len() > CLAIMED_CAP {
+        if let Some(old) = c.1.pop_front() {
+            c.0.remove(&old);
+        }
+    }
+    true
+}
+
+/// Forget a claim attempt that did not claim (so a redelivery may retry it).
+pub fn release_claim(event_id: i64) {
+    let mut c = claimed().lock().unwrap();
+    c.0.remove(&event_id);
+    c.1.retain(|e| *e != event_id);
+}
+
 /// NATS-style subject match: `*` is one token, `>` the rest (one or more).
 pub fn subject_matches(filter: &str, subject: &str) -> bool {
     let f: Vec<&str> = filter.split('.').collect();
@@ -196,6 +228,15 @@ mod tests {
         assert!(!subject_matches("noetl.commands.*.x", "noetl.commands.shared.y"));
         assert!(subject_matches("a.b", "a.b"));
         assert!(!subject_matches("a.b", "a.b.c"));
+    }
+
+    #[test]
+    fn a_command_is_claimed_once_per_process() {
+        assert!(begin_claim(-77));
+        assert!(!begin_claim(-77), "the second delivery is refused");
+        release_claim(-77);
+        assert!(begin_claim(-77), "a released attempt may be retried");
+        release_claim(-77);
     }
 
     #[tokio::test]
