@@ -340,6 +340,8 @@ impl Worker {
         // Not ready for new work. Nothing routes traffic to a worker, but the
         // probe should not claim a pod that is leaving is healthy.
         crate::metrics::set_worker_ready(false);
+        // noetl/ai-meta#561: no new local-drive claims from a pod that is leaving.
+        crate::local_drive::stop_for_drain();
         // No in-flight count here: at this instant the claim loop still holds the permit
         // it parks with, so the number would read one high. `wait_in_flight` counts once
         // the loop has let go of it.

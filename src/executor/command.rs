@@ -1361,6 +1361,9 @@ impl CommandExecutor {
         // here. A parked step, a failure and the drive meta-step never are.
         let terminal_event_id = self.snowflake.next_id();
         let local = crate::local_drive::requested()
+            // re-checked per completion: a pod that started draining mid-chain
+            // (stop_for_drain) stops marking (noetl/ai-meta#561)
+            && crate::local_drive::enabled()
             && terminal_event == "command.completed"
             && !matches!(tool_result.pending_callback, Some(true))
             && command.step != ORCHESTRATE_STEP_NAME;
