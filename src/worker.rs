@@ -1226,6 +1226,12 @@ fn warm_orchestrate_enabled() -> bool {
         Err(_) => {
             crate::state_builder::builder_mode() != crate::state_builder::BuilderMode::Off
                 || crate::materializer::enabled()
+                // noetl/ai-meta#561: a local-drive worker runs `system/orchestrate`
+                // itself. Unwarmed, its FIRST drive pays the Cranelift compile on
+                // the critical path (4.75 s on a fresh prod user-pool pod,
+                // 2026-11-15) — the 3–5 s next-step stall after every rollout and
+                // scale-out.
+                || crate::local_drive::enabled()
         }
     }
 }

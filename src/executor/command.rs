@@ -2465,19 +2465,18 @@ impl CommandExecutor {
         }
 
         let (output, report) = {
-            let mut dispatcher = self.wasm_dispatcher.lock().await;
-            dispatcher
-                .run_and_apply_by_ref_entry(
-                    &path,
-                    version,
-                    &input,
-                    client,
-                    command.execution_id,
-                    &command.step,
-                    &entry,
-                )
-                .await
-                .map_err(|e| {
+            crate::plugin::run_and_apply_locked(
+                &self.wasm_dispatcher,
+                &path,
+                version,
+                &input,
+                client,
+                command.execution_id,
+                &command.step,
+                &entry,
+            )
+            .await
+            .map_err(|e| {
                     noetl_tools::error::ToolError::ExecutionFailed(format!(
                         "wasm dispatch {path}@{version} ({entry}): {e}"
                     ))
@@ -2967,20 +2966,17 @@ impl CommandExecutor {
         // 3. system/orchestrate, the same plug-in and entry the system pool runs
         //    for a WAL-built drive.
         let t = std::time::Instant::now();
-        let ran = {
-            let mut dispatcher = self.wasm_dispatcher.lock().await;
-            dispatcher
-                .run_and_apply_by_ref_entry(
-                    "system/orchestrate",
-                    1,
-                    &input,
-                    &client,
-                    execution_id,
-                    ORCHESTRATE_STEP_NAME,
-                    "run",
-                )
-                .await
-        };
+        let ran = crate::plugin::run_and_apply_locked(
+            &self.wasm_dispatcher,
+            "system/orchestrate",
+            1,
+            &input,
+            &client,
+            execution_id,
+            ORCHESTRATE_STEP_NAME,
+            "run",
+        )
+        .await;
         observe_local_drive("wasm", t.elapsed().as_secs_f64());
         let tool_result = match ran {
             Ok((output, report)) if report.errors.is_empty() => {

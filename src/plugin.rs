@@ -1116,6 +1116,41 @@ pub struct WasmRunOutcome {
 pub struct WasmDispatcher {
     host: WasmPluginHost,
     source: Box<dyn PluginSource>,
+    /// `(path, version)` → the key it last resolved to, and when (noetl/ai-meta#561).
+    /// Only consulted when [`resolve_ttl`] is non-zero.
+    resolved: HashMap<(String, u32), (PluginKey, Instant)>,
+}
+
+/// Flush a plug-in's capability intents AFTER releasing the dispatcher lock
+/// (`NOETL_WASM_FLUSH_UNLOCKED`, noetl/ai-meta#561). Default off: the flush (HTTP
+/// result/object/event writes) runs under the per-process WASM lock, so every
+/// other drive or `kind: wasm` step on the pod queues behind this one's network
+/// I/O. On: only the module resolve + run hold the lock.
+pub fn flush_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("NOETL_WASM_FLUSH_UNLOCKED")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+/// How long a `(path, version)` → digest resolution is reused before the catalog
+/// is asked again (`NOETL_WASM_RESOLVE_TTL_MS`, noetl/ai-meta#561). Default `0`:
+/// resolve on every dispatch, today's behaviour. Every dispatch otherwise pays an
+/// HTTP GET of the whole module (~37 ms per drive on prod, 2026-11-15) just to
+/// learn its digest. A hot reload that keeps `(path, version)` and changes the
+/// digest is picked up within one TTL; a version bump is a new key and is seen at
+/// once.
+pub fn resolve_ttl() -> std::time::Duration {
+    static TTL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        let ms = std::env::var("NOETL_WASM_RESOLVE_TTL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        std::time::Duration::from_millis(ms)
+    })
 }
 
 impl WasmDispatcher {
@@ -1124,6 +1159,7 @@ impl WasmDispatcher {
         Ok(Self {
             host: WasmPluginHost::new()?,
             source,
+            resolved: HashMap::new(),
         })
     }
 
@@ -1135,6 +1171,7 @@ impl WasmDispatcher {
         Ok(Self {
             host: WasmPluginHost::with_limits(limits)?,
             source,
+            resolved: HashMap::new(),
         })
     }
 
@@ -1206,11 +1243,36 @@ impl WasmDispatcher {
         input: &[u8],
         entry: &str,
     ) -> Result<WasmRunOutcome, PluginError> {
+        let key = self.resolve_key(path, version, resolve_ttl()).await?;
+        self.invoke_collected(&key, input, entry)
+    }
+
+    /// The loaded key for `(path, version)`: reused from the last resolution when
+    /// it is younger than `ttl` and still compiled, otherwise resolved from the
+    /// source (and compiled on a new digest). `ttl == 0` always resolves.
+    pub async fn resolve_key(
+        &mut self,
+        path: &str,
+        version: u32,
+        ttl: std::time::Duration,
+    ) -> Result<PluginKey, PluginError> {
+        if !ttl.is_zero() {
+            if let Some((key, at)) = self.resolved.get(&(path.to_string(), version)) {
+                if at.elapsed() < ttl && self.host.cache.contains_key(key) {
+                    crate::metrics::record_plugin_load("resolve_cached", 0.0);
+                    return Ok(key.clone());
+                }
+            }
+        }
         let key = self
             .host
             .ensure_loaded_by_ref(path, version, self.source.as_ref())
             .await?;
-        self.invoke_collected(&key, input, entry)
+        if !ttl.is_zero() {
+            self.resolved
+                .insert((path.to_string(), version), (key.clone(), Instant::now()));
+        }
+        Ok(key)
     }
 
     /// Invoke a loaded plug-in over the byte data-plane with a fresh buffering
@@ -1281,6 +1343,35 @@ impl WasmDispatcher {
         let report = apply_intents(outcome.intents, client, execution_id, step).await;
         Ok((outcome.output, report))
     }
+}
+
+/// Run `(path, version, entry)` on `dispatcher` and flush its intents: the flush
+/// happens with the lock released when [`flush_unlocked`] is on, under it
+/// (today's [`WasmDispatcher::run_and_apply_by_ref_entry`]) when off.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_and_apply_locked(
+    dispatcher: &tokio::sync::Mutex<WasmDispatcher>,
+    path: &str,
+    version: u32,
+    input: &[u8],
+    client: &crate::client::ControlPlaneClient,
+    execution_id: i64,
+    step: &str,
+    entry: &str,
+) -> Result<(Vec<u8>, FlushReport), PluginError> {
+    if !flush_unlocked() {
+        return dispatcher
+            .lock()
+            .await
+            .run_and_apply_by_ref_entry(path, version, input, client, execution_id, step, entry)
+            .await;
+    }
+    let outcome = {
+        let mut d = dispatcher.lock().await;
+        d.run_by_ref_entry(path, version, input, entry).await?
+    };
+    let report = apply_intents(outcome.intents, client, execution_id, step).await;
+    Ok((outcome.output, report))
 }
 
 /// Outcome of flushing a plug-in's [`CapIntent`]s to the control plane.
@@ -1741,6 +1832,34 @@ mod tests {
                 .min(self.revisions.len() - 1);
             Ok(self.revisions[i].clone())
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_key_reuses_within_ttl_and_re_resolves_after() {
+        // noetl/ai-meta#561: with a TTL the digest resolution (an HTTP GET of the
+        // whole module on the real source) is reused; with 0 it runs every time.
+        const REV_B_WAT: &str = r#"
+            (module
+              (import "noetl" "emit" (func $emit (param i32)))
+              (func (export "run") (param $x i32) (result i32)
+                (i32.mul (local.get $x) (i32.const 3))))
+        "#;
+        let src = RepublishSource::new(vec![("sha-a", REFERENCE_PLUGIN_WAT), ("sha-b", REV_B_WAT)]);
+        let mut d = WasmDispatcher::new(Box::new(src)).unwrap();
+        let ttl = std::time::Duration::from_secs(60);
+        let k1 = d.resolve_key("system/reference", 1, ttl).await.unwrap();
+        let k2 = d.resolve_key("system/reference", 1, ttl).await.unwrap();
+        assert_eq!(k1.digest, "sha-a");
+        assert_eq!(k2.digest, "sha-a", "within the TTL the source is not asked again");
+        // TTL 0 = today's behaviour: resolves, and sees the republished digest.
+        let k3 = d.resolve_key("system/reference", 1, std::time::Duration::ZERO).await.unwrap();
+        assert_eq!(k3.digest, "sha-b");
+        // An expired entry re-resolves.
+        let short = std::time::Duration::from_millis(1);
+        let _ = d.resolve_key("system/other", 1, short).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let k4 = d.resolve_key("system/other", 1, short).await.unwrap();
+        assert_eq!(k4.digest, "sha-b");
     }
 
     #[tokio::test]
