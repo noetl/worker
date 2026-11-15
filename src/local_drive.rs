@@ -49,6 +49,19 @@ pub fn enabled() -> bool {
 /// a flag-off server costs one probe, not one per step.
 static DISABLED: AtomicBool = AtomicBool::new(false);
 
+/// Stop local driving because this pod is draining (SIGTERM, noetl/ai-meta#561).
+///
+/// A completion marked for local drive makes the server suppress its own
+/// trigger; if the pod then exits before `begin`/`apply`, the step waits for the
+/// claim to lapse. A draining pod therefore stops marking: its last completions
+/// take today's path, and an in-progress chain ends after the current step.
+pub fn stop_for_drain() {
+    if !DISABLED.swap(true, Ordering::Relaxed) {
+        tracing::info!("worker-local drive stopped: draining");
+        crate::metrics::record_local_drive("stopped_draining");
+    }
+}
+
 pub fn disable_for_process(reason: &str) {
     if !DISABLED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
