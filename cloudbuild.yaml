@@ -56,14 +56,22 @@ options:
   # E2_HIGHCPU_8 was verified available in us-central1 and is still
   # 2x the 4-vCPU GitHub-hosted runner the GHCR job uses.
   #
-  # Once the quota lands, bump this line to E2_HIGHCPU_32 -- nothing
-  # else in this file has to change.
+  # Re-probed 2026-11-14: E2_HIGHCPU_32 is still refused ("quota
+  # restrictions") in us-central1, us-east1 and us-west1 although the
+  # 64-vCPU CPU quota is granted. E2_HIGHCPU_16 / N2 / C3 are not valid
+  # default-pool types, and the private-pool quota is 4 vCPU. So
+  # E2_HIGHCPU_8 is the largest machine that provisions: stay on it and
+  # rely on the cook-layer cache (see the Dockerfile toolchain note).
   machineType: E2_HIGHCPU_8
   # Rust + cargo-chef needs headroom for the target dir.
   diskSizeGb: 200
   logging: CLOUD_LOGGING_ONLY
 
-timeout: 2400s
+# 3600 s, up from 2400 s: a cold-cache build (cook from scratch, e.g. after a
+# Cargo.lock change) on E2_HIGHCPU_8 runs about 30-35 min with the toolchain fix.
+# 2400 s left no margin (6.11.3 and 6.11.4 timed out). A warm build only compiles
+# the worker crates.
+timeout: 3600s
 
 steps:
   # ---------------------------------------------------------------
