@@ -893,6 +893,8 @@ impl CommandExecutor {
             }
         };
 
+        // noetl/ai-meta#561: a call.done held for the fused completion emit.
+        let mut deferred_call_done: Option<ExecutorEvent> = None;
         let tool_result = match dispatch_outcome {
             Ok(result) => {
                 // Emit call.done event with a reference-only result
@@ -1101,20 +1103,48 @@ impl CommandExecutor {
                             return Ok(());
                         }
                     }
-                    self.emit_event_via(
-                        &dispatch_client,
-                        "call.done",
-                        &command.step,
-                        "COMPLETED",
-                        command.execution_id,
-                        command.attempts,
-                        serde_json::json!({
-                            "command_id": command.command_id.clone(),
-                            "call_index": ctx.call_index,
-                            "result": result_obj,
-                        }),
-                    )
-                    .await?;
+                    let call_done_ctx = serde_json::json!({
+                        "command_id": command.command_id.clone(),
+                        "call_index": ctx.call_index,
+                        "result": result_obj,
+                    });
+                    // noetl/ai-meta#561 lifecycle fusion: hold this call.done
+                    // and send it WITH the command.completed below, in one
+                    // request, only when nothing can come between them (one
+                    // in-process tool, no cases, no sink, no control-flow
+                    // verbs, a success that completes). Otherwise per event.
+                    let fuse = lifecycle_fusion_enabled()
+                        && crate::client::seq_supported()
+                        && fusion_eligibility(
+                            command,
+                            &tool_config,
+                            is_sink_step,
+                            result.status,
+                            fail_execution_on_step_error(),
+                        )
+                        .is_ok();
+                    if fuse {
+                        deferred_call_done = Some(self.build_event(
+                            "call.done",
+                            &command.step,
+                            "COMPLETED",
+                            command.execution_id,
+                            command.attempts,
+                            call_done_ctx,
+                            self.snowflake.next_id(),
+                        ));
+                    } else {
+                        self.emit_event_via(
+                            &dispatch_client,
+                            "call.done",
+                            &command.step,
+                            "COMPLETED",
+                            command.execution_id,
+                            command.attempts,
+                            call_done_ctx,
+                        )
+                        .await?;
+                    }
                 }
 
                 // noetl/ai-meta#199 Slice A — confirm the sink. The declared sink
@@ -1370,19 +1400,36 @@ impl CommandExecutor {
         if local {
             crate::local_drive::mark_completed(terminal_event_id);
         }
-        if let Err(e) = self
-            .emit_event_via_id(
-                &dispatch_client,
-                terminal_event,
-                &command.step,
-                &completion_status,
-                command.execution_id,
-                command.attempts,
-                completed_ctx,
-                terminal_event_id,
-            )
-            .await
-        {
+        let emitted = match deferred_call_done.take() {
+            Some(call_done) => {
+                self.emit_fused_completion(
+                    &dispatch_client,
+                    call_done,
+                    terminal_event,
+                    &command.step,
+                    &completion_status,
+                    command.execution_id,
+                    command.attempts,
+                    completed_ctx,
+                    terminal_event_id,
+                )
+                .await
+            }
+            None => {
+                self.emit_event_via_id(
+                    &dispatch_client,
+                    terminal_event,
+                    &command.step,
+                    &completion_status,
+                    command.execution_id,
+                    command.attempts,
+                    completed_ctx,
+                    terminal_event_id,
+                )
+                .await
+            }
+        };
+        if let Err(e) = emitted {
             if local {
                 crate::local_drive::clear_completed();
             }
@@ -1465,7 +1512,27 @@ impl CommandExecutor {
         context: serde_json::Value,
         event_id: i64,
     ) -> Result<()> {
-        let event = ExecutorEvent {
+        let event = self.build_event(event_type, step, status, execution_id, attempts, context, event_id);
+
+        let emit_start = std::time::Instant::now();
+        let result = client.emit_event_with_retry(event, 3).await;
+        crate::metrics::record_event_emit(event_type, emit_start.elapsed().as_secs_f64(), 0);
+        result
+    }
+
+    /// The lifecycle `ExecutorEvent` every emit path sends.
+    #[allow(clippy::too_many_arguments)]
+    fn build_event(
+        &self,
+        event_type: &str,
+        step: &str,
+        status: &str,
+        execution_id: i64,
+        attempts: u32,
+        context: serde_json::Value,
+        event_id: i64,
+    ) -> ExecutorEvent {
+        ExecutorEvent {
             execution_id,
             event_type: event_type.to_string(),
             step: step.to_string(),
@@ -1475,12 +1542,58 @@ impl CommandExecutor {
             event_id: Some(event_id),
             worker_id: Some(self.worker_id.clone()),
             meta: Some(serde_json::json!({ "attempts": attempts })),
-        };
+        }
+    }
 
-        let emit_start = std::time::Instant::now();
-        let result = client.emit_event_with_retry(event, 3).await;
-        crate::metrics::record_event_emit(event_type, emit_start.elapsed().as_secs_f64(), 0);
-        result
+    /// Send a held `call.done` together with this command's terminal event
+    /// (noetl/ai-meta#561). Fused only when the terminal is `command.completed`;
+    /// a refusal before write (older server, affinity, shape) or any other
+    /// terminal sends the two per event, in the same order, with the same ids.
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_fused_completion(
+        &self,
+        client: &ControlPlaneClient,
+        call_done: ExecutorEvent,
+        terminal_event: &str,
+        step: &str,
+        status: &str,
+        execution_id: i64,
+        attempts: u32,
+        context: serde_json::Value,
+        event_id: i64,
+    ) -> Result<()> {
+        let terminal = self.build_event(terminal_event, step, status, execution_id, attempts, context, event_id);
+        if terminal_event == "command.completed" {
+            let emit_start = std::time::Instant::now();
+            let pair = [call_done, terminal];
+            let outcome = client.emit_event_seq_with_retry(&pair, 3).await?;
+            if outcome == crate::client::SeqEmit::Done {
+                crate::metrics::record_event_emit(
+                    "fused.call_done+command_completed",
+                    emit_start.elapsed().as_secs_f64(),
+                    0,
+                );
+                return Ok(());
+            }
+            let [call_done, terminal] = pair;
+            return self.emit_pair_per_event(client, call_done, terminal).await;
+        }
+        self.emit_pair_per_event(client, call_done, terminal).await
+    }
+
+    async fn emit_pair_per_event(
+        &self,
+        client: &ControlPlaneClient,
+        first: ExecutorEvent,
+        second: ExecutorEvent,
+    ) -> Result<()> {
+        for event in [first, second] {
+            let event_type = event.event_type.to_string();
+            let emit_start = std::time::Instant::now();
+            client.emit_event_with_retry(event, 3).await?;
+            crate::metrics::record_event_emit(&event_type, emit_start.elapsed().as_secs_f64(), 0);
+        }
+        Ok(())
     }
 
     /// noetl/ai-meta#145 G2 — spawn the detached container poll fallback.
@@ -3996,6 +4109,99 @@ fn fail_execution_on_step_error() -> bool {
             .as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// `NOETL_WORKER_FUSE_LIFECYCLE` (noetl/ai-meta#561): send one tool's
+/// `call.done` + `command.completed` in one `/api/events/seq` request. Off by
+/// default; read once. Off = REMOVE the variable.
+pub(crate) fn lifecycle_fusion_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("NOETL_WORKER_FUSE_LIFECYCLE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+/// Tool kinds whose execution is one in-process call with no events of its own
+/// and no async completion — the only ones whose lifecycle may be fused.
+const FUSIBLE_TOOL_KINDS: &[&str] = &[
+    "noop", "python", "http", "postgres", "duckdb", "rhai", "shell", "script", "wasm",
+];
+
+/// True when `v` carries an object key `do` at any depth: a task_sequence
+/// control-flow verb (`do: jump | break | retry`, noetl/ai-meta#125).
+fn has_control_flow_verb(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(m) => m.iter().any(|(k, v)| k == "do" || has_control_flow_verb(v)),
+        serde_json::Value::Array(a) => a.iter().any(has_control_flow_verb),
+        _ => false,
+    }
+}
+
+/// Whether a command's `call.done` and `command.completed` may be sent as one
+/// request (noetl/ai-meta#561). Deliberately narrow: exactly ONE tool of an
+/// in-process kind, no `cases` (worker-side routing: step.exit / set var /
+/// fail / goto), no sink, no control-flow verbs, a success that completes, and
+/// never the orchestrate drive (its call.done IS the drive result). A step
+/// whose ordered tool list has several tools — possibly of different runtimes
+/// — is refused, so its events stay exactly per event. `Err` names why.
+pub(crate) fn fusion_eligibility(
+    command: &Command,
+    tool_config: &ToolConfig,
+    is_sink_step: bool,
+    status: noetl_tools::result::ToolStatus,
+    fail_on_step_error: bool,
+) -> std::result::Result<(), &'static str> {
+    if command.step == ORCHESTRATE_STEP_NAME {
+        return Err("orchestrate drive");
+    }
+    if is_sink_step {
+        return Err("sink step");
+    }
+    if command
+        .input
+        .get("cases")
+        .and_then(|v| v.as_array())
+        .is_some_and(|c| !c.is_empty())
+    {
+        return Err("cases");
+    }
+    if status != noetl_tools::result::ToolStatus::Success
+        || terminal_event_for(status, false, fail_on_step_error) != "command.completed"
+    {
+        return Err("not a completing success");
+    }
+    if has_control_flow_verb(&tool_config.config) {
+        return Err("control-flow verb");
+    }
+    let kind = if tool_config.kind == "task_sequence" {
+        let tasks = tool_config
+            .config
+            .get("tool_config")
+            .or_else(|| tool_config.config.get("tasks"))
+            .or(Some(&tool_config.config))
+            .and_then(|v| v.as_array())
+            .ok_or("uninspectable task_sequence")?;
+        let [only] = tasks.as_slice() else {
+            return Err("multi-tool step");
+        };
+        let spec = only
+            .as_object()
+            .filter(|m| m.len() == 1)
+            .and_then(|m| m.values().next())
+            .ok_or("uninspectable task")?;
+        spec.get("kind")
+            .and_then(|k| k.as_str())
+            .ok_or("task without kind")?
+            .to_string()
+    } else {
+        tool_config.kind.clone()
+    };
+    if !FUSIBLE_TOOL_KINDS.contains(&kind.as_str()) {
+        return Err("tool kind not fusible");
+    }
+    Ok(())
 }
 
 /// The terminal event a finished tool call produces.
@@ -6874,6 +7080,130 @@ mod tests {
         assert_eq!(o2.max_wait.as_secs(), 120);
         std::env::remove_var("NOETL_CONTAINER_POLL_INTERVAL_SECS");
         std::env::remove_var("NOETL_CONTAINER_POLL_MAX_WAIT_SECS");
+    }
+
+    // ---- noetl/ai-meta#561 lifecycle fusion ----------------------------
+
+    fn fuse_cmd(step: &str, input: serde_json::Value) -> Command {
+        Command { step: step.to_string(), input, ..predispatch_command() }
+    }
+
+    #[test]
+    fn fusion_only_for_one_in_process_tool() {
+        use noetl_tools::result::ToolStatus::{Error, Success};
+        let c = fuse_cmd("s", serde_json::json!({}));
+        // one tool, plain or wrapped: fused
+        assert_eq!(fusion_eligibility(&c, &tc("python", serde_json::json!({"code": "x"})), false, Success, true), Ok(()));
+        assert_eq!(fusion_eligibility(&c, &task_seq(&["python"]), false, Success, true), Ok(()));
+        // a step whose ordered tool list has several tools (here different
+        // runtimes) is never fused, whatever the kinds
+        assert_eq!(fusion_eligibility(&c, &task_seq(&["python", "http"]), false, Success, true), Err("multi-tool step"));
+        assert_eq!(fusion_eligibility(&c, &task_seq(&["python", "duckdb", "postgres"]), false, Success, true), Err("multi-tool step"));
+        assert_eq!(fusion_eligibility(&c, &task_seq(&["python", "python"]), false, Success, true), Err("multi-tool step"));
+        // control-flow verbs (task_sequence jump/break/retry) anywhere: never
+        let jump = tc("task_sequence", serde_json::json!({"tool_config": [
+            {"t0": {"kind": "python", "spec": {"policy": {"rules": [{"else": {"then": {"do": "jump", "to": "t0"}}}]}}}}
+        ]}));
+        assert_eq!(fusion_eligibility(&c, &jump, false, Success, true), Err("control-flow verb"));
+        // worker-side routing (cases: step.exit / set var / fail / goto): never
+        let cased = fuse_cmd("s", serde_json::json!({"cases": [{"when": "{{ true }}", "then": {"goto": "b"}}]}));
+        assert_eq!(fusion_eligibility(&cased, &task_seq(&["python"]), false, Success, true), Err("cases"));
+        // async / child / remote kinds: never
+        for k in ["playbook", "container", "agent", "mcp", "remote_agent", "subscription", "nats", "transfer"] {
+            assert_eq!(fusion_eligibility(&c, &task_seq(&[k]), false, Success, true), Err("tool kind not fusible"), "{k}");
+        }
+        // sink, drive meta-step, failures: never
+        assert_eq!(fusion_eligibility(&c, &task_seq(&["python"]), true, Success, true), Err("sink step"));
+        let drive = fuse_cmd(ORCHESTRATE_STEP_NAME, serde_json::json!({}));
+        assert_eq!(fusion_eligibility(&drive, &tc("wasm", serde_json::json!({})), false, Success, true), Err("orchestrate drive"));
+        assert_eq!(fusion_eligibility(&c, &task_seq(&["python"]), false, Error, true), Err("not a completing success"));
+        assert!(fusion_eligibility(&c, &tc("task_sequence", serde_json::json!({})), false, Success, true).is_err());
+    }
+
+    /// Mock with `/api/events` and (optionally) `/api/events/seq`; records
+    /// every event in arrival order plus which route carried it.
+    async fn start_seq_sink(with_seq: bool) -> (String, Arc<Mutex<Vec<(String, serde_json::Value)>>>) {
+        let rec: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (rec.clone(), rec.clone());
+        let mut app = Router::new().route(
+            "/api/events",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let a = a.clone();
+                async move {
+                    a.lock().unwrap().push(("single".into(), body));
+                    Json(serde_json::json!({ "status": "ok" }))
+                }
+            }),
+        );
+        if with_seq {
+            app = app.route(
+                "/api/events/seq",
+                axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                    let b = b.clone();
+                    async move {
+                        for e in body["events"].as_array().unwrap() {
+                            b.lock().unwrap().push(("seq".into(), e.clone()));
+                        }
+                        Json(serde_json::json!({ "status": "ok", "event_ids": [] }))
+                    }
+                }),
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, rec)
+    }
+
+    fn strip(e: &serde_json::Value) -> serde_json::Value {
+        let mut e = e.clone();
+        e.as_object_mut().unwrap().remove("created_at");
+        e
+    }
+
+    /// The fused request carries byte-identical events (same ids, order, body)
+    /// to the per-event fallback a server without `/api/events/seq` gets.
+    #[tokio::test]
+    async fn fused_and_fallback_send_identical_events_in_order() {
+        let run = |with_seq: bool| async move {
+            let (base, rec) = start_seq_sink(with_seq).await;
+            let ex = test_executor(&base);
+            let client = ControlPlaneClient::new(&base);
+            let done = ex.build_event("call.done", "s", "COMPLETED", 7, 0,
+                serde_json::json!({"command_id": "c", "call_index": 0, "result": {"status": "success"}}), 101);
+            ex.emit_fused_completion(&client, done, "command.completed", "s", "success", 7, 0,
+                serde_json::json!({"command_id": "c", "status": "success"}), 102)
+                .await
+                .unwrap();
+            let v = rec.lock().unwrap().clone();
+            v
+        };
+        let fused = run(true).await;
+        assert_eq!(fused.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), ["seq", "seq"]);
+        let fallback = run(false).await; // 404 -> per event
+        assert_eq!(fallback.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(), ["single", "single"]);
+        let f: Vec<_> = fused.iter().map(|(_, e)| strip(e)).collect();
+        let g: Vec<_> = fallback.iter().map(|(_, e)| strip(e)).collect();
+        assert_eq!(f, g, "fused and per-event bodies must be identical");
+        assert_eq!(f[0]["event_type"], "call.done");
+        assert_eq!(f[1]["event_type"], "command.completed");
+        assert_eq!(f[0]["event_id"], 101);
+        assert_eq!(f[1]["event_id"], 102);
+    }
+
+    /// A terminal other than command.completed is never fused.
+    #[tokio::test]
+    async fn non_completion_terminal_goes_per_event() {
+        let (base, rec) = start_seq_sink(true).await;
+        let ex = test_executor(&base);
+        let client = ControlPlaneClient::new(&base);
+        let done = ex.build_event("call.done", "s", "COMPLETED", 7, 0, serde_json::json!({}), 201);
+        ex.emit_fused_completion(&client, done, "command.failed", "s", "FAILED", 7, 0, serde_json::json!({}), 202)
+            .await
+            .unwrap();
+        let v = rec.lock().unwrap();
+        assert_eq!(v.iter().map(|(r, e)| (r.as_str(), e["event_type"].as_str().unwrap())).collect::<Vec<_>>(),
+            [("single", "call.done"), ("single", "command.failed")]);
     }
 }
 
