@@ -9,6 +9,7 @@ pub mod tls;
 
 pub(crate) use control_plane::server_outage_budget;
 pub use control_plane::{
+    seq_supported, SeqEmit,
     BatchExecuteResponse, BatchItemOutcome, ClaimResult, Command, ControlPlaneClient, Credential,
     CredentialHttpError, DispatchItem, ExecutorEvent, HeartbeatOutcome, SinkStateAction,
     SubscriptionStatus, CLAIM_UNRESOLVABLE,

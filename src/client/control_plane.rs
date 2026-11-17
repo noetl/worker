@@ -115,6 +115,31 @@ pub struct EventEmitHttpError {
     pub body: String,
 }
 
+/// Outcome of [`ControlPlaneClient::emit_event_seq_with_retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqEmit {
+    /// The server accepted every event.
+    Done,
+    /// The server refused the fused form before writing anything: resend per event.
+    Refused,
+}
+
+/// Set once a server answers `/api/events/seq` with 404/405 (an older server):
+/// the worker stops trying to fuse for the life of the process.
+static SEQ_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// False once a server has shown it has no `/api/events/seq`.
+pub fn seq_supported() -> bool {
+    !SEQ_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Statuses `/api/events/seq` returns before writing anything, so a per-event
+/// resend cannot duplicate a row: no route (404/405), affinity (409), bad body
+/// (415), or a shape it does not fuse (422).
+pub(crate) fn seq_refused_before_write(status: u16) -> bool {
+    matches!(status, 404 | 405 | 409 | 415 | 422)
+}
+
 /// Default for `NOETL_EVENT_EMIT_OUTAGE_BUDGET_SECS`: how long a step's result
 /// keeps retrying while the server is unreachable.
 ///
@@ -642,6 +667,15 @@ impl ControlPlaneClient {
             None
         };
 
+        self.mirror_accepted_event(&event, authoritative_event_id).await;
+
+        Ok(())
+    }
+
+    /// The EHDB live-append hook for an event the control plane accepted.
+    /// Shared by [`Self::emit_event`] and [`Self::emit_event_seq`] so a fused
+    /// emit mirrors each event exactly as a per-event emit would, in order.
+    async fn mirror_accepted_event(&self, event: &ExecutorEvent, authoritative_event_id: Option<i64>) {
         // EHDB event-log live-append hook (noetl/ehdb#234 runtime integration).
         // This is the authoritative event-emit chokepoint every worker path
         // funnels through, so hooking here mirrors ALL live events (emitter,
@@ -652,7 +686,7 @@ impl ControlPlaneClient {
         // a no-op.  Best-effort + isolated: `mirror_live_event` swallows and
         // meters any failure so the authoritative event path is never affected.
         if let Some(env) = self.ehdb_eventlog_hook.as_ref() {
-            if let Ok(payload) = serde_json::to_string(&event) {
+            if let Ok(payload) = serde_json::to_string(event) {
                 let mirrored = crate::ehdb::eventlog::mirror_live_event(
                     env,
                     &event.execution_id.to_string(),
@@ -686,7 +720,107 @@ impl ControlPlaneClient {
             }
         }
 
+    }
+
+    /// One attempt at `POST /api/events/seq` (noetl/ai-meta#561): one tool's
+    /// `call.done` + `command.completed` in a single request. The local-drive
+    /// header follows the LAST event (the completion), as on `/api/events`.
+    pub async fn emit_event_seq(&self, events: &[ExecutorEvent]) -> Result<()> {
+        let Some(last) = events.last() else {
+            return Ok(());
+        };
+        let mut request = self
+            .client
+            .post(format!("{}/api/events/seq", self.server_url))
+            .json(&serde_json::json!({ "events": events }));
+        if crate::local_drive::header_for(last.event_id) {
+            request = request.header(crate::local_drive::HEADER, "1");
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(EventEmitHttpError { status, body }.into());
+        }
+        let ids: Vec<Option<i64>> = if self.ehdb_eventlog_hook.is_some() {
+            response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("event_ids").and_then(|a| a.as_array()).cloned())
+                .map(|a| a.iter().map(|id| id.as_i64()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for (i, event) in events.iter().enumerate() {
+            self.mirror_accepted_event(event, ids.get(i).copied().flatten())
+                .await;
+        }
         Ok(())
+    }
+
+    /// [`Self::emit_event_seq`] with the same retry + outage policy as
+    /// [`Self::emit_event_with_retry`] (keyed on the completion). Every attempt
+    /// sends the same event ids. A status the server returns BEFORE writing
+    /// anything (404/405 endpoint absent, 409/415/422 shape refused) yields
+    /// [`SeqEmit::Refused`] at once so the caller resends per event; 404/405
+    /// also turn fusion off for this process.
+    pub async fn emit_event_seq_with_retry(
+        &self,
+        events: &[ExecutorEvent],
+        max_retries: u32,
+    ) -> Result<SeqEmit> {
+        let Some(last) = events.last() else {
+            return Ok(SeqEmit::Done);
+        };
+        let budget = if may_wait_out_outage(last) {
+            server_outage_budget()
+        } else {
+            Duration::ZERO
+        };
+        let started = std::time::Instant::now();
+        let mut delay = Duration::from_millis(500);
+        let mut attempt = 0;
+        loop {
+            let e = match self.emit_event_seq(events).await {
+                Ok(()) => return Ok(SeqEmit::Done),
+                Err(e) => e,
+            };
+            if let Some(http) = e.downcast_ref::<EventEmitHttpError>() {
+                if seq_refused_before_write(http.status) {
+                    if matches!(http.status, 404 | 405) {
+                        SEQ_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    tracing::info!(
+                        execution_id = last.execution_id,
+                        step = %last.step,
+                        status = http.status,
+                        "events/seq refused before write; resending per event"
+                    );
+                    return Ok(SeqEmit::Refused);
+                }
+            }
+            let in_budget = started.elapsed() < budget && is_server_outage(&e);
+            if attempt < max_retries || in_budget {
+                attempt += 1;
+                tracing::warn!(
+                    execution_id = last.execution_id,
+                    step = %last.step,
+                    attempt,
+                    max_retries,
+                    error = %e,
+                    "fused event emission failed, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, OUTAGE_RETRY_MAX_DELAY);
+            } else {
+                for ev in events {
+                    crate::metrics::record_event_emit_failed(&ev.event_type.to_string());
+                }
+                return Err(e);
+            }
+        }
     }
 
     /// Tell the **server** that an execution holds un-sunk business context, or
