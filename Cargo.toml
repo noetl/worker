@@ -261,7 +261,10 @@ wasmtime = { version = "27", optional = true }
 # remote-agent client. Move this pin only together with `async-nats` below.
 # 4.7.0 (noetl/ai-meta#559): `kind: playbook` waits on `/wait` (NOETL_EXECUTION_WAIT) and
 # parks its slot (NOETL_PLAYBOOK_AWAIT_PARK); both default off.
-noetl-tools = "=4.7.0"
+# 4.7.1 (noetl/travel#185, noetl/tools#121): a `kind: playbook` inside a tool list
+# (task_sequence) awaits inline and never parks — it used to park and leave the step
+# with a `parked` placeholder instead of the child's result. Top-level unchanged.
+noetl-tools = "=4.7.1"
 
 # Shared execution core -- types and utilities shared with the noetl
 # CLI's local-mode runner.  Adoptions:
